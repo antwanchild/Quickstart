@@ -5,6 +5,7 @@ let KOMETA_UPDATING = false
 let KOMETA_VALIDATED = false
 let KOMETA_VALIDATION_IN_PROGRESS = false
 let KOMETA_UPDATE_AVAILABLE = false
+let KOMETA_INSTALLED = false
 // Polling handles (hoist to top so all handlers see them safely)
 let kometaInterval = null
 let kometaStatusInterval = null
@@ -72,6 +73,15 @@ $(document).ready(function () {
   const $runSparkMemKometa = $('#run-spark-mem-kometa')
   const $yamlOutput = $('#final-yaml')
   const $yamlLineCount = $('#yaml-line-count')
+  const headerSelect = document.getElementById('header-style')
+  const headerPreview = document.getElementById('header-style-preview')
+  const headerGrid = document.getElementById('header-style-grid')
+  const headerGridCollapse = document.getElementById('header-style-grid-collapse')
+  const headerStyleWait = document.getElementById('header-style-wait')
+  const finalContentWrapper = document.getElementById('final-content-wrapper')
+  const headerGridStatus = document.getElementById('header-style-grid-status')
+  const headerGridProgress = document.getElementById('header-style-grid-progress')
+  const headerGridProgressBar = headerGridProgress ? headerGridProgress.querySelector('.progress-bar') : null
 
   const showYAML = plexValid && tmdbValid && libsValid && settValid && yamlValid
 
@@ -122,6 +132,140 @@ $(document).ready(function () {
 
   updateYamlLineCount()
   $yamlOutput.on('input', updateYamlLineCount)
+
+  async function updateHeaderPreview (fontValue) {
+    if (!headerPreview) return
+    const font = fontValue || (headerSelect ? headerSelect.value : '')
+    headerPreview.textContent = 'Loading preview...'
+    try {
+      const res = await fetch(`/header-style-preview?font=${encodeURIComponent(font || '')}`)
+      const data = await res.json()
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || 'Preview unavailable.')
+      }
+      headerPreview.textContent = data.preview || ''
+    } catch (err) {
+      headerPreview.textContent = 'Preview unavailable.'
+    }
+  }
+
+  if (headerSelect && headerPreview) {
+    updateHeaderPreview(headerSelect.value)
+    headerSelect.addEventListener('change', () => updateHeaderPreview(headerSelect.value))
+  }
+
+  function normalizeFontName (value) {
+    return String(value || '').trim()
+  }
+
+  function setActiveGridCard (fontName) {
+    if (!headerGrid) return
+    const activeFont = normalizeFontName(fontName)
+    headerGrid.querySelectorAll('.header-style-card').forEach(card => {
+      card.classList.toggle('active', card.dataset.font === activeFont)
+    })
+  }
+
+  function updateGridStatus (message) {
+    if (headerGridStatus) headerGridStatus.textContent = message || ''
+  }
+
+  function updateGridProgress (loaded, total) {
+    if (!headerGridProgress || !headerGridProgressBar) return
+    if (!total) {
+      headerGridProgress.classList.add('d-none')
+      headerGridProgressBar.style.width = '0%'
+      return
+    }
+    const pct = Math.min(100, Math.round((loaded / total) * 100))
+    headerGridProgress.classList.remove('d-none')
+    headerGridProgressBar.style.width = `${pct}%`
+  }
+
+  async function loadHeaderGridSamples () {
+    if (!headerGrid) return
+    const fonts = JSON.parse(headerGrid.dataset.fonts || '[]')
+    if (!fonts.length) {
+      headerGrid.innerHTML = '<div class="text-muted small">No fonts available.</div>'
+      updateGridStatus('')
+      updateGridProgress(0, 0)
+      return
+    }
+
+    updateGridStatus(`Loading ${fonts.length} font previews...`)
+    updateGridProgress(0, fonts.length)
+
+    headerGrid.innerHTML = ''
+    fonts.forEach(font => {
+      const card = document.createElement('button')
+      card.type = 'button'
+      card.className = 'header-style-card'
+      card.dataset.font = font
+      card.innerHTML = `
+        <div class="header-style-card-title">${font.replace(/_/g, ' ')}</div>
+        <pre class="header-style-card-preview">Loading...</pre>
+      `
+      card.addEventListener('click', () => {
+        if (headerSelect) {
+          headerSelect.value = font
+          headerSelect.dispatchEvent(new Event('change'))
+        }
+        setActiveGridCard(font)
+      })
+      headerGrid.appendChild(card)
+    })
+
+    setActiveGridCard(headerSelect ? headerSelect.value : '')
+
+    const chunkSize = 12
+    let loadedCount = 0
+    for (let i = 0; i < fonts.length; i += chunkSize) {
+      const chunk = fonts.slice(i, i + chunkSize)
+      try {
+        const res = await fetch('/header-style-previews', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fonts: chunk })
+        })
+        const data = await res.json()
+        if (!res.ok || !data.success) {
+          throw new Error(data.message || 'Preview unavailable.')
+        }
+        const previews = data.previews || []
+        previews.forEach(entry => {
+          const card = headerGrid.querySelector(`.header-style-card[data-font="${entry.font}"]`)
+          const pre = card ? card.querySelector('.header-style-card-preview') : null
+          if (pre) pre.textContent = entry.preview || ''
+        })
+      } catch (err) {
+        chunk.forEach(font => {
+          const card = headerGrid.querySelector(`.header-style-card[data-font="${font}"]`)
+          const pre = card ? card.querySelector('.header-style-card-preview') : null
+          if (pre) pre.textContent = 'Preview unavailable.'
+        })
+      }
+      loadedCount += chunk.length
+      updateGridStatus(`Loaded ${Math.min(loadedCount, fonts.length)} of ${fonts.length} previews`)
+      updateGridProgress(Math.min(loadedCount, fonts.length), fonts.length)
+    }
+    updateGridStatus(`Loaded ${fonts.length} previews`)
+    updateGridProgress(fonts.length, fonts.length)
+    setTimeout(() => updateGridProgress(0, 0), 800)
+  }
+
+  if (headerGridCollapse && headerGrid) {
+    let gridLoaded = false
+    headerGridCollapse.addEventListener('show.bs.collapse', () => {
+      if (!gridLoaded) {
+        gridLoaded = true
+        loadHeaderGridSamples()
+      }
+    })
+  }
+
+  if (headerSelect && headerGrid) {
+    headerSelect.addEventListener('change', () => setActiveGridCard(headerSelect.value))
+  }
 
   function updateLibraryVisibility (mainOption) {
     const librarySection = $('#library-multiselect').closest('.mb-2')
@@ -459,6 +603,7 @@ $(document).ready(function () {
         if (Array.isArray(res.log)) res.log.forEach(line => $logBox.append(`${line}\n`))
 
         if (res.success) {
+          KOMETA_INSTALLED = true
           $logBox.append('✅ Kometa root validated successfully.\n')
           if (res.kometa_version) $logBox.append(`📦 Local Kometa version: ${res.kometa_version}\n`)
 
@@ -519,6 +664,7 @@ $(document).ready(function () {
             $runNow.prop('disabled', true)
           }
         } else {
+          KOMETA_INSTALLED = false
           KOMETA_VALIDATED = false
           hideRunCommandSectionUntilValidated()
           $runNow.prop('disabled', true)
@@ -529,6 +675,10 @@ $(document).ready(function () {
       error: (xhr) => {
         const msg = xhr?.responseJSON?.error || 'The Kometa root path is invalid or inaccessible. Please try again.'
         $logBox.append(`❌ ${msg}\n`)
+        const lowered = String(msg || '').toLowerCase()
+        if (lowered.includes('kometa.py not found') || lowered.includes('requirements.txt not found')) {
+          KOMETA_INSTALLED = false
+        }
         KOMETA_VALIDATED = false
         hideRunCommandSectionUntilValidated()
         $runNow.prop('disabled', true)
@@ -537,6 +687,7 @@ $(document).ready(function () {
       complete: () => {
         KOMETA_VALIDATION_IN_PROGRESS = false
         updateRunNowState()
+        syncUpdateButtonLabel()
       }
     })
   }
@@ -635,8 +786,10 @@ $(document).ready(function () {
   function getUpdateButtonLabel () {
     const force = $forceUpdateToggle.is(':checked')
     const label = force
-      ? 'Force Update Kometa'
-      : (KOMETA_UPDATE_AVAILABLE ? 'Update Available' : 'Check for Kometa Updates')
+      ? (KOMETA_INSTALLED ? 'Force Update Kometa' : 'Force Install Kometa')
+      : (KOMETA_INSTALLED
+          ? (KOMETA_UPDATE_AVAILABLE ? 'Update Available' : 'Check for Kometa Updates')
+          : 'Install Kometa')
     return `<i class="bi bi-arrow-clockwise me-1"></i> ${label}`
   }
 
@@ -670,7 +823,10 @@ $(document).ready(function () {
     $runNow.prop('disabled', true).html('<i class="bi bi-hourglass me-1"></i> Updating...')
     $stopNow.prop('disabled', true)
 
-    $btn.prop('disabled', true).html(`<i class="bi bi-arrow-repeat me-1"></i> ${forceUpdate ? 'Force Updating...' : 'Checking for updates...'}`)
+    const inProgressLabel = forceUpdate
+      ? (KOMETA_INSTALLED ? 'Force Updating...' : 'Force Installing...')
+      : (KOMETA_INSTALLED ? 'Checking for updates...' : 'Installing...')
+    $btn.prop('disabled', true).html(`<i class="bi bi-arrow-repeat me-1"></i> ${inProgressLabel}`)
     $forceUpdateToggle.prop('disabled', true)
     $logBox.append('\nInitializing/Updating Kometa...\n')
     if ($logBox[0]) $logBox[0].scrollTop = $logBox[0].scrollHeight
@@ -1282,9 +1438,68 @@ $(document).ready(function () {
 
   if (document.getElementById('header-style')) {
     document.getElementById('header-style').addEventListener('change', function () {
-      document.getElementById('configForm').submit()
+      showToast('info', 'Updating header style. Please wait for the page to reload...')
+      if (headerStyleWait) headerStyleWait.classList.remove('d-none')
+      if (finalContentWrapper) finalContentWrapper.classList.add('is-updating')
+      setTimeout(() => {
+        document.getElementById('configForm').submit()
+      }, 150)
     })
   }
+
+  const formatLocalTimestamp = (date) => {
+    const pad2 = (value) => String(value).padStart(2, '0')
+    return [
+      date.getFullYear(),
+      pad2(date.getMonth() + 1),
+      pad2(date.getDate())
+    ].join('-') + ' ' + [
+      pad2(date.getHours()),
+      pad2(date.getMinutes()),
+      pad2(date.getSeconds())
+    ].join(':')
+  }
+
+  const formatRelativeTimestamp = (date, now) => {
+    const base = now || new Date()
+    let diffMs = base - date
+    if (!Number.isFinite(diffMs) || diffMs < 0) diffMs = 0
+    const sec = Math.floor(diffMs / 1000)
+    if (sec < 60) return 'Just now'
+    const min = Math.floor(sec / 60)
+    if (min < 60) return `${min}m ago`
+    const hr = Math.floor(min / 60)
+    const minLeft = min % 60
+    if (hr < 24) return `${hr}h ${minLeft}m ago`
+    const days = Math.floor(hr / 24)
+    const hrLeft = hr % 24
+    if (days < 7) return `${days}d ${hrLeft}h ago`
+    const weeks = Math.floor(days / 7)
+    const dayLeft = days % 7
+    if (weeks < 5) return `${weeks}w ${dayLeft}d ago`
+    const months = Math.floor(days / 30)
+    if (months < 12) return `${months}mo ago`
+    const years = Math.floor(days / 365)
+    return `${years}y ago`
+  }
+
+  const now = new Date()
+  document.querySelectorAll('[data-validation-iso]').forEach(el => {
+    const raw = el.dataset.validationIso
+    if (!raw) return
+    const parsed = new Date(raw)
+    if (!Number.isNaN(parsed.getTime())) {
+      el.textContent = formatLocalTimestamp(parsed)
+    }
+  })
+  document.querySelectorAll('[data-validation-iso-age]').forEach(el => {
+    const raw = el.dataset.validationIsoAge
+    if (!raw) return
+    const parsed = new Date(raw)
+    if (!Number.isNaN(parsed.getTime())) {
+      el.textContent = formatRelativeTimestamp(parsed, now)
+    }
+  })
 
   $('#run-now').on('click', function () {
     if (KOMETA_UPDATING) {

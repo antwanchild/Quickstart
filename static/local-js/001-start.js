@@ -87,11 +87,15 @@ document.addEventListener('DOMContentLoaded', function () {
   const importLibraryMappingSection = document.getElementById('importLibraryMappingSection')
   const importLibraryMappingList = document.getElementById('importLibraryMappingList')
   const importMappingNote = document.getElementById('importMappingNote')
+  const importReportFilters = document.getElementById('importReportFilters')
   let configActionModal = null
   if (configActionModalElement) configActionModal = new bootstrap.Modal(configActionModalElement)
 
   let currentAction = ''
   let importToken = null
+  let importReportHeader = ''
+  let importReportBody = ''
+  let importReportFilter = 'all'
 
   if (importPlexTokenToggle && importPlexToken) {
     if (!importPlexToken.value.trim()) {
@@ -117,8 +121,50 @@ document.addEventListener('DOMContentLoaded', function () {
     if (box) box.classList.toggle('d-none', !(isAddConfig || onlyAddConfigAvailable))
   }
 
+  function updateConfigBadge (name) {
+    const badgeBtn = document.querySelector('.config-badge-button[data-current]')
+    if (!badgeBtn || !name) return
+    badgeBtn.dataset.current = name
+    const label = badgeBtn.querySelector('span')
+    if (!label) return
+    label.textContent = `Config: ${name}`
+    const icon = document.createElement('i')
+    icon.className = 'bi bi-chevron-down ms-1'
+    label.appendChild(icon)
+  }
+
+  async function syncSelectedConfig () {
+    if (!configSelector) return
+    const selected = configSelector.value
+    if (!selected || selected === 'add_config') return
+
+    if (window.pageInfo && window.pageInfo.config_name === selected) {
+      updateConfigBadge(selected)
+      return
+    }
+
+    try {
+      const res = await fetch('/switch-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: selected })
+      })
+      const data = await res.json()
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || 'Failed to switch configs.')
+      }
+      if (window.pageInfo) window.pageInfo.config_name = data.name
+      updateConfigBadge(data.name)
+    } catch (err) {
+      showToast('error', err.message || 'Failed to switch configs.')
+    }
+  }
+
   updateButtonState()
-  configSelector.addEventListener('change', updateButtonState)
+  configSelector.addEventListener('change', () => {
+    updateButtonState()
+    syncSelectedConfig()
+  })
 
   document.querySelectorAll('[data-action]').forEach(button => {
     button.addEventListener('click', function () {
@@ -466,6 +512,56 @@ document.addEventListener('DOMContentLoaded', function () {
     confirmImportButton.disabled = false
   }
 
+  let mappingRefreshTimer = null
+
+  function collectLibraryMapping () {
+    const mapping = {}
+    if (!importLibraryMappingList) return mapping
+    importLibraryMappingList.querySelectorAll('.import-library-map').forEach(select => {
+      if (select.dataset.libraryName && select.value) {
+        mapping[select.dataset.libraryName] = select.value
+      }
+    })
+    return mapping
+  }
+
+  async function refreshMappedPreview () {
+    if (!importToken) return
+    try {
+      const res = await fetch('/import-config/preview-mapped', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: importToken, library_mapping: collectLibraryMapping() })
+      })
+      const data = await res.json()
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || 'Preview refresh failed.')
+      }
+      if (importReport) {
+        importReportHeader = buildImportHeader(data)
+        importReportBody = data.annotated_report || (data.report_lines || []).join('\n')
+        applyImportReportFilter()
+      }
+      if (importSummary) {
+        importSummary.textContent = ''
+        importSummary.classList.add('d-none')
+      }
+      if (downloadImportReport && data.report_url) {
+        downloadImportReport.href = data.report_url
+        downloadImportReport.download = `import_report_${importConfigName?.value || 'import'}.txt`
+        downloadImportReport.classList.remove('d-none')
+      }
+    } catch (err) {
+      setImportError(err.message || 'Preview refresh failed.')
+    }
+  }
+
+  function scheduleMappedPreviewRefresh () {
+    if (!importToken) return
+    if (mappingRefreshTimer) clearTimeout(mappingRefreshTimer)
+    mappingRefreshTimer = setTimeout(refreshMappedPreview, 300)
+  }
+
   function renderLibraryMapping (items, plexLibraries) {
     if (!importLibraryMappingSection || !importLibraryMappingList) return
     importLibraryMappingList.innerHTML = ''
@@ -555,7 +651,10 @@ document.addEventListener('DOMContentLoaded', function () {
 
       if (suggested) select.value = suggested
 
-      select.addEventListener('change', updateImportConfirmState)
+      select.addEventListener('change', () => {
+        updateImportConfirmState()
+        scheduleMappedPreviewRefresh()
+      })
 
       row.appendChild(left)
       row.appendChild(select)
@@ -564,10 +663,14 @@ document.addEventListener('DOMContentLoaded', function () {
 
     importLibraryMappingSection.classList.remove('d-none')
     updateImportConfirmState()
+    scheduleMappedPreviewRefresh()
   }
 
   function resetImportModal () {
     importToken = null
+    importReportHeader = ''
+    importReportBody = ''
+    importReportFilter = 'all'
     if (importConfigFile) importConfigFile.value = ''
     if (importConfigName) {
       importConfigName.value = ''
@@ -578,6 +681,15 @@ document.addEventListener('DOMContentLoaded', function () {
     if (importPlexToken) importPlexToken.value = ''
     if (importPreviewSection) importPreviewSection.classList.add('d-none')
     if (importReport) importReport.textContent = ''
+    if (importSummary) {
+      importSummary.textContent = ''
+      importSummary.classList.add('d-none')
+    }
+    if (importReportFilters) {
+      importReportFilters.querySelectorAll('button[data-filter]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.filter === 'all')
+      })
+    }
     if (importSummary) importSummary.textContent = ''
     if (downloadImportReport) {
       downloadImportReport.classList.add('d-none')
@@ -589,6 +701,86 @@ document.addEventListener('DOMContentLoaded', function () {
     if (confirmImportButton) confirmImportButton.classList.add('d-none')
     if (previewImportButton) previewImportButton.disabled = false
     setImportError('')
+  }
+
+  function clearImportPreviewState () {
+    importToken = null
+    importReportHeader = ''
+    importReportBody = ''
+    if (importPreviewSection) importPreviewSection.classList.add('d-none')
+    if (importReport) importReport.textContent = ''
+    if (importSummary) {
+      importSummary.textContent = ''
+      importSummary.classList.add('d-none')
+    }
+    if (confirmImportButton) confirmImportButton.classList.add('d-none')
+    if (importReportFilters) {
+      importReportFilters.querySelectorAll('button[data-filter]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.filter === 'all')
+      })
+    }
+  }
+
+  function applyImportReportFilter () {
+    if (!importReport) return
+    if (!importReportBody && !importReportHeader) {
+      importReport.textContent = ''
+      return
+    }
+    const lines = importReportBody.split('\n')
+    const filtered = lines.filter(line => {
+      const trimmed = line.trimEnd()
+      if (importReportFilter === 'imported') {
+        return trimmed.endsWith('# imported') || trimmed.endsWith('| imported')
+      }
+      if (importReportFilter === 'not_imported') {
+        return trimmed.endsWith('# not imported') || trimmed.endsWith('| not imported')
+      }
+      if (importReportFilter === 'comments') {
+        return line.trimStart().startsWith('#')
+      }
+      return true
+    })
+    const header = importReportHeader ? `${importReportHeader}\n` : ''
+    importReport.textContent = header + filtered.join('\n')
+  }
+
+  if (importReportFilters) {
+    importReportFilters.addEventListener('click', (event) => {
+      const btn = event.target.closest('button[data-filter]')
+      if (!btn) return
+      importReportFilter = btn.dataset.filter || 'all'
+      importReportFilters.querySelectorAll('button[data-filter]').forEach(node => {
+        node.classList.toggle('active', node === btn)
+      })
+      applyImportReportFilter()
+    })
+  }
+
+  function buildImportHeader (data) {
+    const counts = data.line_counts || {}
+    const summary = data.summary || {}
+    const imported = typeof counts.imported_lines === 'number' ? counts.imported_lines : (summary.imported || 0)
+    const notImported = typeof counts.not_imported_lines === 'number'
+      ? counts.not_imported_lines
+      : ((summary.unmapped || 0) + (summary.skipped || 0))
+    const comments = typeof counts.comments === 'number' ? counts.comments : (data.comments_count || 0)
+    const blank = typeof counts.blank === 'number' ? counts.blank : 0
+    const total = typeof counts.total === 'number' ? counts.total : 0
+    const diff = typeof counts.diff === 'number'
+      ? counts.diff
+      : (total - (imported + notImported + blank + comments))
+    const name = data.config_name || importConfigName?.value || 'import'
+    return [
+      `# Import Report for ${name}`,
+      `# Imported: ${imported}`,
+      `# Not Imported: ${notImported}`,
+      `# Comments: ${comments}`,
+      `# Blank: ${blank}`,
+      `# Total: ${total}`,
+      `# Diff: ${diff}`,
+      ''
+    ].join('\n')
   }
 
   if (importConfigModalEl) {
@@ -612,6 +804,7 @@ document.addEventListener('DOMContentLoaded', function () {
         setImportError('Config name already exists. Choose a unique name or rename it first.')
       } else {
         applyValidationStyles(importConfigName, 'success', 'Name is available')
+        setImportError('')
       }
     })
   }
@@ -622,8 +815,10 @@ document.addEventListener('DOMContentLoaded', function () {
       removeValidationMessages(importConfigName)
       if (isDuplicateName(importConfigName.value)) {
         applyValidationStyles(importConfigName, 'error', 'Name already exists.')
+        setImportError('Config name already exists. Choose a unique name or rename it first.')
       } else if (importConfigName.value) {
         applyValidationStyles(importConfigName, 'success', 'Name is available')
+        setImportError('')
       }
     })
   }
@@ -676,6 +871,7 @@ document.addEventListener('DOMContentLoaded', function () {
               importPlexToken.value = data.plex_token
             }
           }
+          clearImportPreviewState()
           setImportError(data.message || 'Preview failed.')
           return
         }
@@ -683,11 +879,13 @@ document.addEventListener('DOMContentLoaded', function () {
         importToken = data.token
         if (importPreviewSection) importPreviewSection.classList.remove('d-none')
         if (importReport) {
-          importReport.textContent = data.annotated_report || (data.report_lines || []).join('\n')
+          importReportHeader = buildImportHeader(data)
+          importReportBody = data.annotated_report || (data.report_lines || []).join('\n')
+          applyImportReportFilter()
         }
         if (importSummary) {
-          const summary = data.summary || {}
-          importSummary.textContent = `Imported: ${summary.imported || 0} • Unmapped: ${summary.unmapped || 0} • Skipped: ${summary.skipped || 0}`
+          importSummary.textContent = ''
+          importSummary.classList.add('d-none')
         }
         if (downloadImportReport && data.report_url) {
           downloadImportReport.href = data.report_url
@@ -745,7 +943,13 @@ document.addEventListener('DOMContentLoaded', function () {
         if (modal) modal.hide()
         setTimeout(() => window.location.reload(), 1200)
       } catch (err) {
-        setImportError(err.message || 'Import failed.')
+        const message = err.message || 'Import failed.'
+        if (/import token is invalid/i.test(message)) {
+          clearImportPreviewState()
+          setImportError('Import preview expired. Please run Preview Import again.')
+        } else {
+          setImportError(message)
+        }
       } finally {
         confirmImportButton.disabled = false
         confirmImportButton.textContent = 'Import'
@@ -1113,7 +1317,6 @@ document.addEventListener('DOMContentLoaded', function () {
           if (phase === 'download') {
             const hasTotal = Number.isFinite(prog.total) && prog.total > 0
             const isEstimated = prog.estimated === true
-            const estimateNote = typeof prog.estimated_note === 'string' ? prog.estimated_note : ''
             let pct = Number.isFinite(prog.pct) ? prog.pct : null
             if (pct === null && hasTotal && Number.isFinite(prog.downloaded)) {
               pct = Math.max(0, Math.min(100, Math.floor((prog.downloaded || 0) * 100 / prog.total)))
@@ -1134,9 +1337,7 @@ document.addEventListener('DOMContentLoaded', function () {
               setProgress(40, `Downloading… ${bytes(prog.downloaded || 0)} ${speedNote} ${sizeNote}`, { indeterminate: true })
             } else {
               const totalStr = hasTotal ? ` / ${bytes(prog.total)}` : ''
-              const estimateLabel = isEstimated
-                ? ` • estimated${estimateNote ? ` (${estimateNote})` : ''}`
-                : ''
+              const estimateLabel = ''
               setProgress(pct, `Downloading… ${bytes(prog.downloaded || 0)}${totalStr} (${pct}%) ${speedStr ? `• ${speedStr}` : ''}${estimateLabel}`)
             }
           } else if (phase === 'extract') {

@@ -29,7 +29,7 @@ import namesgenerator
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 from cachelib.file import FileSystemCache
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from flask import (
     Flask,
@@ -54,7 +54,7 @@ from werkzeug.wrappers import Request
 Request.max_form_parts = 100000  # Allow more form fields if needed
 
 from flask_session import Session
-from modules import validations, output, persistence, helpers, database, logscan, importer, path_validation
+from modules import validations, output, persistence, helpers, database, logscan, importer, path_validation, url_validation
 from typing import Dict, Any
 
 # A very simple in-memory progress store
@@ -371,9 +371,8 @@ app = Flask(__name__)
 # Run version check at startup
 app.config["VERSION_CHECK"] = helpers.check_for_update()
 
-# Path to the 'kometa' directory next to 'quickstart'
-base_dir = os.path.dirname(os.path.abspath(__file__))
-kometa_path = os.path.abspath(os.path.join(base_dir, "..", "kometa"))
+# Default Kometa root lives under Quickstart's config directory
+kometa_path = os.path.abspath(os.path.join(helpers.CONFIG_DIR, "kometa"))
 
 app.config["KOMETA_ROOT"] = os.environ.get("QS_KOMETA_PATH", kometa_path)
 
@@ -420,6 +419,9 @@ default_test_libs_tmp = os.path.join(helpers.CONFIG_DIR, "tmp")
 app.config["QS_TEST_LIBS_PATH"] = os.getenv("QS_TEST_LIBS_PATH", default_test_libs_path).strip() or default_test_libs_path
 app.config["QS_TEST_LIBS_TMP"] = os.getenv("QS_TEST_LIBS_TMP", default_test_libs_tmp).strip() or default_test_libs_tmp
 app.config["QUICKSTART_DOCKER"] = helpers.booler(os.getenv("QUICKSTART_DOCKER", "0"))
+restart_notice = helpers.consume_restart_notice()
+app.config["QS_RESTART_NOTICE"] = restart_notice
+app.config["QS_SKIP_AUTO_OPEN"] = bool(restart_notice and restart_notice.get("reason") == "update")
 
 cleanup_flag = os.getenv("QS_CONFIG_CLEANUP_DONE", "").strip().lower()
 if cleanup_flag not in {"1", "true", "yes"}:
@@ -433,10 +435,48 @@ if cleanup_flag not in {"1", "true", "yes"}:
         helpers.update_env_variable("QS_CONFIG_CLEANUP_DONE", "1")
         os.environ["QS_CONFIG_CLEANUP_DONE"] = "1"
 
+
+def _load_or_create_secret_key():
+    env_key = os.getenv("QS_SECRET_KEY", "").strip()
+    if env_key:
+        return env_key
+    secret_path = os.path.join(helpers.CONFIG_DIR, ".secret_key")
+    try:
+        if os.path.exists(secret_path):
+            with open(secret_path, "r", encoding="utf-8") as handle:
+                existing = handle.read().strip()
+            if existing:
+                return existing
+        new_key = secrets.token_hex(32)
+        with open(secret_path, "w", encoding="utf-8") as handle:
+            handle.write(new_key)
+        return new_key
+    except Exception:
+        return secrets.token_hex(32)
+
+
+def _get_session_lifetime_days():
+    raw_days = os.getenv("QS_SESSION_LIFETIME_DAYS", "").strip()
+    if raw_days:
+        try:
+            days = max(1, int(raw_days))
+        except (TypeError, ValueError):
+            days = 30
+    else:
+        days = 30
+    return days
+
+
+def _get_session_lifetime_seconds():
+    return int(timedelta(days=_get_session_lifetime_days()).total_seconds())
+
+
+app.config["SECRET_KEY"] = _load_or_create_secret_key()
 app.config["SESSION_TYPE"] = "cachelib"
 
 # Flask session cache dir (portable default)
 flask_cache_dir = os.environ.get("QS_FLASK_SESSION_DIR", os.path.join(helpers.CONFIG_DIR, "flask_session"))
+flask_cache_dir = os.path.abspath(os.path.expanduser(flask_cache_dir))
 os.makedirs(flask_cache_dir, exist_ok=True)
 
 logscan_reingest_lock = threading.Lock()
@@ -446,7 +486,12 @@ logscan_reingest_state = {
     "job_id": None,
 }
 
-app.config["SESSION_CACHELIB"] = FileSystemCache(cache_dir=flask_cache_dir, threshold=500)
+session_ttl = _get_session_lifetime_seconds()
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(seconds=session_ttl)
+app.config["SESSION_REFRESH_EACH_REQUEST"] = True
+app.config["QS_SESSION_LIFETIME_DAYS"] = _get_session_lifetime_days()
+app.config["QS_FLASK_SESSION_DIR"] = flask_cache_dir
+app.config["SESSION_CACHELIB"] = FileSystemCache(cache_dir=flask_cache_dir, threshold=500, default_timeout=session_ttl)
 app.config["SESSION_PERMANENT"] = True
 app.config["SESSION_USE_SIGNER"] = False
 
@@ -481,6 +526,12 @@ def before_request():
         session["qs_user_agent_raw"] = request.headers.get("User-Agent", "") or ""
     except Exception:
         pass
+
+
+def _render_header_style_preview(font: str) -> str:
+    if font == "none":
+        return "No header will be added."
+    return output.section_heading("Quickstart", font=font)
 
 
 @app.route("/update-quickstart", methods=["POST"])
@@ -1118,7 +1169,7 @@ def bulk_delete_configs():
 
     cleaned = [n.strip() for n in names if isinstance(n, str) and n.strip()]
     if not cleaned:
-        return jsonify(success=False, message="No profiles selected."), 400
+        return jsonify(success=False, message="No configs selected."), 400
 
     available = set(database.get_unique_config_names() or [])
     deleted = []
@@ -1180,6 +1231,29 @@ def rename_config():
 
 @app.route("/import-config/preview", methods=["POST"])
 def import_config_preview():
+    def count_comment_lines(text: str) -> int:
+        if not isinstance(text, str):
+            return 0
+        return sum(1 for line in text.splitlines() if line.lstrip().startswith("#"))
+
+    def count_blank_lines(text: str) -> int:
+        if not isinstance(text, str):
+            return 0
+        return sum(1 for line in text.splitlines() if not line.strip())
+
+    def count_annotated_lines(text: str) -> dict:
+        imported = 0
+        not_imported = 0
+        if not isinstance(text, str):
+            return {"imported": 0, "not_imported": 0}
+        for line in text.splitlines():
+            trimmed = line.rstrip()
+            if trimmed.endswith("| imported") or trimmed.endswith("# imported"):
+                imported += 1
+            elif trimmed.endswith("| not imported") or trimmed.endswith("# not imported"):
+                not_imported += 1
+        return {"imported": imported, "not_imported": not_imported}
+
     upload = request.files.get("file")
     raw_name = request.form.get("config_name")
     config_name = importer.sanitize_config_name(raw_name)
@@ -1383,12 +1457,11 @@ def import_config_preview():
                 400,
             )
 
-    library_types, library_inference, _ = importer.build_library_type_plan(parsed, movie_names, show_names)
+    _library_types, library_inference, _ = importer.build_library_type_plan(parsed, movie_names, show_names)
     payload, report = importer.prepare_import_payload(
         parsed,
         movie_names,
         show_names,
-        library_type_overrides=library_types,
     )
     if not payload:
         if extracted_dir:
@@ -1402,18 +1475,20 @@ def import_config_preview():
     if extracted_fonts:
         for font in extracted_fonts:
             report_lines.append(f"imported: bundle.fonts.{font}")
-    annotated_body = importer.annotate_yaml_with_report(config_text, report_lines)
-    annotated_report = ""
-    if annotated_body:
-        legend_lines = [
-            "# Legend:",
-            "# mapped = imported into Quickstart",
-            "# partial = some fields imported, some not",
-            "# unmapped = unsupported or missing mapping",
-            "# skipped = ignored or not applicable",
-            "",
-        ]
-        annotated_report = "\n".join(legend_lines) + annotated_body
+    annotated_report = importer.annotate_yaml_with_report(config_text, report_lines, binary=True)
+    comments_count = count_comment_lines(config_text)
+    blank_count = count_blank_lines(config_text)
+    total_lines = len(config_text.splitlines()) if isinstance(config_text, str) else 0
+    annotated_counts = count_annotated_lines(annotated_report)
+    diff_count = total_lines - (annotated_counts.get("imported", 0) + annotated_counts.get("not_imported", 0) + blank_count + comments_count)
+    line_counts = {
+        "imported_lines": annotated_counts.get("imported", 0),
+        "not_imported_lines": annotated_counts.get("not_imported", 0),
+        "comments": comments_count,
+        "blank": blank_count,
+        "total": total_lines,
+        "diff": diff_count,
+    }
 
     previous_path = session.get("import_preview_path")
     if previous_path:
@@ -1437,12 +1512,17 @@ def import_config_preview():
             {
                 "config_name": config_name,
                 "config_data": parsed,
+                "config_text": config_text,
                 "payload": payload,
                 "fonts_dir": str(extracted_dir) if extracted_dir else None,
                 "fonts": extracted_fonts,
                 "report_lines": report_lines,
                 "report_summary": report.summary(),
                 "annotated_report": annotated_report,
+                "comments_count": comments_count,
+                "line_counts": line_counts,
+                "plex_movie_names": sorted(movie_names) if isinstance(movie_names, (set, list)) else [],
+                "plex_show_names": sorted(show_names) if isinstance(show_names, (set, list)) else [],
             },
             handle,
             ensure_ascii=True,
@@ -1481,6 +1561,8 @@ def import_config_preview():
         token=token,
         config_name=config_name,
         summary=report.summary(),
+        comments_count=comments_count,
+        line_counts=line_counts,
         report_lines=lines,
         annotated_report=annotated_report,
         report_url=f"/import-config/report?token={token}",
@@ -1509,28 +1591,182 @@ def import_config_report():
     report_lines = cached.get("report_lines") or []
     summary = cached.get("report_summary") or {}
     annotated_report = cached.get("annotated_report")
+    line_counts = cached.get("line_counts") or {}
+    imported_count = line_counts.get("imported_lines", summary.get("imported", 0))
+    not_imported_count = line_counts.get(
+        "not_imported_lines",
+        (summary.get("unmapped", 0) + summary.get("skipped", 0)),
+    )
+    comments_count = line_counts.get("comments", cached.get("comments_count", 0))
+    blank_count = line_counts.get("blank", 0)
+    total_count = line_counts.get("total", 0)
+    diff_count = line_counts.get(
+        "diff",
+        total_count - (imported_count + not_imported_count + blank_count + comments_count),
+    )
 
     if annotated_report:
         header = [
             f"# Import Report for {config_name}",
-            f"# Imported: {summary.get('imported', 0)}",
-            f"# Unmapped: {summary.get('unmapped', 0)}",
-            f"# Skipped: {summary.get('skipped', 0)}",
+            f"# Imported: {imported_count}",
+            f"# Not Imported: {not_imported_count}",
+            f"# Comments: {comments_count}",
+            f"# Blank: {blank_count}",
+            f"# Total: {total_count}",
+            f"# Diff: {diff_count}",
             "",
         ]
         text = "\n".join(header) + str(annotated_report)
     else:
         header = [
             f"Import Report for {config_name}",
-            f"Imported: {summary.get('imported', 0)}",
-            f"Unmapped: {summary.get('unmapped', 0)}",
-            f"Skipped: {summary.get('skipped', 0)}",
+            f"Imported: {imported_count}",
+            f"Not Imported: {not_imported_count}",
+            f"Comments: {comments_count}",
+            f"Blank: {blank_count}",
+            f"Total: {total_count}",
+            f"Diff: {diff_count}",
             "",
         ]
         text = "\n".join(header + [str(line) for line in report_lines])
     response = app.response_class(text, mimetype="text/plain")
     response.headers["Content-Disposition"] = f'attachment; filename="{config_name}_import_report.txt"'
     return response
+
+
+@app.route("/import-config/preview-mapped", methods=["POST"])
+def import_config_preview_mapped():
+    data = request.get_json(silent=True) or {}
+    token = data.get("token")
+    library_mapping = data.get("library_mapping") or {}
+    if not token or token != session.get("import_preview_token"):
+        return jsonify(success=False, message="Import token is invalid."), 400
+    if library_mapping and not isinstance(library_mapping, dict):
+        return jsonify(success=False, message="Invalid library mapping."), 400
+
+    cache_path = session.get("import_preview_path")
+    if not cache_path:
+        return jsonify(success=False, message="Import preview not found."), 400
+
+    try:
+        with open(cache_path, "r", encoding="utf-8") as handle:
+            cached = json.load(handle)
+    except Exception:
+        return jsonify(success=False, message="Import preview is unavailable."), 400
+
+    config_data = cached.get("config_data") or {}
+    if not isinstance(config_data, dict):
+        config_data = {}
+    config_text = cached.get("config_text") or ""
+
+    def parse_list(value):
+        if isinstance(value, str):
+            return {v.strip() for v in value.split(",") if v.strip()}
+        if isinstance(value, list):
+            return {str(v).strip() for v in value if str(v).strip()}
+        return set()
+
+    movie_names = parse_list(cached.get("plex_movie_names") or [])
+    show_names = parse_list(cached.get("plex_show_names") or [])
+    needs_plex = isinstance(config_data.get("libraries"), dict) and bool(config_data.get("libraries"))
+
+    if needs_plex and not movie_names and not show_names:
+        plex_url = session.get("import_preview_plex_url") or ""
+        plex_token = session.get("import_preview_plex_token") or ""
+        if plex_url and plex_token:
+            plex_response = validations.validate_plex_server({"plex_url": plex_url, "plex_token": plex_token})
+            plex_result = plex_response.get_json() if isinstance(plex_response, Flask.response_class) else plex_response
+            if plex_result and plex_result.get("validated"):
+                movie_names = parse_list(plex_result.get("movie_libraries", []))
+                show_names = parse_list(plex_result.get("show_libraries", []))
+
+    plex_names = set(movie_names) | set(show_names)
+
+    if isinstance(config_data.get("libraries"), dict):
+        mapped_libraries = {}
+        used_targets = set()
+        for lib_name, lib_cfg in config_data.get("libraries", {}).items():
+            name = str(lib_name)
+            if name in plex_names:
+                target = name
+            else:
+                mapped = library_mapping.get(name)
+                if mapped is None or str(mapped).strip() == "":
+                    continue
+                mapped = str(mapped).strip()
+                if mapped == "__ignore__":
+                    continue
+                if mapped not in plex_names:
+                    continue
+                target = mapped
+
+            if target in used_targets:
+                continue
+            used_targets.add(target)
+            mapped_libraries[target] = lib_cfg
+
+        config_copy = json.loads(json.dumps(config_data))
+        if mapped_libraries:
+            config_copy["libraries"] = mapped_libraries
+        else:
+            config_copy.pop("libraries", None)
+    else:
+        config_copy = config_data
+
+    payload, report = importer.prepare_import_payload(config_copy, movie_names, show_names)
+    report_lines = list(report.lines)
+    annotated_report = importer.annotate_yaml_with_report(config_text, report_lines, binary=True)
+    comments_count = cached.get("comments_count")
+    if not isinstance(comments_count, int):
+        comments_count = sum(1 for line in str(config_text).splitlines() if line.lstrip().startswith("#"))
+    blank_count = sum(1 for line in str(config_text).splitlines() if not line.strip())
+    total_lines = len(str(config_text).splitlines())
+    imported_lines = 0
+    not_imported_lines = 0
+    for line in str(annotated_report).splitlines():
+        trimmed = line.rstrip()
+        if trimmed.endswith("| imported") or trimmed.endswith("# imported"):
+            imported_lines += 1
+        elif trimmed.endswith("| not imported") or trimmed.endswith("# not imported"):
+            not_imported_lines += 1
+    diff_count = total_lines - (imported_lines + not_imported_lines + blank_count + comments_count)
+    line_counts = {
+        "imported_lines": imported_lines,
+        "not_imported_lines": not_imported_lines,
+        "comments": comments_count,
+        "blank": blank_count,
+        "total": total_lines,
+        "diff": diff_count,
+    }
+
+    cached["payload"] = payload
+    cached["report_lines"] = report_lines
+    cached["report_summary"] = report.summary()
+    cached["annotated_report"] = annotated_report
+    cached["comments_count"] = comments_count
+    cached["line_counts"] = line_counts
+    cached["plex_movie_names"] = sorted(movie_names)
+    cached["plex_show_names"] = sorted(show_names)
+
+    with open(cache_path, "w", encoding="utf-8") as handle:
+        json.dump(cached, handle, ensure_ascii=True)
+
+    lines = list(report_lines)
+    max_lines = 500
+    if len(lines) > max_lines:
+        truncated = len(lines) - max_lines
+        lines = lines[:max_lines] + [f"skipped: report truncated ({truncated} more lines)"]
+
+    return jsonify(
+        success=True,
+        config_name=cached.get("config_name") or "",
+        summary=report.summary(),
+        comments_count=comments_count,
+        line_counts=line_counts,
+        report_lines=lines,
+        annotated_report=annotated_report,
+        report_url=f"/import-config/report?token={token}",
+    )
 
 
 @app.route("/import-config/confirm", methods=["POST"])
@@ -1760,11 +1996,14 @@ def step(name):
     page_info = {}
     header_style = "standard"  # Default to 'standard' font
     save_error = None
+    persistence.ensure_session_config_name()
 
     if request.method == "POST":
-        validation_errors = path_validation.validate_payload(request.form)
+        path_errors = path_validation.validate_payload(request.form)
+        url_errors = url_validation.validate_payload(request.form)
+        validation_errors = path_errors + url_errors
         if validation_errors:
-            save_error = "Invalid path values: " + " ".join(validation_errors)
+            save_error = "Invalid values: " + " ".join(validation_errors)
         else:
             persistence.save_settings(request.referrer, request.form)
             header_style = request.form.get("header_style", "standard")
@@ -1786,11 +2025,6 @@ def step(name):
     available_fonts = helpers.get_pyfiglet_fonts()
 
     page_info["available_fonts"] = available_fonts
-
-    # Ensure session["config_name"] always exists
-    if "config_name" not in session:
-        session["config_name"] = namesgenerator.get_random_name()
-        helpers.ts_log(f"Assigned new config_name: {session['config_name']}")
 
     # Retrieve stored settings from DB
     saved_settings = persistence.retrieve_settings(name)  # Retrieve from DB
@@ -1829,6 +2063,8 @@ def step(name):
     page_info["qs_optimize_defaults"] = app.config.get("QS_OPTIMIZE_DEFAULTS", True)
     page_info["qs_config_history"] = app.config.get("QS_CONFIG_HISTORY", 0)
     page_info["qs_kometa_log_keep"] = app.config.get("QS_KOMETA_LOG_KEEP", 0)
+    page_info["qs_session_lifetime_days"] = app.config.get("QS_SESSION_LIFETIME_DAYS", 30)
+    page_info["qs_flask_session_dir"] = app.config.get("QS_FLASK_SESSION_DIR", "")
     _, test_libs_path, test_libs_tmp, _, _ = _resolve_test_libraries_paths(helpers.get_app_root())
     page_info["qs_test_libs_path"] = test_libs_path
     page_info["qs_test_libs_tmp"] = test_libs_tmp
@@ -1918,7 +2154,8 @@ def step(name):
 
     # --- Refresh Plex data if needed ---
     if name in ["010-plex", "025-libraries", "900-final"] or config_changed:
-        refresh_plex_libraries()
+        if all_libraries.get("validated"):
+            refresh_plex_libraries()
         telemetry = persistence.retrieve_settings("plex_telemetry")
     else:
         telemetry = persistence.retrieve_settings("plex_telemetry")
@@ -2087,7 +2324,59 @@ def step(name):
 
     add_offset_vars(overlay_config)
 
+    service_validation_sources = [
+        ("010-plex", "plex"),
+        ("020-tmdb", "tmdb"),
+        ("050-omdb", "omdb"),
+        ("060-mdblist", "mdblist"),
+        ("100-anidb", "anidb"),
+        ("130-trakt", "trakt"),
+        ("140-mal", "mal"),
+    ]
+    validation_pages = {
+        "010-plex",
+        "020-tmdb",
+        "025-libraries",
+        "027-playlist_files",
+        "030-tautulli",
+        "040-github",
+        "050-omdb",
+        "060-mdblist",
+        "070-notifiarr",
+        "080-gotify",
+        "085-ntfy",
+        "090-webhooks",
+        "100-anidb",
+        "110-radarr",
+        "120-sonarr",
+        "130-trakt",
+        "140-mal",
+        "150-settings",
+    }
+    service_validations = {}
+    for section, key in service_validation_sources:
+        settings = persistence.retrieve_settings(section)
+        service_validations[key] = helpers.booler(settings.get("validated", False))
+    validation_sections = {key: key.split("-", 1)[1] for key in validation_pages}
+    validated_sections = database.retrieve_validated_map(config_name, list(validation_sections.values()))
+    jump_to_validations = {key: validated_sections.get(section, False) for key, section in validation_sections.items()}
+
     if name == "900-final":
+        validation_meta = []
+        for file, display_name in file_list:
+            template_key = file.rsplit(".", 1)[0]
+            settings = persistence.retrieve_settings(template_key)
+            has_validation = template_key in validation_pages
+            validation_meta.append(
+                {
+                    "key": template_key,
+                    "label": display_name,
+                    "page": template_key,
+                    "has_validation": has_validation,
+                    "validated": helpers.booler(settings.get("validated", False)) if has_validation else None,
+                    "validated_at": settings.get("validated_at", "") if has_validation else "",
+                }
+            )
         validated, validation_error, config_data, yaml_content = output.build_config(header_style, config_name=config_name)
         used_fonts = helpers.collect_font_references(config_data)
         saved_filename = helpers.save_to_named_config(yaml_content, config_name, used_fonts)
@@ -2118,6 +2407,9 @@ def step(name):
             show_libraries=show_libraries,
             config_dir=str(Path(helpers.CONFIG_DIR).resolve()),
             overlay_fonts=list_overlay_fonts(),
+            service_validations=service_validations,
+            validation_meta=validation_meta,
+            jump_to_validations=jump_to_validations,
         )
 
         end_time = time.perf_counter()
@@ -2135,14 +2427,6 @@ def step(name):
         "movie": sum(1 for lib in movie_libraries if lib["id"] in configured_ids),
         "show": sum(1 for lib in show_libraries if lib["id"] in configured_ids),
     }
-    service_validations = {
-        "tmdb": helpers.booler(persistence.retrieve_settings("020-tmdb").get("validated", False)),
-        "mdblist": helpers.booler(persistence.retrieve_settings("060-mdblist").get("validated", False)),
-        "trakt": helpers.booler(persistence.retrieve_settings("130-trakt").get("validated", False)),
-        "mal": helpers.booler(persistence.retrieve_settings("140-mal").get("validated", False)),
-        "anidb": helpers.booler(persistence.retrieve_settings("100-anidb").get("validated", False)),
-    }
-
     html = render_template(
         name + ".html",
         page_info=page_info,
@@ -2158,6 +2442,7 @@ def step(name):
         available_configs=available_configs,
         overlay_fonts=list_overlay_fonts(),
         service_validations=service_validations,
+        jump_to_validations=jump_to_validations,
         image_data={
             "movie": os.listdir(UPLOAD_FOLDERS["movie"]),
             "show": os.listdir(UPLOAD_FOLDERS["show"]),
@@ -3857,8 +4142,7 @@ def logscan_trends_reingest():
 
 @app.route("/logscan-trends", methods=["GET"])
 def logscan_trends_page():
-    if "config_name" not in session:
-        session["config_name"] = namesgenerator.get_random_name()
+    persistence.ensure_session_config_name()
     if "shutdown_nonce" not in session:
         session["shutdown_nonce"] = secrets.token_urlsafe(16)
 
@@ -3872,6 +4156,8 @@ def logscan_trends_page():
         "qs_optimize_defaults": app.config.get("QS_OPTIMIZE_DEFAULTS", True),
         "qs_config_history": app.config.get("QS_CONFIG_HISTORY", 0),
         "qs_kometa_log_keep": app.config.get("QS_KOMETA_LOG_KEEP", 0),
+        "qs_session_lifetime_days": app.config.get("QS_SESSION_LIFETIME_DAYS", 30),
+        "qs_flask_session_dir": app.config.get("QS_FLASK_SESSION_DIR", ""),
         "shutdown_nonce": session["shutdown_nonce"],
         "hide_step_nav": False,
     }
@@ -4164,6 +4450,24 @@ def update_quickstart_settings():
         if log_keep_value is not None and log_keep_value < 0:
             errors.append("Kometa log retention must be a non-negative number.")
 
+    session_lifetime_raw = data.get("session_lifetime_days")
+    session_lifetime_value = None
+    if session_lifetime_raw is not None:
+        try:
+            session_lifetime_value = int(str(session_lifetime_raw).strip())
+        except (TypeError, ValueError):
+            errors.append("Session lifetime must be a positive number of days.")
+            session_lifetime_value = None
+        if session_lifetime_value is not None and session_lifetime_value < 1:
+            errors.append("Session lifetime must be at least 1 day.")
+
+    session_dir_raw = data.get("session_dir")
+    session_dir_value = None
+    if session_dir_raw is not None:
+        session_dir_value = str(session_dir_raw).strip()
+
+    regenerate_secret = data.get("regenerate_secret") is True
+
     theme_raw = data.get("theme")
     theme_value = None
     if theme_raw is not None:
@@ -4215,6 +4519,48 @@ def update_quickstart_settings():
         app.config["QS_KOMETA_LOG_KEEP"] = log_keep_value
         changes_applied = True
 
+    if session_lifetime_value is not None and session_lifetime_value != app.config.get("QS_SESSION_LIFETIME_DAYS", 30):
+        helpers.update_env_variable("QS_SESSION_LIFETIME_DAYS", str(session_lifetime_value))
+        app.config["QS_SESSION_LIFETIME_DAYS"] = session_lifetime_value
+        app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=session_lifetime_value)
+        cache_dir = app.config.get("QS_FLASK_SESSION_DIR", flask_cache_dir)
+        app.config["SESSION_CACHELIB"] = FileSystemCache(
+            cache_dir=cache_dir,
+            threshold=500,
+            default_timeout=int(timedelta(days=session_lifetime_value).total_seconds()),
+        )
+        changes_applied = True
+
+    if session_dir_value is not None:
+        default_session_dir = os.path.abspath(os.path.expanduser(os.path.join(helpers.CONFIG_DIR, "flask_session")))
+        desired_session_dir = os.path.abspath(os.path.expanduser(session_dir_value or default_session_dir))
+        current_session_dir = app.config.get("QS_FLASK_SESSION_DIR", default_session_dir)
+        if desired_session_dir != current_session_dir:
+            try:
+                os.makedirs(desired_session_dir, exist_ok=True)
+            except Exception:
+                return jsonify(success=False, message="Failed to create the session storage directory."), 500
+            helpers.update_env_variable("QS_FLASK_SESSION_DIR", desired_session_dir)
+            app.config["QS_FLASK_SESSION_DIR"] = desired_session_dir
+            app.config["SESSION_CACHELIB"] = FileSystemCache(
+                cache_dir=desired_session_dir,
+                threshold=500,
+                default_timeout=int(timedelta(days=app.config.get("QS_SESSION_LIFETIME_DAYS", 30)).total_seconds()),
+            )
+            changes_applied = True
+
+    if regenerate_secret:
+        new_secret = secrets.token_hex(32)
+        helpers.update_env_variable("QS_SECRET_KEY", new_secret)
+        app.config["SECRET_KEY"] = new_secret
+        app.secret_key = new_secret
+        try:
+            with open(os.path.join(helpers.CONFIG_DIR, ".secret_key"), "w", encoding="utf-8") as handle:
+                handle.write(new_secret)
+        except Exception:
+            pass
+        changes_applied = True
+
     if not changes_applied:
         return jsonify(
             success=True,
@@ -4224,6 +4570,8 @@ def update_quickstart_settings():
             optimize_defaults=app.config.get("QS_OPTIMIZE_DEFAULTS", True),
             config_history=app.config.get("QS_CONFIG_HISTORY", 0),
             kometa_log_keep=app.config.get("QS_KOMETA_LOG_KEEP", 0),
+            session_lifetime_days=app.config.get("QS_SESSION_LIFETIME_DAYS", 30),
+            session_dir=app.config.get("QS_FLASK_SESSION_DIR", ""),
         )
 
     if restart_required:
@@ -4237,6 +4585,8 @@ def update_quickstart_settings():
             optimize_defaults=app.config.get("QS_OPTIMIZE_DEFAULTS", True),
             config_history=app.config.get("QS_CONFIG_HISTORY", 0),
             kometa_log_keep=app.config.get("QS_KOMETA_LOG_KEEP", 0),
+            session_lifetime_days=app.config.get("QS_SESSION_LIFETIME_DAYS", 30),
+            session_dir=app.config.get("QS_FLASK_SESSION_DIR", ""),
         )
 
     return jsonify(
@@ -4248,7 +4598,41 @@ def update_quickstart_settings():
         optimize_defaults=app.config.get("QS_OPTIMIZE_DEFAULTS", True),
         config_history=app.config.get("QS_CONFIG_HISTORY", 0),
         kometa_log_keep=app.config.get("QS_KOMETA_LOG_KEEP", 0),
+        session_lifetime_days=app.config.get("QS_SESSION_LIFETIME_DAYS", 30),
+        session_dir=app.config.get("QS_FLASK_SESSION_DIR", ""),
     )
+
+
+@app.route("/header-style-preview", methods=["GET"])
+def header_style_preview():
+    font = str(request.args.get("font", "") or "").strip()
+    available_fonts = helpers.get_pyfiglet_fonts()
+    if not font:
+        font = "standard"
+    if font not in available_fonts:
+        return jsonify(success=False, message="Unknown header style."), 404
+
+    preview = _render_header_style_preview(font)
+
+    return jsonify(success=True, font=font, preview=preview)
+
+
+@app.route("/header-style-previews", methods=["POST"])
+def header_style_previews():
+    data = request.get_json(silent=True) or {}
+    fonts = data.get("fonts") or []
+    if not isinstance(fonts, list):
+        return jsonify(success=False, message="Fonts must be a list."), 400
+
+    available = set(helpers.get_pyfiglet_fonts())
+    previews = []
+    for font in fonts:
+        font_name = str(font or "").strip()
+        if not font_name or font_name not in available:
+            continue
+        previews.append({"font": font_name, "preview": _render_header_style_preview(font_name)})
+
+    return jsonify(success=True, previews=previews)
 
 
 @app.route("/validate-kometa-root", methods=["POST"])
@@ -5092,6 +5476,14 @@ def purge_test_libraries():
 
 @app.route("/restart", methods=["POST"])
 def restart_quickstart():
+    data = request.get_json(silent=True) or {}
+    reason = data.get("reason")
+    if reason == "update":
+        helpers.set_restart_notice(
+            "update",
+            "Update complete. Quickstart restarted.",
+        )
+
     def restart():
         # Give time for the response to complete before restarting
         time.sleep(1)
@@ -5250,8 +5642,12 @@ if __name__ == "__main__":
                 helpers.ts_log(
                     f"Port and Debug Settings can be amended via the Settings cog in the UI, " f"right-clicking the system tray icon, or by editing your {DOTENV} file",
                     level="INFO",
-                )  # Open the browser automatically
-                webbrowser.open(f"http://localhost:{running_port}")
+                )
+                if app.config.get("QS_SKIP_AUTO_OPEN"):
+                    helpers.ts_log("Skipping auto-open after update restart.", level="INFO")
+                else:
+                    # Open the browser automatically
+                    webbrowser.open(f"http://localhost:{running_port}")
 
                 # Keep the invisible parent alive
                 self.dialog_parent.showMinimized()

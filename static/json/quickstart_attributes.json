@@ -135,6 +135,10 @@
           "Arabic"
         ],
         [
+          "bg",
+          "Bulgarian"
+        ],
+        [
           "da",
           "Danish"
         ],
@@ -155,11 +159,15 @@
           "French"
         ],
         [
+          "hu",
+          "Hungarian"
+        ],
+        [
           "it",
           "Italian"
         ],
         [
-          "nb_NO",
+          "nb-no",
           "Norwegian (Norway)"
         ],
         [

@@ -2,6 +2,7 @@ import namesgenerator
 import os
 import secrets
 import json
+import datetime
 
 from flask import current_app as app
 from flask import session
@@ -10,7 +11,7 @@ from ruamel.yaml.constructor import DuplicateKeyError  # noqa
 from urllib.parse import urlparse
 from werkzeug.datastructures import MultiDict
 
-from modules import database, helpers, iso
+from modules import database, helpers, iso, url_validation
 
 
 def extract_names(raw_source):
@@ -26,6 +27,24 @@ def extract_names(raw_source):
     # source_name will be `plex`
 
     return source, source_name
+
+
+def ensure_session_config_name():
+    existing = session.get("config_name")
+    if existing:
+        return existing
+
+    last_used = database.get_last_used_config_name()
+    if last_used:
+        session["config_name"] = last_used
+        if app.config["QS_DEBUG"]:
+            helpers.ts_log(f"Recovered session config_name from DB: {session['config_name']}", level="DEBUG")
+        return session["config_name"]
+
+    session["config_name"] = namesgenerator.get_random_name()
+    if app.config["QS_DEBUG"]:
+        helpers.ts_log(f"Initialized missing session config_name: {session['config_name']}", level="DEBUG")
+    return session["config_name"]
 
 
 def clean_form_data(form_data):
@@ -50,7 +69,19 @@ def clean_form_data(form_data):
             if form_data.get(f"{prefix}-template_variables[use_separator]", "false") != "none":
                 clean_data.setdefault(f"{prefix}-template_variables", {})["sep_style"] = value.strip()
 
+        elif url_validation.is_url_key(key) and isinstance(value, str) and url_validation.is_placeholder(value):
+            clean_data[key] = None
+
         elif isinstance(value, str):
+            if url_validation.is_url_key(key):
+                raw = value.strip()
+                if raw:
+                    try:
+                        parsed = urlparse(raw)
+                        if parsed.scheme:
+                            value = parsed._replace(scheme=parsed.scheme.lower()).geturl()
+                    except Exception:
+                        value = value
             lc_value = value.lower().strip()
             if len(value) == 0 or lc_value == "none":
                 clean_data[key] = None
@@ -73,11 +104,7 @@ def save_settings(raw_source, form_data):
     path = urlparse(raw_source).path
     source = os.path.basename(path)
 
-    # Ensure session config_name exists once
-    if "config_name" not in session:
-        session["config_name"] = namesgenerator.get_random_name()
-        if app.config["QS_DEBUG"]:
-            helpers.ts_log(f"Initialized missing session config_name: {session['config_name']}", level="DEBUG")
+    ensure_session_config_name()
 
     is_form = hasattr(form_data, "getlist")
 
@@ -159,11 +186,28 @@ def save_settings(raw_source, form_data):
 
             data["libraries"] = merged_libraries
 
-            # Keep previous validated flag if caller didn't provide one
+            # Keep previous validated flag and timestamp if caller didn't provide them
             if "validated" not in data and existing_validated is not None:
                 data["validated"] = existing_validated
+            existing_validated_at = existing_settings.get("validated_at")
+            if "validated_at" not in data and existing_validated_at is not None:
+                data["validated_at"] = existing_validated_at
         except Exception as e:
             helpers.ts_log(f"Failed to merge libraries during save: {e}", level="ERROR")
+
+    # Ensure a timestamp for pages that validate without explicit validation buttons
+    if source_name in ["libraries", "webhooks"]:
+        existing_validated_at = data.get("validated_at")
+        if not existing_validated_at:
+            try:
+                stored = retrieve_settings(source)
+                existing_validated_at = stored.get("validated_at") if isinstance(stored, dict) else None
+            except Exception:
+                existing_validated_at = None
+        if helpers.booler(data.get("validated")) and not existing_validated_at:
+            data["validated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        elif existing_validated_at and "validated_at" not in data:
+            data["validated_at"] = existing_validated_at
 
     # Validation
     base_data = get_dummy_data(source_name)
@@ -214,6 +258,7 @@ def update_stored_plex_libraries(name, movie_libraries, show_libraries, music_li
 
         # Preserve `validated` status
         validated_before = settings_before.get("validated", True)
+        validated_at_before = settings_before.get("validated_at")
 
         # Update library data
         settings_before["plex"]["tmp_movie_libraries"] = ",".join(movie_libraries) if movie_libraries else ""
@@ -225,6 +270,8 @@ def update_stored_plex_libraries(name, movie_libraries, show_libraries, music_li
 
         # Restore `validated` before saving
         settings_formatted["validated"] = validated_before  # Prevents losing validation state
+        if validated_at_before:
+            settings_formatted["validated_at"] = validated_at_before
 
         if app.config["QS_DEBUG"]:
             helpers.ts_log(f"Sending updated Plex settings to save_settings(): {settings_formatted}", level="DEBUG")
@@ -242,9 +289,7 @@ def update_stored_plex_libraries(name, movie_libraries, show_libraries, music_li
 
 
 def retrieve_settings(target):
-    # Ensure session config_name is set
-    if "config_name" not in session:
-        session["config_name"] = namesgenerator.get_random_name()
+    ensure_session_config_name()
 
     # target will be `010-plex`
     data = {}
@@ -262,9 +307,20 @@ def retrieve_settings(target):
     data["validated"] = helpers.booler(db_data[0])
     data["user_entered"] = helpers.booler(db_data[1])
     data[source_name] = db_data[2].get(source_name, {}) if db_data[2] else {}
+    if db_data[2] and isinstance(db_data[2], dict):
+        data["validated_at"] = db_data[2].get("validated_at")
+    else:
+        data["validated_at"] = None
 
     if not data[source_name]:
         data[source_name] = get_dummy_data(source_name)
+
+    if source_name == "settings" and isinstance(data[source_name], dict):
+        asset_directory = data[source_name].get("asset_directory")
+        if isinstance(asset_directory, str):
+            data[source_name]["asset_directory"] = [line.strip() for line in asset_directory.splitlines() if line.strip()]
+        elif isinstance(asset_directory, list):
+            data[source_name]["asset_directory"] = [str(item).strip() for item in asset_directory if str(item).strip()]
 
     if source_name == "trakt":
         section = data[source_name]

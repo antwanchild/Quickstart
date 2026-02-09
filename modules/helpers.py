@@ -55,6 +55,7 @@ BUILDNUM_FILE = os.path.join(MEIPASS_DIR, "BUILDNUM")
 LOG_DIR = os.path.join("config", "logs")
 LOG_FILE = os.path.join(LOG_DIR, "quickstart.log")
 MAX_LOG_BACKUPS = 10
+RESTART_NOTICE_FILE = os.path.join(CONFIG_DIR, ".restart_notice.json")
 
 
 def normalize_id(name, existing_ids):
@@ -348,7 +349,7 @@ def build_oauth_dict(source, form_data):
             "localhost_url",
         ]:
             data[source][final_key] = value  # Store outside authorization
-        elif final_key == "validated":
+        elif final_key in ["validated", "validated_at"]:
             data[final_key] = value
         else:
             if final_key != "url":
@@ -382,7 +383,7 @@ def build_simple_dict(source, form_data):
                         value = value.strip() if isinstance(value, str) else value
 
             # Assign the value to the appropriate key
-            if final_key == "validated":
+            if final_key in ["validated", "validated_at"]:
                 data[final_key] = value
             else:
                 data[source][final_key] = value
@@ -647,6 +648,39 @@ def update_env_variable(key, value):
                 file.write(line)
         if not key_found:
             file.write(f"{key}={value}\n")
+
+
+def set_restart_notice(reason, message=None):
+    if not isinstance(reason, str) or not reason.strip():
+        return False
+    payload = {
+        "reason": reason.strip(),
+        "message": message.strip() if isinstance(message, str) and message.strip() else None,
+        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+    }
+    try:
+        with open(RESTART_NOTICE_FILE, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        return True
+    except Exception as exc:
+        ts_log(f"Failed to write restart notice: {exc}", level="WARNING")
+        return False
+
+
+def consume_restart_notice():
+    if not os.path.exists(RESTART_NOTICE_FILE):
+        return None
+    try:
+        with open(RESTART_NOTICE_FILE, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        ts_log(f"Failed to read restart notice: {exc}", level="WARNING")
+        payload = None
+    try:
+        os.remove(RESTART_NOTICE_FILE)
+    except Exception as exc:
+        ts_log(f"Failed to remove restart notice: {exc}", level="WARNING")
+    return payload
 
 
 def load_quickstart_config(filename: str):
@@ -997,14 +1031,24 @@ def save_to_named_config(yaml_text, config_name, font_refs=None):
 
     # Save the new config to both locations
     config_dir.mkdir(parents=True, exist_ok=True)
-    kometa_config_dir.mkdir(parents=True, exist_ok=True)
+    kometa_write_ok = True
+    try:
+        kometa_config_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        kometa_write_ok = False
+        ts_log(f"Failed to create Kometa config directory {kometa_config_dir}: {exc}", level="WARNING")
 
     with open(latest_path, "w", encoding="utf-8") as f:
         f.write(yaml_text)
-    with open(kometa_path, "w", encoding="utf-8") as f:
-        f.write(yaml_text)
+    if kometa_write_ok:
+        try:
+            with open(kometa_path, "w", encoding="utf-8") as f:
+                f.write(yaml_text)
+        except OSError as exc:
+            kometa_write_ok = False
+            ts_log(f"Failed to write Kometa config to {kometa_path}: {exc}", level="WARNING")
 
-    if font_refs:
+    if font_refs and kometa_write_ok:
         try:
             font_result = copy_fonts_to_kometa(font_refs, kometa_root=kometa_root)
             missing = font_result.get("missing", [])
@@ -1017,7 +1061,8 @@ def save_to_named_config(yaml_text, config_name, font_refs=None):
             ts_log(f"Failed to sync fonts to Kometa: {exc}", level="WARNING")
 
     ts_log(f"Saved new config to: {latest_path}")
-    ts_log(f"Also copied config to: {kometa_path}")
+    if kometa_write_ok:
+        ts_log(f"Also copied config to: {kometa_path}")
 
     # Return POSIX-style filename (used for CLI path like --config config/name_config.yml)
     return latest_path.name

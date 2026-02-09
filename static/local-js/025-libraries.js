@@ -6,7 +6,6 @@ document.addEventListener('DOMContentLoaded', function () {
   const scriptsToLoad = [
     '/static/local-js/imageHandler.js',
     '/static/local-js/overlayHandler.js',
-    '/static/local-js/pathValidation.js',
     '/static/local-js/validationHandler.js',
     '/static/local-js/eventHandler.js'
   ]
@@ -118,6 +117,41 @@ document.addEventListener('DOMContentLoaded', function () {
         if (typeof updateFontPreviewForSelect === 'function') {
           updateFontPreviewForSelect(select)
         }
+        if (typeof updateFontPickerButton === 'function') {
+          updateFontPickerButton(select)
+        }
+      })
+    }
+
+    function sortLanguageSelects (scope) {
+      const root = scope || document
+      const selects = Array.from(root.querySelectorAll('select')).filter(select => {
+        const name = select.name || ''
+        const id = select.id || ''
+        return name.includes('attribute_template_variables[language]') ||
+          name.includes('template_variables[language]') ||
+          /template_variables_language$/i.test(id)
+      })
+
+      selects.forEach(select => {
+        const options = Array.from(select.options)
+        if (!options.length) return
+        const currentValue = select.value
+        const keep = []
+        const sortable = []
+        options.forEach(option => {
+          const label = option.textContent.trim().toLowerCase()
+          if (option.value === '' || label === 'none') {
+            keep.push(option)
+          } else {
+            sortable.push(option)
+          }
+        })
+        sortable.sort((a, b) => a.textContent.trim().localeCompare(b.textContent.trim()))
+        select.innerHTML = ''
+        keep.forEach(option => select.appendChild(option))
+        sortable.forEach(option => select.appendChild(option))
+        select.value = currentValue
       })
     }
 
@@ -144,6 +178,9 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function updateFontPreviewForSelect (select) {
       if (!select) return
+      if (typeof updateFontPickerButton === 'function') {
+        updateFontPickerButton(select)
+      }
       const preview = document.querySelector(`[data-preview-for="${select.id}"]`)
       if (!preview) return
       const value = select.value || select.dataset.default || ''
@@ -162,12 +199,173 @@ document.addEventListener('DOMContentLoaded', function () {
     }
     window.updateFontPreviewForSelect = updateFontPreviewForSelect
 
+    function updateFontPickerButton (select) {
+      if (!select) return
+      const button = document.querySelector(`[data-font-picker-target="${select.id}"]`)
+      if (!button) return
+      const value = select.value || select.dataset.default || ''
+      const file = value.split(/[\\/]/).pop()
+      button.textContent = file || 'Select font'
+      button.title = file || ''
+      if (!file) {
+        button.style.fontFamily = ''
+        return
+      }
+      loadFontPreview(file).then(family => {
+        if (family) {
+          button.style.fontFamily = `"${family}", sans-serif`
+        }
+      })
+    }
+    window.updateFontPickerButton = updateFontPickerButton
+
+    const fontPickerState = {
+      activeSelect: null,
+      sampleText: 'AaBb123 Quickstart'
+    }
+
+    function getFontPickerModal () {
+      const modalEl = document.getElementById('fontPickerModal')
+      if (!modalEl || !bootstrap || !bootstrap.Modal) return null
+      return bootstrap.Modal.getOrCreateInstance(modalEl)
+    }
+
+    function getFontsFromSelect (select) {
+      const fonts = []
+      const seen = new Set()
+      if (!select) return fonts
+      select.querySelectorAll('option').forEach(option => {
+        const value = option.value || ''
+        if (!value || seen.has(value)) return
+        fonts.push(value)
+        seen.add(value)
+      })
+      return fonts
+    }
+
+    function renderFontPickerGrid (select) {
+      const modalEl = document.getElementById('fontPickerModal')
+      const grid = document.getElementById('font-picker-grid')
+      const status = document.getElementById('font-picker-status')
+      const search = document.getElementById('font-picker-search')
+      const sampleInput = document.getElementById('font-picker-sample')
+      if (!grid || !modalEl) return
+
+      const fonts = getFontsFromSelect(select)
+      const query = (search?.value || '').trim().toLowerCase()
+      const sampleText = sampleInput ? sampleInput.value : fontPickerState.sampleText
+      fontPickerState.sampleText = sampleText
+
+      const cards = []
+      fonts.forEach(font => {
+        const label = font.split(/[\\/]/).pop()
+        cards.push({ font, label })
+      })
+
+      const filtered = cards.filter(card => {
+        if (!query) return true
+        return card.label.toLowerCase().includes(query)
+      })
+
+      grid.innerHTML = ''
+      if (status) {
+        status.textContent = `${filtered.length} font${filtered.length === 1 ? '' : 's'}`
+      }
+
+      if (!filtered.length) {
+        const empty = document.createElement('div')
+        empty.className = 'text-muted small'
+        empty.textContent = 'No fonts match your search.'
+        grid.appendChild(empty)
+        return
+      }
+
+      const selectedValue = select ? (select.value || '') : ''
+
+      filtered.forEach(card => {
+        const button = document.createElement('button')
+        button.type = 'button'
+        button.className = 'font-picker-card'
+        button.dataset.font = card.font
+        if ((card.font || '') === selectedValue) {
+          button.classList.add('active')
+        }
+        const title = document.createElement('div')
+        title.className = 'font-picker-card-title'
+        title.textContent = card.label
+        const sample = document.createElement('div')
+        sample.className = 'font-picker-card-sample'
+        sample.textContent = sampleText || 'AaBb123 Quickstart'
+
+        if (card.font) {
+          const file = card.font.split(/[\\/]/).pop()
+          loadFontPreview(file).then(family => {
+            if (family) {
+              sample.style.fontFamily = `"${family}", sans-serif`
+            }
+          })
+        }
+
+        button.appendChild(title)
+        button.appendChild(sample)
+        button.addEventListener('click', () => {
+          if (select) {
+            select.value = card.font
+            select.dispatchEvent(new Event('change', { bubbles: true }))
+            updateFontPickerButton(select)
+            updateFontPreviewForSelect(select)
+          }
+          const modal = getFontPickerModal()
+          if (modal) modal.hide()
+        })
+
+        grid.appendChild(button)
+      })
+    }
+
+    function wireFontPickerModal () {
+      const modalEl = document.getElementById('fontPickerModal')
+      if (!modalEl) return
+      const search = document.getElementById('font-picker-search')
+      const sampleInput = document.getElementById('font-picker-sample')
+
+      modalEl.addEventListener('show.bs.modal', () => {
+        if (sampleInput) {
+          sampleInput.value = fontPickerState.sampleText
+        }
+        renderFontPickerGrid(fontPickerState.activeSelect)
+      })
+
+      if (search) {
+        search.addEventListener('input', () => renderFontPickerGrid(fontPickerState.activeSelect))
+      }
+      if (sampleInput) {
+        sampleInput.addEventListener('input', () => renderFontPickerGrid(fontPickerState.activeSelect))
+      }
+    }
+
+    function wireFontPickerButtons (scope) {
+      const root = scope || document
+      root.querySelectorAll('[data-font-picker-target]').forEach(button => {
+        if (button.dataset.fontPickerBound === 'true') return
+        button.addEventListener('click', () => {
+          const selectId = button.dataset.fontPickerTarget
+          const select = selectId ? document.getElementById(selectId) : null
+          fontPickerState.activeSelect = select
+          const modal = getFontPickerModal()
+          if (modal) modal.show()
+        })
+        button.dataset.fontPickerBound = 'true'
+      })
+    }
+
     function wireFontPreviews (scope) {
       const root = scope || document
       root.querySelectorAll('select[data-font-select]').forEach(select => {
         if (select.dataset.fontPreviewBound === 'true') return
         select.addEventListener('change', () => updateFontPreviewForSelect(select))
         updateFontPreviewForSelect(select)
+        updateFontPickerButton(select)
         select.dataset.fontPreviewBound = 'true'
       })
     }
@@ -207,6 +405,7 @@ document.addEventListener('DOMContentLoaded', function () {
               throw new Error(data.message || 'Font upload failed.')
             }
             updateFontSelects(data.fonts || [], root)
+            renderFontPickerGrid(fontPickerState.activeSelect)
             input.value = ''
             const saved = Array.isArray(data.saved) ? data.saved.length : 0
             setStatus(`Uploaded ${saved} font(s).`, false)
@@ -292,6 +491,7 @@ document.addEventListener('DOMContentLoaded', function () {
       wireIncludeToggle(card, libraryId)
       refreshPickerLabels()
       initTooltips(card)
+      sortLanguageSelects(card)
       wireOffsetReset(card)
       initSortablesInScope(card)
       setupCustomStringListHandlers('mass_genre_update', card)
@@ -328,7 +528,10 @@ document.addEventListener('DOMContentLoaded', function () {
       }
       wireFontUploads(card)
       wireFontPreviews(card)
+      wireFontPickerButtons(card)
     }
+
+    wireFontPickerModal()
 
     function buildPayloadFromCard (card) {
       const payload = {}
@@ -355,6 +558,7 @@ document.addEventListener('DOMContentLoaded', function () {
     function autosaveActiveLibrary () {
       const card = libraryContainer.firstElementChild
       if (!activeLibraryId || !card) return Promise.resolve()
+      if (window.QS_SWITCHING_CONFIG) return Promise.resolve()
 
       if (typeof PathValidation !== 'undefined' && PathValidation.validateAll) {
         const pathValid = PathValidation.validateAll(card)
@@ -927,6 +1131,81 @@ function wireOffsetReset (scope) {
   root.querySelectorAll('.reset-offset-btn').forEach(btn => {
     if (btn.dataset.listenerAdded) return
     btn.addEventListener('click', () => {
+      const group = btn.closest('.template-toggle-group')
+      if (group) {
+        group.dataset.resetting = 'true'
+      }
+      const changes = []
+      const touched = new Set()
+      const isRatingsOverlay = group?.dataset?.overlayId === 'overlay_ratings'
+      const escapeHtml = (value) => String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+      const getInputLabel = (input) => {
+        if (!input) return 'Field'
+        const describedBy = input.getAttribute('aria-describedby')
+        if (describedBy) {
+          const firstId = describedBy.split(' ')[0]
+          const el = document.getElementById(firstId)
+          if (el && el.textContent) return el.textContent.trim()
+        }
+        if (input.id) {
+          const label = document.querySelector(`label[for="${input.id}"]`)
+          if (label && label.textContent) return label.textContent.trim()
+        }
+        return input.name || input.id || 'Field'
+      }
+      const getDisplayValue = (input) => {
+        if (!input) return ''
+        if (input.tagName === 'SELECT') {
+          return input.selectedOptions?.[0]?.textContent?.trim() || input.value || ''
+        }
+        if (input.type === 'checkbox') return input.checked ? 'On' : 'Off'
+        if (input.type === 'radio') return input.checked ? 'Selected' : 'Not selected'
+        return input.value ?? ''
+      }
+      const ratingFontInputs = isRatingsOverlay
+        ? new Set(
+          Array.from(group.querySelectorAll('select[id$="-rating1_font"], select[id$="-rating2_font"], select[id$="-rating3_font"]'))
+        )
+        : new Set()
+      const ratingFontBefore = new Map()
+      if (isRatingsOverlay) {
+        ratingFontInputs.forEach(input => {
+          ratingFontBefore.set(input, getDisplayValue(input))
+        })
+      }
+      const getDefaultDisplayValue = (input, defaultValue) => {
+        if (!input) return ''
+        if (input.type === 'checkbox' || input.type === 'radio') {
+          const normalizedDefault = (defaultValue || '').toString().toLowerCase()
+          const normalizedValue = (input.value || '').toString().toLowerCase()
+          const checked = normalizedDefault === 'true' || normalizedDefault === normalizedValue
+          return checked ? (input.type === 'radio' ? 'Selected' : 'On') : (input.type === 'radio' ? 'Not selected' : 'Off')
+        }
+        if (input.tagName === 'SELECT') {
+          const option = Array.from(input.options).find(o => String(o.value) === String(defaultValue))
+          return option ? (option.textContent || '').trim() : (defaultValue ?? '')
+        }
+        return defaultValue ?? ''
+      }
+      const recordReset = (input, defaultValue) => {
+        if (!input || touched.has(input)) return
+        touched.add(input)
+        const from = getDisplayValue(input)
+        const to = getDefaultDisplayValue(input, defaultValue)
+        if (from !== to) {
+          if (!(isRatingsOverlay && ratingFontInputs.has(input))) {
+            changes.push({ label: getInputLabel(input), from, to })
+          }
+          return true
+        }
+        return false
+      }
+
       const hId = btn.dataset.horizontalId
       const vId = btn.dataset.verticalId
       const pId = btn.dataset.positionId
@@ -939,16 +1218,25 @@ function wireOffsetReset (scope) {
         .filter(Boolean)
 
       if (hInput && hInput.dataset.default !== undefined) {
-        hInput.value = hInput.dataset.default
-        hInput.dispatchEvent(new Event('change', { bubbles: true }))
+        const changed = recordReset(hInput, hInput.dataset.default)
+        if (changed) {
+          hInput.value = hInput.dataset.default
+          hInput.dispatchEvent(new Event('change', { bubbles: true }))
+        }
       }
       if (vInput && vInput.dataset.default !== undefined) {
-        vInput.value = vInput.dataset.default
-        vInput.dispatchEvent(new Event('change', { bubbles: true }))
+        const changed = recordReset(vInput, vInput.dataset.default)
+        if (changed) {
+          vInput.value = vInput.dataset.default
+          vInput.dispatchEvent(new Event('change', { bubbles: true }))
+        }
       }
       if (pInput && pInput.dataset.default !== undefined) {
-        pInput.value = pInput.dataset.default
-        pInput.dispatchEvent(new Event('change', { bubbles: true }))
+        const changed = recordReset(pInput, pInput.dataset.default)
+        if (changed) {
+          pInput.value = pInput.dataset.default
+          pInput.dispatchEvent(new Event('change', { bubbles: true }))
+        }
       }
       extraIds.forEach(id => {
         const input = document.getElementById(id)
@@ -957,16 +1245,22 @@ function wireOffsetReset (scope) {
           if (input.type === 'checkbox') {
             const normalizedDefault = (defaultValue || '').toString().toLowerCase()
             const normalizedValue = (input.value || '').toString().toLowerCase()
-            input.checked = normalizedDefault === 'true' || normalizedDefault === normalizedValue
-            input.dispatchEvent(new Event('change', { bubbles: true }))
+            const nextChecked = normalizedDefault === 'true' || normalizedDefault === normalizedValue
+            const changed = recordReset(input, defaultValue)
+            if (changed) {
+              input.checked = nextChecked
+              input.dispatchEvent(new Event('change', { bubbles: true }))
+            }
             return
           }
-          input.value = defaultValue
-          input.dispatchEvent(new Event('change', { bubbles: true }))
+          const changed = recordReset(input, defaultValue)
+          if (changed) {
+            input.value = defaultValue
+            input.dispatchEvent(new Event('change', { bubbles: true }))
+          }
         }
       })
 
-      const group = btn.closest('.template-toggle-group')
       if (group) {
         group.querySelectorAll('input[data-default], select[data-default], textarea[data-default]').forEach(input => {
           if (input.disabled) return
@@ -976,13 +1270,59 @@ function wireOffsetReset (scope) {
           if (input.type === 'checkbox' || input.type === 'radio') {
             const normalizedDefault = (defaultValue || '').toString().toLowerCase()
             const normalizedValue = (input.value || '').toString().toLowerCase()
-            input.checked = normalizedDefault === 'true' || normalizedDefault === normalizedValue
+            const nextChecked = normalizedDefault === 'true' || normalizedDefault === normalizedValue
+            const changed = recordReset(input, defaultValue)
+            if (changed) input.checked = nextChecked
           } else {
-            input.value = defaultValue
+            const changed = recordReset(input, defaultValue)
+            if (changed) input.value = defaultValue
           }
-          input.dispatchEvent(new Event('input', { bubbles: true }))
+          if (changes.length && touched.has(input)) {
+            input.dispatchEvent(new Event('input', { bubbles: true }))
+            input.dispatchEvent(new Event('change', { bubbles: true }))
+          }
+        })
+      }
+
+      if (group) {
+        delete group.dataset.resetting
+        if (changes.length) {
+          const trigger = group.querySelector('input:not([disabled]), select:not([disabled]), textarea:not([disabled])')
+          if (trigger) {
+            trigger.dispatchEvent(new Event('change', { bubbles: true }))
+          }
+        }
+      }
+
+      const finalizeToast = () => {
+        if (changes.length && typeof showToast === 'function') {
+          const details = changes
+            .map(change => `${escapeHtml(change.label)}: ${escapeHtml(change.from)} → ${escapeHtml(change.to)}`)
+            .join('<br>')
+          showToast('info', `Reset to defaults:<br>${details}`)
+        } else if (!changes.length && typeof showToast === 'function') {
+          showToast('info', 'Already at defaults (no changes).')
+        }
+      }
+
+      if (isRatingsOverlay && group) {
+        group.dataset.ratingFontForce = 'true'
+        const ratingImageInputs = group.querySelectorAll('[name$="[rating1_image]"], [name$="[rating2_image]"], [name$="[rating3_image]"]')
+        ratingImageInputs.forEach(input => {
           input.dispatchEvent(new Event('change', { bubbles: true }))
         })
+        window.setTimeout(() => {
+          ratingFontInputs.forEach(input => {
+            const from = ratingFontBefore.get(input) || ''
+            const to = getDisplayValue(input)
+            if (from !== to) {
+              changes.push({ label: getInputLabel(input), from, to })
+            }
+          })
+          finalizeToast()
+        }, 0)
+      } else {
+        finalizeToast()
       }
     })
     btn.dataset.listenerAdded = 'true'

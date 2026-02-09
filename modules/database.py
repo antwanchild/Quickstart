@@ -67,6 +67,27 @@ def retrieve_section_data(name, section):
     return False, False, None
 
 
+def retrieve_validated_map(name, sections=None):
+    with sqlite3.connect(get_database_path(), detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES) as connection:
+        connection.row_factory = sqlite3.Row
+        with closing(connection.cursor()) as cursor:
+            cursor.execute(persisted_section_table_create())
+            if sections:
+                placeholders = ",".join("?" for _ in sections)
+                cursor.execute(
+                    f"""SELECT section, validated from section_data where name == ? AND section IN ({placeholders})""",
+                    (name, *sections),
+                )
+            else:
+                cursor.execute(
+                    """SELECT section, validated from section_data where name == ?""",
+                    (name,),
+                )
+            rows = cursor.fetchall()
+            return {row["section"]: helpers.booler(row["validated"]) for row in rows}
+    return {}
+
+
 def reset_data(name, section=None):
     with sqlite3.connect(get_database_path(), detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES) as connection:
         connection.row_factory = sqlite3.Row
@@ -84,6 +105,24 @@ def get_unique_config_names():
         with closing(connection.cursor()) as cursor:
             cursor.execute("SELECT DISTINCT name FROM section_data ORDER BY name ASC")
             return [row["name"] for row in cursor.fetchall()]
+
+
+def get_last_used_config_name():
+    with sqlite3.connect(get_database_path(), detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES) as connection:
+        connection.row_factory = sqlite3.Row
+        with closing(connection.cursor()) as cursor:
+            cursor.execute(persisted_section_table_create())
+            row = cursor.execute("SELECT name FROM section_data ORDER BY rowid DESC LIMIT 1").fetchone()
+            if row and row["name"]:
+                return row["name"]
+
+            cursor.execute(log_runs_table_create())
+            row = cursor.execute("""SELECT config_name FROM log_runs
+                   WHERE config_name IS NOT NULL AND config_name != ''
+                   ORDER BY created_at DESC LIMIT 1""").fetchone()
+            if row and row["config_name"]:
+                return row["config_name"]
+    return None
 
 
 def log_runs_table_create():
@@ -111,6 +150,7 @@ def log_runs_table_create():
         library_counts TEXT,
         quickstart_run_marker INTEGER,
         config_line_count INTEGER,
+        cache_line_count INTEGER,
         created_at TEXT
     )"""
 
@@ -136,6 +176,7 @@ def _ensure_log_runs_columns(cursor):
         "library_counts": "TEXT",
         "quickstart_run_marker": "INTEGER",
         "config_line_count": "INTEGER",
+        "cache_line_count": "INTEGER",
     }
     for name, ddl in columns.items():
         if name not in existing:
@@ -165,6 +206,7 @@ def save_log_run(summary, recommendations=None):
         library_counts = json.dumps(library_counts, ensure_ascii=True)
     quickstart_run_marker = 1 if summary.get("quickstart_run_marker") else 0
     config_line_count = summary.get("config_line_count")
+    cache_line_count = summary.get("cache_line_count")
     with sqlite3.connect(get_database_path(), detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES) as connection:
         connection.row_factory = sqlite3.Row
         with closing(connection.cursor()) as cursor:
@@ -194,8 +236,9 @@ def save_log_run(summary, recommendations=None):
                     library_counts,
                     quickstart_run_marker,
                     config_line_count,
+                    cache_line_count,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_key,
                     summary.get("finished_at"),
@@ -220,6 +263,7 @@ def save_log_run(summary, recommendations=None):
                     library_counts,
                     quickstart_run_marker,
                     config_line_count,
+                    cache_line_count,
                     summary.get("created_at"),
                 ),
             )
@@ -246,7 +290,7 @@ def get_log_runs(limit=100):
                           config_name, config_hash, run_command, command_signature, section_runtimes,
                           recommendations, log_mtime, log_size, debug_count, info_count, warning_count,
                           error_count, critical_count, trace_count, analysis_counts, library_counts,
-                          quickstart_run_marker, config_line_count, created_at
+                          quickstart_run_marker, config_line_count, cache_line_count, created_at
                    FROM log_runs
                    ORDER BY created_at DESC
                    LIMIT ?""",
