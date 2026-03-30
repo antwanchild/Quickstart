@@ -47,7 +47,7 @@ class ImportReport:
     def add(self, status: str, path: str, reason: str | None = None) -> None:
         if status not in self.counts:
             status = "skipped"
-        suffix = f" - {reason}" if reason else ""
+        suffix = f" :: {reason}" if reason else ""
         self.lines.append(f"{status}: {path}{suffix}")
         self.counts[status] += 1
 
@@ -55,10 +55,11 @@ class ImportReport:
         return dict(self.counts)
 
 
-def _parse_report_statuses(report_lines: list[str]) -> dict[str, str]:
+def _parse_report_details(report_lines: list[str]) -> tuple[dict[str, str], dict[str, str]]:
     status_map: dict[str, str] = {}
+    reason_map: dict[str, str] = {}
     if not report_lines:
-        return status_map
+        return status_map, reason_map
     for line in report_lines:
         if not isinstance(line, str) or ":" not in line:
             continue
@@ -67,13 +68,57 @@ def _parse_report_statuses(report_lines: list[str]) -> dict[str, str]:
         if status not in {"imported", "unmapped", "skipped"}:
             continue
         path = rest.strip()
-        if " - " in path:
-            path = path.split(" - ", 1)[0].strip()
+        reason = ""
+        if " :: " in path:
+            path, reason = path.rsplit(" :: ", 1)
+            path = path.strip()
+            reason = reason.strip()
+        elif " - " in path and status != "imported":
+            candidate_path, candidate_reason = path.rsplit(" - ", 1)
+            if " - " not in candidate_path:
+                path = candidate_path.strip()
+                reason = candidate_reason.strip()
         if not path:
             continue
         mapped = "mapped" if status == "imported" else status
         status_map[path] = mapped
+        if reason:
+            reason_map[path] = reason
+    return status_map, reason_map
+
+
+def _parse_report_statuses(report_lines: list[str]) -> dict[str, str]:
+    status_map, _ = _parse_report_details(report_lines)
     return status_map
+
+
+def _lookup_report_reason(reason_map: dict[str, str], status_path: str | None) -> str | None:
+    if not status_path:
+        return None
+    if status_path in reason_map:
+        return reason_map[status_path]
+    if "[" in status_path:
+        normalized = re.sub(r"\[\d+\]", "", status_path)
+        if normalized in reason_map:
+            return reason_map[normalized]
+    if status_path.endswith(".default"):
+        alt = status_path[: -len(".default")]
+        if alt in reason_map:
+            return reason_map[alt]
+    parts = status_path.split(".")
+    for idx in range(len(parts) - 1, 0, -1):
+        prefix = ".".join(parts[:idx])
+        if prefix in reason_map:
+            return reason_map[prefix]
+    return None
+
+
+def _format_report_status(status: str | None, reason: str | None) -> str | None:
+    if not status:
+        return None
+    if reason:
+        return f"{status} - {reason}"
+    return status
 
 
 def _build_prefix_flags(status_map: dict[str, str]) -> dict[str, dict[str, bool]]:
@@ -151,7 +196,7 @@ def _append_status_annotation(line: str, status: str | None) -> str:
 def annotate_yaml_with_report(raw_text: str, report_lines: list[str], binary: bool = False) -> str:
     if not raw_text:
         return ""
-    status_map = _parse_report_statuses(report_lines)
+    status_map, reason_map = _parse_report_details(report_lines)
     if binary:
         imported_only = {path: status for path, status in status_map.items() if status == "mapped"}
         prefix_map = _build_prefix_flags(imported_only)
@@ -253,9 +298,15 @@ def annotate_yaml_with_report(raw_text: str, report_lines: list[str], binary: bo
             flags = prefix_map.get(normalized_path)
         if binary and status_path:
             status = "imported" if flags and flags.get("mapped") else "not imported"
+            reason = _lookup_report_reason(reason_map, status_path) if status == "not imported" else None
+            if status == "not imported" and not reason:
+                reason = "No matching Quickstart mapping"
+            status_text = _format_report_status(status, reason)
         else:
             status = _status_from_flags(flags)
-        annotated.append(_append_status_annotation(line, status))
+            reason = _lookup_report_reason(reason_map, status_path) if status and status != "imported" else None
+            status_text = _format_report_status(status, reason)
+        annotated.append(_append_status_annotation(line, status_text))
 
     return "\n".join(annotated)
 
@@ -554,7 +605,6 @@ def build_library_type_plan(
     detail_map = {d.get("name"): d for d in details}
     library_types: dict[str, str] = {}
     inference_list: list[dict] = []
-
     libraries_payload = config_data.get("libraries")
     if not isinstance(libraries_payload, dict):
         return library_types, inference_list, False
@@ -623,6 +673,7 @@ def prepare_import_payload(
     collection_config = helpers.load_quickstart_config("quickstart_collections.json") or []
     overlay_config = helpers.load_quickstart_config("quickstart_overlays.json") or []
     attribute_config = helpers.load_quickstart_config("quickstart_attributes.json") or {}
+    inferred_types, _ = infer_library_types(config_data)
 
     collection_by_id, collection_by_alias = _build_collection_index(collection_config)
     overlay_by_id, overlay_by_alias, overlay_radio = _build_overlay_index(overlay_config)
@@ -811,6 +862,81 @@ def prepare_import_payload(
         report.add("unmapped", f"libraries.{lib_name}.operations.{op_key}", "Unsupported operation format.")
         return True, False
 
+    def _handle_delete_collections_operation(
+        lib_id: str,
+        lib_name: str,
+        op_key: str,
+        op_value: Any,
+    ) -> tuple[bool, bool]:
+        if op_key != "delete_collections":
+            return False, False
+        if not isinstance(op_value, dict):
+            report.add(
+                "unmapped",
+                f"libraries.{lib_name}.operations.{op_key}",
+                "Unsupported delete_collections format.",
+            )
+            return True, False
+
+        mapping = {
+            "configured": "delete_collections_configured",
+            "managed": "delete_collections_managed",
+            "ignore_empty_smart_collections": "delete_collections_ignore_empty_smart_collections",
+            "less": "delete_collections_less",
+        }
+        imported_any = False
+
+        for raw_key, raw_value in op_value.items():
+            key = str(raw_key)
+            target = mapping.get(key)
+            if not target:
+                report.add("unmapped", f"libraries.{lib_name}.operations.{op_key}.{key}")
+                continue
+            if key == "less":
+                try:
+                    if raw_value is None or raw_value == "":
+                        report.add(
+                            "unmapped",
+                            f"libraries.{lib_name}.operations.{op_key}.{key}",
+                            "Missing numeric value.",
+                        )
+                        continue
+                    libraries_data[f"{lib_id}-attribute_{target}"] = int(raw_value)
+                    report.add("imported", f"libraries.{lib_name}.operations.{op_key}.{key}")
+                    imported_any = True
+                except Exception:
+                    report.add(
+                        "unmapped",
+                        f"libraries.{lib_name}.operations.{op_key}.{key}",
+                        "Invalid numeric value.",
+                    )
+                continue
+            bool_value = None
+            if isinstance(raw_value, bool):
+                bool_value = raw_value
+            elif isinstance(raw_value, str):
+                lowered = raw_value.strip().lower()
+                if lowered in {"true", "yes", "1"}:
+                    bool_value = True
+                elif lowered in {"false", "no", "0"}:
+                    bool_value = False
+            if bool_value is None:
+                report.add(
+                    "unmapped",
+                    f"libraries.{lib_name}.operations.{op_key}.{key}",
+                    "Invalid boolean value.",
+                )
+                continue
+            libraries_data[f"{lib_id}-attribute_{target}"] = bool_value
+            report.add("imported", f"libraries.{lib_name}.operations.{op_key}.{key}")
+            imported_any = True
+
+        if imported_any:
+            report.add("imported", f"libraries.{lib_name}.operations.{op_key}")
+        else:
+            report.add("unmapped", f"libraries.{lib_name}.operations.{op_key}", "No importable values found.")
+        return True, imported_any
+
     for section in SIMPLE_SECTIONS:
         if section not in config_data:
             continue
@@ -818,15 +944,27 @@ def prepare_import_payload(
         if section == "playlist_files":
             libraries = []
             if isinstance(section_payload, list):
-                for entry in section_payload:
+                for idx, entry in enumerate(section_payload):
                     if isinstance(entry, dict):
                         tv = entry.get("template_variables", {})
                         if isinstance(tv, dict):
                             libs = tv.get("libraries")
                             if isinstance(libs, list):
-                                libraries.extend([str(lib) for lib in libs if str(lib).strip()])
+                                entry_libs = [str(lib) for lib in libs if str(lib).strip()]
+                                libraries.extend(entry_libs)
+                                report.add("imported", f"{section}[{idx}]")
+                                default_value = entry.get("default")
+                                if default_value == "playlist":
+                                    report.add("imported", f"{section}[{idx}].default")
+                                elif default_value is not None:
+                                    report.add("unmapped", f"{section}[{idx}].default", "Unsupported playlist default.")
+                                report.add("imported", f"{section}[{idx}].template_variables")
+                                report.add("imported", f"{section}[{idx}].template_variables.libraries")
+                                for lib_idx in range(len(entry_libs)):
+                                    report.add("imported", f"{section}[{idx}].template_variables.libraries[{lib_idx}]")
             if libraries:
                 payload[section] = {"playlist_files": {"libraries": ",".join(libraries)}}
+                report.add("imported", section)
                 report.add("imported", f"{section}.libraries")
             else:
                 report.add("unmapped", section, "Missing playlist library entries.")
@@ -842,6 +980,12 @@ def prepare_import_payload(
                     normalized = [entry for entry in normalized if entry]
                     section_payload = dict(section_payload)
                     section_payload["asset_directory"] = normalized
+            if section == "anidb":
+                if "enable" not in section_payload:
+                    has_values = any(value not in [None, "", [], {}] for value in section_payload.values())
+                    if has_values:
+                        section_payload = dict(section_payload)
+                        section_payload["enable"] = True
             payload[section] = {section: section_payload}
             _flatten_dict(section, section_payload, report)
         else:
@@ -862,21 +1006,31 @@ def prepare_import_payload(
                 override = library_type_overrides.get(str(lib_name))
             override_prefix, override_default = _normalize_library_type(override)
 
-            if lib_name in plex_movie_names:
+            name = str(lib_name)
+            resolved_name = name
+            if name in plex_movie_names:
                 lib_type = "mov"
                 builder_default = "movie"
-            elif lib_name in plex_show_names:
+            elif name in plex_show_names:
                 lib_type = "sho"
                 builder_default = "show"
             elif override_prefix and override_default:
                 lib_type = override_prefix
                 builder_default = override_default
             else:
-                report.add("unmapped", f"libraries.{lib_name}", "Library type could not be determined.")
-                continue
+                inferred = inferred_types.get(name)
+                if inferred == "movie":
+                    lib_type = "mov"
+                    builder_default = "movie"
+                elif inferred == "show":
+                    lib_type = "sho"
+                    builder_default = "show"
+                else:
+                    report.add("unmapped", f"libraries.{lib_name}", "Library type could not be determined.")
+                    continue
 
-            lib_id = f"{lib_type}-library_{helpers.normalize_id(str(lib_name), existing_ids)}"
-            libraries_data[f"{lib_id}-library"] = lib_name
+            lib_id = f"{lib_type}-library_{helpers.normalize_id(name, existing_ids)}"
+            libraries_data[f"{lib_id}-library"] = resolved_name
             report.add("imported", f"libraries.{lib_name}.library")
 
             # Top-level values
@@ -892,6 +1046,7 @@ def prepare_import_payload(
                     if key in template_vars or key in special_template_vars:
                         if key == "placeholder_imdb_id":
                             name = f"{lib_id}-attribute_template_variables[{key}]"
+                            libraries_data[name] = value
                         elif key == "sep_style":
                             name = f"{lib_id}-template_variables[{key}]"
                             libraries_data[name] = value
@@ -940,10 +1095,34 @@ def prepare_import_payload(
                     if isinstance(template_values, dict):
                         allowed = _collect_template_keys(collection_by_id[collection_id].get("template_variables"))
                         clean_id = collection_id.replace("collection_", "", 1)
-                        for key, value in template_values.items():
+                        expanded_template_values = dict(template_values)
+                        data_block = expanded_template_values.get("data")
+                        data_reported = set()
+                        if isinstance(data_block, dict):
+                            for subkey, subval in data_block.items():
+                                flat_key = f"data_{subkey}"
+                                if flat_key in allowed and flat_key not in expanded_template_values:
+                                    expanded_template_values[flat_key] = subval
+                                if flat_key in allowed:
+                                    report.add(
+                                        "imported",
+                                        f"libraries.{lib_name}.collection_files[{idx}].template_variables.data.{subkey}",
+                                    )
+                                    data_reported.add(subkey)
+                            if "data" in expanded_template_values and "data" not in allowed:
+                                expanded_template_values.pop("data", None)
+                            if data_reported:
+                                report.add(
+                                    "imported",
+                                    f"libraries.{lib_name}.collection_files[{idx}].template_variables.data",
+                                )
+                        for key, value in expanded_template_values.items():
                             if key in allowed:
                                 child_name = f"{lib_id}-template_collection_{clean_id}_{key}"
-                                libraries_data[child_name] = value
+                                if isinstance(value, list):
+                                    libraries_data[child_name] = json.dumps(value, ensure_ascii=True)
+                                else:
+                                    libraries_data[child_name] = value
                                 report.add(
                                     "imported",
                                     f"libraries.{lib_name}.collection_files[{idx}].template_variables.{key}",
@@ -990,6 +1169,17 @@ def prepare_import_payload(
                         continue
 
                     overlay_meta = overlay_by_id.get(overlay_id, {})
+                    if overlay_id == "overlay_languages" and isinstance(template_values, dict) and str(template_values.get("use_subtitles", "")).strip().lower() == "true":
+                        subtitles_id = overlay_by_alias.get("languages_subtitles")
+                        if subtitles_id:
+                            overlay_id = subtitles_id
+                            overlay_meta = overlay_by_id.get(overlay_id, {})
+                            template_values = dict(template_values)
+                            template_values.pop("use_subtitles", None)
+                            report.add(
+                                "imported",
+                                f"libraries.{lib_name}.overlay_files[{idx}].template_variables.use_subtitles",
+                            )
                     media_types = overlay_meta.get("media_types") or []
                     if builder_level == "movie" and media_types and "movie" not in media_types:
                         report.add(
@@ -1034,6 +1224,65 @@ def prepare_import_payload(
             elif overlay_files is not None:
                 report.add("unmapped", f"libraries.{lib_name}.overlay_files", "Unsupported overlay_files format.")
 
+            # Library settings
+            settings_section = lib_cfg.get("settings")
+            if isinstance(settings_section, dict):
+                imported_settings = False
+                for key, value in settings_section.items():
+                    if key == "asset_directory":
+                        if isinstance(value, list):
+                            normalized = [str(item).strip() for item in value if str(item).strip()]
+                        elif isinstance(value, str):
+                            normalized = [line.strip() for line in value.splitlines() if line.strip()]
+                        else:
+                            normalized = []
+
+                        if normalized:
+                            libraries_data[f"{lib_id}-attribute_{key}"] = normalized
+                            report.add("imported", f"libraries.{lib_name}.settings.{key}")
+                            imported_settings = True
+                        else:
+                            report.add(
+                                "unmapped",
+                                f"libraries.{lib_name}.settings.{key}",
+                                "No importable asset directory entries found.",
+                            )
+                        continue
+
+                    if key == "prioritize_assets" and not isinstance(value, (dict, list)):
+                        bool_value = None
+                        if isinstance(value, bool):
+                            bool_value = value
+                        elif isinstance(value, str):
+                            lowered = value.strip().lower()
+                            if lowered in {"true", "yes", "1"}:
+                                bool_value = True
+                            elif lowered in {"false", "no", "0"}:
+                                bool_value = False
+
+                        if bool_value is None:
+                            report.add(
+                                "unmapped",
+                                f"libraries.{lib_name}.settings.{key}",
+                                "Invalid boolean value.",
+                            )
+                        else:
+                            libraries_data[f"{lib_id}-attribute_{key}"] = bool_value
+                            report.add("imported", f"libraries.{lib_name}.settings.{key}")
+                            imported_settings = True
+                        continue
+
+                    report.add(
+                        "unmapped",
+                        f"libraries.{lib_name}.settings.{key}",
+                        "Library setting not supported for import.",
+                    )
+
+                if imported_settings:
+                    report.add("imported", f"libraries.{lib_name}.settings")
+            elif settings_section is not None:
+                report.add("unmapped", f"libraries.{lib_name}.settings", "Unsupported settings format.")
+
             # Operations
             operations = lib_cfg.get("operations")
             if isinstance(operations, dict):
@@ -1043,6 +1292,11 @@ def prepare_import_payload(
                         libraries_data[f"{lib_id}-attribute_{key}"] = value
                         report.add("imported", f"libraries.{lib_name}.operations.{key}")
                         imported_ops = True
+                        continue
+
+                    handled, imported = _handle_delete_collections_operation(lib_id, str(lib_name), key, value)
+                    if handled:
+                        imported_ops = imported_ops or imported
                         continue
 
                     handled, imported = _handle_mass_update_operation(lib_id, str(lib_name), key, value)
@@ -1064,7 +1318,7 @@ def prepare_import_payload(
             elif operations is not None:
                 report.add("unmapped", f"libraries.{lib_name}.operations", "Unsupported operations format.")
 
-            handled_keys = {"collection_files", "overlay_files", "template_variables", "operations"}
+            handled_keys = {"collection_files", "overlay_files", "template_variables", "settings", "operations"}
             handled_keys.update(top_level_map.keys())
             for key in lib_cfg.keys():
                 if key in handled_keys:

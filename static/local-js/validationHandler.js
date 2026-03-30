@@ -27,6 +27,9 @@ const ValidationHandler = {
 
     document.getElementById('libraries').value = selectedNames.join(',')
     document.getElementById('libraries_validated').value = isValid ? 'true' : 'false'
+    if (window.QSValidationCallouts && typeof window.QSValidationCallouts.refresh === 'function') {
+      window.QSValidationCallouts.refresh('libraries_validated')
+    }
     if (librariesValidatedAtInput) {
       if (librariesTouched) {
         librariesValidatedAtInput.value = isValid ? new Date().toISOString() : ''
@@ -222,7 +225,7 @@ const ValidationHandler = {
       .filter(input => input.value && input.value.trim() !== '')
       .map(input => input.id.replace('-library-value', ''))
 
-    console.log(`[DEBUG] Selected ${type} Library IDs:`, selected)
+    console.log('[DEBUG] Selected', type, 'Library IDs:', selected)
     return selected
   },
 
@@ -231,7 +234,7 @@ const ValidationHandler = {
       .filter(input => input.value && input.value.trim() !== '')
       .map(input => input.value.trim())
 
-    console.log(`[DEBUG] Selected ${type} Library Names:`, names)
+    console.log('[DEBUG] Selected', type, 'Library Names:', names)
     return names
   },
 
@@ -264,7 +267,7 @@ const ValidationHandler = {
 
     console.log(`[DEBUG] Showing validation message: "${message}" (${type})`)
 
-    validationBox.innerHTML = message
+    validationBox.textContent = message
     validationBox.classList.remove('alert-danger', 'alert-success')
     validationBox.classList.add(`alert-${type}`)
     validationBox.style.display = 'block'

@@ -48,6 +48,29 @@ function sanitizeConfigName (value) {
   return String(value || '').toLowerCase().replace(/[^a-z0-9_]/g, '')
 }
 
+function setIconOnlyButton (button, iconClasses) {
+  if (!button) return
+  const icon = document.createElement('i')
+  icon.className = iconClasses
+  button.replaceChildren(icon)
+}
+
+function setButtonIconAndText (button, iconClasses, text) {
+  if (!button) return
+  const icon = document.createElement('i')
+  icon.className = iconClasses
+  button.replaceChildren(icon, document.createTextNode(` ${text}`))
+}
+
+function setButtonSpinner (button, text) {
+  if (!button) return
+  const spinner = document.createElement('span')
+  spinner.className = 'spinner-border spinner-border-sm me-2'
+  spinner.setAttribute('role', 'status')
+  spinner.setAttribute('aria-hidden', 'true')
+  button.replaceChildren(spinner, document.createTextNode(` ${text}`))
+}
+
 /* ============================== */
 /* Main page logic                */
 /* ============================== */
@@ -73,10 +96,17 @@ document.addEventListener('DOMContentLoaded', function () {
   const importConfigModalEl = document.getElementById('importConfigModal')
   const importConfigFile = document.getElementById('importConfigFile')
   const importConfigName = document.getElementById('importConfigName')
+  const importModeNew = document.getElementById('importModeNew')
+  const importModeMerge = document.getElementById('importModeMerge')
+  const importMergeBaseSection = document.getElementById('importMergeBaseSection')
+  const importMergeBaseConfig = document.getElementById('importMergeBaseConfig')
   const importPlexCredentials = document.getElementById('importPlexCredentials')
   const importPlexUrl = document.getElementById('importPlexUrl')
   const importPlexToken = document.getElementById('importPlexToken')
   const importPlexTokenToggle = document.getElementById('importPlexTokenToggle')
+  const importTmdbCredentials = document.getElementById('importTmdbCredentials')
+  const importTmdbApiKey = document.getElementById('importTmdbApiKey')
+  const importTmdbApiKeyToggle = document.getElementById('importTmdbApiKeyToggle')
   const importConfigError = document.getElementById('importConfigError')
   const previewImportButton = document.getElementById('previewImportButton')
   const confirmImportButton = document.getElementById('confirmImportButton')
@@ -84,6 +114,10 @@ document.addEventListener('DOMContentLoaded', function () {
   const importSummary = document.getElementById('importSummary')
   const importReport = document.getElementById('importReport')
   const downloadImportReport = document.getElementById('downloadImportReport')
+  const importMergeSection = document.getElementById('importMergeSection')
+  const importMergeSectionList = document.getElementById('importMergeSectionList')
+  const importMergeSelectAll = document.getElementById('importMergeSelectAll')
+  const importMergeSelectNone = document.getElementById('importMergeSelectNone')
   const importLibraryMappingSection = document.getElementById('importLibraryMappingSection')
   const importLibraryMappingList = document.getElementById('importLibraryMappingList')
   const importMappingNote = document.getElementById('importMappingNote')
@@ -96,16 +130,30 @@ document.addEventListener('DOMContentLoaded', function () {
   let importReportHeader = ''
   let importReportBody = ''
   let importReportFilter = 'all'
+  let importNeedsPlexCredentials = false
+  let importNeedsTmdbCredentials = false
 
   if (importPlexTokenToggle && importPlexToken) {
     if (!importPlexToken.value.trim()) {
       importPlexToken.setAttribute('type', 'text')
-      importPlexTokenToggle.innerHTML = '<i class="bi bi-eye-slash"></i>'
+      setIconOnlyButton(importPlexTokenToggle, 'bi bi-eye-slash')
     }
     importPlexTokenToggle.addEventListener('click', () => {
       const isPassword = importPlexToken.getAttribute('type') === 'password'
       importPlexToken.setAttribute('type', isPassword ? 'text' : 'password')
-      importPlexTokenToggle.innerHTML = isPassword ? '<i class="bi bi-eye-slash"></i>' : '<i class="bi bi-eye"></i>'
+      setIconOnlyButton(importPlexTokenToggle, isPassword ? 'bi bi-eye-slash' : 'bi bi-eye')
+    })
+  }
+
+  if (importTmdbApiKeyToggle && importTmdbApiKey) {
+    if (!importTmdbApiKey.value.trim()) {
+      importTmdbApiKey.setAttribute('type', 'text')
+      setIconOnlyButton(importTmdbApiKeyToggle, 'bi bi-eye-slash')
+    }
+    importTmdbApiKeyToggle.addEventListener('click', () => {
+      const isPassword = importTmdbApiKey.getAttribute('type') === 'password'
+      importTmdbApiKey.setAttribute('type', isPassword ? 'text' : 'password')
+      setIconOnlyButton(importTmdbApiKeyToggle, isPassword ? 'bi bi-eye-slash' : 'bi bi-eye')
     })
   }
 
@@ -239,7 +287,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
   function renderBulkDeleteList () {
     if (!bulkDeleteList) return
-    bulkDeleteList.innerHTML = ''
+    bulkDeleteList.replaceChildren()
 
     const configs = getAvailableConfigs()
     if (!configs.length) {
@@ -483,19 +531,181 @@ document.addEventListener('DOMContentLoaded', function () {
       importConfigError.classList.add('d-none')
       importConfigError.textContent = ''
       if (importPlexCredentials) importPlexCredentials.classList.add('d-none')
+      if (importTmdbCredentials) importTmdbCredentials.classList.add('d-none')
       return
     }
     importConfigError.classList.remove('d-none')
     importConfigError.textContent = message
     if (importPlexCredentials) {
-      const needsPlex = /plex/i.test(message)
+      const needsPlex = importNeedsPlexCredentials || /plex/i.test(message)
       importPlexCredentials.classList.toggle('d-none', !needsPlex)
     }
+    if (importTmdbCredentials) {
+      const needsTmdb = importNeedsTmdbCredentials || /tmdb/i.test(message)
+      importTmdbCredentials.classList.toggle('d-none', !needsTmdb)
+    }
+  }
+
+  function setImportCredentialFlags (options) {
+    importNeedsPlexCredentials = Boolean(options && options.needsPlex)
+    importNeedsTmdbCredentials = Boolean(options && options.needsTmdb)
+  }
+
+  function getImportMode () {
+    if (importModeMerge && importModeMerge.checked) return 'merge'
+    return 'new'
+  }
+
+  function getMergeBaseConfig () {
+    if (!importMergeBaseConfig) return ''
+    return importMergeBaseConfig.value.trim()
+  }
+
+  function clearMergeSections () {
+    if (importMergeSectionList) importMergeSectionList.replaceChildren()
+    if (importMergeSection) importMergeSection.classList.add('d-none')
+  }
+
+  function toggleImportModeUI () {
+    const isMerge = getImportMode() === 'merge'
+    if (importMergeBaseSection) importMergeBaseSection.classList.toggle('d-none', !isMerge)
+    if (!isMerge) clearMergeSections()
+  }
+
+  function titleCase (value) {
+    return String(value || '')
+      .split('_')
+      .map(part => (part ? part[0].toUpperCase() + part.slice(1) : ''))
+      .join(' ')
+  }
+
+  const mergeSectionLabels = {
+    plex: 'Plex',
+    tmdb: 'TMDb',
+    omdb: 'OMDb',
+    mdblist: 'MDBList',
+    tautulli: 'Tautulli',
+    notifiarr: 'Notifiarr',
+    gotify: 'Gotify',
+    ntfy: 'ntfy',
+    github: 'GitHub',
+    radarr: 'Radarr',
+    sonarr: 'Sonarr',
+    trakt: 'Trakt',
+    mal: 'MyAnimeList',
+    anidb: 'AniDB',
+    webhooks: 'Webhooks',
+    settings: 'Settings',
+    playlist_files: 'Playlists',
+    libraries: 'Libraries'
+  }
+
+  const mergeSectionOrder = [
+    'plex',
+    'tmdb',
+    'libraries',
+    'playlist_files',
+    'tautulli',
+    'github',
+    'omdb',
+    'mdblist',
+    'notifiarr',
+    'gotify',
+    'ntfy',
+    'webhooks',
+    'anidb',
+    'radarr',
+    'sonarr',
+    'trakt',
+    'mal',
+    'settings'
+  ]
+
+  const mergeDefaultSelected = new Set(['libraries', 'playlist_files', 'settings'])
+
+  function renderMergeSections (sections) {
+    if (!importMergeSection || !importMergeSectionList) return
+    importMergeSectionList.replaceChildren()
+    if (getImportMode() !== 'merge') {
+      importMergeSection.classList.add('d-none')
+      return
+    }
+    const list = Array.isArray(sections) ? sections.filter(Boolean) : []
+    if (!list.length) {
+      importMergeSection.classList.add('d-none')
+      return
+    }
+    const ordered = []
+    const remaining = new Set(list)
+    mergeSectionOrder.forEach(section => {
+      if (remaining.has(section)) {
+        ordered.push(section)
+        remaining.delete(section)
+      }
+    })
+    Array.from(remaining).sort().forEach(section => ordered.push(section))
+
+    const shouldUseDefaults = ordered.some(section => mergeDefaultSelected.has(section))
+
+    ordered.forEach((section, idx) => {
+      const id = `import-merge-${idx}-${String(section).replace(/[^a-zA-Z0-9_-]/g, '_')}`
+      const wrapper = document.createElement('div')
+      wrapper.className = 'form-check form-check-inline'
+
+      const input = document.createElement('input')
+      input.type = 'checkbox'
+      input.className = 'form-check-input import-merge-section'
+      input.id = id
+      input.value = section
+      input.checked = shouldUseDefaults ? mergeDefaultSelected.has(section) : true
+      input.addEventListener('change', updateImportConfirmState)
+
+      const label = document.createElement('label')
+      label.className = 'form-check-label small'
+      label.setAttribute('for', id)
+      label.textContent = mergeSectionLabels[section] || titleCase(section)
+
+      wrapper.appendChild(input)
+      wrapper.appendChild(label)
+      importMergeSectionList.appendChild(wrapper)
+    })
+    importMergeSection.classList.remove('d-none')
+  }
+
+  function collectMergeSections () {
+    if (!importMergeSectionList) return []
+    return Array.from(importMergeSectionList.querySelectorAll('.import-merge-section:checked'))
+      .map(input => input.value)
+  }
+
+  function setMergeSelection (checked) {
+    if (!importMergeSectionList) return
+    importMergeSectionList.querySelectorAll('.import-merge-section').forEach(input => {
+      input.checked = checked
+    })
+    updateImportConfirmState()
+  }
+
+  if (importMergeSelectAll) {
+    importMergeSelectAll.addEventListener('click', () => {
+      setMergeSelection(true)
+    })
+  }
+  if (importMergeSelectNone) {
+    importMergeSelectNone.addEventListener('click', () => {
+      setMergeSelection(false)
+    })
   }
 
   function updateImportConfirmState () {
     if (!confirmImportButton) return
     if (confirmImportButton.classList.contains('d-none')) return
+    const isMerge = getImportMode() === 'merge'
+    if (isMerge && !getMergeBaseConfig()) {
+      confirmImportButton.disabled = true
+      setImportError('Select a base config to merge into.')
+      return
+    }
     if (importLibraryMappingSection && !importLibraryMappingSection.classList.contains('d-none')) {
       const selects = importLibraryMappingList
         ? Array.from(importLibraryMappingList.querySelectorAll('.import-library-map'))
@@ -509,7 +719,13 @@ document.addEventListener('DOMContentLoaded', function () {
       }
       return
     }
+    if (isMerge && !collectMergeSections().length) {
+      confirmImportButton.disabled = true
+      setImportError('Select at least one section to merge.')
+      return
+    }
     confirmImportButton.disabled = false
+    setImportError('')
   }
 
   let mappingRefreshTimer = null
@@ -551,6 +767,7 @@ document.addEventListener('DOMContentLoaded', function () {
         downloadImportReport.download = `import_report_${importConfigName?.value || 'import'}.txt`
         downloadImportReport.classList.remove('d-none')
       }
+      renderMergeSections(data.importable_sections)
     } catch (err) {
       setImportError(err.message || 'Preview refresh failed.')
     }
@@ -564,7 +781,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
   function renderLibraryMapping (items, plexLibraries) {
     if (!importLibraryMappingSection || !importLibraryMappingList) return
-    importLibraryMappingList.innerHTML = ''
+    importLibraryMappingList.replaceChildren()
     const pending = Array.isArray(items) ? items : []
     if (!pending.length) {
       importLibraryMappingSection.classList.add('d-none')
@@ -597,7 +814,9 @@ document.addEventListener('DOMContentLoaded', function () {
       const left = document.createElement('div')
       left.className = 'd-flex flex-column'
       const title = document.createElement('div')
-      title.innerHTML = `<strong>${item.name}</strong>`
+      const titleStrong = document.createElement('strong')
+      titleStrong.textContent = item.name
+      title.replaceChildren(titleStrong)
       const meta = document.createElement('div')
       meta.className = 'small text-muted'
       const confidence = item.confidence || 'unknown'
@@ -671,14 +890,31 @@ document.addEventListener('DOMContentLoaded', function () {
     importReportHeader = ''
     importReportBody = ''
     importReportFilter = 'all'
+    setImportCredentialFlags({ needsPlex: false, needsTmdb: false })
     if (importConfigFile) importConfigFile.value = ''
     if (importConfigName) {
       importConfigName.value = ''
       removeValidationMessages(importConfigName)
     }
+    if (importModeNew) importModeNew.checked = true
+    if (importModeMerge) importModeMerge.checked = false
+    if (importMergeBaseConfig) {
+      const current = configSelector?.value && configSelector.value !== 'add_config'
+        ? configSelector.value
+        : ''
+      if (current) {
+        importMergeBaseConfig.value = current
+      } else if (importMergeBaseConfig.options.length) {
+        importMergeBaseConfig.selectedIndex = 0
+      }
+    }
+    if (importMergeBaseSection) importMergeBaseSection.classList.add('d-none')
+    clearMergeSections()
     if (importPlexCredentials) importPlexCredentials.classList.add('d-none')
     if (importPlexUrl) importPlexUrl.value = ''
     if (importPlexToken) importPlexToken.value = ''
+    if (importTmdbCredentials) importTmdbCredentials.classList.add('d-none')
+    if (importTmdbApiKey) importTmdbApiKey.value = ''
     if (importPreviewSection) importPreviewSection.classList.add('d-none')
     if (importReport) importReport.textContent = ''
     if (importSummary) {
@@ -696,17 +932,20 @@ document.addEventListener('DOMContentLoaded', function () {
       downloadImportReport.removeAttribute('href')
     }
     if (importLibraryMappingSection) importLibraryMappingSection.classList.add('d-none')
-    if (importLibraryMappingList) importLibraryMappingList.innerHTML = ''
+    if (importLibraryMappingList) importLibraryMappingList.replaceChildren()
     if (importMappingNote) importMappingNote.classList.add('d-none')
     if (confirmImportButton) confirmImportButton.classList.add('d-none')
     if (previewImportButton) previewImportButton.disabled = false
     setImportError('')
   }
 
-  function clearImportPreviewState () {
+  function clearImportPreviewState (options = {}) {
     importToken = null
     importReportHeader = ''
     importReportBody = ''
+    if (!options.keepCredentials) {
+      setImportCredentialFlags({ needsPlex: false, needsTmdb: false })
+    }
     if (importPreviewSection) importPreviewSection.classList.add('d-none')
     if (importReport) importReport.textContent = ''
     if (importSummary) {
@@ -714,6 +953,8 @@ document.addEventListener('DOMContentLoaded', function () {
       importSummary.classList.add('d-none')
     }
     if (confirmImportButton) confirmImportButton.classList.add('d-none')
+    if (importTmdbCredentials) importTmdbCredentials.classList.add('d-none')
+    clearMergeSections()
     if (importReportFilters) {
       importReportFilters.querySelectorAll('button[data-filter]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.filter === 'all')
@@ -727,14 +968,16 @@ document.addEventListener('DOMContentLoaded', function () {
       importReport.textContent = ''
       return
     }
+    const importedPattern = /(?:#|\|) imported(?:\s*-.*)?$/
+    const notImportedPattern = /(?:#|\|) not imported(?:\s*-.*)?$/
     const lines = importReportBody.split('\n')
     const filtered = lines.filter(line => {
       const trimmed = line.trimEnd()
       if (importReportFilter === 'imported') {
-        return trimmed.endsWith('# imported') || trimmed.endsWith('| imported')
+        return importedPattern.test(trimmed)
       }
       if (importReportFilter === 'not_imported') {
-        return trimmed.endsWith('# not imported') || trimmed.endsWith('| not imported')
+        return notImportedPattern.test(trimmed)
       }
       if (importReportFilter === 'comments') {
         return line.trimStart().startsWith('#')
@@ -771,7 +1014,7 @@ document.addEventListener('DOMContentLoaded', function () {
       ? counts.diff
       : (total - (imported + notImported + blank + comments))
     const name = data.config_name || importConfigName?.value || 'import'
-    return [
+    const header = [
       `# Import Report for ${name}`,
       `# Imported: ${imported}`,
       `# Not Imported: ${notImported}`,
@@ -780,7 +1023,21 @@ document.addEventListener('DOMContentLoaded', function () {
       `# Total: ${total}`,
       `# Diff: ${diff}`,
       ''
-    ].join('\n')
+    ]
+    const mapping = data.mapping_summary || {}
+    if (mapping && Object.keys(mapping).length) {
+      const mapped = mapping.mapped || 0
+      const ignored = mapping.ignored || 0
+      const missing = mapping.missing || 0
+      const invalid = mapping.invalid || 0
+      const duplicate = mapping.duplicate || 0
+      header.splice(
+        header.length - 1,
+        0,
+        `# Mapping Applied: mapped ${mapped}, ignored ${ignored}, missing ${missing}, invalid ${invalid}, duplicate ${duplicate}`
+      )
+    }
+    return header.join('\n')
   }
 
   if (importConfigModalEl) {
@@ -789,6 +1046,17 @@ document.addEventListener('DOMContentLoaded', function () {
       if (!importConfigName) return
       removeValidationMessages(importConfigName)
       setImportError('')
+      if (importModeNew) importModeNew.checked = true
+      if (importModeMerge) importModeMerge.checked = false
+      if (importMergeBaseConfig) {
+        const current = configSelector?.value && configSelector.value !== 'add_config'
+          ? configSelector.value
+          : ''
+        if (current) {
+          importMergeBaseConfig.value = current
+        }
+      }
+      toggleImportModeUI()
       let suggested = ''
       const selectorValue = configSelector?.value || ''
       if (selectorValue === 'add_config') {
@@ -823,9 +1091,37 @@ document.addEventListener('DOMContentLoaded', function () {
     })
   }
 
+  function handleImportMergeSettingsChange () {
+    toggleImportModeUI()
+    clearImportPreviewState({ keepCredentials: true })
+    if (previewImportButton) previewImportButton.textContent = 'Preview Import'
+    updateImportConfirmState()
+  }
+
+  if (importModeNew) {
+    importModeNew.addEventListener('change', handleImportMergeSettingsChange)
+  }
+  if (importModeMerge) {
+    importModeMerge.addEventListener('change', handleImportMergeSettingsChange)
+  }
+  if (importMergeBaseConfig) {
+    importMergeBaseConfig.addEventListener('change', handleImportMergeSettingsChange)
+  }
+
   if (previewImportButton) {
     previewImportButton.addEventListener('click', async () => {
       setImportError('')
+      if (importToken && importPreviewSection && !importPreviewSection.classList.contains('d-none')) {
+        previewImportButton.disabled = true
+        previewImportButton.textContent = 'Refreshing Preview...'
+        try {
+          await refreshMappedPreview()
+        } finally {
+          previewImportButton.disabled = false
+          previewImportButton.textContent = 'Refresh Preview'
+        }
+        return
+      }
       if (downloadImportReport) {
         downloadImportReport.classList.add('d-none')
         downloadImportReport.removeAttribute('href')
@@ -842,6 +1138,10 @@ document.addEventListener('DOMContentLoaded', function () {
         setImportError('That config name already exists.')
         return
       }
+      if (getImportMode() === 'merge' && !getMergeBaseConfig()) {
+        setImportError('Select a base config to merge into.')
+        return
+      }
 
       previewImportButton.disabled = true
       previewImportButton.textContent = 'Previewing...'
@@ -850,11 +1150,19 @@ document.addEventListener('DOMContentLoaded', function () {
         const formData = new FormData()
         formData.append('file', importConfigFile.files[0])
         formData.append('config_name', importConfigName.value)
+        if (getImportMode() === 'merge') {
+          formData.append('merge_mode', 'merge')
+          const baseConfig = getMergeBaseConfig()
+          if (baseConfig) formData.append('base_config', baseConfig)
+        }
         if (importPlexUrl && importPlexUrl.value.trim()) {
           formData.append('plex_url', importPlexUrl.value.trim())
         }
         if (importPlexToken && importPlexToken.value.trim()) {
           formData.append('plex_token', importPlexToken.value.trim())
+        }
+        if (importTmdbApiKey && importTmdbApiKey.value.trim()) {
+          formData.append('tmdb_apikey', importTmdbApiKey.value.trim())
         }
         const res = await fetch('/import-config/preview', {
           method: 'POST',
@@ -862,6 +1170,10 @@ document.addEventListener('DOMContentLoaded', function () {
         })
         const data = await res.json()
         if (!res.ok || !data.success) {
+          setImportCredentialFlags({
+            needsPlex: Boolean(data && data.needs_plex_credentials),
+            needsTmdb: Boolean(data && data.needs_tmdb_credentials)
+          })
           if (data && data.needs_plex_credentials && importPlexCredentials) {
             importPlexCredentials.classList.remove('d-none')
             if (importPlexUrl && data.plex_url && !importPlexUrl.value.trim()) {
@@ -871,11 +1183,19 @@ document.addEventListener('DOMContentLoaded', function () {
               importPlexToken.value = data.plex_token
             }
           }
-          clearImportPreviewState()
+          if (data && data.needs_tmdb_credentials && importTmdbCredentials) {
+            importTmdbCredentials.classList.remove('d-none')
+            if (importTmdbApiKey && data.tmdb_apikey && !importTmdbApiKey.value.trim()) {
+              importTmdbApiKey.value = data.tmdb_apikey
+            }
+          }
+          clearImportPreviewState({ keepCredentials: true })
           setImportError(data.message || 'Preview failed.')
           return
         }
+        setImportCredentialFlags({ needsPlex: false, needsTmdb: false })
         if (importPlexCredentials) importPlexCredentials.classList.add('d-none')
+        if (importTmdbCredentials) importTmdbCredentials.classList.add('d-none')
         importToken = data.token
         if (importPreviewSection) importPreviewSection.classList.remove('d-none')
         if (importReport) {
@@ -892,6 +1212,7 @@ document.addEventListener('DOMContentLoaded', function () {
           downloadImportReport.download = `import_report_${importConfigName.value}.txt`
           downloadImportReport.classList.remove('d-none')
         }
+        renderMergeSections(data.importable_sections)
         renderLibraryMapping(data.library_mapping || [], data.plex_libraries || {})
         if (confirmImportButton) confirmImportButton.classList.remove('d-none')
         updateImportConfirmState()
@@ -899,7 +1220,7 @@ document.addEventListener('DOMContentLoaded', function () {
         setImportError(err.message || 'Preview failed.')
       } finally {
         previewImportButton.disabled = false
-        previewImportButton.textContent = 'Preview Import'
+        previewImportButton.textContent = (importToken ? 'Refresh Preview' : 'Preview Import')
       }
     })
   }
@@ -912,6 +1233,71 @@ document.addEventListener('DOMContentLoaded', function () {
       }
       confirmImportButton.disabled = true
       confirmImportButton.textContent = 'Importing...'
+
+      function showImportRedirectOverlay (message, detail) {
+        const existing = document.getElementById('qs-import-redirect')
+        if (existing) {
+          const msgEl = existing.querySelector('.qs-import-redirect-message')
+          const detailEl = existing.querySelector('.qs-import-redirect-detail')
+          if (msgEl) msgEl.textContent = message || msgEl.textContent
+          if (detailEl) detailEl.textContent = detail || detailEl.textContent
+          return
+        }
+
+        const overlay = document.createElement('div')
+        overlay.id = 'qs-import-redirect'
+        overlay.setAttribute('role', 'dialog')
+        overlay.setAttribute('aria-modal', 'true')
+        overlay.style.cssText = [
+          'position:fixed',
+          'inset:0',
+          'z-index:2000',
+          'background:rgba(8, 10, 12, 0.78)',
+          'display:flex',
+          'align-items:center',
+          'justify-content:center',
+          'padding:24px'
+        ].join(';')
+
+        const card = document.createElement('div')
+        card.className = 'text-center text-light p-4 rounded'
+        card.style.cssText = 'background:#0f1113;border:1px solid #2b2f33;max-width:520px;width:100%;'
+
+        const spinner = document.createElement('div')
+        spinner.className = 'spinner-border text-info mb-3'
+        spinner.setAttribute('role', 'status')
+        spinner.setAttribute('aria-hidden', 'true')
+
+        const messageEl = document.createElement('div')
+        messageEl.className = 'fw-semibold mb-1 qs-import-redirect-message'
+        messageEl.textContent = message || 'Import complete. Redirecting...'
+
+        const detailEl = document.createElement('div')
+        detailEl.className = 'small text-muted mb-3 qs-import-redirect-detail'
+        detailEl.style.whiteSpace = 'pre-line'
+        detailEl.textContent = detail || 'Loading Final Validation. This can take up to 30 seconds.'
+
+        const button = document.createElement('button')
+        button.type = 'button'
+        button.className = 'btn btn-sm btn-outline-info qs-import-redirect-btn d-none'
+        button.textContent = 'Go to Final Validation'
+
+        card.append(spinner, messageEl, detailEl, button)
+        overlay.appendChild(card)
+
+        document.body.appendChild(overlay)
+        const redirectBtn = overlay.querySelector('.qs-import-redirect-btn')
+        if (redirectBtn) {
+          redirectBtn.addEventListener('click', () => {
+            window.location = '/step/900-final'
+          })
+          setTimeout(() => {
+            if (document.getElementById('qs-import-redirect')) {
+              redirectBtn.classList.remove('d-none')
+            }
+          }, 60000)
+        }
+      }
       try {
         const libraryMapping = {}
         if (importLibraryMappingList) {
@@ -921,10 +1307,20 @@ document.addEventListener('DOMContentLoaded', function () {
             }
           })
         }
+        const isMerge = getImportMode() === 'merge'
+        const mergePayload = {
+          merge_mode: isMerge,
+          base_config: isMerge ? getMergeBaseConfig() : '',
+          merge_sections: isMerge ? collectMergeSections() : []
+        }
         const res = await fetch('/import-config/confirm', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: importToken, library_mapping: libraryMapping })
+          body: JSON.stringify({
+            token: importToken,
+            library_mapping: libraryMapping,
+            ...mergePayload
+          })
         })
         const data = await res.json()
         if (!res.ok || !data.success) {
@@ -934,14 +1330,22 @@ document.addEventListener('DOMContentLoaded', function () {
         if (Array.isArray(data.fonts_copied) && data.fonts_copied.length) {
           msg += ` Fonts added: ${data.fonts_copied.length}.`
         }
-        if (Array.isArray(data.fonts_skipped) && data.fonts_skipped.length) {
+        const skippedExisting = Array.isArray(data.fonts_skipped_existing) ? data.fonts_skipped_existing : []
+        const skippedFailed = Array.isArray(data.fonts_skipped_failed) ? data.fonts_skipped_failed : []
+        if (skippedExisting.length) {
+          msg += ` Fonts skipped (already exists): ${skippedExisting.length}.`
+        }
+        if (skippedFailed.length) {
+          msg += ` Fonts skipped (copy failed): ${skippedFailed.length}.`
+        }
+        if (!skippedExisting.length && !skippedFailed.length && Array.isArray(data.fonts_skipped) && data.fonts_skipped.length) {
           msg += ` Fonts skipped: ${data.fonts_skipped.length}.`
         }
-        showToast('success', msg)
-        showToast('error', 'Review each page after import and validate before generating the final config.')
+        const guidance = 'Import complete. Go to Final Validation and click Validate Configured Services to check all services, then fix any failures (especially interactive pages).'
+        showImportRedirectOverlay(msg, `${guidance}\nLoading Final Validation. This can take up to 30 seconds.`)
         const modal = bootstrap.Modal.getInstance(importConfigModalEl)
         if (modal) modal.hide()
-        setTimeout(() => window.location.reload(), 1200)
+        setTimeout(() => { window.location = '/step/900-final' }, 1200)
       } catch (err) {
         const message = err.message || 'Import failed.'
         if (/import token is invalid/i.test(message)) {
@@ -973,6 +1377,18 @@ document.addEventListener('DOMContentLoaded', function () {
   const finalPathInput = document.getElementById('test-lib-final-path')
   const savePathsBtn = document.getElementById('test-lib-paths-apply')
   const pathsStatus = document.getElementById('test-lib-paths-status')
+  const testLibAccordion = document.getElementById('test-lib-accordion-collapse')
+
+  function setTestLibAccordionExpanded (shouldExpand) {
+    if (!testLibAccordion) return
+    if (typeof bootstrap !== 'undefined' && bootstrap.Collapse) {
+      const instance = bootstrap.Collapse.getOrCreateInstance(testLibAccordion, { toggle: false })
+      if (shouldExpand) instance.show()
+      else instance.hide()
+    } else {
+      testLibAccordion.classList.toggle('show', Boolean(shouldExpand))
+    }
+  }
 
   // Progress block (existing or injected)
   let progWrap = document.getElementById('test-lib-progress')
@@ -995,14 +1411,24 @@ document.addEventListener('DOMContentLoaded', function () {
   // --- Spinner button helpers (prevents flicker) -------------------
   // Structure: <button id="clone-test-lib-btn"><span class="spin"></span><span class="btn-label"></span></button>
   function ensureBusyButtonSkeleton () {
-    if (!cloneBtn.querySelector('.btn-label')) {
-      cloneBtn.innerHTML = `
-        <span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>
-        <span class="btn-label"></span>
-      `
-    } else if (!cloneBtn.querySelector('.spinner-border')) {
-      cloneBtn.insertAdjacentHTML('afterbegin',
-        '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>')
+    const label = cloneBtn.querySelector('.btn-label')
+    const spinner = cloneBtn.querySelector('.spinner-border')
+    if (!label) {
+      const spinnerEl = document.createElement('span')
+      spinnerEl.className = 'spinner-border spinner-border-sm me-2'
+      spinnerEl.setAttribute('role', 'status')
+      spinnerEl.setAttribute('aria-hidden', 'true')
+      const labelEl = document.createElement('span')
+      labelEl.className = 'btn-label'
+      cloneBtn.replaceChildren(spinnerEl, labelEl)
+      return
+    }
+    if (!spinner) {
+      const spinnerEl = document.createElement('span')
+      spinnerEl.className = 'spinner-border spinner-border-sm me-2'
+      spinnerEl.setAttribute('role', 'status')
+      spinnerEl.setAttribute('aria-hidden', 'true')
+      cloneBtn.insertBefore(spinnerEl, label)
     }
   }
   function setButtonBusy (text) {
@@ -1117,30 +1543,55 @@ document.addEventListener('DOMContentLoaded', function () {
     progTxt.textContent = ''
   }
 
-  function setScenarioNotFound (pathHtml, opts = {}) {
-    const unrecognizedNote = opts.unrecognized
-      ? '<div class="small text-danger mt-1">Target path exists but does not look like test libraries.</div>'
-      : ''
+  function setScenarioNotFound (pathValue, opts = {}) {
+    const showUnrecognized = Boolean(opts.unrecognized)
     testLibStatus.classList.remove('d-none', 'alert-success', 'alert-danger')
     testLibStatus.classList.add('alert-warning')
-    statusMsg.innerHTML = `
-      <strong>Test media libraries not found.</strong>
-      <span class="ms-1">We recommend setting them up for testing with Kometa. Be patient as the repository is about 7GB.</span>
-      ${pathHtml || ''}
-      ${unrecognizedNote}
-    `
+    statusMsg.replaceChildren()
+    const strong = document.createElement('strong')
+    strong.textContent = 'Test media libraries not found.'
+    const note = document.createElement('span')
+    note.className = 'ms-1'
+    note.textContent = 'We recommend setting them up for testing with Kometa. Be patient as the repository is about 7GB.'
+    statusMsg.append(strong, document.createTextNode(' '), note)
+    if (pathValue) {
+      const code = document.createElement('code')
+      code.textContent = pathValue
+      statusMsg.append(document.createElement('br'), code)
+    }
+    if (showUnrecognized) {
+      const warn = document.createElement('div')
+      warn.className = 'small text-danger mt-1'
+      warn.textContent = 'Target path exists but does not look like test libraries.'
+      statusMsg.appendChild(warn)
+    }
     cloneBtn.classList.remove('d-none')
     purgeBtn.classList.add('d-none')
     updateRow?.classList.add('d-none')
+    setTestLibAccordionExpanded(true)
   }
 
-  function setScenarioFoundZip (data, pathHtml) {
+  function setScenarioFoundZip (data, pathValue) {
     testLibStatus.classList.remove('d-none', 'alert-warning', 'alert-danger')
     testLibStatus.classList.add('alert-success')
-    const shaNotice = (data.local_sha && data.remote_sha)
-      ? `<br><small>Installed version: <code>${data.local_sha}</code> • Latest: <code>${data.remote_sha}</code></small>`
-      : ''
-    statusMsg.innerHTML = `<strong>✅ Test libraries already set up (ZIP install).</strong>${pathHtml || ''}${shaNotice}`
+    statusMsg.replaceChildren()
+    const strong = document.createElement('strong')
+    strong.textContent = '✅ Test libraries already set up (ZIP install).'
+    statusMsg.appendChild(strong)
+    if (pathValue) {
+      const code = document.createElement('code')
+      code.textContent = pathValue
+      statusMsg.append(document.createElement('br'), code)
+    }
+    if (data.local_sha && data.remote_sha) {
+      const small = document.createElement('small')
+      const localCode = document.createElement('code')
+      const remoteCode = document.createElement('code')
+      localCode.textContent = data.local_sha
+      remoteCode.textContent = data.remote_sha
+      small.append('Installed version: ', localCode, ' • Latest: ', remoteCode)
+      statusMsg.append(document.createElement('br'), small)
+    }
     cloneBtn.classList.add('d-none')
     purgeBtn.classList.remove('d-none')
     if (data.is_outdated) {
@@ -1150,6 +1601,7 @@ document.addEventListener('DOMContentLoaded', function () {
     } else {
       updateRow?.classList.add('d-none')
     }
+    setTestLibAccordionExpanded(false)
   }
 
   async function refreshStatus () {
@@ -1162,9 +1614,9 @@ document.addEventListener('DOMContentLoaded', function () {
       })
     })
     const data = await res.json()
-    const pathHtml = data.target_path ? `<br><code>${data.target_path}</code>` : ''
-    if (!data.found) setScenarioNotFound(pathHtml, { unrecognized: data.unrecognized })
-    else setScenarioFoundZip(data, pathHtml)
+    const pathValue = data.target_path || ''
+    if (!data.found) setScenarioNotFound(pathValue, { unrecognized: data.unrecognized })
+    else setScenarioFoundZip(data, pathValue)
   }
 
   if (isManagedInstall && testLibStatus && statusMsg && cloneBtn && purgeBtn) {
@@ -1183,7 +1635,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
       const prevText = cloneBtn.textContent
       purgeBtn.disabled = true
-      purgeBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span> Purging...'
+      setButtonSpinner(purgeBtn, 'Purging...')
 
       try {
         const res = await fetch('/purge-test-libraries', {
@@ -1196,7 +1648,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }).then(r => r.json())
 
         purgeBtn.disabled = false
-        purgeBtn.innerHTML = '<i class="bi bi-trash3 me-1"></i> Delete Test Libraries'
+        setButtonIconAndText(purgeBtn, 'bi bi-trash3 me-1', 'Delete Test Libraries')
 
         if (res.success) {
           showToast('success', res.message)
@@ -1208,7 +1660,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }
       } catch (err) {
         purgeBtn.disabled = false
-        purgeBtn.innerHTML = '<i class="bi bi-trash3 me-1"></i> Delete Test Libraries'
+        setButtonIconAndText(purgeBtn, 'bi bi-trash3 me-1', 'Delete Test Libraries')
         showToast('error', `Failed to purge: ${err.message}`)
       }
     })
@@ -1362,7 +1814,9 @@ document.addEventListener('DOMContentLoaded', function () {
       } catch (err) {
         testLibStatus.classList.remove('alert-success', 'alert-warning')
         testLibStatus.classList.add('alert-danger')
-        statusMsg.innerHTML = `<strong>❌ ${String(err.message || err)}</strong>`
+        const errorStrong = document.createElement('strong')
+        errorStrong.textContent = `❌ ${String(err.message || err)}`
+        statusMsg.replaceChildren(errorStrong)
         showToast('error', String(err.message || err))
       } finally {
         running = false

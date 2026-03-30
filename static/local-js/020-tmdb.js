@@ -1,5 +1,18 @@
 /* global showSpinner, hideSpinner */
 
+function refreshValidationCallout () {
+  if (window.QSValidationCallouts && typeof window.QSValidationCallouts.refresh === 'function') {
+    window.QSValidationCallouts.refresh('tmdb_validated')
+  }
+}
+
+function setToggleButtonIcon (button, showPlainText) {
+  if (!button) return
+  const icon = document.createElement('i')
+  icon.className = showPlainText ? 'fas fa-eye-slash' : 'fas fa-eye'
+  button.replaceChildren(icon)
+}
+
 document.addEventListener('DOMContentLoaded', function () {
   const validateButton = document.getElementById('validateButton')
   const apiKeyInput = document.getElementById('tmdb_apikey')
@@ -19,10 +32,10 @@ document.addEventListener('DOMContentLoaded', function () {
   // Set initial visibility based on API key value
   if (apiKeyInput.value.trim() === '') {
     apiKeyInput.setAttribute('type', 'text') // Show placeholder text
-    toggleButton.innerHTML = '<i class="fas fa-eye-slash"></i>' // Set eye-slash icon
+    setToggleButtonIcon(toggleButton, true)
   } else {
     apiKeyInput.setAttribute('type', 'password') // Hide actual key
-    toggleButton.innerHTML = '<i class="fas fa-eye"></i>' // Set eye icon
+    setToggleButtonIcon(toggleButton, false)
   }
 
   // Disable validate button if already validated
@@ -91,11 +104,13 @@ document.addEventListener('DOMContentLoaded', function () {
         if (data.valid) {
           tmdbValidatedInput.value = 'true'
           if (tmdbValidatedAtInput) tmdbValidatedAtInput.value = new Date().toISOString()
+          refreshValidationCallout()
           statusMessage.textContent = 'API key is valid!'
           statusMessage.style.color = '#75b798' // Green
         } else {
           tmdbValidatedInput.value = 'false'
           if (tmdbValidatedAtInput) tmdbValidatedAtInput.value = ''
+          refreshValidationCallout()
           statusMessage.textContent = 'Failed to validate TMDb. Please check your API Key.'
           statusMessage.style.color = '#ea868f' // Red
         }
@@ -106,6 +121,7 @@ document.addEventListener('DOMContentLoaded', function () {
         statusMessage.textContent = 'An error occurred. Please try again.'
         statusMessage.style.color = '#ea868f' // Red
         if (tmdbValidatedAtInput) tmdbValidatedAtInput.value = ''
+        refreshValidationCallout()
       })
       .finally(() => {
         hideSpinner('validate')
@@ -117,15 +133,14 @@ document.addEventListener('DOMContentLoaded', function () {
   toggleButton.addEventListener('click', function () {
     const currentType = apiKeyInput.getAttribute('type')
     apiKeyInput.setAttribute('type', currentType === 'password' ? 'text' : 'password')
-    this.innerHTML = currentType === 'password'
-      ? '<i class="fas fa-eye-slash"></i>'
-      : '<i class="fas fa-eye"></i>'
+    setToggleButtonIcon(this, currentType === 'password')
   })
 
   // Event listener for API key input changes
   apiKeyInput.addEventListener('input', function () {
     tmdbValidatedInput.value = 'false' // Mark API key as invalid
     if (tmdbValidatedAtInput) tmdbValidatedAtInput.value = ''
+    refreshValidationCallout()
     validateButton.disabled = false // Re-enable the validate button
     statusMessage.style.display = 'none' // Hide validation message
     updateNavigationState() // Disable Next and JumpTo

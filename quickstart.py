@@ -65,6 +65,107 @@ LOGSCAN_ANALYSIS_CACHE = {"mtime": None, "size": None, "data": None}
 KOMETA_CPU_CACHE = {}
 SYSTEM_CPU_CACHE = {"total": None, "idle": None}
 
+VALIDATION_DOC_BASE = "/step/"
+VALIDATION_DOC_FALLBACK = "/step/900-final"
+VALIDATION_DOCS = {
+    "settings": f"{VALIDATION_DOC_BASE}150-settings",
+    "libraries": f"{VALIDATION_DOC_BASE}025-libraries",
+    "plex": f"{VALIDATION_DOC_BASE}010-plex",
+    "tmdb": f"{VALIDATION_DOC_BASE}020-tmdb",
+    "trakt": f"{VALIDATION_DOC_BASE}130-trakt",
+    "radarr": f"{VALIDATION_DOC_BASE}110-radarr",
+    "sonarr": f"{VALIDATION_DOC_BASE}120-sonarr",
+    "tautulli": f"{VALIDATION_DOC_BASE}030-tautulli",
+    "omdb": f"{VALIDATION_DOC_BASE}050-omdb",
+    "mdblist": f"{VALIDATION_DOC_BASE}060-mdblist",
+    "notifiarr": f"{VALIDATION_DOC_BASE}070-notifiarr",
+    "github": f"{VALIDATION_DOC_BASE}040-github",
+    "gotify": f"{VALIDATION_DOC_BASE}080-gotify",
+    "ntfy": f"{VALIDATION_DOC_BASE}085-ntfy",
+    "mal": f"{VALIDATION_DOC_BASE}140-mal",
+    "anidb": f"{VALIDATION_DOC_BASE}100-anidb",
+    "webhooks": f"{VALIDATION_DOC_BASE}090-webhooks",
+    "collections": f"{VALIDATION_DOC_BASE}025-libraries",
+    "overlays": f"{VALIDATION_DOC_BASE}025-libraries",
+    "playlist_files": f"{VALIDATION_DOC_BASE}027-playlist_files",
+}
+VALIDATION_REASON_LABELS = {
+    "missing_credentials": "Missing credentials",
+    "missing_plex_validation": "Plex not validated",
+    "no_libraries": "No libraries selected",
+    "invalid_paths": "Invalid paths",
+    "missing_placeholder_imdb": "Missing placeholder IMDb ID",
+    "invalid_fields": "Invalid fields",
+    "no_webhooks": "No webhooks configured",
+    "disabled": "Disabled",
+    "missing_settings": "Settings missing",
+    "missing_tokens": "Missing tokens",
+    "token_invalid": "Invalid tokens",
+    "account_locked": "Account locked",
+    "validation_error": "Validation error",
+}
+VALIDATION_KEY_SUGGESTIONS = {
+    "settings": {
+        "playlist_sync_to_user": "playlist_sync_to_users",
+    }
+}
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def build_validation_summary(errors):
+    summary = []
+    if not errors:
+        return summary
+    for err in errors[:20]:
+        path_parts = [str(p) for p in err.path]
+        section = path_parts[0] if path_parts else ""
+        path_display = ".".join(path_parts) if path_parts else (section or "config")
+        doc_url = VALIDATION_DOCS.get(section, VALIDATION_DOC_FALLBACK)
+        title = f"{path_display}: {err.message}"
+        details = ""
+        suggestions = []
+
+        if err.validator == "additionalProperties":
+            extras = []
+            try:
+                extras = list(err.params.get("additionalProperties") or [])
+            except Exception:
+                extras = []
+            if extras:
+                title = f"{section or 'config'}: Unexpected key(s)"
+                details = f"Unknown keys: {', '.join(extras)}."
+                for key in extras:
+                    suggestion = VALIDATION_KEY_SUGGESTIONS.get(section, {}).get(key)
+                    if suggestion:
+                        suggestions.append(f"{key} → {suggestion}")
+        elif err.validator == "type":
+            expected = err.validator_value
+            details = f"Expected type: {expected}."
+        elif err.validator == "enum":
+            values = err.validator_value or []
+            details = f"Expected one of: {', '.join(map(str, values))}."
+        elif err.validator == "minimum":
+            details = f"Minimum allowed: {err.validator_value}."
+        elif err.validator == "maximum":
+            details = f"Maximum allowed: {err.validator_value}."
+        elif err.validator == "pattern":
+            details = "Value does not match the expected format."
+
+        summary.append(
+            {
+                "title": title,
+                "details": details,
+                "doc_url": doc_url,
+                "section": section or "config",
+                "suggestions": suggestions,
+            }
+        )
+
+    return summary
+
 
 def _calculate_process_cpu_percent(proc):
     try:
@@ -229,6 +330,67 @@ def _sanitize_config_name(raw_name: str | None) -> str:
 def _normalize_config_filename(config_name: str | None) -> str:
     name = (config_name or "").strip().lower().replace(" ", "_")
     return name or "default"
+
+
+def _safe_rel_path(raw_path: str | None, allow_subdirs: bool = False) -> str | None:
+    if not isinstance(raw_path, str):
+        return None
+    raw_path = raw_path.strip()
+    if not raw_path:
+        return None
+    if "\x00" in raw_path:
+        return None
+
+    drive, _ = os.path.splitdrive(raw_path)
+    if drive:
+        return None
+    if os.path.isabs(raw_path):
+        return None
+
+    normalized = os.path.normpath(raw_path)
+    if normalized in (".", ""):
+        return None
+    if normalized.startswith("..") or normalized.startswith("../") or normalized.startswith("..\\"):
+        return None
+    if not allow_subdirs and ("/" in normalized or "\\" in normalized):
+        return None
+
+    return normalized
+
+
+def _safe_join(base_dir: str | Path, raw_path: str | None, allow_subdirs: bool = False) -> Path | None:
+    rel = _safe_rel_path(raw_path, allow_subdirs=allow_subdirs)
+    if not rel:
+        return None
+    try:
+        base = Path(base_dir).resolve()
+        candidate = (base / rel).resolve()
+        candidate.relative_to(base)
+        return candidate
+    except Exception:
+        return None
+
+
+def _resolve_user_dir(raw_path: str | None) -> Path | None:
+    if not isinstance(raw_path, str):
+        return None
+    raw_path = raw_path.strip()
+    if not raw_path:
+        return None
+    if "\x00" in raw_path:
+        return None
+    try:
+        path = Path(raw_path)
+    except Exception:
+        return None
+    if not path.is_absolute():
+        return None
+    if any(part == ".." for part in path.parts):
+        return None
+    try:
+        return path.resolve()
+    except Exception:
+        return None
 
 
 def _rename_config_files(old_name: str, new_name: str, dry_run: bool = False) -> dict:
@@ -558,7 +720,8 @@ def update_quickstart():
         )
 
     except Exception as e:
-        logs.append(f"Exception during Quickstart update: {e}")
+        helpers.ts_log(f"Quickstart update failed: {e}", level="ERROR")
+        logs.append("Exception during Quickstart update.")
         return jsonify({"success": False, "log": logs}), 500
 
 
@@ -710,6 +873,13 @@ def fetch_library_image():
             400,
         )
 
+    valid_url, url_message = url_validation.validate_url(image_url, allow_local=False)
+    if not valid_url:
+        return (
+            jsonify({"status": "error", "message": f"Invalid image URL: {url_message}"}),
+            400,
+        )
+
     try:
         response = requests.get(image_url, stream=True, timeout=5)
         response.raise_for_status()
@@ -785,19 +955,27 @@ def rename_library_image():
         return jsonify({"status": "error", "message": "Invalid parameters"}), 400
 
     save_folder = UPLOAD_FOLDERS[image_type]
-    old_path = os.path.join(save_folder, old_name)
+    old_path = _safe_join(save_folder, old_name)
+    if not old_path:
+        return jsonify({"status": "error", "message": "Invalid file name"}), 400
 
-    if not os.path.exists(old_path):
+    if not old_path.exists():
         return jsonify({"status": "error", "message": "File not found"}), 404
 
-    old_ext = os.path.splitext(old_name)[1]
-    if "." not in new_name:
-        new_name += old_ext
-    elif not new_name.endswith(old_ext):
-        new_name += old_ext
+    old_ext = old_path.suffix
+    safe_new_name = str(new_name).strip()
+    if not safe_new_name:
+        return jsonify({"status": "error", "message": "Invalid parameters"}), 400
+    if old_ext:
+        if "." not in safe_new_name:
+            safe_new_name += old_ext
+        elif not safe_new_name.endswith(old_ext):
+            safe_new_name += old_ext
 
-    new_path = os.path.join(save_folder, new_name)
-    if os.path.exists(new_path):
+    new_path = _safe_join(save_folder, safe_new_name)
+    if not new_path:
+        return jsonify({"status": "error", "message": "Invalid file name"}), 400
+    if new_path.exists():
         return (
             jsonify({"status": "error", "message": "File with new name already exists"}),
             400,
@@ -853,7 +1031,7 @@ def generate_preview():
                 ext = os.path.splitext(urlparse(url).path)[1].lower()
                 if ext not in [".png", ".jpg", ".jpeg", ".webp"]:
                     ext = ".png"
-                cache_key = hashlib.sha1(url.encode("utf-8")).hexdigest()
+                cache_key = hashlib.sha256(url.encode("utf-8")).hexdigest()
                 cache_path = os.path.join(OVERLAY_CACHE_FOLDER, f"{cache_key}{ext}")
                 if os.path.exists(cache_path):
                     age = time.time() - os.path.getmtime(cache_path)
@@ -1072,9 +1250,9 @@ def get_preview_image(img_type):
 
 @app.route("/config/previews/<filename>")
 def serve_preview_image(filename):
-    path = os.path.join(PREVIEW_FOLDER, filename)
-    if os.path.exists(path):
-        return send_file(path, mimetype="image/png")
+    safe_path = _safe_join(PREVIEW_FOLDER, filename)
+    if safe_path and safe_path.exists():
+        return send_file(safe_path, mimetype="image/png")
     return send_file(os.path.join(IMAGES_FOLDER, "default.png"), mimetype="image/png")
     try:
         data = request.get_json()
@@ -1093,9 +1271,11 @@ def delete_library_image(filename):
         return jsonify({"status": "error", "message": "Invalid image type"}), 400
 
     uploads_dir = UPLOAD_FOLDERS[image_type]
-    file_path = os.path.join(uploads_dir, filename)
+    file_path = _safe_join(uploads_dir, filename)
+    if not file_path:
+        return jsonify({"status": "error", "message": "Invalid file name"}), 400
 
-    if not os.path.exists(file_path):
+    if not file_path.exists():
         return jsonify({"status": "error", "message": "File not found"}), 404
 
     try:
@@ -1216,17 +1396,40 @@ def rename_config():
     try:
         update_result = database.rename_config(old_name, new_name)
     except Exception as exc:
+        helpers.ts_log(f"Failed to update database during rename: {exc}", level="ERROR")
         rollback = _rename_config_files(new_name, old_name)
-        return jsonify(success=False, message=f"Failed to update database: {exc}", details=rollback), 500
+        response = {"success": False, "message": "Failed to update database."}
+        if app.config["QS_DEBUG"]:
+            response["details"] = rollback
+        return jsonify(response), 500
 
     if not update_result.get("success"):
         rollback = _rename_config_files(new_name, old_name)
-        return jsonify(success=False, message="Failed to update database.", details=rollback), 500
+        response = {"success": False, "message": "Failed to update database."}
+        if app.config["QS_DEBUG"]:
+            response["details"] = rollback
+        return jsonify(response), 500
 
     if session.get("config_name") == old_name:
         session["config_name"] = new_name
 
     return jsonify(success=True, old_name=old_name, new_name=new_name, files=file_result)
+
+
+def count_annotated_lines(text: str) -> dict:
+    imported = 0
+    not_imported = 0
+    if not isinstance(text, str):
+        return {"imported": 0, "not_imported": 0}
+    imported_pattern = re.compile(r"(?:#|\|) imported(?:\s*-.*)?$")
+    not_imported_pattern = re.compile(r"(?:#|\|) not imported(?:\s*-.*)?$")
+    for line in text.splitlines():
+        trimmed = line.rstrip()
+        if imported_pattern.search(trimmed):
+            imported += 1
+        elif not_imported_pattern.search(trimmed):
+            not_imported += 1
+    return {"imported": imported, "not_imported": not_imported}
 
 
 @app.route("/import-config/preview", methods=["POST"])
@@ -1246,17 +1449,21 @@ def import_config_preview():
         not_imported = 0
         if not isinstance(text, str):
             return {"imported": 0, "not_imported": 0}
+        imported_pattern = re.compile(r"(?:#|\|) imported(?:\s*-.*)?$")
+        not_imported_pattern = re.compile(r"(?:#|\|) not imported(?:\s*-.*)?$")
         for line in text.splitlines():
             trimmed = line.rstrip()
-            if trimmed.endswith("| imported") or trimmed.endswith("# imported"):
+            if imported_pattern.search(trimmed):
                 imported += 1
-            elif trimmed.endswith("| not imported") or trimmed.endswith("# not imported"):
+            elif not_imported_pattern.search(trimmed):
                 not_imported += 1
         return {"imported": imported, "not_imported": not_imported}
 
     upload = request.files.get("file")
     raw_name = request.form.get("config_name")
     config_name = importer.sanitize_config_name(raw_name)
+    merge_mode = str(request.form.get("merge_mode") or "").strip().lower() in {"1", "true", "yes", "merge"}
+    base_config = (request.form.get("base_config") or "").strip()
 
     if not upload or not upload.filename:
         return jsonify(success=False, message="No config file uploaded."), 400
@@ -1269,6 +1476,11 @@ def import_config_preview():
     available = database.get_unique_config_names() or []
     if any(name.lower() == config_name.lower() for name in available):
         return jsonify(success=False, message="Config name already exists."), 400
+    if merge_mode:
+        base_match = next((name for name in available if name.lower() == base_config.lower()), "")
+        if not base_match:
+            return jsonify(success=False, message="Base config not found. Select an existing config to merge."), 400
+        base_config = base_match
 
     raw_text = upload.read()
     config_text = ""
@@ -1339,6 +1551,34 @@ def import_config_preview():
             return {str(v).strip() for v in value if str(v).strip()}
         return set()
 
+    def parse_base_plex_libraries(base_name: str):
+        if not base_name:
+            return set(), set()
+        try:
+            _validated, _user_entered, stored = database.retrieve_section_data(base_name, "plex")
+        except Exception:
+            return set(), set()
+        if not isinstance(stored, dict):
+            return set(), set()
+        plex_block = stored.get("plex") if isinstance(stored.get("plex"), dict) else stored
+        if not isinstance(plex_block, dict):
+            return set(), set()
+        return parse_list(plex_block.get("tmp_movie_libraries", "")), parse_list(plex_block.get("tmp_show_libraries", ""))
+
+    def parse_base_plex_libraries(base_name: str):
+        if not base_name:
+            return set(), set()
+        try:
+            _validated, _user_entered, stored = database.retrieve_section_data(base_name, "plex")
+        except Exception:
+            return set(), set()
+        if not isinstance(stored, dict):
+            return set(), set()
+        plex_block = stored.get("plex") if isinstance(stored.get("plex"), dict) else stored
+        if not isinstance(plex_block, dict):
+            return set(), set()
+        return parse_list(plex_block.get("tmp_movie_libraries", "")), parse_list(plex_block.get("tmp_show_libraries", ""))
+
     def parse_plex_credentials(config_data):
         plex_block = config_data.get("plex", {}) if isinstance(config_data, dict) else {}
         if not isinstance(plex_block, dict):
@@ -1347,26 +1587,79 @@ def import_config_preview():
         token = plex_block.get("token") or plex_block.get("plex_token") or ""
         return str(url).strip(), str(token).strip()
 
+    def parse_base_plex_credentials(base_name: str):
+        if not base_name:
+            return "", ""
+        try:
+            _validated, _user_entered, stored = database.retrieve_section_data(base_name, "plex")
+        except Exception:
+            return "", ""
+        if not isinstance(stored, dict):
+            return "", ""
+        if "plex" in stored:
+            return parse_plex_credentials(stored)
+        url = stored.get("url") or stored.get("plex_url") or ""
+        token = stored.get("token") or stored.get("plex_token") or ""
+        return str(url).strip(), str(token).strip()
+
     def parse_form_plex_credentials(form_data):
         url = form_data.get("plex_url", "") or ""
         token = form_data.get("plex_token", "") or ""
         return str(url).strip(), str(token).strip()
 
+    def parse_tmdb_credentials(config_data):
+        tmdb_block = config_data.get("tmdb", {}) if isinstance(config_data, dict) else {}
+        if not isinstance(tmdb_block, dict):
+            return ""
+        api_key = tmdb_block.get("apikey") or tmdb_block.get("api_key") or tmdb_block.get("tmdb_apikey") or tmdb_block.get("token") or ""
+        return str(api_key).strip()
+
+    def parse_base_tmdb_credentials(base_name: str):
+        if not base_name:
+            return ""
+        try:
+            _validated, _user_entered, stored = database.retrieve_section_data(base_name, "tmdb")
+        except Exception:
+            return ""
+        if not isinstance(stored, dict):
+            return ""
+        if "tmdb" in stored:
+            return parse_tmdb_credentials(stored)
+        api_key = stored.get("apikey") or stored.get("api_key") or stored.get("tmdb_apikey") or stored.get("token") or ""
+        return str(api_key).strip()
+
+    def parse_form_tmdb_credentials(form_data):
+        api_key = form_data.get("tmdb_apikey", "") or ""
+        return str(api_key).strip()
+
     needs_plex = isinstance(parsed.get("libraries"), dict) and bool(parsed.get("libraries"))
+    needs_tmdb = isinstance(parsed, dict) and bool(parsed.get("tmdb") or parsed.get("libraries") or parsed.get("collections") or parsed.get("overlays"))
     plex_data = persistence.retrieve_settings("010-plex").get("plex", {})
     movie_names = parse_list(plex_data.get("tmp_movie_libraries", ""))
     show_names = parse_list(plex_data.get("tmp_show_libraries", ""))
     plex_libraries = {"movie": sorted(movie_names), "show": sorted(show_names)}
 
     if needs_plex:
+        base_movie_names, base_show_names = (set(), set())
+        skip_plex_validation = False
+        if merge_mode and base_config:
+            base_movie_names, base_show_names = parse_base_plex_libraries(base_config)
+            if base_movie_names or base_show_names:
+                movie_names = base_movie_names
+                show_names = base_show_names
+                plex_libraries = {"movie": sorted(movie_names), "show": sorted(show_names)}
+                skip_plex_validation = True
+
         form_plex_url, form_plex_token = parse_form_plex_credentials(request.form or {})
         imported_plex_url, imported_plex_token = parse_plex_credentials(parsed)
+        base_plex_url, base_plex_token = parse_base_plex_credentials(base_config) if merge_mode else ("", "")
         has_form = bool(form_plex_url and form_plex_token)
         has_imported = bool(imported_plex_url and imported_plex_token)
+        has_base = bool(base_plex_url and base_plex_token)
         used_plex_url = ""
         used_plex_token = ""
 
-        if not has_form and not has_imported:
+        if not skip_plex_validation and not has_form and not has_imported and not has_base:
             if extracted_dir:
                 try:
                     shutil.rmtree(extracted_dir)
@@ -1383,56 +1676,69 @@ def import_config_preview():
                 400,
             )
 
-        plex_result = None
-        last_error = None
-        if has_form:
-            used_plex_url = form_plex_url
-            used_plex_token = form_plex_token
-            plex_response = validations.validate_plex_server({"plex_url": form_plex_url, "plex_token": form_plex_token})
-            plex_result = plex_response.get_json() if isinstance(plex_response, Flask.response_class) else plex_response
-            if not plex_result or not plex_result.get("validated"):
-                if isinstance(plex_result, dict):
-                    last_error = plex_result.get("error")
-                if extracted_dir:
-                    try:
-                        shutil.rmtree(extracted_dir)
-                    except OSError:
-                        pass
-                return (
-                    jsonify(
-                        success=False,
-                        needs_plex_credentials=True,
-                        message=last_error or "Plex validation failed. Please enter valid credentials.",
-                        plex_url=form_plex_url or "",
-                        plex_token=form_plex_token or "",
-                    ),
-                    400,
-                )
-        else:
-            used_plex_url = imported_plex_url
-            used_plex_token = imported_plex_token
-            plex_response = validations.validate_plex_server({"plex_url": imported_plex_url, "plex_token": imported_plex_token})
-            plex_result = plex_response.get_json() if isinstance(plex_response, Flask.response_class) else plex_response
-            if not plex_result or not plex_result.get("validated"):
-                if isinstance(plex_result, dict):
-                    last_error = plex_result.get("error")
-                if extracted_dir:
-                    try:
-                        shutil.rmtree(extracted_dir)
-                    except OSError:
-                        pass
-                return (
-                    jsonify(
-                        success=False,
-                        needs_plex_credentials=True,
-                        message=("Plex credentials in the import file could not be validated. " "Please enter a valid Plex URL and token."),
-                        plex_url=imported_plex_url or "",
-                        plex_token=imported_plex_token or "",
-                    ),
-                    400,
-                )
-        session["import_preview_plex_url"] = used_plex_url
-        session["import_preview_plex_token"] = used_plex_token
+        if not skip_plex_validation:
+            plex_result = None
+            last_error = None
+            if has_form:
+                used_plex_url = form_plex_url
+                used_plex_token = form_plex_token
+                plex_response = validations.validate_plex_server({"plex_url": form_plex_url, "plex_token": form_plex_token})
+                plex_result = plex_response.get_json() if isinstance(plex_response, Flask.response_class) else plex_response
+                if not plex_result or not plex_result.get("validated"):
+                    if isinstance(plex_result, dict):
+                        last_error = plex_result.get("error")
+                    if extracted_dir:
+                        try:
+                            shutil.rmtree(extracted_dir)
+                        except OSError:
+                            pass
+                    return (
+                        jsonify(
+                            success=False,
+                            needs_plex_credentials=True,
+                            message=last_error or "Plex validation failed. Please enter valid credentials.",
+                            plex_url=form_plex_url or "",
+                            plex_token=form_plex_token or "",
+                        ),
+                        400,
+                    )
+            else:
+                candidates = []
+                if merge_mode and has_base:
+                    candidates.append((base_plex_url, base_plex_token))
+                if has_imported:
+                    candidates.append((imported_plex_url, imported_plex_token))
+                if not candidates:
+                    candidates.append((imported_plex_url or base_plex_url, imported_plex_token or base_plex_token))
+                for candidate_url, candidate_token in candidates:
+                    used_plex_url = candidate_url
+                    used_plex_token = candidate_token
+                    plex_response = validations.validate_plex_server({"plex_url": used_plex_url, "plex_token": used_plex_token})
+                    plex_result = plex_response.get_json() if isinstance(plex_response, Flask.response_class) else plex_response
+                    if plex_result and plex_result.get("validated"):
+                        last_error = None
+                        break
+                    if isinstance(plex_result, dict):
+                        last_error = plex_result.get("error")
+                if not plex_result or not plex_result.get("validated"):
+                    if extracted_dir:
+                        try:
+                            shutil.rmtree(extracted_dir)
+                        except OSError:
+                            pass
+                    return (
+                        jsonify(
+                            success=False,
+                            needs_plex_credentials=True,
+                            message=("Plex credentials from the import/base config could not be validated. " "Please enter a valid Plex URL and token."),
+                            plex_url=imported_plex_url or base_plex_url or "",
+                            plex_token=imported_plex_token or base_plex_token or "",
+                        ),
+                        400,
+                    )
+        if not skip_plex_validation:
+            session["import_preview_plex_url"] = used_plex_url
+            session["import_preview_plex_token"] = used_plex_token
         if used_plex_url and used_plex_token:
             plex_block = parsed.get("plex")
             if not isinstance(plex_block, dict):
@@ -1440,10 +1746,34 @@ def import_config_preview():
                 parsed["plex"] = plex_block
             plex_block["url"] = used_plex_url
             plex_block["token"] = used_plex_token
-        movie_names = parse_list(plex_result.get("movie_libraries", []))
-        show_names = parse_list(plex_result.get("show_libraries", []))
-        plex_libraries = {"movie": sorted(movie_names), "show": sorted(show_names)}
-        if not movie_names and not show_names:
+        if not skip_plex_validation:
+            movie_names = parse_list(plex_result.get("movie_libraries", []))
+            show_names = parse_list(plex_result.get("show_libraries", []))
+            plex_libraries = {"movie": sorted(movie_names), "show": sorted(show_names)}
+            if not movie_names and not show_names:
+                if extracted_dir:
+                    try:
+                        shutil.rmtree(extracted_dir)
+                    except OSError:
+                        pass
+                return (
+                    jsonify(
+                        success=False,
+                        message="No movie or show libraries found in Plex.",
+                    ),
+                    400,
+                )
+
+    if needs_tmdb:
+        form_tmdb_key = parse_form_tmdb_credentials(request.form or {})
+        imported_tmdb_key = parse_tmdb_credentials(parsed)
+        base_tmdb_key = parse_base_tmdb_credentials(base_config) if merge_mode else ""
+        has_form = bool(form_tmdb_key)
+        has_imported = bool(imported_tmdb_key)
+        has_base = bool(base_tmdb_key)
+        used_tmdb_key = ""
+
+        if not has_form and not has_imported and not has_base:
             if extracted_dir:
                 try:
                     shutil.rmtree(extracted_dir)
@@ -1452,10 +1782,75 @@ def import_config_preview():
             return (
                 jsonify(
                     success=False,
-                    message="No movie or show libraries found in Plex.",
+                    needs_tmdb_credentials=True,
+                    message="TMDb API key is required to import metadata settings. Enter a valid TMDb API key to continue.",
+                    tmdb_apikey="",
                 ),
                 400,
             )
+
+        tmdb_result = None
+        last_error = None
+        if has_form:
+            used_tmdb_key = form_tmdb_key
+            tmdb_response = validations.validate_tmdb_server({"tmdb_apikey": form_tmdb_key})
+            tmdb_result = tmdb_response.get_json() if isinstance(tmdb_response, Flask.response_class) else tmdb_response
+            if not tmdb_result or not tmdb_result.get("valid"):
+                if isinstance(tmdb_result, dict):
+                    last_error = tmdb_result.get("message")
+                if extracted_dir:
+                    try:
+                        shutil.rmtree(extracted_dir)
+                    except OSError:
+                        pass
+                return (
+                    jsonify(
+                        success=False,
+                        needs_tmdb_credentials=True,
+                        message=last_error or "TMDb validation failed. Please enter a valid API key.",
+                        tmdb_apikey=form_tmdb_key or "",
+                    ),
+                    400,
+                )
+        else:
+            candidates = []
+            if merge_mode and has_base:
+                candidates.append(base_tmdb_key)
+            if has_imported:
+                candidates.append(imported_tmdb_key)
+            if not candidates:
+                candidates.append(imported_tmdb_key or base_tmdb_key)
+            for candidate_key in candidates:
+                used_tmdb_key = candidate_key
+                tmdb_response = validations.validate_tmdb_server({"tmdb_apikey": used_tmdb_key})
+                tmdb_result = tmdb_response.get_json() if isinstance(tmdb_response, Flask.response_class) else tmdb_response
+                if tmdb_result and tmdb_result.get("valid"):
+                    last_error = None
+                    break
+                if isinstance(tmdb_result, dict):
+                    last_error = tmdb_result.get("message")
+            if not tmdb_result or not tmdb_result.get("valid"):
+                if extracted_dir:
+                    try:
+                        shutil.rmtree(extracted_dir)
+                    except OSError:
+                        pass
+                return (
+                    jsonify(
+                        success=False,
+                        needs_tmdb_credentials=True,
+                        message="TMDb API key from the import/base config could not be validated. Please enter a valid key.",
+                        tmdb_apikey=imported_tmdb_key or base_tmdb_key or "",
+                    ),
+                    400,
+                )
+        session["import_preview_tmdb_apikey"] = used_tmdb_key
+        if used_tmdb_key:
+            tmdb_block = parsed.get("tmdb")
+            if not isinstance(tmdb_block, dict):
+                tmdb_block = {}
+                parsed["tmdb"] = tmdb_block
+            tmdb_block["apikey"] = used_tmdb_key
 
     _library_types, library_inference, _ = importer.build_library_type_plan(parsed, movie_names, show_names)
     payload, report = importer.prepare_import_payload(
@@ -1470,6 +1865,7 @@ def import_config_preview():
             except OSError:
                 pass
         return jsonify(success=False, message="No importable sections found."), 400
+    importable_sections = sorted(payload.keys())
 
     report_lines = list(report.lines)
     if extracted_fonts:
@@ -1523,6 +1919,9 @@ def import_config_preview():
                 "line_counts": line_counts,
                 "plex_movie_names": sorted(movie_names) if isinstance(movie_names, (set, list)) else [],
                 "plex_show_names": sorted(show_names) if isinstance(show_names, (set, list)) else [],
+                "merge_mode": merge_mode,
+                "base_config": base_config,
+                "importable_sections": importable_sections,
             },
             handle,
             ensure_ascii=True,
@@ -1543,7 +1942,8 @@ def import_config_preview():
     if needs_plex and isinstance(parsed.get("libraries"), dict):
         inference_map = {item.get("name"): item for item in library_inference}
         for lib_name in parsed.get("libraries", {}).keys():
-            if lib_name in movie_names or lib_name in show_names:
+            name = str(lib_name)
+            if name in movie_names or name in show_names:
                 continue
             info = inference_map.get(lib_name, {})
             library_mapping.append(
@@ -1568,6 +1968,9 @@ def import_config_preview():
         report_url=f"/import-config/report?token={token}",
         library_mapping=library_mapping,
         plex_libraries=plex_libraries,
+        merge_mode=merge_mode,
+        base_config=base_config,
+        importable_sections=importable_sections,
     )
 
 
@@ -1634,6 +2037,50 @@ def import_config_report():
     return response
 
 
+def _map_playlist_libraries(payload, library_mapping, plex_names):
+    if not isinstance(payload, dict):
+        return
+    playlist_payload = payload.get("playlist_files")
+    if not isinstance(playlist_payload, list):
+        return
+    mapped_entries = []
+    for entry in playlist_payload:
+        if not isinstance(entry, dict):
+            mapped_entries.append(entry)
+            continue
+        tv = entry.get("template_variables")
+        if isinstance(tv, dict):
+            libs = tv.get("libraries")
+            if isinstance(libs, list):
+                mapped = []
+                for lib in libs:
+                    name = str(lib).strip()
+                    if not name:
+                        continue
+                    mapped_name = library_mapping.get(name, name)
+                    if mapped_name is None:
+                        mapped_name = name
+                    mapped_name = str(mapped_name).strip()
+                    if not mapped_name or mapped_name == "__ignore__":
+                        continue
+                    mapped.append(mapped_name)
+                deduped = []
+                seen = set()
+                for lib_name in mapped:
+                    if lib_name in seen:
+                        continue
+                    seen.add(lib_name)
+                    deduped.append(lib_name)
+                if plex_names:
+                    deduped = [lib_name for lib_name in deduped if lib_name in plex_names]
+                tv = dict(tv)
+                tv["libraries"] = deduped
+                entry = dict(entry)
+                entry["template_variables"] = tv
+        mapped_entries.append(entry)
+    payload["playlist_files"] = mapped_entries
+
+
 @app.route("/import-config/preview-mapped", methods=["POST"])
 def import_config_preview_mapped():
     data = request.get_json(silent=True) or {}
@@ -1680,30 +2127,49 @@ def import_config_preview_mapped():
                 movie_names = parse_list(plex_result.get("movie_libraries", []))
                 show_names = parse_list(plex_result.get("show_libraries", []))
 
-    plex_names = set(movie_names) | set(show_names)
+    plex_lookup = {name: name for name in movie_names}
+    plex_lookup.update({name: name for name in show_names})
+    plex_names = set(plex_lookup.values())
 
+    mapping_skip_reasons = {}
+    alias_map = {}
+    mapping_stats = {"mapped": 0, "ignored": 0, "missing": 0, "invalid": 0, "duplicate": 0}
     if isinstance(config_data.get("libraries"), dict):
         mapped_libraries = {}
         used_targets = set()
         for lib_name, lib_cfg in config_data.get("libraries", {}).items():
             name = str(lib_name)
-            if name in plex_names:
-                target = name
+            if name in plex_lookup:
+                target = plex_lookup[name]
             else:
                 mapped = library_mapping.get(name)
                 if mapped is None or str(mapped).strip() == "":
+                    mapping_skip_reasons[name] = "Library mapping not provided."
+                    mapping_stats["missing"] += 1
                     continue
                 mapped = str(mapped).strip()
                 if mapped == "__ignore__":
+                    mapping_skip_reasons[name] = "Mapping set to ignore library."
+                    mapping_stats["ignored"] += 1
                     continue
-                if mapped not in plex_names:
+                if mapped not in plex_lookup:
+                    mapping_skip_reasons[name] = "Mapped library not found in Plex."
+                    mapping_stats["invalid"] += 1
                     continue
-                target = mapped
+                target = plex_lookup[mapped]
+
+            if target != name:
+                alias_map[name] = target
 
             if target in used_targets:
+                mapping_skip_reasons[name] = "Mapped library already assigned to another entry."
+                if name not in plex_names:
+                    mapping_stats["duplicate"] += 1
                 continue
             used_targets.add(target)
             mapped_libraries[target] = lib_cfg
+            if name not in plex_names:
+                mapping_stats["mapped"] += 1
 
         config_copy = json.loads(json.dumps(config_data))
         if mapped_libraries:
@@ -1713,22 +2179,64 @@ def import_config_preview_mapped():
     else:
         config_copy = config_data
 
+    _map_playlist_libraries(config_copy, library_mapping, plex_names)
+
     payload, report = importer.prepare_import_payload(config_copy, movie_names, show_names)
+    importable_sections = sorted(payload.keys()) if isinstance(payload, dict) else []
     report_lines = list(report.lines)
+    if mapping_skip_reasons:
+        seen = set(report_lines)
+        for lib_name, reason in mapping_skip_reasons.items():
+            if not lib_name:
+                continue
+            line = f"skipped: libraries.{lib_name} :: {reason}"
+            if line not in seen:
+                report_lines.append(line)
+                seen.add(line)
+    if alias_map and isinstance(config_data.get("libraries"), dict):
+        alias_lines = []
+        seen = set(report_lines)
+        for original_name, mapped_name in alias_map.items():
+            if not original_name:
+                continue
+            mapped_name = str(mapped_name).strip()
+            if not mapped_name or mapped_name == "__ignore__":
+                continue
+            if mapped_name == original_name:
+                continue
+            prefix = f"libraries.{mapped_name}"
+            for line in report_lines:
+                if not isinstance(line, str) or ":" not in line:
+                    continue
+                status, rest = line.split(":", 1)
+                status = status.strip()
+                path = rest.strip()
+                suffix = ""
+                if " :: " in path:
+                    path, reason = path.split(" :: ", 1)
+                    path = path.strip()
+                    suffix = f" :: {reason}"
+                elif status != "imported" and " - " in path:
+                    path, reason = path.split(" - ", 1)
+                    path = path.strip()
+                    suffix = f" - {reason}"
+                if path == prefix or path.startswith(prefix + "."):
+                    alias_path = f"libraries.{original_name}{path[len(prefix):]}"
+                    alias_line = f"{status}: {alias_path}{suffix}"
+                    if alias_line not in seen:
+                        alias_lines.append(alias_line)
+                        seen.add(alias_line)
+        if alias_lines:
+            report_lines.extend(alias_lines)
     annotated_report = importer.annotate_yaml_with_report(config_text, report_lines, binary=True)
     comments_count = cached.get("comments_count")
     if not isinstance(comments_count, int):
         comments_count = sum(1 for line in str(config_text).splitlines() if line.lstrip().startswith("#"))
     blank_count = sum(1 for line in str(config_text).splitlines() if not line.strip())
     total_lines = len(str(config_text).splitlines())
-    imported_lines = 0
-    not_imported_lines = 0
-    for line in str(annotated_report).splitlines():
-        trimmed = line.rstrip()
-        if trimmed.endswith("| imported") or trimmed.endswith("# imported"):
-            imported_lines += 1
-        elif trimmed.endswith("| not imported") or trimmed.endswith("# not imported"):
-            not_imported_lines += 1
+    annotated_counts = count_annotated_lines(str(annotated_report))
+    imported_lines = annotated_counts.get("imported", 0)
+    not_imported_lines = annotated_counts.get("not_imported", 0)
     diff_count = total_lines - (imported_lines + not_imported_lines + blank_count + comments_count)
     line_counts = {
         "imported_lines": imported_lines,
@@ -1747,6 +2255,7 @@ def import_config_preview_mapped():
     cached["line_counts"] = line_counts
     cached["plex_movie_names"] = sorted(movie_names)
     cached["plex_show_names"] = sorted(show_names)
+    cached["importable_sections"] = importable_sections
 
     with open(cache_path, "w", encoding="utf-8") as handle:
         json.dump(cached, handle, ensure_ascii=True)
@@ -1757,6 +2266,9 @@ def import_config_preview_mapped():
         truncated = len(lines) - max_lines
         lines = lines[:max_lines] + [f"skipped: report truncated ({truncated} more lines)"]
 
+    mapping_total = sum(mapping_stats.values())
+    mapping_summary = mapping_stats if mapping_total else {}
+
     return jsonify(
         success=True,
         config_name=cached.get("config_name") or "",
@@ -1765,7 +2277,9 @@ def import_config_preview_mapped():
         line_counts=line_counts,
         report_lines=lines,
         annotated_report=annotated_report,
+        mapping_summary=mapping_summary,
         report_url=f"/import-config/report?token={token}",
+        importable_sections=importable_sections,
     )
 
 
@@ -1774,10 +2288,22 @@ def import_config_confirm():
     data = request.get_json(silent=True) or {}
     token = data.get("token")
     library_mapping = data.get("library_mapping") or {}
+    raw_merge_mode = data.get("merge_mode")
+    base_config = (data.get("base_config") or "").strip()
+    merge_sections = data.get("merge_sections")
     if not token or token != session.get("import_preview_token"):
         return jsonify(success=False, message="Import token is invalid."), 400
     if library_mapping and not isinstance(library_mapping, dict):
         return jsonify(success=False, message="Invalid library mapping."), 400
+
+    def _boolish(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "merge", "on"}
+        return False
+
+    merge_mode = _boolish(raw_merge_mode)
 
     cache_path = session.get("import_preview_path")
     if not cache_path:
@@ -1794,6 +2320,37 @@ def import_config_confirm():
     config_data = cached.get("config_data") or {}
     fonts_dir = cached.get("fonts_dir")
     fonts = cached.get("fonts") or []
+    cached_merge_mode = helpers.booler(cached.get("merge_mode"))
+    if not merge_mode:
+        merge_mode = cached_merge_mode
+    if not base_config:
+        base_config = cached.get("base_config") or ""
+    if merge_sections is None:
+        merge_sections = cached.get("merge_sections")
+    if isinstance(merge_sections, str):
+        merge_sections = [entry.strip() for entry in merge_sections.split(",") if entry.strip()]
+    elif not isinstance(merge_sections, list):
+        merge_sections = []
+    merge_sections = [str(entry).strip() for entry in merge_sections if str(entry).strip()]
+    if not isinstance(config_data, dict):
+        config_data = {}
+    importable_sections = set(cached.get("importable_sections") or payload.keys())
+    selected_sections = set()
+    if merge_mode:
+        if not base_config:
+            return jsonify(success=False, message="Base config is required for merge."), 400
+        available = database.get_unique_config_names() or []
+        base_match = next((name for name in available if name.lower() == base_config.lower()), "")
+        if not base_match:
+            return jsonify(success=False, message="Base config not found. Select an existing config to merge."), 400
+        base_config = base_match
+        if merge_sections:
+            selected_sections = {section for section in merge_sections if section in importable_sections}
+        else:
+            selected_sections = set(importable_sections)
+        if not selected_sections:
+            return jsonify(success=False, message="Select at least one section to merge."), 400
+        config_data = {key: value for key, value in config_data.items() if key in selected_sections}
     if not config_name:
         return jsonify(success=False, message="Import payload is invalid."), 400
 
@@ -1808,50 +2365,107 @@ def import_config_confirm():
             return {str(v).strip() for v in value if str(v).strip()}
         return set()
 
+    def parse_base_plex_libraries(base_name: str):
+        if not base_name:
+            return set(), set()
+        try:
+            _validated, _user_entered, stored = database.retrieve_section_data(base_name, "plex")
+        except Exception:
+            return set(), set()
+        if not isinstance(stored, dict):
+            return set(), set()
+        plex_block = stored.get("plex") if isinstance(stored.get("plex"), dict) else stored
+        if not isinstance(plex_block, dict):
+            return set(), set()
+        return parse_list(plex_block.get("tmp_movie_libraries", "")), parse_list(plex_block.get("tmp_show_libraries", ""))
+
     movie_names = set()
     show_names = set()
     if config_data:
         libraries_payload = config_data.get("libraries")
         needs_plex = isinstance(libraries_payload, dict) and bool(libraries_payload)
+        needs_tmdb = isinstance(config_data, dict) and bool(
+            config_data.get("tmdb") or config_data.get("libraries") or config_data.get("collections") or config_data.get("overlays")
+        )
         if needs_plex:
-            plex_url = session.get("import_preview_plex_url") or ""
-            plex_token = session.get("import_preview_plex_token") or ""
-            if not plex_url or not plex_token:
-                return (
-                    jsonify(
-                        success=False,
-                        message="Plex credentials are required to confirm the import. Re-run Preview Import.",
-                    ),
-                    400,
-                )
+            skip_plex_validation = False
+            if merge_mode and base_config:
+                base_movie_names, base_show_names = parse_base_plex_libraries(base_config)
+                if base_movie_names or base_show_names:
+                    movie_names = base_movie_names
+                    show_names = base_show_names
+                    skip_plex_validation = True
 
-            plex_response = validations.validate_plex_server({"plex_url": plex_url, "plex_token": plex_token})
-            plex_result = plex_response.get_json() if isinstance(plex_response, Flask.response_class) else plex_response
-            if not plex_result or not plex_result.get("validated"):
-                error_message = plex_result.get("error") if isinstance(plex_result, dict) else None
-                return (
-                    jsonify(
-                        success=False,
-                        message=error_message or "Plex validation failed. Re-run Preview Import.",
-                    ),
-                    400,
-                )
-            movie_names = parse_list(plex_result.get("movie_libraries", []))
-            show_names = parse_list(plex_result.get("show_libraries", []))
-            if not movie_names and not show_names:
-                return (
-                    jsonify(
-                        success=False,
-                        message="No movie or show libraries found in Plex.",
-                    ),
-                    400,
-                )
+            if skip_plex_validation:
+                plex_names = set(movie_names) | set(show_names)
+                if not plex_names:
+                    skip_plex_validation = False
+            if skip_plex_validation:
+                # Skip Plex validation when base config provides library cache.
+                pass
+            else:
+                plex_url = session.get("import_preview_plex_url") or ""
+                plex_token = session.get("import_preview_plex_token") or ""
+                if not plex_url or not plex_token:
+                    return (
+                        jsonify(
+                            success=False,
+                            message="Plex credentials are required to confirm the import. Re-run Preview Import.",
+                        ),
+                        400,
+                    )
+
+                plex_response = validations.validate_plex_server({"plex_url": plex_url, "plex_token": plex_token})
+                plex_result = plex_response.get_json() if isinstance(plex_response, Flask.response_class) else plex_response
+                if not plex_result or not plex_result.get("validated"):
+                    error_message = plex_result.get("error") if isinstance(plex_result, dict) else None
+                    return (
+                        jsonify(
+                            success=False,
+                            message=error_message or "Plex validation failed. Re-run Preview Import.",
+                        ),
+                        400,
+                    )
+                movie_names = parse_list(plex_result.get("movie_libraries", []))
+                show_names = parse_list(plex_result.get("show_libraries", []))
+                if not movie_names and not show_names:
+                    return (
+                        jsonify(
+                            success=False,
+                            message="No movie or show libraries found in Plex.",
+                        ),
+                        400,
+                    )
         else:
             plex_data = persistence.retrieve_settings("010-plex").get("plex", {})
             movie_names = parse_list(plex_data.get("tmp_movie_libraries", ""))
             show_names = parse_list(plex_data.get("tmp_show_libraries", ""))
 
-        plex_names = set(movie_names) | set(show_names)
+        if needs_tmdb:
+            tmdb_apikey = session.get("import_preview_tmdb_apikey") or ""
+            if not tmdb_apikey:
+                return (
+                    jsonify(
+                        success=False,
+                        message="TMDb API key is required to confirm the import. Re-run Preview Import.",
+                    ),
+                    400,
+                )
+            tmdb_response = validations.validate_tmdb_server({"tmdb_apikey": tmdb_apikey})
+            tmdb_result = tmdb_response.get_json() if isinstance(tmdb_response, Flask.response_class) else tmdb_response
+            if not tmdb_result or not tmdb_result.get("valid"):
+                error_message = tmdb_result.get("message") if isinstance(tmdb_result, dict) else None
+                return (
+                    jsonify(
+                        success=False,
+                        message=error_message or "TMDb validation failed. Re-run Preview Import.",
+                    ),
+                    400,
+                )
+
+        plex_lookup = {name: name for name in movie_names}
+        plex_lookup.update({name: name for name in show_names})
+        plex_names = set(plex_lookup.values())
 
         if isinstance(libraries_payload, dict):
             if needs_plex and not plex_names:
@@ -1871,8 +2485,8 @@ def import_config_confirm():
 
             for lib_name, lib_cfg in libraries_payload.items():
                 name = str(lib_name)
-                if name in plex_names:
-                    target = name
+                if name in plex_lookup:
+                    target = plex_lookup[name]
                 else:
                     mapped = library_mapping.get(name)
                     if mapped is None:
@@ -1884,10 +2498,10 @@ def import_config_confirm():
                         continue
                     if mapped == "__ignore__":
                         continue
-                    if mapped not in plex_names:
+                    if mapped not in plex_lookup:
                         invalid_targets.append(mapped)
                         continue
-                    target = mapped
+                    target = plex_lookup[mapped]
 
                 if target in used_targets:
                     duplicates.append(target)
@@ -1927,14 +2541,36 @@ def import_config_confirm():
             else:
                 config_data.pop("libraries", None)
 
+        _map_playlist_libraries(config_data, library_mapping, plex_names)
+
         payload, report = importer.prepare_import_payload(config_data, movie_names, show_names)
+        if merge_mode and selected_sections:
+            payload = {section: data_blob for section, data_blob in payload.items() if section in selected_sections}
         if not payload:
             return jsonify(success=False, message="No importable sections found."), 400
 
+    if merge_mode and selected_sections:
+        payload = {section: data_blob for section, data_blob in payload.items() if section in selected_sections}
     if not payload:
         return jsonify(success=False, message="No importable sections found."), 400
 
     imported_sections = []
+    if merge_mode:
+        base_sections = database.retrieve_config_sections(base_config)
+        if not base_sections:
+            return jsonify(success=False, message="Base config has no saved data to merge."), 400
+        for entry in base_sections:
+            section = entry.get("section")
+            data_blob = entry.get("data")
+            if not section or data_blob is None:
+                continue
+            database.save_section_data(
+                name=config_name,
+                section=section,
+                validated=helpers.booler(entry.get("validated")),
+                user_entered=helpers.booler(entry.get("user_entered")),
+                data=data_blob,
+            )
     for section, data_blob in payload.items():
         database.save_section_data(
             name=config_name,
@@ -1947,6 +2583,8 @@ def import_config_confirm():
 
     fonts_copied = []
     fonts_skipped = []
+    fonts_skipped_existing = []
+    fonts_skipped_failed = []
     if fonts_dir and fonts:
         os.makedirs(CUSTOM_FONTS_FOLDER, exist_ok=True)
         for font_name in fonts:
@@ -1954,12 +2592,14 @@ def import_config_confirm():
             dest_path = os.path.join(CUSTOM_FONTS_FOLDER, font_name)
             if os.path.exists(dest_path):
                 fonts_skipped.append(font_name)
+                fonts_skipped_existing.append(font_name)
                 continue
             try:
                 shutil.copy2(src_path, dest_path)
                 fonts_copied.append(font_name)
             except OSError:
                 fonts_skipped.append(font_name)
+                fonts_skipped_failed.append(font_name)
         if fonts_copied:
             global _FONT_CACHE
             _FONT_CACHE = []
@@ -1980,6 +2620,7 @@ def import_config_confirm():
     session.pop("import_preview_fonts_dir", None)
     session.pop("import_preview_plex_url", None)
     session.pop("import_preview_plex_token", None)
+    session.pop("import_preview_tmdb_apikey", None)
     session["config_name"] = config_name
 
     return jsonify(
@@ -1988,13 +2629,15 @@ def import_config_confirm():
         imported_sections=imported_sections,
         fonts_copied=fonts_copied,
         fonts_skipped=fonts_skipped,
+        fonts_skipped_existing=fonts_skipped_existing,
+        fonts_skipped_failed=fonts_skipped_failed,
     )
 
 
 @app.route("/step/<name>", methods=["GET", "POST"])
 def step(name):
     page_info = {}
-    header_style = "standard"  # Default to 'standard' font
+    header_style = "single_line"  # Default to 'single_line' font
     save_error = None
     persistence.ensure_session_config_name()
 
@@ -2006,7 +2649,7 @@ def step(name):
             save_error = "Invalid values: " + " ".join(validation_errors)
         else:
             persistence.save_settings(request.referrer, request.form)
-            header_style = request.form.get("header_style", "standard")
+            header_style = request.form.get("header_style", "single_line")
 
     # --- Detect config change ---
     previous_config = session.get("config_name")
@@ -2034,11 +2677,11 @@ def step(name):
         header_style = saved_settings["final"]["header_style"]
 
     if header_style is None:
-        header_style = "none"
+        header_style = "single_line" if "single_line" in available_fonts else "standard"
 
     # Ensure the selected font is valid
     if header_style not in available_fonts:
-        header_style = "standard"
+        header_style = "single_line" if "single_line" in available_fonts else "standard"
 
     page_info["header_style"] = header_style  # Now properly restored
 
@@ -2098,7 +2741,9 @@ def step(name):
     try:
         item = template_list[num]
     except (ValueError, IndexError, KeyError):
-        return f"ERROR WITH NAME {name}; stem, num, b: {stem}, {num}, {b}"
+        if app.config["QS_DEBUG"]:
+            helpers.ts_log(f"Invalid step name '{name}' (stem={stem}, num={num}, b={b}).", level="ERROR")
+        return abort(404)
 
     if num in progress_keys and total_steps:
         progress_index = progress_keys.index(num)
@@ -2367,6 +3012,40 @@ def step(name):
             template_key = file.rsplit(".", 1)[0]
             settings = persistence.retrieve_settings(template_key)
             has_validation = template_key in validation_pages
+            validation_status = None
+            validation_reason = None
+            validation_details = None
+            if has_validation:
+                section_name = template_key.split("-", 1)[1]
+                stored_section = database.retrieve_section_data(config_name, section_name)
+                stored_payload = stored_section[2] if stored_section else None
+                if isinstance(stored_payload, dict):
+                    validation_status = stored_payload.get("validation_status")
+                    validation_reason = stored_payload.get("validation_reason")
+                    validation_details = stored_payload.get("validation_details")
+            if not validation_status and has_validation:
+                if helpers.booler(settings.get("validated", False)):
+                    validation_status = "validated"
+                elif settings.get("validated_at"):
+                    validation_status = "failed"
+
+            validation_result = ""
+            if validation_status:
+                label = validation_status.capitalize()
+                if validation_reason:
+                    pretty = VALIDATION_REASON_LABELS.get(validation_reason, validation_reason.replace("_", " "))
+                    detail_text = ""
+                    if isinstance(validation_details, (list, tuple)):
+                        detail_text = ", ".join(str(item) for item in validation_details if str(item))
+                    elif validation_details is not None:
+                        detail_text = str(validation_details)
+                    if detail_text:
+                        validation_result = f"{label}: {pretty}: {detail_text}"
+                    else:
+                        validation_result = f"{label}: {pretty}"
+                else:
+                    validation_result = label
+
             validation_meta.append(
                 {
                     "key": template_key,
@@ -2375,9 +3054,22 @@ def step(name):
                     "has_validation": has_validation,
                     "validated": helpers.booler(settings.get("validated", False)) if has_validation else None,
                     "validated_at": settings.get("validated_at", "") if has_validation else "",
+                    "validation_result": validation_result,
                 }
             )
-        validated, validation_error, config_data, yaml_content = output.build_config(header_style, config_name=config_name)
+        validated, validation_error, config_data, yaml_content, validation_errors = output.build_config(header_style, config_name=config_name)
+        validation_summary = build_validation_summary(validation_errors)
+        validation_rollup = None
+        validation_rollup_at = None
+        try:
+            stored_validation = database.retrieve_section_data(config_name, "validation_summary")
+            stored_payload = stored_validation[2] if stored_validation else None
+            if isinstance(stored_payload, dict):
+                validation_rollup = stored_payload.get("summary_text")
+                validation_rollup_at = stored_payload.get("updated_at")
+        except Exception:
+            validation_rollup = None
+            validation_rollup_at = None
         used_fonts = helpers.collect_font_references(config_data)
         saved_filename = helpers.save_to_named_config(yaml_content, config_name, used_fonts)
         page_info["saved_filename"] = saved_filename
@@ -2401,6 +3093,9 @@ def step(name):
             data=data,
             yaml_content=yaml_content,
             validation_error=validation_error,
+            validation_summary=validation_summary,
+            validation_rollup=validation_rollup,
+            validation_rollup_at=validation_rollup_at,
             template_list=file_list,
             available_configs=available_configs,
             movie_libraries=movie_libraries,
@@ -2651,12 +3346,29 @@ def copy_library_settings():
                 incoming_dict = helpers.build_config_dict("libraries", clean_payload).get("libraries", {})
 
                 merged = libraries_data.copy()
+
+                def _library_prefix(key):
+                    if not isinstance(key, str) or not key.startswith(("mov-library_", "sho-library_")):
+                        return None
+                    if "-template_" in key:
+                        return key.split("-template_", 1)[0]
+                    if "-attribute_" in key:
+                        return key.split("-attribute_", 1)[0]
+                    if "-collection_" in key:
+                        return key.split("-collection_", 1)[0]
+                    if "-overlay_" in key:
+                        return key.split("-overlay_", 1)[0]
+                    if "-top_level_" in key:
+                        return key.split("-top_level_", 1)[0]
+                    if key.endswith("-library"):
+                        return key[: -len("-library")]
+                    return None
+
                 prefixes = set()
                 for key in incoming_dict:
-                    if key.startswith(("mov-library_", "sho-library_")):
-                        parts = key.split("-", 2)
-                        if len(parts) >= 2:
-                            prefixes.add("-".join(parts[:2]))
+                    prefix = _library_prefix(key)
+                    if prefix:
+                        prefixes.add(prefix)
 
                 for prefix in prefixes:
                     for existing_key in list(merged.keys()):
@@ -2854,7 +3566,7 @@ def download():
             download_name="config.yml",
         )
     flash("No configuration to download", "danger")
-    return redirect(request.referrer or url_for("step", page="900-final"))
+    return redirect(url_for("step", page="900-final"))
 
 
 @app.route("/download_redacted")
@@ -2890,24 +3602,33 @@ def download_redacted():
             download_name="config_redacted.yml",
         )
     flash("No configuration to download", "danger")
-    return redirect(request.referrer or url_for("step", page="900-final"))
+    return redirect(url_for("step", page="900-final"))
 
 
 @app.route("/validate_gotify", methods=["POST"])
 def validate_gotify():
-    data = request.json
+    data = request.get_json(silent=True) or {}
+    valid, message = url_validation.validate_url(data.get("gotify_url"), allow_local=True)
+    if not valid:
+        return jsonify({"valid": False, "error": f"Gotify URL: {message}"}), 400
     return validations.validate_gotify_server(data)
 
 
 @app.route("/validate_ntfy", methods=["POST"])
 def validate_ntfy():
-    data = request.json
+    data = request.get_json(silent=True) or {}
+    valid, message = url_validation.validate_url(data.get("ntfy_url"), allow_local=True)
+    if not valid:
+        return jsonify({"valid": False, "error": f"ntfy URL: {message}"}), 400
     return validations.validate_ntfy_server(data)
 
 
 @app.route("/validate_plex", methods=["POST"])
 def validate_plex():
-    data = request.json
+    data = request.get_json(silent=True) or {}
+    valid, message = url_validation.validate_url(data.get("plex_url"), allow_local=True)
+    if not valid:
+        return jsonify({"valid": False, "error": f"Plex URL: {message}"}), 400
     return validations.validate_plex_server(data)
 
 
@@ -2973,7 +3694,8 @@ def refresh_plex_libraries():
         return jsonify(merged_response)
 
     except Exception as e:
-        return jsonify({"valid": False, "error": f"Server error: {str(e)}"}), 500
+        helpers.ts_log(f"Plex validation failed: {e}", level="ERROR")
+        return jsonify({"valid": False, "error": "Server error."}), 500
 
 
 @app.route("/validate_tautulli", methods=["POST"])
@@ -2988,16 +3710,209 @@ def validate_trakt():
     return validations.validate_trakt_server(data)
 
 
+@app.route("/validate_trakt_token", methods=["POST"])
+def validate_trakt_token():
+    data = request.get_json(silent=True) or {}
+    access_token = data.get("access_token")
+    client_id = data.get("client_id")
+    client_secret = data.get("client_secret")
+    refresh_token = data.get("refresh_token")
+    debug_enabled = helpers.booler(app.config.get("QS_DEBUG", False)) or helpers.booler(data.get("debug", False))
+
+    def is_blank(value):
+        if value is None:
+            return True
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed == "" or trimmed.lower() in ("none", "null"):
+                return True
+        return False
+
+    if is_blank(access_token) or is_blank(client_id) or is_blank(client_secret) or is_blank(refresh_token):
+        settings = persistence.retrieve_settings("130-trakt") or {}
+        trakt_data = settings.get("trakt", {}) if isinstance(settings, dict) else {}
+        auth = trakt_data.get("authorization", {}) if isinstance(trakt_data, dict) else {}
+        if is_blank(access_token):
+            access_token = auth.get("access_token")
+        if is_blank(client_id):
+            client_id = trakt_data.get("client_id") or auth.get("client_id")
+        if is_blank(client_secret):
+            client_secret = trakt_data.get("client_secret") or auth.get("client_secret")
+        if is_blank(refresh_token):
+            refresh_token = auth.get("refresh_token")
+
+    if is_blank(access_token) or is_blank(client_id):
+        debug_payload = None
+        if debug_enabled:
+            settings = persistence.retrieve_settings("130-trakt") or {}
+            trakt_data = settings.get("trakt", {}) if isinstance(settings, dict) else {}
+            auth = trakt_data.get("authorization", {}) if isinstance(trakt_data, dict) else {}
+            debug_payload = {
+                "config_name": session.get("config_name"),
+                "request": {
+                    "access_token": not is_blank(data.get("access_token")),
+                    "client_id": not is_blank(data.get("client_id")),
+                    "client_secret": not is_blank(data.get("client_secret")),
+                    "refresh_token": not is_blank(data.get("refresh_token")),
+                },
+                "stored": {
+                    "access_token": not is_blank(auth.get("access_token")),
+                    "client_id": not is_blank(trakt_data.get("client_id") or auth.get("client_id")),
+                    "client_secret": not is_blank(trakt_data.get("client_secret") or auth.get("client_secret")),
+                    "refresh_token": not is_blank(auth.get("refresh_token")),
+                },
+            }
+        response = {"valid": False, "error": "Missing Trakt access token or client ID."}
+        if debug_payload:
+            response["debug"] = debug_payload
+        return jsonify(response), 400
+    try:
+        response = requests.get(
+            "https://api.trakt.tv/users/settings",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {access_token}",
+                "trakt-api-version": "2",
+                "trakt-api-key": client_id,
+            },
+            timeout=10,
+        )
+        if debug_enabled:
+            helpers.ts_log(f"Trakt token check status={response.status_code}", level="DEBUG")
+        if response.status_code == 200:
+            return jsonify({"valid": True})
+        if response.status_code == 423:
+            return jsonify({"valid": False, "error": "Account is locked; please contact Trakt Support."}), 400
+        if response.status_code in (401, 403):
+            if is_blank(refresh_token) or is_blank(client_secret):
+                return jsonify({"valid": False, "error": "Access token is invalid or expired."}), 400
+
+            refresh_response = requests.post(
+                "https://api.trakt.tv/oauth/token",
+                json={
+                    "refresh_token": refresh_token,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+                    "grant_type": "refresh_token",
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if refresh_response.status_code != 200:
+                debug_payload = None
+                if debug_enabled:
+                    debug_payload = {
+                        "status": response.status_code,
+                        "refresh_status": refresh_response.status_code,
+                    }
+                response_body = {"valid": False, "error": "Access token is invalid or expired."}
+                if debug_payload:
+                    response_body["debug"] = debug_payload
+                return jsonify(response_body), 400
+
+            refreshed = refresh_response.json()
+            new_access = refreshed.get("access_token")
+            if is_blank(new_access):
+                return jsonify({"valid": False, "error": "Access token refresh failed."}), 400
+
+            config_name = session.get("config_name") or persistence.ensure_session_config_name()
+            stored_validated, user_entered, stored_data = database.retrieve_section_data(config_name, "trakt")
+            if not isinstance(stored_data, dict):
+                stored_data = {}
+            trakt_data = stored_data.get("trakt", {}) if isinstance(stored_data.get("trakt"), dict) else {}
+            auth = trakt_data.get("authorization", {}) if isinstance(trakt_data.get("authorization"), dict) else {}
+            auth["access_token"] = new_access
+            if refreshed.get("refresh_token"):
+                auth["refresh_token"] = refreshed.get("refresh_token")
+            if refreshed.get("token_type"):
+                auth["token_type"] = refreshed.get("token_type")
+            if refreshed.get("expires_in"):
+                auth["expires_in"] = refreshed.get("expires_in")
+            if refreshed.get("scope"):
+                auth["scope"] = refreshed.get("scope")
+            if refreshed.get("created_at"):
+                auth["created_at"] = refreshed.get("created_at")
+            trakt_data["authorization"] = auth
+            stored_data["trakt"] = trakt_data
+            stored_data["validated"] = True
+            stored_data["validated_at"] = utc_now_iso()
+            database.save_section_data(
+                name=config_name,
+                section="trakt",
+                validated=True,
+                user_entered=user_entered,
+                data=stored_data,
+            )
+            return jsonify({"valid": True, "refreshed": True, "authorization": auth})
+        response_body = {"valid": False, "error": f"Trakt validation failed ({response.status_code})."}
+        if debug_enabled:
+            response_body["debug"] = {"status": response.status_code}
+        return jsonify(response_body), 400
+    except requests.exceptions.RequestException as exc:
+        helpers.ts_log(f"Trakt validation error: {exc}", level="ERROR")
+        response_body = {"valid": False, "error": "Trakt validation error."}
+        if debug_enabled:
+            response_body["debug"] = {"status": "request_exception"}
+        return jsonify(response_body), 400
+
+
 @app.route("/validate_mal", methods=["POST"])
 def validate_mal():
     data = request.json
     return validations.validate_mal_server(data)
 
 
-@app.route("/validate_anidb", methods=["POST"])
-def validate_anidb():
-    data = request.json
-    return validations.validate_anidb_server(data)
+@app.route("/validate_mal_token", methods=["POST"])
+def validate_mal_token():
+    data = request.get_json(silent=True) or {}
+    access_token = data.get("access_token")
+    debug_enabled = helpers.booler(app.config.get("QS_DEBUG", False)) or helpers.booler(data.get("debug", False))
+
+    def is_blank(value):
+        if value is None:
+            return True
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed == "" or trimmed.lower() in ("none", "null"):
+                return True
+        return False
+
+    if is_blank(access_token):
+        settings = persistence.retrieve_settings("140-mal") or {}
+        mal_data = settings.get("mal", {}) if isinstance(settings, dict) else {}
+        auth = mal_data.get("authorization", {}) if isinstance(mal_data, dict) else {}
+        access_token = auth.get("access_token")
+
+    if is_blank(access_token):
+        debug_payload = None
+        if debug_enabled:
+            settings = persistence.retrieve_settings("140-mal") or {}
+            mal_data = settings.get("mal", {}) if isinstance(settings, dict) else {}
+            auth = mal_data.get("authorization", {}) if isinstance(mal_data.get("authorization"), dict) else {}
+            debug_payload = {
+                "config_name": session.get("config_name"),
+                "request": {"access_token": not is_blank(data.get("access_token"))},
+                "stored": {"access_token": not is_blank(auth.get("access_token"))},
+            }
+        response = {"valid": False, "error": "Missing MyAnimeList access token."}
+        if debug_payload:
+            response["debug"] = debug_payload
+        return jsonify(response), 400
+    try:
+        response = requests.get(
+            "https://api.myanimelist.net/v2/users/@me",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        if response.status_code == 200:
+            return jsonify({"valid": True})
+        if response.status_code in (401, 403):
+            return jsonify({"valid": False, "error": "Access token is invalid or expired."}), 400
+        return jsonify({"valid": False, "error": f"MyAnimeList validation failed ({response.status_code})."}), 400
+    except requests.exceptions.RequestException as exc:
+        helpers.ts_log(f"MyAnimeList validation error: {exc}", level="ERROR")
+        return jsonify({"valid": False, "error": "MyAnimeList validation error."}), 400
 
 
 @app.route("/validate_webhook", methods=["POST"])
@@ -3081,6 +3996,507 @@ def validate_notifiarr():
         return jsonify(result.get_json())
     else:
         return jsonify(result.get_json()), 400
+
+
+@app.route("/validate_all_services", methods=["POST"])
+def validate_all_services():
+    config_name = session.get("config_name") or persistence.ensure_session_config_name()
+
+    def is_blank_value(value):
+        if value is None:
+            return True
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed == "":
+                return True
+            if trimmed.lower() == "none":
+                return True
+        return False
+
+    def has_required_credentials(payload, required_keys):
+        for key in required_keys:
+            value = payload.get(key)
+            if value is None:
+                return False
+            if isinstance(value, str) and not value.strip():
+                return False
+            if isinstance(value, str) and value.strip().lower() == "none":
+                return False
+        return True
+
+    def apply_validation_metadata(stored_data, status, reason=None, details=None, updated_at=None):
+        if not isinstance(stored_data, dict):
+            stored_data = {}
+        stored_data["validation_status"] = status
+        if reason is not None:
+            stored_data["validation_reason"] = reason
+        if details is not None:
+            stored_data["validation_details"] = details
+        stored_data["validation_updated_at"] = updated_at or utc_now_iso()
+        return stored_data
+
+    def persist_validation_metadata(section, status, reason=None, details=None, validated_override=None):
+        stored_validated, user_entered, stored_data = database.retrieve_section_data(config_name, section)
+        stored_data = apply_validation_metadata(stored_data, status, reason=reason, details=details)
+        validated_value = stored_validated if validated_override is None else validated_override
+        database.save_section_data(
+            name=config_name,
+            section=section,
+            validated=validated_value,
+            user_entered=user_entered,
+            data=stored_data,
+        )
+
+    targets = [
+        (
+            "010-plex",
+            "plex",
+            validations.validate_plex_server,
+            lambda s: {"plex_url": s.get("plex", {}).get("url"), "plex_token": s.get("plex", {}).get("token")},
+            ["plex_url", "plex_token"],
+        ),
+        ("020-tmdb", "tmdb", validations.validate_tmdb_server, lambda s: {"tmdb_apikey": s.get("tmdb", {}).get("apikey")}, ["tmdb_apikey"]),
+        (
+            "030-tautulli",
+            "tautulli",
+            validations.validate_tautulli_server,
+            lambda s: {"tautulli_url": s.get("tautulli", {}).get("url"), "tautulli_apikey": s.get("tautulli", {}).get("apikey")},
+            ["tautulli_url", "tautulli_apikey"],
+        ),
+        ("040-github", "github", validations.validate_github_server, lambda s: {"github_token": s.get("github", {}).get("token")}, ["github_token"]),
+        ("050-omdb", "omdb", validations.validate_omdb_server, lambda s: {"omdb_apikey": s.get("omdb", {}).get("apikey")}, ["omdb_apikey"]),
+        ("060-mdblist", "mdblist", validations.validate_mdblist_server, lambda s: {"mdblist_apikey": s.get("mdblist", {}).get("apikey")}, ["mdblist_apikey"]),
+        ("070-notifiarr", "notifiarr", validations.validate_notifiarr_server, lambda s: {"notifiarr_apikey": s.get("notifiarr", {}).get("apikey")}, ["notifiarr_apikey"]),
+        (
+            "080-gotify",
+            "gotify",
+            validations.validate_gotify_server,
+            lambda s: {"gotify_url": s.get("gotify", {}).get("url"), "gotify_token": s.get("gotify", {}).get("token")},
+            ["gotify_url", "gotify_token"],
+        ),
+        (
+            "085-ntfy",
+            "ntfy",
+            validations.validate_ntfy_server,
+            lambda s: {"ntfy_url": s.get("ntfy", {}).get("url"), "ntfy_token": s.get("ntfy", {}).get("token"), "ntfy_topic": s.get("ntfy", {}).get("topic")},
+            ["ntfy_url", "ntfy_token", "ntfy_topic"],
+        ),
+        (
+            "110-radarr",
+            "radarr",
+            validations.validate_radarr_server,
+            lambda s: {"radarr_url": s.get("radarr", {}).get("url"), "radarr_token": s.get("radarr", {}).get("token")},
+            ["radarr_url", "radarr_token"],
+        ),
+        (
+            "120-sonarr",
+            "sonarr",
+            validations.validate_sonarr_server,
+            lambda s: {"sonarr_url": s.get("sonarr", {}).get("url"), "sonarr_token": s.get("sonarr", {}).get("token")},
+            ["sonarr_url", "sonarr_token"],
+        ),
+    ]
+
+    results = {}
+    summary = {"validated": 0, "failed": 0, "skipped": 0}
+
+    for template_key, section, validator, payload_builder, required_keys in targets:
+        settings = persistence.retrieve_settings(template_key)
+        validated_at = settings.get("validated_at")
+        payload = payload_builder(settings) or {}
+        if not has_required_credentials(payload, required_keys):
+            results[template_key] = {
+                "status": "skipped",
+                "validated_at": validated_at or "",
+                "reason": "missing_credentials",
+            }
+            persist_validation_metadata(section, "skipped", reason="missing_credentials")
+            summary["skipped"] += 1
+            continue
+        try:
+            response = validator(payload)
+            if isinstance(response, tuple) and response:
+                response = response[0]
+            response_data = response.get_json() if hasattr(response, "get_json") else response
+            if not isinstance(response_data, dict):
+                response_data = {}
+        except Exception as e:
+            response_data = {"valid": False, "error": str(e)}
+
+        is_valid = helpers.booler(response_data.get("validated", response_data.get("valid", False)))
+        stored_validated, user_entered, stored_data = database.retrieve_section_data(config_name, section)
+        if not isinstance(stored_data, dict):
+            stored_data = {}
+        existing_validated_at = stored_data.get("validated_at") or validated_at or ""
+
+        if is_valid:
+            new_validated_at = utc_now_iso()
+            stored_data["validated"] = True
+            stored_data["validated_at"] = new_validated_at
+            stored_data = apply_validation_metadata(stored_data, "validated")
+            database.save_section_data(
+                name=config_name,
+                section=section,
+                validated=True,
+                user_entered=user_entered,
+                data=stored_data,
+            )
+            results[template_key] = {"status": "validated", "validated_at": new_validated_at}
+            summary["validated"] += 1
+        else:
+            stored_data["validated"] = False
+            if existing_validated_at:
+                stored_data["validated_at"] = existing_validated_at
+            message = response_data.get("message") or response_data.get("error")
+            fail_reason = None
+            if isinstance(message, str) and "invalid" in message.lower():
+                fail_reason = "token_invalid"
+            else:
+                fail_reason = "validation_error"
+            stored_data = apply_validation_metadata(stored_data, "failed", reason=fail_reason, details=message)
+            database.save_section_data(
+                name=config_name,
+                section=section,
+                validated=False,
+                user_entered=user_entered,
+                data=stored_data,
+            )
+            results[template_key] = {"status": "failed", "validated_at": existing_validated_at, "reason": fail_reason}
+            if message:
+                results[template_key]["details"] = message
+            summary["failed"] += 1
+
+    def update_section_validation(template_key, section, is_valid, reason=None, details=None):
+        stored_validated, user_entered, stored_data = database.retrieve_section_data(config_name, section)
+        if not isinstance(stored_data, dict):
+            stored_data = {}
+        existing_validated_at = stored_data.get("validated_at") or ""
+
+        if is_valid:
+            new_validated_at = utc_now_iso()
+            stored_data["validated"] = True
+            stored_data["validated_at"] = new_validated_at
+            stored_data = apply_validation_metadata(stored_data, "validated")
+            database.save_section_data(
+                name=config_name,
+                section=section,
+                validated=True,
+                user_entered=user_entered,
+                data=stored_data,
+            )
+            results[template_key] = {"status": "validated", "validated_at": new_validated_at}
+            summary["validated"] += 1
+            return
+
+        stored_data["validated"] = False
+        if existing_validated_at:
+            stored_data["validated_at"] = existing_validated_at
+        stored_data = apply_validation_metadata(stored_data, "failed", reason=reason, details=details)
+        database.save_section_data(
+            name=config_name,
+            section=section,
+            validated=False,
+            user_entered=user_entered,
+            data=stored_data,
+        )
+        result = {"status": "failed", "validated_at": existing_validated_at}
+        if reason:
+            result["reason"] = reason
+        if details:
+            result["details"] = details
+        results[template_key] = result
+        summary["failed"] += 1
+
+    def skip_section_validation(template_key, section, reason=None, details=None):
+        stored_validated, user_entered, stored_data = database.retrieve_section_data(config_name, section)
+        if not isinstance(stored_data, dict):
+            stored_data = {}
+        existing_validated_at = stored_data.get("validated_at") or ""
+        stored_data = apply_validation_metadata(stored_data, "skipped", reason=reason, details=details)
+        database.save_section_data(
+            name=config_name,
+            section=section,
+            validated=stored_validated,
+            user_entered=user_entered,
+            data=stored_data,
+        )
+        result = {"status": "skipped", "validated_at": existing_validated_at}
+        if reason:
+            result["reason"] = reason
+        if details:
+            result["details"] = details
+        results[template_key] = result
+        summary["skipped"] += 1
+
+    # Bulk validation for libraries
+    plex_settings = persistence.retrieve_settings("010-plex") or {}
+    plex_is_valid = helpers.booler(plex_settings.get("validated", False)) if isinstance(plex_settings, dict) else False
+    if not plex_is_valid:
+        skip_section_validation("025-libraries", "libraries", reason="missing_plex_validation")
+        skip_section_validation("027-playlist_files", "playlist_files", reason="missing_plex_validation")
+    else:
+        libraries_settings = persistence.retrieve_settings("025-libraries") or {}
+        libraries_data = libraries_settings.get("libraries", {}) if isinstance(libraries_settings, dict) else {}
+        selected_library_ids = [
+            key[: -len("-library")]
+            for key, value in libraries_data.items()
+            if isinstance(key, str) and key.startswith(("mov-library_", "sho-library_")) and key.endswith("-library") and not is_blank_value(value)
+        ]
+
+        if not selected_library_ids:
+            skip_section_validation("025-libraries", "libraries", reason="no_libraries")
+        else:
+            libraries_reason = None
+            path_errors = path_validation.validate_payload(libraries_data)
+            if path_errors:
+                libraries_reason = "invalid_paths"
+            else:
+                missing_placeholders = []
+                library_names = {}
+                for lib_id in selected_library_ids:
+                    name = libraries_data.get(f"{lib_id}-library")
+                    library_names[lib_id] = name if isinstance(name, str) and name.strip() else lib_id
+
+                def find_library_value(lib_id, suffixes):
+                    for suffix in suffixes:
+                        direct = f"{lib_id}-{suffix}"
+                        if direct in libraries_data:
+                            return libraries_data.get(direct)
+                    for key, value in libraries_data.items():
+                        if not isinstance(key, str) or not key.startswith(f"{lib_id}-"):
+                            continue
+                        if any(key.endswith(suffix) for suffix in suffixes):
+                            return value
+                    return None
+
+                for lib_id in selected_library_ids:
+                    use_separator = find_library_value(lib_id, ["template_variables[use_separator]", "attribute_use_separator"])
+                    if is_blank_value(use_separator) or str(use_separator).strip().lower() == "none":
+                        continue
+                    placeholder = find_library_value(lib_id, ["attribute_template_variables[placeholder_imdb_id]", "template_variables[placeholder_imdb_id]"])
+                    if is_blank_value(placeholder):
+                        missing_placeholders.append(library_names.get(lib_id, lib_id))
+                if missing_placeholders:
+                    libraries_reason = "missing_placeholder_imdb"
+
+            update_section_validation(
+                "025-libraries",
+                "libraries",
+                libraries_reason is None,
+                reason=libraries_reason,
+                details=missing_placeholders if libraries_reason == "missing_placeholder_imdb" else None,
+            )
+
+        playlist_settings = persistence.retrieve_settings("027-playlist_files") or {}
+        playlist_payload = playlist_settings.get("playlist_files", {}) if isinstance(playlist_settings, dict) else {}
+        if isinstance(playlist_payload, dict) and isinstance(playlist_payload.get("playlist_files"), dict):
+            playlist_payload = playlist_payload.get("playlist_files", {})
+        libraries_value = ""
+        if isinstance(playlist_payload, dict):
+            libraries_value = playlist_payload.get("libraries") or ""
+        playlist_libraries = [lib.strip() for lib in str(libraries_value).split(",") if lib.strip()]
+        if playlist_libraries:
+            update_section_validation("027-playlist_files", "playlist_files", True)
+        else:
+            skip_section_validation("027-playlist_files", "playlist_files", reason="no_libraries")
+
+    # Bulk validation for settings
+    settings_settings = persistence.retrieve_settings("150-settings") or {}
+    settings_section = settings_settings.get("settings", {}) if isinstance(settings_settings, dict) else {}
+    if not isinstance(settings_section, dict) or not settings_section:
+        skip_section_validation("150-settings", "settings", reason="missing_settings")
+    else:
+        invalid_fields = []
+
+        def check_regex(key, pattern, flags=0):
+            if key not in settings_section:
+                return
+            value = settings_section.get(key)
+            if value is None:
+                return
+            if isinstance(value, str) and not value.strip():
+                invalid_fields.append(key)
+                return
+            value_text = str(value).strip()
+            if not re.match(pattern, value_text, flags):
+                invalid_fields.append(key)
+
+        check_regex("asset_depth", r"^(0|[1-9]\d*)$")
+        check_regex("overlay_artwork_quality", r"^(100|[1-9][0-9]?)$")
+        check_regex("cache_expiration", r"^[1-9]\d*$")
+        check_regex("item_refresh_delay", r"^(0|[1-9]\d*)$")
+        check_regex("minimum_items", r"^[1-9]\d*$")
+        check_regex("run_again_delay", r"^(0|[1-9]\d*)$")
+        check_regex("ignore_ids", r"^(None|\d{1,8}(,\d{1,8})*)$", flags=re.IGNORECASE)
+        check_regex("ignore_imdb_ids", r"^(None|tt\d{7,8}(,tt\d{7,8})*)$", flags=re.IGNORECASE)
+        check_regex("custom_repo", r"^(None|https?:\/\/[\da-z.-]+\.[a-z.]{2,6}([/\w.-]*)*\/?)$", flags=re.IGNORECASE)
+
+        asset_dirs = settings_section.get("asset_directory") if isinstance(settings_section, dict) else None
+        if isinstance(asset_dirs, str):
+            asset_dirs = [line.strip() for line in asset_dirs.splitlines() if line.strip()]
+        elif isinstance(asset_dirs, list):
+            asset_dirs = [str(item).strip() for item in asset_dirs if str(item).strip()]
+        else:
+            asset_dirs = []
+
+        if asset_dirs:
+            md = MultiDict()
+            for entry in asset_dirs:
+                md.add("asset_directory", entry)
+            path_errors = path_validation.validate_payload(md)
+            if path_errors:
+                invalid_fields.append("asset_directory")
+
+        if invalid_fields:
+            update_section_validation("150-settings", "settings", False, reason="invalid_fields")
+        else:
+            update_section_validation("150-settings", "settings", True)
+
+    # Bulk validation for AniDB
+    anidb_settings = persistence.retrieve_settings("100-anidb") or {}
+    anidb_data = anidb_settings.get("anidb", {}) if isinstance(anidb_settings, dict) else {}
+    anidb_enabled = helpers.booler(anidb_data.get("enable")) if isinstance(anidb_data, dict) else False
+    if anidb_enabled:
+        update_section_validation("100-anidb", "anidb", True)
+    else:
+        skip_section_validation("100-anidb", "anidb", reason="disabled")
+
+    # Bulk validation for Webhooks
+    webhooks_settings = persistence.retrieve_settings("090-webhooks") or {}
+    webhooks_data = webhooks_settings.get("webhooks", {}) if isinstance(webhooks_settings, dict) else {}
+    configured_webhooks = False
+    if isinstance(webhooks_data, dict):
+        for value in webhooks_data.values():
+            if is_blank_value(value):
+                continue
+            configured_webhooks = True
+            break
+    if configured_webhooks:
+        update_section_validation("090-webhooks", "webhooks", True)
+    else:
+        skip_section_validation("090-webhooks", "webhooks", reason="no_webhooks")
+
+    # Bulk validation for Trakt (token check if present)
+    trakt_settings = persistence.retrieve_settings("130-trakt") or {}
+    trakt_data = trakt_settings.get("trakt", {}) if isinstance(trakt_settings, dict) else {}
+    trakt_auth = trakt_data.get("authorization", {}) if isinstance(trakt_data, dict) else {}
+    trakt_access = trakt_auth.get("access_token") if isinstance(trakt_auth, dict) else None
+    trakt_client_id = trakt_data.get("client_id") if isinstance(trakt_data, dict) else None
+    if is_blank_value(trakt_access) or is_blank_value(trakt_client_id):
+        skip_section_validation("130-trakt", "trakt", reason="missing_tokens")
+    else:
+        try:
+            response = requests.get(
+                "https://api.trakt.tv/users/settings",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {trakt_access}",
+                    "trakt-api-version": "2",
+                    "trakt-api-key": trakt_client_id,
+                },
+                timeout=10,
+            )
+            if response.status_code == 200:
+                update_section_validation("130-trakt", "trakt", True)
+            elif response.status_code == 423:
+                update_section_validation("130-trakt", "trakt", False, reason="account_locked")
+            elif response.status_code in (401, 403):
+                update_section_validation("130-trakt", "trakt", False, reason="token_invalid")
+            else:
+                update_section_validation("130-trakt", "trakt", False, reason="validation_error")
+        except requests.exceptions.RequestException:
+            update_section_validation("130-trakt", "trakt", False, reason="validation_error")
+
+    # Bulk validation for MAL (token check if present)
+    mal_settings = persistence.retrieve_settings("140-mal") or {}
+    mal_data = mal_settings.get("mal", {}) if isinstance(mal_settings, dict) else {}
+    mal_auth = mal_data.get("authorization", {}) if isinstance(mal_data, dict) else {}
+    mal_access = mal_auth.get("access_token") if isinstance(mal_auth, dict) else None
+    if is_blank_value(mal_access):
+        skip_section_validation("140-mal", "mal", reason="missing_tokens")
+    else:
+        try:
+            response = requests.get(
+                "https://api.myanimelist.net/v2/users/@me",
+                headers={"Authorization": f"Bearer {mal_access}"},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                update_section_validation("140-mal", "mal", True)
+            elif response.status_code in (401, 403):
+                update_section_validation("140-mal", "mal", False, reason="token_invalid")
+            else:
+                update_section_validation("140-mal", "mal", False, reason="validation_error")
+        except requests.exceptions.RequestException:
+            update_section_validation("140-mal", "mal", False, reason="validation_error")
+
+    reason_labels = {
+        "missing_credentials": "Missing credentials",
+        "missing_plex_validation": "Plex not validated",
+        "no_libraries": "No libraries selected",
+        "invalid_paths": "Invalid paths",
+        "missing_placeholder_imdb": "Missing placeholder IMDb ID",
+        "invalid_fields": "Invalid fields",
+        "no_webhooks": "No webhooks configured",
+        "disabled": "Disabled",
+        "missing_settings": "Settings missing",
+        "missing_tokens": "Missing tokens",
+        "token_invalid": "Invalid tokens",
+        "account_locked": "Account locked",
+        "validation_error": "Validation error",
+    }
+    label_map = {}
+    try:
+        for file, display_name in helpers.get_menu_list():
+            label_map[file.rsplit(".", 1)[0]] = display_name
+    except Exception:
+        label_map = {}
+
+    def label_for_key(key):
+        return label_map.get(key, key)
+
+    def format_with_reason(key, result):
+        label = label_for_key(key)
+        reason = result.get("reason")
+        details = result.get("details")
+        if not reason:
+            return label
+        pretty = reason_labels.get(reason, reason.replace("_", " "))
+        detail_text = ""
+        if isinstance(details, (list, tuple)):
+            detail_text = ", ".join(str(item) for item in details if str(item))
+        elif details is not None:
+            detail_text = str(details)
+        if detail_text:
+            return f"{label} ({pretty}: {detail_text})"
+        return f"{label} ({pretty})"
+
+    failed_keys = [key for key, result in results.items() if result.get("status") == "failed"]
+    failed_labels = [format_with_reason(key, results[key]) for key in failed_keys]
+    failed_detail = f" Failed: {', '.join(failed_labels)}." if failed_labels else ""
+    skipped_keys = [key for key, result in results.items() if result.get("status") == "skipped"]
+    skipped_labels = [format_with_reason(key, results[key]) for key in skipped_keys]
+    skipped_detail = f" Skipped: {', '.join(skipped_labels)}." if skipped_labels else ""
+    ok = summary.get("validated", 0)
+    failed = summary.get("failed", 0)
+    skipped = summary.get("skipped", 0)
+    separator = "\u2022"
+    summary_text = f"Completed. Validated: {ok} {separator} Failed: {failed} {separator} Skipped: {skipped}."
+    summary_updated_at = utc_now_iso()
+    summary_payload = {
+        "summary_text": summary_text,
+        "summary": summary,
+        "results": results,
+        "updated_at": summary_updated_at,
+    }
+    database.save_section_data(
+        name=config_name,
+        section="validation_summary",
+        validated=True,
+        user_entered=True,
+        data=summary_payload,
+    )
+    return jsonify({"success": True, "results": results, "summary": summary, "summary_text": summary_text, "summary_updated_at": summary_updated_at})
 
 
 @app.route("/shutdown", methods=["POST"])
@@ -3372,6 +4788,8 @@ def tail_log():
                 return cached.get("stats")
 
             counts = {
+                "total_lines": 0,
+                "cache": 0,
                 "debug": 0,
                 "info": 0,
                 "warning": 0,
@@ -3382,7 +4800,10 @@ def tail_log():
             try:
                 with path.open("r", encoding="utf-8", errors="replace") as handle:
                     for line in handle:
+                        counts["total_lines"] += 1
                         upper = line.upper()
+                        if "FROM CACHE" in upper:
+                            counts["cache"] += 1
                         if "[DEBUG]" in upper:
                             counts["debug"] += 1
                         if "[INFO]" in upper:
@@ -4637,7 +6058,8 @@ def header_style_previews():
 
 @app.route("/validate-kometa-root", methods=["POST"])
 def validate_kometa_root():
-    root_path = request.json.get("path", "").strip()
+    payload = request.get_json(silent=True) or {}
+    root_path = str(payload.get("path", "")).strip()
     logs = []
 
     def log(msg):
@@ -4648,7 +6070,10 @@ def validate_kometa_root():
         log("❌ No path provided.")
         return jsonify(success=False, error="No path provided.", log=logs), 400
 
-    p = Path(root_path).resolve()
+    p = _resolve_user_dir(root_path)
+    if not p:
+        log("❌ Invalid path provided.")
+        return jsonify(success=False, error="Invalid path provided.", log=logs), 400
 
     session["kometa_root"] = p.as_posix()
     app.config["KOMETA_ROOT"] = str(p)
@@ -4771,13 +6196,20 @@ def validate_kometa_root():
         return jsonify(success=False, error="Failed pip install.", log=logs), 500
 
     # Copy generated YAML into <root>/config/<file>
-    config_name = request.json.get("config_name", "kometa")
-    src_yaml = Path("config") / f"{config_name}"
-    if not src_yaml.exists():
+    config_name = _safe_rel_path(payload.get("config_name", "kometa"))
+    if not config_name:
+        log("❌ Invalid config filename.")
+        return jsonify(success=False, error="Invalid config filename.", log=logs), 400
+
+    src_yaml = _safe_join(Path("config"), config_name)
+    if not src_yaml or not src_yaml.exists():
         log(f"❌ Source YAML does not exist: {src_yaml}")
         return jsonify(success=False, error="Generated YAML not found.", log=logs), 500
 
-    dest_yaml = p / "config" / f"{config_name}"
+    dest_yaml = _safe_join(p / "config", config_name)
+    if not dest_yaml:
+        log("❌ Invalid config destination.")
+        return jsonify(success=False, error="Invalid config destination.", log=logs), 400
     try:
         shutil.copy2(src_yaml, dest_yaml)
         log(f"✅ YAML copied to Kometa config folder at: {dest_yaml}")
@@ -4871,7 +6303,8 @@ def update_kometa():
         )
 
     except Exception as e:
-        logs.append(f"Exception during Kometa update: {e}")
+        helpers.ts_log(f"Kometa update failed: {e}", level="ERROR")
+        logs.append("Exception during Kometa update.")
         return jsonify({"success": False, "log": logs}), 500
 
 
@@ -4926,14 +6359,16 @@ def _ensure_rw_dir(path):
     try:
         os.makedirs(path, exist_ok=True)
     except Exception as e:
-        return False, f"Unable to create folder: {path} ({e})"
+        helpers.ts_log(f"Unable to create folder '{path}': {e}", level="ERROR")
+        return False, "Unable to create folder."
     test_file = os.path.join(path, f".qs_write_test_{uuid.uuid4().hex}")
     try:
         with open(test_file, "w", encoding="utf-8") as f:
             f.write("test")
         os.remove(test_file)
     except Exception as e:
-        return False, f"Unable to write to folder: {path} ({e})"
+        helpers.ts_log(f"Unable to write to folder '{path}': {e}", level="ERROR")
+        return False, "Unable to write to folder."
     return True, ""
 
 
@@ -5043,8 +6478,7 @@ def update_test_libraries_settings():
             jsonify(
                 success=False,
                 needs_confirm=True,
-                message=f"Test libraries exist at the previous path: {old_final}. Quickstart will not move them.",
-                old_path=old_final,
+                message="Test libraries exist at the previous configured path. Quickstart will not move them.",
             ),
             409,
         )
@@ -5061,8 +6495,7 @@ def update_test_libraries_settings():
             jsonify(
                 success=False,
                 needs_confirm=True,
-                message=f"The final path is not empty and does not look like test libraries: {final_path}. Quickstart will replace this folder during install/update.",
-                final_path=final_path,
+                message="The final path is not empty and does not look like test libraries. Quickstart will replace this folder during install/update.",
             ),
             409,
         )
@@ -5443,7 +6876,8 @@ def clone_test_libraries():
         return jsonify(success=True, message="Test libraries installed successfully.", target_path=resolved_path)
 
     except Exception as e:
-        return jsonify(success=False, message=f"Unexpected error: {str(e)}")
+        helpers.ts_log(f"Test library install failed: {e}", level="ERROR")
+        return jsonify(success=False, message="Unexpected error.")
 
 
 @app.route("/purge-test-libraries", methods=["POST"])

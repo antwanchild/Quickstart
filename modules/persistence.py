@@ -56,8 +56,11 @@ def clean_form_data(form_data):
 
     for key, value in form_data.items():
         # Handle asset_directory as a list
-        if key == "asset_directory":
-            value_list = form_data.getlist(key)
+        if key == "asset_directory" or key.endswith("-attribute_asset_directory"):
+            if isinstance(value, list):
+                value_list = value
+            else:
+                value_list = form_data.getlist(key)
             clean_data[key] = [v.strip() for v in value_list if v.strip()]
 
         elif key.endswith("use_separator"):
@@ -73,6 +76,9 @@ def clean_form_data(form_data):
             clean_data[key] = None
 
         elif isinstance(value, str):
+            if key.endswith("template_overlay_runtimes[text]") and value == "":
+                clean_data[key] = ""
+                continue
             if url_validation.is_url_key(key):
                 raw = value.strip()
                 if raw:
@@ -94,6 +100,23 @@ def clean_form_data(form_data):
 
         else:
             clean_data[key] = value
+
+    cache_defaults = {
+        "cache_expiration": "60",
+        "tmdb_cache_expiration": "60",
+        "omdb_cache_expiration": "60",
+        "mdblist_cache_expiration": "60",
+        "anidb_cache_expiration": "60",
+        "mal_cache_expiration": "60",
+    }
+    for key, default_value in cache_defaults.items():
+        if key not in clean_data:
+            continue
+        value = clean_data[key]
+        if value is None:
+            clean_data[key] = default_value
+        elif isinstance(value, str) and value.strip() == "":
+            clean_data[key] = default_value
 
     return clean_data
 
@@ -156,13 +179,29 @@ def save_settings(raw_source, form_data):
             merged_libraries = existing_libraries.copy() if isinstance(existing_libraries, dict) else {}
             incoming_libraries = incoming_libraries if isinstance(incoming_libraries, dict) else {}
 
+            def _library_prefix(key):
+                if not isinstance(key, str) or not key.startswith(("mov-library_", "sho-library_")):
+                    return None
+                if "-template_" in key:
+                    return key.split("-template_", 1)[0]
+                if "-attribute_" in key:
+                    return key.split("-attribute_", 1)[0]
+                if "-collection_" in key:
+                    return key.split("-collection_", 1)[0]
+                if "-overlay_" in key:
+                    return key.split("-overlay_", 1)[0]
+                if "-top_level_" in key:
+                    return key.split("-top_level_", 1)[0]
+                if key.endswith("-library"):
+                    return key[: -len("-library")]
+                return None
+
             # Identify library prefixes present in this payload (e.g., mov-library_xxx, sho-library_yyy)
             prefixes = set()
             for key in incoming_libraries:
-                if key.startswith(("mov-library_", "sho-library_")):
-                    parts = key.split("-", 2)
-                    if len(parts) >= 2:
-                        prefixes.add("-".join(parts[:2]))
+                prefix = _library_prefix(key)
+                if prefix:
+                    prefixes.add(prefix)
 
             # Remove existing entries for the affected prefixes so we can replace them cleanly
             for prefix in prefixes:
@@ -196,7 +235,7 @@ def save_settings(raw_source, form_data):
             helpers.ts_log(f"Failed to merge libraries during save: {e}", level="ERROR")
 
     # Ensure a timestamp for pages that validate without explicit validation buttons
-    if source_name in ["libraries", "webhooks"]:
+    if source_name in ["libraries", "webhooks", "anidb"]:
         existing_validated_at = data.get("validated_at")
         if not existing_validated_at:
             try:
@@ -212,7 +251,16 @@ def save_settings(raw_source, form_data):
     # Validation
     base_data = get_dummy_data(source_name)
     user_entered = data != base_data
+    if source_name == "anidb":
+        anidb_enabled = helpers.booler(data.get("anidb", {}).get("enable"))
+        if not anidb_enabled:
+            data["validated"] = False
+            data["validated_at"] = ""
+        elif "validated" not in data:
+            data["validated"] = user_entered
     validated = data.get("validated", False)
+    if source_name == "anidb" and validated and not data.get("validated_at"):
+        data["validated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
 
     # Save to DB
     database.save_section_data(

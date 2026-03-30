@@ -1,6 +1,36 @@
 /* global $, initialRadarrRootFolderPath, initialRadarrQualityProfile, showSpinner, hideSpinner, PathValidation */
 
+function refreshValidationCallout () {
+  if (window.QSValidationCallouts && typeof window.QSValidationCallouts.refresh === 'function') {
+    window.QSValidationCallouts.refresh('radarr_validated')
+  }
+}
+
 const validatedAtInput = document.getElementById('radarr_validated_at')
+
+function setToggleButtonIcon (button, showPlainText) {
+  if (!button) return
+  const icon = document.createElement('i')
+  icon.className = showPlainText ? 'fas fa-eye-slash' : 'fas fa-eye'
+  button.replaceChildren(icon)
+}
+
+function setStatusMessageLines (element, messages) {
+  if (!element) return
+  element.textContent = ''
+  messages.forEach((message, index) => {
+    if (index > 0) element.appendChild(document.createElement('br'))
+    element.appendChild(document.createTextNode(message))
+  })
+}
+
+function resetDropdown (dropdown, placeholderText) {
+  if (!dropdown) return
+  const option = document.createElement('option')
+  option.value = ''
+  option.textContent = placeholderText
+  dropdown.replaceChildren(option)
+}
 
 $(document).ready(function () {
   const apiKeyInput = document.getElementById('radarr_token')
@@ -13,10 +43,10 @@ $(document).ready(function () {
   // Set initial visibility based on API key value
   if (apiKeyInput.value.trim() === '') {
     apiKeyInput.setAttribute('type', 'text') // Show placeholder text
-    toggleButton.innerHTML = '<i class="fas fa-eye-slash"></i>' // Show eye-slash
+    setToggleButtonIcon(toggleButton, true)
   } else {
     apiKeyInput.setAttribute('type', 'password') // Hide actual key
-    toggleButton.innerHTML = '<i class="fas fa-eye"></i>' // Show eye
+    setToggleButtonIcon(toggleButton, false)
   }
 
   // Disable validate button if already validated
@@ -35,12 +65,14 @@ $(document).ready(function () {
     document.getElementById('radarr_validated').value = 'false'
     if (validatedAtInput) validatedAtInput.value = ''
     document.getElementById('validateButton').disabled = false
+    refreshValidationCallout()
   })
 
   document.getElementById('radarr_url').addEventListener('input', function () {
     document.getElementById('radarr_validated').value = 'false'
     if (validatedAtInput) validatedAtInput.value = ''
     document.getElementById('validateButton').disabled = false
+    refreshValidationCallout()
   })
 
   // Attach event listeners for validation and toggle functionality
@@ -80,7 +112,7 @@ function fetchDropdownData () {
 
 function populateDropdown (elementId, data, valueField, textField, selectedValue = '') {
   const dropdown = document.getElementById(elementId)
-  dropdown.innerHTML = '<option value="">Select an option</option>'
+  resetDropdown(dropdown, 'Select an option')
 
   data.forEach((item) => {
     const option = document.createElement('option')
@@ -130,7 +162,7 @@ function validateRadarrPage () {
 
   // Display validation messages
   if (!isValid) {
-    statusMessage.innerHTML = validationMessages.join('<br>')
+    setStatusMessageLines(statusMessage, validationMessages)
     statusMessage.style.color = '#ea868f' // Warning color
     statusMessage.style.display = 'block'
   } else {
@@ -161,6 +193,7 @@ function validateRadarrApi () {
       if (data.valid) {
         document.getElementById('radarr_validated').value = 'true'
         if (validatedAtInput) validatedAtInput.value = new Date().toISOString()
+        refreshValidationCallout()
         statusMessage.textContent = 'Radarr API key is valid.'
         statusMessage.style.color = '#75b798'
         statusMessage.style.display = 'block'
@@ -171,6 +204,7 @@ function validateRadarrApi () {
       } else {
         document.getElementById('radarr_validated').value = 'false'
         if (validatedAtInput) validatedAtInput.value = ''
+        refreshValidationCallout()
         console.log('Error validating Radarr', data.message)
         statusMessage.textContent = 'Failed to validate Radarr server. Please check your URL and Token.'
         statusMessage.style.color = '#ea868f'
@@ -185,6 +219,7 @@ function validateRadarrApi () {
       statusMessage.style.display = 'block'
       document.getElementById('radarr_validated').value = 'false'
       if (validatedAtInput) validatedAtInput.value = ''
+      refreshValidationCallout()
     })
 }
 
@@ -194,10 +229,10 @@ function toggleApiKeyVisibility () {
   if (apiKeyInput && toggleButton) {
     if (apiKeyInput.type === 'password') {
       apiKeyInput.type = 'text'
-      toggleButton.innerHTML = '<i class="fas fa-eye-slash"></i>'
+      setToggleButtonIcon(toggleButton, true)
     } else {
       apiKeyInput.type = 'password'
-      toggleButton.innerHTML = '<i class="fas fa-eye"></i>'
+      setToggleButtonIcon(toggleButton, false)
     }
   }
 }

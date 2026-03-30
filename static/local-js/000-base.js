@@ -17,15 +17,17 @@
 
   const isVerbose = typeof window.QS_VERBOSE !== 'undefined' && String(window.QS_VERBOSE).toLowerCase() === 'true'
 
-  if (isDebug && isVerbose) {
-    ['log', 'debug', 'warn', 'error'].forEach((method) => {
-      const original = console[method]
-      console[method] = function (...args) {
-        original.call(console, `[${getLocalTimestamp()}]`, ...args)
-      }
-    })
+  if (isDebug) {
+    if (isVerbose) {
+      ['log', 'debug', 'warn', 'error'].forEach((method) => {
+        const original = console[method]
+        console[method] = function (...args) {
+          original.call(console, `[${getLocalTimestamp()}]`, ...args)
+        }
+      })
+    }
   } else {
-    // In non-verbose mode, keep errors but mute spammy logs
+    // In non-debug mode, keep errors but mute spammy logs
     console.debug = () => { }
     console.log = () => { }
     console.warn = () => { }
@@ -67,6 +69,10 @@ document.addEventListener('DOMContentLoaded', function () {
 function loading (action) {
   console.log('action:', action)
 
+  if (action === 'prev' || action === 'next') {
+    restoreBlankCacheExpirations()
+  }
+
   let spinnerIcon
   switch (action) {
     case 'prev':
@@ -101,6 +107,39 @@ function loading (action) {
   spinnerIcon.classList.add('spinner-border', 'spinner-border-sm')
 }
 
+function resetNavigationSpinners () {
+  const prevIcon = document.getElementById('prev-spinner-icon')
+  if (prevIcon) {
+    prevIcon.classList.remove('spinner-border', 'spinner-border-sm')
+    if (!prevIcon.classList.contains('fa-arrow-left')) {
+      prevIcon.classList.add('fa-arrow-left')
+    }
+  }
+  const nextIcon = document.getElementById('next-spinner-icon')
+  if (nextIcon) {
+    nextIcon.classList.remove('spinner-border', 'spinner-border-sm')
+    if (!nextIcon.classList.contains('fa-arrow-right')) {
+      nextIcon.classList.add('fa-arrow-right')
+    }
+  }
+  const jumpLeft = document.querySelector('.jump-to-left')
+  if (jumpLeft) {
+    jumpLeft.classList.remove('is-loading')
+  }
+}
+
+document.addEventListener('invalid', function () {
+  resetNavigationSpinners()
+}, true)
+
+document.addEventListener('submit', function (event) {
+  setTimeout(() => {
+    if (event.defaultPrevented) {
+      resetNavigationSpinners()
+    }
+  }, 0)
+})
+
 /* eslint-disable no-unused-vars */
 // Function to show the spinner on validate
 function showSpinner (webhookType) {
@@ -115,6 +154,8 @@ function hideSpinner (webhookType) {
 // Function to handle jump to action
 function jumpTo (targetPage) {
   console.log('JumpTo initiated for target page:', targetPage)
+
+  restoreBlankCacheExpirations()
 
   const form = document.getElementById('configForm') || document.getElementById('final-form')
   if (!form) {
@@ -148,10 +189,27 @@ function jumpTo (targetPage) {
   form.action = originalAction // optional restore
 }
 
+function escapeHtml (value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function setButtonIconAndText (button, iconClasses, text) {
+  if (!button) return
+  const icon = document.createElement('i')
+  icon.className = iconClasses
+  button.replaceChildren(icon, document.createTextNode(` ${text}`))
+}
+
 // Function to show toast messages
 function showToast (type, message) {
   const toastId = `toast-${Date.now()}` // Unique ID for each toast
   const toastContainer = document.querySelector('.toast-container')
+  const safeMessage = escapeHtml(message)
 
   // Define Bootstrap colors, icons, and progress bar styles per type
   const toastConfig = {
@@ -170,7 +228,7 @@ function showToast (type, message) {
     <div id="${toastId}" class="toast align-items-center ${toastTypeClass} border-0 shadow-lg" role="alert" aria-live="assertive" aria-atomic="true" data-bs-delay="10000">
       <div class="d-flex">
         <div class="toast-body">
-          <i class="bi ${icon} me-2"></i> ${message}
+          <i class="bi ${icon} me-2"></i> ${safeMessage}
         </div>
         <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
       </div>
@@ -198,6 +256,170 @@ function showToast (type, message) {
 
   // Show the toast
   toast.show()
+}
+
+function getValidatedInput () {
+  const form = document.getElementById('configForm') || document.getElementById('final-form') || document
+  if (!form) return null
+  return form.querySelector('input[id$="_validated"]')
+}
+
+function updateValidationCallouts (inputId) {
+  const callouts = document.querySelectorAll('.qs-validation-accordion')
+  if (!callouts.length) return
+
+  callouts.forEach((wrapper) => {
+    const targetId = inputId || wrapper.dataset.qsValidatedInput
+    const validatedInput = targetId ? document.getElementById(targetId) : getValidatedInput()
+    if (!validatedInput) return
+
+    const isValidated = String(validatedInput.value || '').toLowerCase() === 'true'
+    const collapse = wrapper.querySelector('.accordion-collapse')
+    const button = wrapper.querySelector('.accordion-button')
+    if (!collapse || !button) return
+
+    const shouldShow = !isValidated
+    button.classList.toggle('collapsed', !shouldShow)
+    button.setAttribute('aria-expanded', shouldShow ? 'true' : 'false')
+
+    if (typeof bootstrap !== 'undefined' && bootstrap.Collapse) {
+      const instance = bootstrap.Collapse.getOrCreateInstance(collapse, { toggle: false })
+      if (shouldShow) {
+        instance.show()
+      } else {
+        instance.hide()
+      }
+    } else {
+      collapse.classList.toggle('show', shouldShow)
+    }
+  })
+}
+
+function setupValidationCallouts () {
+  const callouts = document.querySelectorAll('.qs-validation-callout')
+  if (!callouts.length) return
+
+  callouts.forEach((alert, index) => {
+    if (alert.closest('.modal')) return
+    if (alert.closest('.qs-validation-accordion')) return
+
+    const validatedInput = getValidatedInput()
+    if (!validatedInput) return
+
+    const isValidated = String(validatedInput.value || '').toLowerCase() === 'true'
+    const heading = alert.querySelector('h6, h4')
+    const title = alert.dataset.qsCalloutTitle || (heading ? heading.textContent.trim() : 'Setup guidance')
+    const accordionId = `qs-validation-accordion-${index}`
+    const collapseId = `qs-validation-collapse-${index}`
+    const headingId = `qs-validation-heading-${index}`
+
+    const wrapper = document.createElement('div')
+    wrapper.className = 'accordion qs-validation-accordion mb-2'
+    wrapper.dataset.qsValidatedInput = validatedInput.id
+    const accordionItem = document.createElement('div')
+    accordionItem.className = 'accordion-item'
+
+    const header = document.createElement('h2')
+    header.className = 'accordion-header'
+    header.id = headingId
+
+    const button = document.createElement('button')
+    button.className = `accordion-button ${isValidated ? 'collapsed' : ''}`
+    button.type = 'button'
+    button.setAttribute('data-bs-toggle', 'collapse')
+    button.setAttribute('data-bs-target', `#${collapseId}`)
+    button.setAttribute('aria-expanded', isValidated ? 'false' : 'true')
+    button.setAttribute('aria-controls', collapseId)
+    button.textContent = title
+
+    header.appendChild(button)
+
+    const collapse = document.createElement('div')
+    collapse.id = collapseId
+    collapse.className = `accordion-collapse collapse ${isValidated ? '' : 'show'}`
+    collapse.setAttribute('aria-labelledby', headingId)
+
+    const body = document.createElement('div')
+    body.className = 'accordion-body p-0'
+
+    collapse.appendChild(body)
+    accordionItem.appendChild(header)
+    accordionItem.appendChild(collapse)
+    wrapper.appendChild(accordionItem)
+
+    const parent = alert.parentNode
+    parent.insertBefore(wrapper, alert)
+    body.appendChild(alert)
+    alert.classList.add('mb-0')
+  })
+}
+
+const CACHE_EXPIRATION_FIELDS = [
+  { id: 'tmdb_cache_expiration', label: 'TMDb cache expiration' },
+  { id: 'omdb_cache_expiration', label: 'OMDb cache expiration' },
+  { id: 'mdblist_cache_expiration', label: 'MDBList cache expiration' },
+  { id: 'anidb_cache_expiration', label: 'AniDB cache expiration' },
+  { id: 'mal_cache_expiration', label: 'MyAnimeList cache expiration' },
+  { id: 'cache_expiration', label: 'Cache expiration' },
+  { id: 'plex_db_cache', label: 'Plex cache size' },
+  { id: 'plex_timeout', label: 'Plex timeout' }
+]
+
+function restoreBlankCacheExpirations () {
+  const restored = []
+  const isNumericValue = (value) => {
+    if (value === null || value === undefined) return false
+    const trimmed = String(value).trim()
+    if (trimmed === '') return false
+    return Number.isFinite(Number(trimmed))
+  }
+
+  CACHE_EXPIRATION_FIELDS.forEach(({ id, label }) => {
+    const input = document.getElementById(id)
+    if (!input) return
+
+    const currentValue = String(input.value || '').trim()
+    if (currentValue !== '') return
+
+    const fallbackValue = String(input.dataset.defaultValue || input.defaultValue || '').trim()
+    let restoreValue = null
+    let reason = 'default'
+
+    if (isNumericValue(fallbackValue)) {
+      restoreValue = fallbackValue
+    } else {
+      const minValue = input.getAttribute('min')
+      if (isNumericValue(minValue)) {
+        restoreValue = String(minValue).trim()
+        reason = 'minimum'
+      }
+    }
+
+    if (!restoreValue) return
+
+    input.value = restoreValue
+    restored.push({ label, value: restoreValue, reason })
+  })
+
+  if (restored.length && typeof showToast === 'function') {
+    const message = restored
+      .map(item => (
+        item.reason === 'minimum'
+          ? `${item.label} was blank. Set to minimum: ${item.value}.`
+          : `${item.label} was blank. Restored to default: ${item.value}.`
+      ))
+      .join('<br>')
+    showToast('info', message)
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  setupValidationCallouts()
+})
+
+window.QSValidationCallouts = {
+  refresh: updateValidationCallouts,
+  setup: setupValidationCallouts
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -241,10 +463,17 @@ function restartQuickstart (reason) {
         const restartBtn = document.querySelector('#updateResult button')
         if (restartBtn) restartBtn.disabled = true
 
-        document.getElementById('updateResult').innerHTML = `
-          <strong>🚀 ${data.message}</strong><br>
-          Please wait while Quickstart restarts... this page will auto-reload shortly.
-        `
+        const updateResult = document.getElementById('updateResult')
+        if (updateResult) {
+          const message = data.message || 'Update complete. Quickstart restarted successfully.'
+          const strong = document.createElement('strong')
+          strong.textContent = `🚀 ${message}`
+          updateResult.replaceChildren(
+            strong,
+            document.createElement('br'),
+            document.createTextNode('Please wait while Quickstart restarts... this page will auto-reload shortly.')
+          )
+        }
         setTimeout(() => location.reload(), 6000)
       } else {
         showToast('error', data.message || 'Restart failed.')
@@ -267,7 +496,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return
       }
       updateBtn.disabled = true
-      updateBtn.innerHTML = '<i class="bi bi-arrow-repeat spin"></i> Updating...'
+      setButtonIconAndText(updateBtn, 'bi bi-arrow-repeat spin', 'Updating...')
       updateBtn.dataset.originalClasses = updateBtn.className
       updateBtn.classList.remove('btn-warning')
       updateBtn.classList.add('btn-secondary')
@@ -290,30 +519,55 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (data.success) {
           updateSucceeded = true
-          resultBox.innerHTML = `
-            <strong>✅ Update Successful!</strong><br>
-            <span class="text-info">Branch: <code>${data.branch || branch}</code></span>
-            <pre class="form-control bg-dark text-light" style="height: 300px; overflow-y: auto; overflow-x: auto; white-space: pre;">${lines.join('\n')}</pre>
-          `
+          const branchLabel = data.branch || branch
+          const successStrong = document.createElement('strong')
+          successStrong.textContent = '✅ Update Successful!'
+          const branchSpan = document.createElement('span')
+          branchSpan.className = 'text-info'
+          const branchCode = document.createElement('code')
+          branchCode.textContent = branchLabel
+          branchSpan.append('Branch: ', branchCode)
+          const successPre = document.createElement('pre')
+          successPre.className = 'form-control bg-dark text-light'
+          successPre.style.height = '300px'
+          successPre.style.overflowY = 'auto'
+          successPre.style.overflowX = 'auto'
+          successPre.style.whiteSpace = 'pre'
+          successPre.textContent = lines.join('\n')
+          resultBox.replaceChildren(successStrong, document.createElement('br'), branchSpan, successPre)
         } else {
-          resultBox.innerHTML = `
-            <strong>❌ Error:</strong> ${data.error || 'Update failed'}<br>
-            <pre class="form-control bg-dark text-light" style="height: 300px; overflow-y: auto; overflow-x: auto; white-space: pre;">${lines.join('\n')}</pre>
-          `
+          const errorMessage = data.error || 'Update failed'
+          const errorStrong = document.createElement('strong')
+          errorStrong.textContent = '❌ Error:'
+          const errorPre = document.createElement('pre')
+          errorPre.className = 'form-control bg-dark text-light'
+          errorPre.style.height = '300px'
+          errorPre.style.overflowY = 'auto'
+          errorPre.style.overflowX = 'auto'
+          errorPre.style.whiteSpace = 'pre'
+          errorPre.textContent = lines.join('\n')
+          resultBox.replaceChildren(
+            errorStrong,
+            document.createTextNode(` ${errorMessage}`),
+            document.createElement('br'),
+            errorPre
+          )
         }
       } catch (err) {
         resultBox.classList.remove('d-none')
-        resultBox.innerHTML = `<strong>❌ Request Failed:</strong> ${String(err)}`
+        const errorStrong = document.createElement('strong')
+        errorStrong.textContent = '❌ Request Failed:'
+        resultBox.replaceChildren(errorStrong, document.createTextNode(` ${String(err)}`))
       } finally {
         if (updateSucceeded) {
           updateBtn.disabled = false
           updateBtn.dataset.state = 'ready-restart'
           updateBtn.classList.remove('btn-secondary')
           updateBtn.classList.add('btn-success')
-          updateBtn.innerHTML = '<i class="bi bi-arrow-repeat"></i> Restart Quickstart'
+          setButtonIconAndText(updateBtn, 'bi bi-arrow-repeat', 'Restart Quickstart')
         } else {
           updateBtn.disabled = false
-          updateBtn.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Run Update Now'
+          setButtonIconAndText(updateBtn, 'bi bi-arrow-clockwise', 'Run Update Now')
           if (updateBtn.dataset.originalClasses) {
             updateBtn.className = updateBtn.dataset.originalClasses
             delete updateBtn.dataset.originalClasses
@@ -368,8 +622,7 @@ document.addEventListener('DOMContentLoaded', () => {
           throw new Error(data.message || 'Failed to switch configs.')
         }
         showToast('success', `Switched to config "${data.name}".`)
-        const nextUrl = window.location.pathname + window.location.search
-        setTimeout(() => window.location.assign(nextUrl), 150)
+        setTimeout(() => window.location.reload(), 150)
       } catch (err) {
         window.QS_SWITCHING_CONFIG = false
         confirmBtn.disabled = false
@@ -779,7 +1032,6 @@ document.addEventListener('DOMContentLoaded', () => {
         showToast('info', 'Restarting Quickstart...')
         await fetch('/restart', { method: 'POST' })
 
-        const newPort = data.new_port || portNum || getCurrentPort()
         if (data.theme) {
           document.documentElement.setAttribute('data-theme', data.theme)
           window.QS_THEME = data.theme
@@ -810,10 +1062,17 @@ document.addEventListener('DOMContentLoaded', () => {
           window.QS_FLASK_SESSION_DIR = sessionDirFlag
           if (triggerBtn) triggerBtn.dataset.currentSessionDir = sessionDirFlag
         }
-        const protocol = window.location.protocol
-        const host = window.location.hostname
+        const rawPort = data.new_port ?? portNum ?? getCurrentPort()
+        const parsedPort = Number(rawPort)
+        const safePort = Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535
+          ? parsedPort
+          : null
         setTimeout(() => {
-          window.location.href = `${protocol}//${host}:${newPort}`
+          if (safePort) {
+            window.location.port = String(safePort)
+          } else {
+            window.location.reload()
+          }
         }, 4000)
       } catch (err) {
         setStatus(err.message || 'Failed to update settings.', true)
@@ -1064,6 +1323,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const refreshBtn = modalEl.querySelector('#supportInfoRefresh')
   const copyBtn = modalEl.querySelector('#supportInfoCopy')
   const status = modalEl.querySelector('#supportInfoStatus')
+  const isSecureContext = window.isSecureContext
 
   function setStatus (text, isError) {
     if (!status) return
@@ -1072,8 +1332,13 @@ document.addEventListener('DOMContentLoaded', () => {
     status.classList.toggle('text-muted', !isError)
   }
 
+  if (copyBtn && !isSecureContext) {
+    copyBtn.textContent = 'Select'
+  }
+
   async function loadSupportInfo () {
     if (!output) return
+    if (copyBtn) copyBtn.disabled = true
     setStatus('Loading...', false)
     output.textContent = 'Loading support info...'
 
@@ -1085,27 +1350,52 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       output.textContent = data.text
       setStatus(data.generated_at ? `Updated ${data.generated_at}` : 'Updated', false)
+      if (copyBtn) copyBtn.disabled = !data.text.trim()
     } catch (err) {
       output.textContent = `Unable to load support info.\n${err.message || String(err)}`
       setStatus('Error loading support info', true)
+      if (copyBtn) copyBtn.disabled = true
     }
   }
 
-  function fallbackCopy (text) {
+  function fallbackCopy (text, opts = {}) {
+    const showFailureToast = opts.showFailureToast !== false
+    const showSuccessToast = opts.showSuccessToast !== false
     const textarea = document.createElement('textarea')
     textarea.value = text
     textarea.setAttribute('readonly', '')
     textarea.style.position = 'absolute'
     textarea.style.left = '-9999px'
     document.body.appendChild(textarea)
+    textarea.focus()
     textarea.select()
+    textarea.setSelectionRange(0, textarea.value.length)
     try {
-      document.execCommand('copy')
-      showToast('success', 'Support info copied to clipboard.')
+      const success = document.execCommand('copy')
+      if (success) {
+        if (showSuccessToast) showToast('success', 'Support info copied to clipboard.')
+        return true
+      }
+      if (showFailureToast) showToast('error', 'Copy failed. Please copy manually.')
     } catch (err) {
-      showToast('error', 'Copy failed. Please copy manually.')
+      if (showFailureToast) showToast('error', 'Copy failed. Please copy manually.')
     } finally {
       document.body.removeChild(textarea)
+    }
+    return false
+  }
+
+  function selectSupportInfoText () {
+    if (!output) return
+    try {
+      const selection = window.getSelection()
+      const range = document.createRange()
+      range.selectNodeContents(output)
+      selection.removeAllRanges()
+      selection.addRange(range)
+      if (typeof output.focus === 'function') output.focus()
+    } catch (err) {
+      // No-op: selection best-effort only.
     }
   }
 
@@ -1116,16 +1406,23 @@ document.addEventListener('DOMContentLoaded', () => {
       showToast('warning', 'Nothing to copy yet.')
       return
     }
-    if (navigator.clipboard && navigator.clipboard.writeText) {
+    const canUseClipboard = isSecureContext && navigator.clipboard && navigator.clipboard.writeText
+    if (canUseClipboard) {
       try {
         await navigator.clipboard.writeText(text)
         showToast('success', 'Support info copied to clipboard.')
+        return
       } catch (err) {
-        fallbackCopy(text)
+        // Fall back to execCommand below.
       }
-    } else {
-      fallbackCopy(text)
     }
+    if (canUseClipboard) {
+      fallbackCopy(text, { showFailureToast: true })
+      return
+    }
+    fallbackCopy(text, { showFailureToast: false, showSuccessToast: false })
+    selectSupportInfoText()
+    showToast('warning', 'Clipboard blocked on non-HTTPS. Text selected; press Ctrl+C to copy.')
   }
 
   modalEl.addEventListener('show.bs.modal', () => {
@@ -1193,7 +1490,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Optional: Rotate icon spinner style
 const style = document.createElement('style')
-style.innerHTML = `
+style.textContent = `
   .spin {
     animation: spin 1s linear infinite;
   }

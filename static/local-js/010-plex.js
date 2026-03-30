@@ -1,5 +1,18 @@
 /* global $, validateButton, showSpinner, hideSpinner */
 
+function refreshValidationCallout () {
+  if (window.QSValidationCallouts && typeof window.QSValidationCallouts.refresh === 'function') {
+    window.QSValidationCallouts.refresh('plex_validated')
+  }
+}
+
+function setToggleButtonIcon (button, showPlainText) {
+  if (!button) return
+  const icon = document.createElement('i')
+  icon.className = showPlainText ? 'fas fa-eye-slash' : 'fas fa-eye'
+  button.replaceChildren(icon)
+}
+
 $(document).ready(function () {
   const validateButton = document.getElementById('validateButton')
   const isValidated = document.getElementById('plex_validated').value.toLowerCase()
@@ -22,10 +35,10 @@ $(document).ready(function () {
   // Set initial visibility based on token value
   if (plexTokenInput.value.trim() === '') {
     plexTokenInput.setAttribute('type', 'text') // Show placeholder text
-    toggleButton.innerHTML = '<i class="fas fa-eye-slash"></i>' // Set eye-slash icon
+    setToggleButtonIcon(toggleButton, true)
   } else {
     plexTokenInput.setAttribute('type', 'password') // Hide actual token
-    toggleButton.innerHTML = '<i class="fas fa-eye"></i>' // Set eye icon
+    setToggleButtonIcon(toggleButton, false)
   }
 
   // Enable validate button and reset validation when token or URL changes
@@ -33,12 +46,14 @@ $(document).ready(function () {
     validateButton.disabled = false
     document.getElementById('plex_validated').value = 'false'
     if (validatedAtInput) validatedAtInput.value = ''
+    refreshValidationCallout()
   })
 
   plexUrlInput.addEventListener('input', function () {
     validateButton.disabled = false
     document.getElementById('plex_validated').value = 'false'
     if (validatedAtInput) validatedAtInput.value = ''
+    refreshValidationCallout()
   })
 })
 
@@ -47,7 +62,7 @@ document.getElementById('toggleApikeyVisibility').addEventListener('click', func
   const apikeyInput = document.getElementById('plex_token')
   const currentType = apikeyInput.getAttribute('type')
   apikeyInput.setAttribute('type', currentType === 'password' ? 'text' : 'password')
-  this.innerHTML = currentType === 'password' ? '<i class="fas fa-eye-slash"></i>' : '<i class="fas fa-eye"></i>'
+  setToggleButtonIcon(this, currentType === 'password')
 })
 
 // Plex validation script
@@ -109,6 +124,7 @@ document.getElementById('validateButton').addEventListener('click', function () 
 
         document.getElementById('plex_validated').value = 'true'
         if (validatedAtInput) validatedAtInput.value = new Date().toISOString()
+        refreshValidationCallout()
 
         statusMessage.textContent = 'Plex server validated successfully!'
         statusMessage.style.color = '#75b798'
@@ -131,6 +147,7 @@ document.getElementById('validateButton').addEventListener('click', function () 
         validateButton.disabled = false
         document.getElementById('plex_validated').value = false
         if (validatedAtInput) validatedAtInput.value = ''
+        refreshValidationCallout()
         statusMessage.textContent = 'Failed to validate Plex server. Please check your URL and Token.'
         statusMessage.style.color = '#ea868f'
       }
@@ -145,5 +162,6 @@ document.getElementById('validateButton').addEventListener('click', function () 
       statusMessage.style.display = 'block'
       const validatedAtInput = document.getElementById('plex_validated_at')
       if (validatedAtInput) validatedAtInput.value = ''
+      refreshValidationCallout()
     })
 })

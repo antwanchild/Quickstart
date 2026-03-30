@@ -39,11 +39,6 @@ function formatElapsed (ms) {
 }
 
 $(document).ready(function () {
-  const plexValid = $('#plex_valid').data('plex-valid') === 'True'
-  const tmdbValid = $('#tmdb_valid').data('tmdb-valid') === 'True'
-  const libsValid = $('#libs_valid').data('libs-valid') === 'True'
-  const settValid = $('#sett_valid').data('sett-valid') === 'True'
-  const yamlValid = $('#yaml_valid').data('yaml-valid') === 'True'
   const $runLog = $('#run-output-log')
   const $tailNotice = $('#run-output-notice')
   const $tailSelect = $('#run-log-tail')
@@ -73,8 +68,8 @@ $(document).ready(function () {
   const $runSparkMemKometa = $('#run-spark-mem-kometa')
   const $yamlOutput = $('#final-yaml')
   const $yamlLineCount = $('#yaml-line-count')
+  let showYAML = false
   const headerSelect = document.getElementById('header-style')
-  const headerPreview = document.getElementById('header-style-preview')
   const headerGrid = document.getElementById('header-style-grid')
   const headerGridCollapse = document.getElementById('header-style-grid-collapse')
   const headerStyleWait = document.getElementById('header-style-wait')
@@ -82,31 +77,70 @@ $(document).ready(function () {
   const headerGridStatus = document.getElementById('header-style-grid-status')
   const headerGridProgress = document.getElementById('header-style-grid-progress')
   const headerGridProgressBar = headerGridProgress ? headerGridProgress.querySelector('.progress-bar') : null
+  const headerStyleLabel = document.getElementById('header-style-label')
 
-  const showYAML = plexValid && tmdbValid && libsValid && settValid && yamlValid
+  function readMetaFlag (id, datasetKey, attrKey) {
+    const el = document.getElementById(id)
+    if (!el) return false
+    const raw = (el.dataset && el.dataset[datasetKey]) || el.getAttribute(`data-${attrKey}`) || ''
+    return String(raw).toLowerCase() === 'true'
+  }
 
-  const validationMessages = []
-  if (!plexValid) validationMessages.push('Plex settings have not been validated successfully...<br>')
-  if (!tmdbValid) validationMessages.push('TMDb settings have not been validated successfully...<br>')
-  if (!libsValid) validationMessages.push('Libraries page settings have not been validated successfully...<br>')
-  if (!settValid) validationMessages.push('Settings page values have likely been skipped...<br>')
+  function setMetaFlag (id, datasetKey, attrKey, value) {
+    const el = document.getElementById(id)
+    if (!el) return
+    const serialized = value ? 'True' : 'False'
+    if (el.dataset) el.dataset[datasetKey] = serialized
+    el.setAttribute(`data-${attrKey}`, serialized)
+  }
 
-  $('#run-now').prop('disabled', true)
-  $('#run-now-label').text('Run Now')
+  function updateValidationGate () {
+    const plexValid = readMetaFlag('plex_valid', 'plexValid', 'plex-valid')
+    const tmdbValid = readMetaFlag('tmdb_valid', 'tmdbValid', 'tmdb-valid')
+    const libsValid = readMetaFlag('libs_valid', 'libsValid', 'libs-valid')
+    const settValid = readMetaFlag('sett_valid', 'settValid', 'sett-valid')
+    const yamlValid = readMetaFlag('yaml_valid', 'yamlValid', 'yaml-valid')
 
-  if (!showYAML) {
-    $('#validation-messages').html(validationMessages.join('<br>')).show()
-    $('#no-validation-warning, #yaml-warnings, #yaml-warning-msg, #validation-error').removeClass('d-none')
-    $('#download-btn, #download-redacted-btn').addClass('d-none')
-    $('#run-controls-container').addClass('d-none') // Hide run section
-  } else {
-    $('#validation-messages').hide()
-    $('#no-validation-warning, #yaml-warnings, #yaml-warning-msg, #validation-error').addClass('d-none')
-    $('#yaml-content, #final-yaml, #download-btn, #download-redacted-btn').removeClass('d-none')
-    $('#run-controls-container').removeClass('d-none') // Show run section
+    showYAML = plexValid && tmdbValid && libsValid && settValid && yamlValid
+
+    const validationMessages = []
+    const rowFor = (label, href) => {
+      return `
+        <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+          <span>${label}</span>
+          <a href="${href}" class="ms-2 text-decoration-none">
+            Open page
+            <i class="bi bi-box-arrow-up-right"></i>
+          </a>
+        </div>
+      `
+    }
+    if (!plexValid) validationMessages.push(rowFor('Plex settings have not been validated successfully.', '/step/010-plex'))
+    if (!tmdbValid) validationMessages.push(rowFor('TMDb settings have not been validated successfully.', '/step/020-tmdb'))
+    if (!libsValid) validationMessages.push(rowFor('Libraries page settings have not been validated successfully.', '/step/025-libraries'))
+    if (!settValid) validationMessages.push(rowFor('Settings page values have likely been skipped.', '/step/150-settings'))
+
     $('#run-now').prop('disabled', true)
     $('#run-now-label').text('Run Now')
+
+    if (!showYAML) {
+      $('#validation-messages').html(validationMessages.join('<br>')).show()
+      $('#no-validation-warning, #yaml-warnings, #yaml-warning-msg, #validation-error').removeClass('d-none')
+      $('#download-btn, #download-redacted-btn').addClass('d-none')
+      $('#run-controls-container').addClass('d-none') // Hide run section
+    } else {
+      $('#validation-messages').hide()
+      $('#no-validation-warning, #yaml-warnings, #yaml-warning-msg, #validation-error').addClass('d-none')
+      $('#yaml-content, #final-yaml, #download-btn, #download-redacted-btn').removeClass('d-none')
+      $('#run-controls-container').removeClass('d-none') // Show run section
+      $('#run-now').prop('disabled', true)
+      $('#run-now-label').text('Run Now')
+    }
+
+    updateRunNowState()
   }
+
+  updateValidationGate()
 
   tailSize = $tailSelect.val() || tailSize
   updateTailNotice()
@@ -133,29 +167,19 @@ $(document).ready(function () {
   updateYamlLineCount()
   $yamlOutput.on('input', updateYamlLineCount)
 
-  async function updateHeaderPreview (fontValue) {
-    if (!headerPreview) return
-    const font = fontValue || (headerSelect ? headerSelect.value : '')
-    headerPreview.textContent = 'Loading preview...'
-    try {
-      const res = await fetch(`/header-style-preview?font=${encodeURIComponent(font || '')}`)
-      const data = await res.json()
-      if (!res.ok || !data.success) {
-        throw new Error(data.message || 'Preview unavailable.')
-      }
-      headerPreview.textContent = data.preview || ''
-    } catch (err) {
-      headerPreview.textContent = 'Preview unavailable.'
-    }
-  }
-
-  if (headerSelect && headerPreview) {
-    updateHeaderPreview(headerSelect.value)
-    headerSelect.addEventListener('change', () => updateHeaderPreview(headerSelect.value))
-  }
-
   function normalizeFontName (value) {
     return String(value || '').trim()
+  }
+
+  function formatHeaderStyleLabel (value) {
+    const text = normalizeFontName(value)
+    if (!text) return 'Single line'
+    return text.replace(/_/g, ' ').replace(/\b\w/g, letter => letter.toUpperCase())
+  }
+
+  function updateHeaderStyleLabel (value) {
+    if (!headerStyleLabel) return
+    headerStyleLabel.textContent = formatHeaderStyleLabel(value)
   }
 
   function setActiveGridCard (fontName) {
@@ -186,7 +210,11 @@ $(document).ready(function () {
     if (!headerGrid) return
     const fonts = JSON.parse(headerGrid.dataset.fonts || '[]')
     if (!fonts.length) {
-      headerGrid.innerHTML = '<div class="text-muted small">No fonts available.</div>'
+      headerGrid.replaceChildren()
+      const empty = document.createElement('div')
+      empty.className = 'text-muted small'
+      empty.textContent = 'No fonts available.'
+      headerGrid.appendChild(empty)
       updateGridStatus('')
       updateGridProgress(0, 0)
       return
@@ -195,21 +223,25 @@ $(document).ready(function () {
     updateGridStatus(`Loading ${fonts.length} font previews...`)
     updateGridProgress(0, fonts.length)
 
-    headerGrid.innerHTML = ''
+    headerGrid.replaceChildren()
     fonts.forEach(font => {
       const card = document.createElement('button')
       card.type = 'button'
       card.className = 'header-style-card'
       card.dataset.font = font
-      card.innerHTML = `
-        <div class="header-style-card-title">${font.replace(/_/g, ' ')}</div>
-        <pre class="header-style-card-preview">Loading...</pre>
-      `
+      const title = document.createElement('div')
+      title.className = 'header-style-card-title'
+      title.textContent = font.replace(/_/g, ' ')
+      const preview = document.createElement('pre')
+      preview.className = 'header-style-card-preview'
+      preview.textContent = 'Loading...'
+      card.append(title, preview)
       card.addEventListener('click', () => {
         if (headerSelect) {
           headerSelect.value = font
           headerSelect.dispatchEvent(new Event('change'))
         }
+        updateHeaderStyleLabel(font)
         setActiveGridCard(font)
       })
       headerGrid.appendChild(card)
@@ -266,6 +298,7 @@ $(document).ready(function () {
   if (headerSelect && headerGrid) {
     headerSelect.addEventListener('change', () => setActiveGridCard(headerSelect.value))
   }
+  updateHeaderStyleLabel(headerSelect ? headerSelect.value : '')
 
   function updateLibraryVisibility (mainOption) {
     const librarySection = $('#library-multiselect').closest('.mb-2')
@@ -1007,6 +1040,7 @@ $(document).ready(function () {
 
   function computeLogStats (text) {
     const stats = {
+      cache: 0,
       debug: 0,
       info: 0,
       warning: 0,
@@ -1018,6 +1052,7 @@ $(document).ready(function () {
     const lines = text.split(/\r?\n/)
     lines.forEach(line => {
       if (!line) return
+      if (line.toLowerCase().includes('from cache')) stats.cache += 1
       if (line.includes('[DEBUG]')) stats.debug += 1
       if (line.includes('[INFO]')) stats.info += 1
       if (line.includes('[WARNING]')) stats.warning += 1
@@ -1030,7 +1065,7 @@ $(document).ready(function () {
 
   function updateStatRow ($row, stats) {
     if (!$row || !$row.length || !stats) return
-    const keys = ['debug', 'info', 'warning', 'error', 'critical', 'trace']
+    const keys = ['cache', 'debug', 'info', 'warning', 'error', 'critical', 'trace']
     keys.forEach(key => {
       const val = typeof stats[key] === 'number' ? stats[key] : 0
       $row.find(`[data-log-stat="${key}"]`).text(val)
@@ -1234,6 +1269,10 @@ $(document).ready(function () {
     }
     const ageText = formatRunSeconds(data.log_age_seconds) || 'n/a'
     let logText = `meta.log updated ${ageText} ago`
+    const totalLines = data?.stats?.total_lines ?? lastLogStatsTotal?.total_lines
+    if (typeof totalLines === 'number' && Number.isFinite(totalLines)) {
+      logText += ` • ${totalLines.toLocaleString()} lines`
+    }
     if (data.log_is_stale && KOMETA_STATUS === 'running') {
       logText += ' • waiting for new meta.log entries from this run'
       $runStatusLog.addClass('text-warning').removeClass('text-muted')
@@ -1500,6 +1539,202 @@ $(document).ready(function () {
       el.textContent = formatRelativeTimestamp(parsed, now)
     }
   })
+
+  const validationReasonLabels = {
+    missing_credentials: 'Missing credentials',
+    missing_plex_validation: 'Plex not validated',
+    no_libraries: 'No libraries selected',
+    invalid_paths: 'Invalid paths',
+    missing_placeholder_imdb: 'Missing placeholder IMDb ID',
+    invalid_fields: 'Invalid fields',
+    no_webhooks: 'No webhooks configured',
+    disabled: 'Disabled',
+    missing_settings: 'Settings missing',
+    missing_tokens: 'Missing tokens',
+    token_invalid: 'Invalid tokens',
+    account_locked: 'Account locked',
+    validation_error: 'Validation error'
+  }
+
+  function formatValidationResult (status, reason, details) {
+    if (!status) return ''
+    const label = status.charAt(0).toUpperCase() + status.slice(1)
+    if (!reason) return label
+    const pretty = validationReasonLabels[reason] || reason.replace(/_/g, ' ')
+    if (Array.isArray(details) && details.length) {
+      return `${label}: ${pretty}: ${details.join(', ')}`
+    }
+    if (details) {
+      return `${label}: ${pretty}: ${details}`
+    }
+    return `${label}: ${pretty}`
+  }
+
+  function updateValidationRow (key, result) {
+    const row = document.querySelector(`[data-validation-key="${key}"]`)
+    if (!row || !result) return
+
+    const pill = row.querySelector('.validation-status-pill')
+    const timestampEl = row.querySelector('.validation-timestamp')
+    const ageEl = row.querySelector('.validation-age')
+    const status = result.status
+    const validatedAt = result.validated_at || ''
+
+    if (pill) {
+      pill.classList.remove(
+        'rating-mapping-option-via--validated',
+        'rating-mapping-option-via--unvalidated',
+        'rating-mapping-option-via--neutral'
+      )
+      if (status === 'validated') {
+        pill.classList.add('rating-mapping-option-via--validated')
+      } else if (status === 'failed') {
+        pill.classList.add('rating-mapping-option-via--unvalidated')
+      } else if (status === 'skipped') {
+        pill.classList.add('rating-mapping-option-via--neutral')
+      }
+    }
+
+    if (validatedAt && timestampEl) {
+      timestampEl.dataset.validationIso = validatedAt
+      const parsed = new Date(validatedAt)
+      if (!Number.isNaN(parsed.getTime())) {
+        timestampEl.textContent = formatLocalTimestamp(parsed)
+      }
+    }
+
+    if (validatedAt && ageEl) {
+      ageEl.dataset.validationIsoAge = validatedAt
+      const parsed = new Date(validatedAt)
+      if (!Number.isNaN(parsed.getTime())) {
+        ageEl.textContent = formatRelativeTimestamp(parsed, new Date())
+      }
+    }
+
+    const resultEl = row.querySelector('.validation-result')
+    if (resultEl) {
+      const resultText = formatValidationResult(status, result.reason, result.details)
+      resultEl.textContent = resultText || (status ? status.charAt(0).toUpperCase() + status.slice(1) : '—')
+    }
+  }
+
+  const validateAllBtn = document.getElementById('validate-all-services')
+  const validateAllSpinner = document.getElementById('validate-all-spinner')
+  const validateAllStatus = document.getElementById('validate-all-status')
+  const validateAllStatusTime = document.getElementById('validate-all-status-time')
+  const validationStatusLastRun = document.getElementById('validation-status-last-run')
+  if (validateAllBtn) {
+    validateAllBtn.addEventListener('click', function () {
+      if (validateAllBtn.disabled) return
+      const previouslyBlocked = !showYAML
+      const previousStatuses = {}
+      document.querySelectorAll('[data-validation-key]').forEach(row => {
+        const key = row.dataset.validationKey
+        const pill = row.querySelector('.validation-status-pill')
+        if (key && pill) {
+          previousStatuses[key] = pill.classList.contains('rating-mapping-option-via--validated')
+        }
+      })
+      validateAllBtn.disabled = true
+      if (validateAllSpinner) validateAllSpinner.classList.remove('d-none')
+      if (validateAllStatus) {
+        validateAllStatus.classList.add('d-none', 'text-danger')
+        validateAllStatus.classList.remove('text-success')
+        validateAllStatus.textContent = 'Validating configured services...'
+        validateAllStatus.classList.remove('d-none')
+      }
+
+      fetch('/validate_all_services', { method: 'POST' })
+        .then(async (res) => {
+          let data = null
+          try {
+            data = await res.json()
+          } catch (err) {
+            data = null
+          }
+
+          if (!res.ok) {
+            const message = (data && (data.message || data.error)) || `Request failed (${res.status}).`
+            throw new Error(message)
+          }
+
+          if (!data || !data.success) {
+            throw new Error((data && (data.message || data.error)) || 'Validation failed. Please try again.')
+          }
+
+          const results = data.results || {}
+          const gateTargets = {
+            '010-plex': { id: 'plex_valid', datasetKey: 'plexValid', attrKey: 'plex-valid' },
+            '020-tmdb': { id: 'tmdb_valid', datasetKey: 'tmdbValid', attrKey: 'tmdb-valid' },
+            '025-libraries': { id: 'libs_valid', datasetKey: 'libsValid', attrKey: 'libs-valid' },
+            '150-settings': { id: 'sett_valid', datasetKey: 'settValid', attrKey: 'sett-valid' }
+          }
+          Object.keys(results).forEach(key => updateValidationRow(key, results[key]))
+          Object.keys(results).forEach(key => {
+            const target = gateTargets[key]
+            const result = results[key]
+            if (!target || !result) return
+            if (result.status === 'validated') {
+              setMetaFlag(target.id, target.datasetKey, target.attrKey, true)
+            } else if (result.status === 'failed' || result.status === 'skipped') {
+              setMetaFlag(target.id, target.datasetKey, target.attrKey, false)
+            }
+          })
+          const summary = data.summary || {}
+          const ok = summary.validated || 0
+          const failed = summary.failed || 0
+          const skipped = summary.skipped || 0
+          showToast('info', `Validate all complete. Validated: ${ok} • Failed: ${failed} • Skipped: ${skipped}`)
+          if (validateAllStatus) {
+            // Per-row Validation Results show details; no per-summary label mapping needed.
+            // Note: summary details are shown per-row in the Validation Results column.
+            validateAllStatus.classList.remove('d-none', 'text-danger')
+            validateAllStatus.classList.add('text-success')
+            const summaryText = data.summary_text || `Completed. Validated: ${ok} • Failed: ${failed} • Skipped: ${skipped}.`
+            validateAllStatus.textContent = summaryText
+            const summaryUpdatedAt = data.summary_updated_at || new Date().toISOString()
+            if (validateAllStatusTime) {
+              validateAllStatusTime.dataset.validationIso = summaryUpdatedAt
+              const parsed = new Date(summaryUpdatedAt)
+              if (!Number.isNaN(parsed.getTime())) {
+                validateAllStatusTime.textContent = formatLocalTimestamp(parsed)
+              }
+            }
+            if (validationStatusLastRun) {
+              validationStatusLastRun.dataset.validationIso = summaryUpdatedAt
+              const parsed = new Date(summaryUpdatedAt)
+              if (!Number.isNaN(parsed.getTime())) {
+                validationStatusLastRun.textContent = formatLocalTimestamp(parsed)
+              }
+            }
+          }
+          updateValidationGate()
+          const anyNewlyValidated = Object.keys(results).some(key => results[key]?.status === 'validated' && !previousStatuses[key])
+          if (previouslyBlocked && showYAML) {
+            showToast('info', 'Validation complete. Refreshing YAML output...')
+            setTimeout(() => window.location.reload(), 300)
+            return
+          }
+          if (anyNewlyValidated) {
+            showToast('info', 'Validation updated. Refreshing YAML output...')
+            setTimeout(() => window.location.reload(), 300)
+          }
+        })
+        .catch((err) => {
+          const message = err && err.message ? err.message : 'Validate all failed. Please try again.'
+          showToast('error', message)
+          if (validateAllStatus) {
+            validateAllStatus.classList.remove('d-none', 'text-success')
+            validateAllStatus.classList.add('text-danger')
+            validateAllStatus.textContent = message
+          }
+        })
+        .finally(() => {
+          validateAllBtn.disabled = false
+          if (validateAllSpinner) validateAllSpinner.classList.add('d-none')
+        })
+    })
+  }
 
   $('#run-now').on('click', function () {
     if (KOMETA_UPDATING) {

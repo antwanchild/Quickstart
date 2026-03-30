@@ -1,5 +1,18 @@
 /* global $, showSpinner, hideSpinner */
 
+function refreshValidationCallout () {
+  if (window.QSValidationCallouts && typeof window.QSValidationCallouts.refresh === 'function') {
+    window.QSValidationCallouts.refresh('gotify_validated')
+  }
+}
+
+function setToggleButtonIcon (button, showPlainText) {
+  if (!button) return
+  const icon = document.createElement('i')
+  icon.className = showPlainText ? 'fas fa-eye-slash' : 'fas fa-eye'
+  button.replaceChildren(icon)
+}
+
 const validatedAtInput = document.getElementById('gotify_validated_at')
 
 $(document).ready(function () {
@@ -13,10 +26,10 @@ $(document).ready(function () {
   // Set initial visibility based on API key value
   if (gotifyTokenInput.value.trim() === '') {
     gotifyTokenInput.setAttribute('type', 'text') // Show placeholder text
-    toggleButton.innerHTML = '<i class="fas fa-eye-slash"></i>' // Set eye icon
+    setToggleButtonIcon(toggleButton, true)
   } else {
     gotifyTokenInput.setAttribute('type', 'password') // Hide actual key
-    toggleButton.innerHTML = '<i class="fas fa-eye"></i>' // Set eye-slash icon
+    setToggleButtonIcon(toggleButton, false)
   }
 
   // Disable validate button if already validated
@@ -27,12 +40,14 @@ $(document).ready(function () {
     document.getElementById('gotify_validated').value = 'false'
     if (validatedAtInput) validatedAtInput.value = ''
     validateButton.disabled = false
+    refreshValidationCallout()
   })
 
   document.getElementById('gotify_url').addEventListener('input', function () {
     document.getElementById('gotify_validated').value = 'false'
     if (validatedAtInput) validatedAtInput.value = ''
     validateButton.disabled = false
+    refreshValidationCallout()
   })
 })
 
@@ -41,7 +56,7 @@ document.getElementById('toggleTokenVisibility').addEventListener('click', funct
   const tokenInput = document.getElementById('gotify_token')
   const currentType = tokenInput.getAttribute('type')
   tokenInput.setAttribute('type', currentType === 'password' ? 'text' : 'password')
-  this.innerHTML = currentType === 'password' ? '<i class="fas fa-eye-slash"></i>' : '<i class="fas fa-eye"></i>'
+  setToggleButtonIcon(this, currentType === 'password')
 })
 
 /* eslint-disable camelcase */
@@ -76,12 +91,14 @@ document.getElementById('validateButton').addEventListener('click', function () 
         hideSpinner('validate')
         document.getElementById('gotify_validated').value = 'true'
         if (validatedAtInput) validatedAtInput.value = new Date().toISOString()
+        refreshValidationCallout()
         statusMessage.textContent = 'Gotify credentials validated successfully!'
         statusMessage.style.color = '#75b798'
       } else {
         hideSpinner('validate')
         document.getElementById('gotify_validated').value = 'false'
         if (validatedAtInput) validatedAtInput.value = ''
+        refreshValidationCallout()
         statusMessage.textContent = data.error
         statusMessage.style.color = '#ea868f'
       }
@@ -95,6 +112,7 @@ document.getElementById('validateButton').addEventListener('click', function () 
       statusMessage.style.color = '#ea868f'
       statusMessage.style.display = 'block'
       if (validatedAtInput) validatedAtInput.value = ''
+      refreshValidationCallout()
     })
 })
 /* eslint-enable camelcase */

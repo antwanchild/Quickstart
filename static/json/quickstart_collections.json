@@ -27,10 +27,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_best_picture",
@@ -66,7 +156,7 @@
               "movie"
             ]
           },
-                    {
+          {
             "key": "collection_mode",
             "label": "Collection Mode",
             "type": "select",
@@ -91,7 +181,6 @@
               }
             ]
           },
-
           {
             "key": "visible_home",
             "label": "Visible Home",
@@ -491,10 +580,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_golden",
@@ -937,10 +1116,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_best",
@@ -1383,10 +1652,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_palm",
@@ -1829,10 +2188,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_best",
@@ -2276,10 +2725,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_best",
@@ -2724,10 +3263,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_best",
@@ -3172,10 +3801,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_best_picture",
@@ -3646,10 +4365,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_best",
@@ -4092,10 +4901,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_all_time",
@@ -4539,10 +5438,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_pca",
@@ -4986,10 +5975,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_golden",
@@ -5432,10 +6511,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_golden",
@@ -5878,10 +7047,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_grand",
@@ -6324,10 +7583,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_best",
@@ -6770,10 +8119,100 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "130",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "latest-5",
+            "tooltip": "Determines the starting year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "latest",
+            "tooltip": "Determines the ending year of the event to use to create collections. Allowed values: number greater than 0, first, latest, relative first (first+#), or relative latest (latest-#).",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "first",
+                "label": "First",
+                "kind": "fixed",
+                "token": "first"
+              },
+              {
+                "value": "latest",
+                "label": "Latest",
+                "kind": "fixed",
+                "token": "latest"
+              },
+              {
+                "value": "relative_first",
+                "label": "Relative First (first+#)",
+                "kind": "relative",
+                "prefix": "first+"
+              },
+              {
+                "value": "relative_latest",
+                "label": "Relative Latest (latest-#)",
+                "kind": "relative",
+                "prefix": "latest-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "default": "1",
+            "tooltip": "Determines the amount incremented from one collection to the other. Allowed values: number greater than 0.",
+            "input_type": "number",
+            "min": 1,
+            "step": 1
           },
           {
             "key": "use_golden",
@@ -7235,7 +8674,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "010",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -7700,7 +9139,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "020",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -8148,7 +9587,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "020",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -8664,7 +10103,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "020",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -9233,7 +10672,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "020",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -9800,7 +11239,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "020",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -10340,7 +11779,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "020",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -10895,7 +12334,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "020",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -11693,7 +13132,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "020",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -12266,7 +13705,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "060",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -13497,7 +14936,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "040",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -14323,7 +15762,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "085",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -15208,10 +16647,17 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "110",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "use_other",
+            "label": "Other",
+            "tooltip": "Include an \"Other\" collection for items that do not match the listed values.",
+            "type": "toggle",
+            "default": true
           },
           {
             "key": "collection_mode",
@@ -15610,10 +17056,17 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "110",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "use_other",
+            "label": "Other",
+            "tooltip": "Include an \"Other\" collection for items that do not match the listed values.",
+            "type": "toggle",
+            "default": true
           },
           {
             "key": "collection_mode",
@@ -16013,10 +17466,17 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "110",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "use_other",
+            "label": "Other",
+            "tooltip": "Include an \"Other\" collection for items that do not match the listed values.",
+            "type": "toggle",
+            "default": true
           },
           {
             "key": "collection_mode",
@@ -16416,10 +17876,17 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "110",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "use_other",
+            "label": "Other",
+            "tooltip": "Include an \"Other\" collection for items that do not match the listed values.",
+            "type": "toggle",
+            "default": true
           },
           {
             "key": "collection_mode",
@@ -16819,10 +18286,17 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "110",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "use_other",
+            "label": "Other",
+            "tooltip": "Include an \"Other\" collection for items that do not match the listed values.",
+            "type": "toggle",
+            "default": true
           },
           {
             "key": "collection_mode",
@@ -17222,10 +18696,17 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "110",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "use_other",
+            "label": "Other",
+            "tooltip": "Include an \"Other\" collection for items that do not match the listed values.",
+            "type": "toggle",
+            "default": true
           },
           {
             "key": "collection_mode",
@@ -17625,10 +19106,17 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "110",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "use_other",
+            "label": "Other",
+            "tooltip": "Include an \"Other\" collection for items that do not match the listed values.",
+            "type": "toggle",
+            "default": true
           },
           {
             "key": "collection_mode",
@@ -18028,10 +19516,17 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "110",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "use_other",
+            "label": "Other",
+            "tooltip": "Include an \"Other\" collection for items that do not match the listed values.",
+            "type": "toggle",
+            "default": true
           },
           {
             "key": "collection_mode",
@@ -18436,10 +19931,17 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "080",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "use_other",
+            "label": "Other",
+            "tooltip": "Include an \"Other\" collection for items that do not match the listed values.",
+            "type": "toggle",
+            "default": true
           },
           {
             "key": "collection_mode",
@@ -18838,10 +20340,17 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "110",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "use_other",
+            "label": "Other",
+            "tooltip": "Include an \"Other\" collection for items that do not match the listed values.",
+            "type": "toggle",
+            "default": true
           },
           {
             "key": "collection_mode",
@@ -19241,7 +20750,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "081",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -19812,7 +21321,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "082",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -20270,7 +21779,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "125",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -20729,7 +22238,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "120",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -20737,7 +22246,7 @@
           {
             "key": "style",
             "label": "Style",
-            "url":"https://kometa.wiki/en/nightly/defaults/both/resolution/#standards-style",
+            "url": "https://kometa.wiki/en/nightly/defaults/both/resolution/#standards-style",
             "type": "select",
             "tooltip": "Controls the visual theme of the collections created.",
             "default": "default",
@@ -21150,10 +22659,17 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "090",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "use_other",
+            "label": "Other",
+            "tooltip": "Include an \"Other\" collection for items that do not match the listed values.",
+            "type": "toggle",
+            "default": true
           },
           {
             "key": "collection_mode",
@@ -21553,10 +23069,17 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "095",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "use_other",
+            "label": "Other",
+            "tooltip": "Include an \"Other\" collection for items that do not match the listed values.",
+            "type": "toggle",
+            "default": true
           },
           {
             "key": "collection_mode",
@@ -21964,10 +23487,76 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "140",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "style",
+            "label": "Style",
+            "type": "select",
+            "tooltip": "Controls the visual theme of the collections created.",
+            "default": "bw",
+            "options": [
+              {
+                "value": "bw",
+                "label": "BW",
+                "image_url": "/static/images/people-styles/actor_bw.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_bw.png"
+              },
+              {
+                "value": "rainier",
+                "label": "Rainier",
+                "image_url": "/static/images/people-styles/actor_rainier.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_rainier.png"
+              },
+              {
+                "value": "signature",
+                "label": "Signature",
+                "image_url": "/static/images/people-styles/actor_signature.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_signature.png"
+              },
+              {
+                "value": "diiivoy",
+                "label": "Diiivoy",
+                "image_url": "/static/images/people-styles/actor_diiivoy.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_diiivoy.png"
+              },
+              {
+                "value": "diiivoycolor",
+                "label": "Diiivoy Color",
+                "image_url": "/static/images/people-styles/actor_diiivoycolor.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_diiivoycolor.png"
+              }
+            ]
+          },
+          {
+            "key": "data_depth",
+            "label": "Data Depth",
+            "type": "text_input",
+            "input_type": "number",
+            "min": 1,
+            "step": 1,
+            "default": "5",
+            "tooltip": "Replaces the data dynamic collection value. Controls the depth within the casting credits to search for common actors."
+          },
+          {
+            "key": "data_limit",
+            "label": "Data Limit",
+            "type": "text_input",
+            "input_type": "number",
+            "min": 1,
+            "step": 1,
+            "default": "25",
+            "tooltip": "Replaces the data dynamic collection value. Controls the maximum number of collections to create."
+          },
+          {
+            "key": "exclude",
+            "label": "Exclude",
+            "type": "string_list",
+            "tooltip": "Exclude specific people from these collections.",
+            "placeholder": "Add person name (e.g. Jeremy Kleiner)"
           },
           {
             "key": "collection_mode",
@@ -22368,10 +23957,76 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "150",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "style",
+            "label": "Style",
+            "type": "select",
+            "tooltip": "Controls the visual theme of the collections created.",
+            "default": "bw",
+            "options": [
+              {
+                "value": "bw",
+                "label": "BW",
+                "image_url": "/static/images/people-styles/actor_bw.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_bw.png"
+              },
+              {
+                "value": "rainier",
+                "label": "Rainier",
+                "image_url": "/static/images/people-styles/actor_rainier.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_rainier.png"
+              },
+              {
+                "value": "signature",
+                "label": "Signature",
+                "image_url": "/static/images/people-styles/actor_signature.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_signature.png"
+              },
+              {
+                "value": "diiivoy",
+                "label": "Diiivoy",
+                "image_url": "/static/images/people-styles/actor_diiivoy.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_diiivoy.png"
+              },
+              {
+                "value": "diiivoycolor",
+                "label": "Diiivoy Color",
+                "image_url": "/static/images/people-styles/actor_diiivoycolor.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_diiivoycolor.png"
+              }
+            ]
+          },
+          {
+            "key": "data_depth",
+            "label": "Data Depth",
+            "type": "text_input",
+            "input_type": "number",
+            "min": 1,
+            "step": 1,
+            "default": "5",
+            "tooltip": "Replaces the data dynamic collection value. Controls the depth within the casting credits to search for common actors."
+          },
+          {
+            "key": "data_limit",
+            "label": "Data Limit",
+            "type": "text_input",
+            "input_type": "number",
+            "min": 1,
+            "step": 1,
+            "default": "25",
+            "tooltip": "Replaces the data dynamic collection value. Controls the maximum number of collections to create."
+          },
+          {
+            "key": "exclude",
+            "label": "Exclude",
+            "type": "string_list",
+            "tooltip": "Exclude specific people from these collections.",
+            "placeholder": "Add person name (e.g. Jeremy Kleiner)"
           },
           {
             "key": "collection_mode",
@@ -22781,10 +24436,76 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "160",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "style",
+            "label": "Style",
+            "type": "select",
+            "tooltip": "Controls the visual theme of the collections created.",
+            "default": "bw",
+            "options": [
+              {
+                "value": "bw",
+                "label": "BW",
+                "image_url": "/static/images/people-styles/actor_bw.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_bw.png"
+              },
+              {
+                "value": "rainier",
+                "label": "Rainier",
+                "image_url": "/static/images/people-styles/actor_rainier.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_rainier.png"
+              },
+              {
+                "value": "signature",
+                "label": "Signature",
+                "image_url": "/static/images/people-styles/actor_signature.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_signature.png"
+              },
+              {
+                "value": "diiivoy",
+                "label": "Diiivoy",
+                "image_url": "/static/images/people-styles/actor_diiivoy.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_diiivoy.png"
+              },
+              {
+                "value": "diiivoycolor",
+                "label": "Diiivoy Color",
+                "image_url": "/static/images/people-styles/actor_diiivoycolor.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_diiivoycolor.png"
+              }
+            ]
+          },
+          {
+            "key": "data_depth",
+            "label": "Data Depth",
+            "type": "text_input",
+            "input_type": "number",
+            "min": 1,
+            "step": 1,
+            "default": "5",
+            "tooltip": "Replaces the data dynamic collection value. Controls the depth within the casting credits to search for common actors."
+          },
+          {
+            "key": "data_limit",
+            "label": "Data Limit",
+            "type": "text_input",
+            "input_type": "number",
+            "min": 1,
+            "step": 1,
+            "default": "25",
+            "tooltip": "Replaces the data dynamic collection value. Controls the maximum number of collections to create."
+          },
+          {
+            "key": "exclude",
+            "label": "Exclude",
+            "type": "string_list",
+            "tooltip": "Exclude specific people from these collections.",
+            "placeholder": "Add person name (e.g. Jeremy Kleiner)"
           },
           {
             "key": "collection_mode",
@@ -23194,10 +24915,76 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "170",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "style",
+            "label": "Style",
+            "type": "select",
+            "tooltip": "Controls the visual theme of the collections created.",
+            "default": "bw",
+            "options": [
+              {
+                "value": "bw",
+                "label": "BW",
+                "image_url": "/static/images/people-styles/actor_bw.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_bw.png"
+              },
+              {
+                "value": "rainier",
+                "label": "Rainier",
+                "image_url": "/static/images/people-styles/actor_rainier.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_rainier.png"
+              },
+              {
+                "value": "signature",
+                "label": "Signature",
+                "image_url": "/static/images/people-styles/actor_signature.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_signature.png"
+              },
+              {
+                "value": "diiivoy",
+                "label": "Diiivoy",
+                "image_url": "/static/images/people-styles/actor_diiivoy.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_diiivoy.png"
+              },
+              {
+                "value": "diiivoycolor",
+                "label": "Diiivoy Color",
+                "image_url": "/static/images/people-styles/actor_diiivoycolor.webp",
+                "fallback_url": "https://kometa.wiki/en/nightly/assets/images/defaults/styles/actor_diiivoycolor.png"
+              }
+            ]
+          },
+          {
+            "key": "data_depth",
+            "label": "Data Depth",
+            "type": "text_input",
+            "input_type": "number",
+            "min": 1,
+            "step": 1,
+            "default": "5",
+            "tooltip": "Replaces the data dynamic collection value. Controls the depth within the casting credits to search for common actors."
+          },
+          {
+            "key": "data_limit",
+            "label": "Data Limit",
+            "type": "text_input",
+            "input_type": "number",
+            "min": 1,
+            "step": 1,
+            "default": "25",
+            "tooltip": "Replaces the data dynamic collection value. Controls the maximum number of collections to create."
+          },
+          {
+            "key": "exclude",
+            "label": "Exclude",
+            "type": "string_list",
+            "tooltip": "Exclude specific people from these collections.",
+            "placeholder": "Add person name (e.g. Jeremy Kleiner)"
           },
           {
             "key": "collection_mode",
@@ -23614,7 +25401,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "030",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -24514,7 +26301,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "070",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -24918,7 +26705,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "050",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -25337,7 +27124,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "000",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -25360,6 +27147,14 @@
             ]
           },
           {
+            "key": "schedule_aapi",
+            "label": "Schedule - Asian American Pacific Islander Month",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(04/30-05/31)",
+            "label_width": 240
+          },
+          {
             "key": "use_black_history",
             "label": "Black History Month Movies",
             "tooltip": "Movies related to Black History Month",
@@ -25375,6 +27170,14 @@
             "media_types": [
               "movie"
             ]
+          },
+          {
+            "key": "schedule_black_history",
+            "label": "Schedule - Black History Month",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(02/01-03/01)",
+            "label_width": 240
           },
           {
             "key": "use_christmas",
@@ -25394,6 +27197,14 @@
             ]
           },
           {
+            "key": "schedule_christmas",
+            "label": "Schedule - Christmas",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(12/01-12/31)",
+            "label_width": 240
+          },
+          {
             "key": "use_disabilities",
             "label": "Disability Month Movies",
             "tooltip": "Movies related to Disability Awareness Month",
@@ -25409,6 +27220,14 @@
             "media_types": [
               "movie"
             ]
+          },
+          {
+            "key": "schedule_disabilities",
+            "label": "Schedule - Disability Awareness Day",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(12/02-12/04)",
+            "label_width": 240
           },
           {
             "key": "use_easter",
@@ -25428,6 +27247,14 @@
             ]
           },
           {
+            "key": "schedule_easter",
+            "label": "Schedule - Easter",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(03/20-04/30)",
+            "label_width": 240
+          },
+          {
             "key": "use_father",
             "label": "Father's Day Movies",
             "tooltip": "Movies related to Father's Day",
@@ -25443,6 +27270,14 @@
             "media_types": [
               "movie"
             ]
+          },
+          {
+            "key": "schedule_father",
+            "label": "Schedule - Father's Day",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(06/15-06/20)",
+            "label_width": 240
           },
           {
             "key": "use_halloween",
@@ -25462,6 +27297,14 @@
             ]
           },
           {
+            "key": "schedule_halloween",
+            "label": "Schedule - Halloween",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(10/01-10/31)",
+            "label_width": 240
+          },
+          {
             "key": "use_independence",
             "label": "Independence Day Movies",
             "tooltip": "Movies related to Independence Day",
@@ -25477,6 +27320,14 @@
             "media_types": [
               "movie"
             ]
+          },
+          {
+            "key": "schedule_independence",
+            "label": "Schedule - Independence Day",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(06/23-07/11)",
+            "label_width": 240
           },
           {
             "key": "use_labor",
@@ -25496,6 +27347,14 @@
             ]
           },
           {
+            "key": "schedule_labor",
+            "label": "Schedule - Labor Day",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(09/01-09/10)",
+            "label_width": 240
+          },
+          {
             "key": "use_lgbtq",
             "label": "LGBTQ Month Movies",
             "tooltip": "Movies related to LGBTQ Pride Month",
@@ -25511,6 +27370,14 @@
             "media_types": [
               "movie"
             ]
+          },
+          {
+            "key": "schedule_lgbtq",
+            "label": "Schedule - LGBTQ+ Pride Month",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(05/31-06/30)",
+            "label_width": 240
           },
           {
             "key": "use_memorial",
@@ -25530,6 +27397,14 @@
             ]
           },
           {
+            "key": "schedule_memorial",
+            "label": "Schedule - Memorial Day",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(5/18-6/7)",
+            "label_width": 240
+          },
+          {
             "key": "use_mother",
             "label": "Mother's Day Movies",
             "tooltip": "Movies related to Mother's Day",
@@ -25545,6 +27420,14 @@
             "media_types": [
               "movie"
             ]
+          },
+          {
+            "key": "schedule_mother",
+            "label": "Schedule - Mother's Day",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(05/05-05/10)",
+            "label_width": 240
           },
           {
             "key": "use_latinx",
@@ -25564,6 +27447,14 @@
             ]
           },
           {
+            "key": "schedule_latinx",
+            "label": "Schedule - National Hispanic Heritage Month",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(09/15-10/15)",
+            "label_width": 240
+          },
+          {
             "key": "use_years",
             "label": "New Year's Day Movies",
             "tooltip": "Movies related to New Year's Day",
@@ -25579,6 +27470,14 @@
             "media_types": [
               "movie"
             ]
+          },
+          {
+            "key": "schedule_years",
+            "label": "Schedule - New Year's Day",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(12/26-01/04)",
+            "label_width": 240
           },
           {
             "key": "use_patrick",
@@ -25598,6 +27497,14 @@
             ]
           },
           {
+            "key": "schedule_patrick",
+            "label": "Schedule - St. Patrick's Day",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(03/01-03/18)",
+            "label_width": 240
+          },
+          {
             "key": "use_thanksgiving",
             "label": "Thanksgiving Movies",
             "tooltip": "Movies related to Thanksgiving",
@@ -25613,6 +27520,14 @@
             "media_types": [
               "movie"
             ]
+          },
+          {
+            "key": "schedule_thanksgiving",
+            "label": "Schedule - Thanksgiving",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(11/01-11/30)",
+            "label_width": 240
           },
           {
             "key": "use_valentine",
@@ -25632,6 +27547,14 @@
             ]
           },
           {
+            "key": "schedule_valentine",
+            "label": "Schedule - Valentine's Day",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(02/01-02/29)",
+            "label_width": 240
+          },
+          {
             "key": "use_veteran",
             "label": "Veteran's Day Movies",
             "tooltip": "Movies related to Veteran's Day",
@@ -25649,6 +27572,14 @@
             ]
           },
           {
+            "key": "schedule_veteran",
+            "label": "Schedule - Veteran's Day",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(11/01-11/30)",
+            "label_width": 240
+          },
+          {
             "key": "use_women",
             "label": "Women's History Month Movies",
             "tooltip": "Movies related to Women's History Month",
@@ -25664,6 +27595,14 @@
             "media_types": [
               "movie"
             ]
+          },
+          {
+            "key": "schedule_women",
+            "label": "Schedule - Women's History Month",
+            "tooltip": "Override this collection's schedule. Examples: hourly(17) or hourly(17-04), daily, weekly(sunday|tuesday), monthly(1), yearly(01/30), date(01/30/2025), range(12/01-12/31) or range(8/01-8/15|9/01-9/15), never, non_existing, all[weekly(sunday), hourly(17)].",
+            "type": "text_input",
+            "default": "range(02/28-03/31)",
+            "label_width": 240
           },
           {
             "key": "collection_mode",
@@ -26072,10 +28011,76 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "105",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
+          },
+          {
+            "key": "data_starting",
+            "label": "Data Starting",
+            "type": "relative_year",
+            "default": "current_year-10",
+            "tooltip": "Controls the starting year for collections. Allowed values: number greater than 0, current_year, or a relative value like current_year-5.",
+            "min": 1,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "current_year",
+                "label": "Current Year",
+                "kind": "fixed",
+                "token": "current_year"
+              },
+              {
+                "value": "relative_current_year",
+                "label": "Relative Current Year (current_year-#)",
+                "kind": "relative",
+                "prefix": "current_year-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_ending",
+            "label": "Data Ending",
+            "type": "relative_year",
+            "default": "current_year",
+            "tooltip": "Controls the ending year for collections. Allowed values: number greater than 1, current_year, or a relative value like current_year-5.",
+            "min": 2,
+            "step": 1,
+            "relative_options": [
+              {
+                "value": "current_year",
+                "label": "Current Year",
+                "kind": "fixed",
+                "token": "current_year"
+              },
+              {
+                "value": "relative_current_year",
+                "label": "Relative Current Year (current_year-#)",
+                "kind": "relative",
+                "prefix": "current_year-"
+              },
+              {
+                "value": "year",
+                "label": "Specific Year",
+                "kind": "year"
+              }
+            ]
+          },
+          {
+            "key": "data_increment",
+            "label": "Data Increment",
+            "type": "text_input",
+            "input_type": "number",
+            "min": 1,
+            "step": 1,
+            "default": "1",
+            "tooltip": "Controls the increment (i.e. every 5th year). Allowed values: number greater than 0."
           },
           {
             "key": "collection_mode",
@@ -26474,7 +28479,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "100",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."
@@ -26876,7 +28881,7 @@
           {
             "key": "collection_section",
             "label": "Collection Section",
-            "url":"https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
+            "url": "https://kometa.wiki/en/nightly/kometa/guides/order/#kometa-default-collection-sorting",
             "type": "text_input",
             "default": "100",
             "tooltip": "This number determines where this collection appears in the Plex Collections page. Lower numbers/characters based on ascii are placed earlier."

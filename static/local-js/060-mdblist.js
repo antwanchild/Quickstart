@@ -1,5 +1,18 @@
 /* global $, showSpinner, hideSpinner */
 
+function refreshValidationCallout () {
+  if (window.QSValidationCallouts && typeof window.QSValidationCallouts.refresh === 'function') {
+    window.QSValidationCallouts.refresh('mdblist_validated')
+  }
+}
+
+function setToggleButtonIcon (button, showPlainText) {
+  if (!button) return
+  const icon = document.createElement('i')
+  icon.className = showPlainText ? 'fas fa-eye-slash' : 'fas fa-eye'
+  button.replaceChildren(icon)
+}
+
 $(document).ready(function () {
   const apiKeyInput = document.getElementById('mdblist_apikey')
   const validateButton = document.getElementById('validateButton')
@@ -12,10 +25,10 @@ $(document).ready(function () {
   // Set initial visibility based on API key value
   if (apiKeyInput.value.trim() === '') {
     apiKeyInput.setAttribute('type', 'text') // Show placeholder text
-    toggleButton.innerHTML = '<i class="fas fa-eye-slash"></i>' // Ensure eye-slash icon
+    setToggleButtonIcon(toggleButton, true)
   } else {
     apiKeyInput.setAttribute('type', 'password') // Hide actual key
-    toggleButton.innerHTML = '<i class="fas fa-eye"></i>' // Ensure eye icon
+    setToggleButtonIcon(toggleButton, false)
   }
 
   // Disable validate button if already validated
@@ -26,6 +39,7 @@ $(document).ready(function () {
     document.getElementById('mdblist_validated').value = 'false'
     if (validatedAtInput) validatedAtInput.value = ''
     validateButton.disabled = false
+    refreshValidationCallout()
   })
 
   document.getElementById('validateButton').addEventListener('click', function () {
@@ -55,6 +69,7 @@ $(document).ready(function () {
           hideSpinner('validate')
           document.getElementById('mdblist_validated').value = 'true'
           if (validatedAtInput) validatedAtInput.value = new Date().toISOString()
+          refreshValidationCallout()
           statusMessage.textContent = 'API key is valid!'
           statusMessage.style.color = '#75b798'
           validateButton.disabled = true
@@ -62,6 +77,7 @@ $(document).ready(function () {
           console.log('NOT valid')
           document.getElementById('mdblist_validated').value = 'false'
           if (validatedAtInput) validatedAtInput.value = ''
+          refreshValidationCallout()
           statusMessage.textContent = 'Failed to validate MDBList server. Please check your API Key.'
           statusMessage.style.color = '#ea868f'
         }
@@ -73,6 +89,7 @@ $(document).ready(function () {
         statusMessage.style.color = '#ea868f'
         statusMessage.style.display = 'block'
         if (validatedAtInput) validatedAtInput.value = ''
+        refreshValidationCallout()
       })
       .finally(() => {
         hideSpinner('validate')
@@ -83,7 +100,7 @@ $(document).ready(function () {
   document.getElementById('toggleApikeyVisibility').addEventListener('click', function () {
     const currentType = apiKeyInput.getAttribute('type')
     apiKeyInput.setAttribute('type', currentType === 'password' ? 'text' : 'password')
-    this.innerHTML = currentType === 'password' ? '<i class="fas fa-eye-slash"></i>' : '<i class="fas fa-eye"></i>'
+    setToggleButtonIcon(this, currentType === 'password')
   })
 })
 

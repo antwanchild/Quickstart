@@ -1,10 +1,11 @@
 import io
 import os
+import ast
 import json
 import re
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 import platform
 import psutil
 
@@ -15,7 +16,7 @@ from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import PlainScalarString
 from ruamel.yaml.comments import CommentedSeq
 
-from modules import helpers, persistence
+from modules import helpers, persistence, database
 
 
 def add_border_to_ascii_art(art):
@@ -126,6 +127,88 @@ def _to_number(value):
         if re.fullmatch(r"-?\d*\.\d+", cleaned):
             return float(cleaned)
     return None
+
+
+def _coerce_string_list(values):
+    cleaned = []
+    seen = set()
+    for item in values:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text in {"[", "]"}:
+            continue
+        if not text or text in seen:
+            continue
+        cleaned.append(text)
+        seen.add(text)
+    return cleaned
+
+
+def _parse_string_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return _coerce_string_list(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = json.loads(stripped)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                return _coerce_string_list(parsed)
+            try:
+                parsed = ast.literal_eval(stripped)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                return _coerce_string_list(parsed)
+        return _coerce_string_list([stripped])
+    return _coerce_string_list([value])
+
+
+def _normalize_asset_directory_entry(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # Convert YAML-style escaped Windows paths back to plain paths while preserving UNC prefixes.
+    if re.match(r"^[A-Za-z]:\\\\", text):
+        while "\\\\" in text:
+            text = text.replace("\\\\", "\\")
+        return text
+
+    if text.startswith("\\\\"):
+        prefix = "\\\\"
+        remainder = text[2:]
+        while "\\\\" in remainder:
+            remainder = remainder.replace("\\\\", "\\")
+        return prefix + remainder
+
+    return text
+
+
+def _normalize_asset_directory_values(value):
+    normalized = []
+    if isinstance(value, str):
+        items = value.splitlines()
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = []
+
+    for item in items:
+        cleaned = _normalize_asset_directory_entry(item)
+        if cleaned:
+            normalized.append(cleaned)
+    return normalized
 
 
 def _values_match(default, actual):
@@ -335,11 +418,108 @@ def _prune_template_variables(template_vars, defaults):
 
 
 def optimize_template_variables(config_data, library_types=None):
+    def _to_offset_number(value, fallback):
+        if isinstance(value, bool):
+            return fallback
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return fallback
+            try:
+                return int(stripped)
+            except ValueError:
+                try:
+                    return float(stripped)
+                except ValueError:
+                    return fallback
+        return fallback
+
+    def _is_ratings_entry(default_name):
+        return isinstance(default_name, str) and (default_name == "ratings" or default_name.startswith("overlay_ratings"))
+
+    def _ensure_explicit_ratings_offsets(tv, defaults):
+        if not isinstance(tv, dict):
+            return
+        slot_ids = []
+        for idx in ("1", "2", "3"):
+            rating_key = f"rating{idx}"
+            image_key = f"{rating_key}_image"
+            if rating_key in tv and image_key in tv:
+                slot_ids.append(idx)
+        if not slot_ids:
+            return
+
+        defaults = defaults or {}
+        back_height = _to_offset_number(tv.get("back_height", defaults.get("back_height")), 160)
+        back_padding = max(0, _to_offset_number(tv.get("back_padding", defaults.get("back_padding")), 15))
+        vertical_step = back_height + (back_padding * 3)
+        center_index = (len(slot_ids) - 1) / 2
+
+        shared_horizontal = tv.get("horizontal_offset", defaults.get("horizontal_offset", 15))
+        shared_vertical = tv.get("vertical_offset", defaults.get("vertical_offset", 0))
+        shared_horizontal_num = _to_offset_number(shared_horizontal, 15) + back_padding
+        shared_vertical_num = _to_offset_number(shared_vertical, 0)
+
+        explicit_verticals = []
+        all_explicit_verticals_present = True
+        for idx in slot_ids:
+            key = f"rating{idx}_vertical_offset"
+            if key not in tv:
+                all_explicit_verticals_present = False
+                break
+            explicit_verticals.append(_to_offset_number(tv.get(key), None))
+        if any(value is None for value in explicit_verticals):
+            all_explicit_verticals_present = False
+
+        explicit_horizontals = []
+        all_explicit_horizontals_present = True
+        for idx in slot_ids:
+            key = f"rating{idx}_horizontal_offset"
+            if key not in tv:
+                all_explicit_horizontals_present = False
+                break
+            explicit_horizontals.append(_to_offset_number(tv.get(key), None))
+        if any(value is None for value in explicit_horizontals):
+            all_explicit_horizontals_present = False
+
+        old_vertical_step = back_height + back_padding
+
+        for slot_position, idx in enumerate(slot_ids):
+            h_key = f"rating{idx}_horizontal_offset"
+            v_key = f"rating{idx}_vertical_offset"
+            if h_key not in tv:
+                tv[h_key] = int(round(shared_horizontal_num))
+            if v_key not in tv or not all_explicit_verticals_present:
+                relative_index = slot_position - center_index
+                tv[v_key] = int(round(shared_vertical_num + (vertical_step * relative_index)))
+
+        if all_explicit_horizontals_present and explicit_horizontals and len(set(explicit_horizontals)) == 1:
+            explicit_horizontal = explicit_horizontals[0]
+            legacy_horizontal = _to_offset_number(shared_horizontal, 15)
+            if explicit_horizontal == legacy_horizontal:
+                for idx in slot_ids:
+                    tv[f"rating{idx}_horizontal_offset"] = int(round(shared_horizontal_num))
+
+        if all_explicit_verticals_present and explicit_verticals:
+            legacy_matches = True
+            for slot_position, explicit_vertical in enumerate(explicit_verticals):
+                relative_index = slot_position - center_index
+                expected_legacy = int(round(shared_vertical_num + (old_vertical_step * relative_index)))
+                if explicit_vertical != expected_legacy:
+                    legacy_matches = False
+                    break
+            if legacy_matches:
+                for slot_position, idx in enumerate(slot_ids):
+                    relative_index = slot_position - center_index
+                    tv[f"rating{idx}_vertical_offset"] = int(round(shared_vertical_num + (vertical_step * relative_index)))
+
     def _reorder_ratings_template_vars(entry):
         if not isinstance(entry, dict):
             return
         default_name = entry.get("default", "")
-        if not (isinstance(default_name, str) and (default_name == "ratings" or default_name.startswith("overlay_ratings"))):
+        if not _is_ratings_entry(default_name):
             return
         tv = entry.get("template_variables")
         if not isinstance(tv, dict) or not tv:
@@ -353,6 +533,8 @@ def optimize_template_variables(config_data, library_types=None):
             "rating1_font_color",
             "rating1_stroke_width",
             "rating1_stroke_color",
+            "rating1_horizontal_offset",
+            "rating1_vertical_offset",
             "rating2",
             "rating2_image",
             "rating2_font",
@@ -360,6 +542,8 @@ def optimize_template_variables(config_data, library_types=None):
             "rating2_font_color",
             "rating2_stroke_width",
             "rating2_stroke_color",
+            "rating2_horizontal_offset",
+            "rating2_vertical_offset",
             "rating3",
             "rating3_image",
             "rating3_font",
@@ -367,6 +551,8 @@ def optimize_template_variables(config_data, library_types=None):
             "rating3_font_color",
             "rating3_stroke_width",
             "rating3_stroke_color",
+            "rating3_horizontal_offset",
+            "rating3_vertical_offset",
             "horizontal_position",
             "horizontal_offset",
             "vertical_offset",
@@ -431,6 +617,8 @@ def optimize_template_variables(config_data, library_types=None):
                 if not defaults:
                     continue
                 pruned = _prune_template_variables(tv, defaults)
+                if entry.get("default") == "year" and "data_ending" in tv:
+                    pruned["data_ending"] = tv.get("data_ending")
                 if pruned:
                     entry["template_variables"] = pruned
                 else:
@@ -463,18 +651,27 @@ def optimize_template_variables(config_data, library_types=None):
                     if offsets:
                         defaults.update(offsets)
 
+                if _is_ratings_entry(entry.get("default")):
+                    _ensure_explicit_ratings_offsets(tv, defaults)
+
                 pruned = _prune_template_variables(tv, defaults)
                 always_keep = set()
-                if entry.get("default") in {"ratings", "overlay_ratings"}:
+                if _is_ratings_entry(entry.get("default")):
                     always_keep.update(
                         {
                             "builder_level",
                             "rating1",
                             "rating1_image",
+                            "rating1_horizontal_offset",
+                            "rating1_vertical_offset",
                             "rating2",
                             "rating2_image",
+                            "rating2_horizontal_offset",
+                            "rating2_vertical_offset",
                             "rating3",
                             "rating3_image",
+                            "rating3_horizontal_offset",
+                            "rating3_vertical_offset",
                             "horizontal_position",
                         }
                     )
@@ -490,6 +687,53 @@ def optimize_template_variables(config_data, library_types=None):
                 else:
                     entry.pop("template_variables", None)
 
+    return config_data
+
+
+def _collapse_collection_data_template_vars(config_data):
+    if not isinstance(config_data, dict):
+        return config_data
+    libraries_section = config_data.get("libraries", {})
+    libraries = libraries_section.get("libraries")
+    if not isinstance(libraries, dict):
+        return config_data
+    for library_data in libraries.values():
+        if not isinstance(library_data, dict):
+            continue
+        collection_files = library_data.get("collection_files")
+        if not isinstance(collection_files, list):
+            continue
+        for entry in collection_files:
+            if not isinstance(entry, dict):
+                continue
+            template_vars = entry.get("template_variables")
+            if not isinstance(template_vars, dict):
+                continue
+            data_block = {}
+            for key in list(template_vars.keys()):
+                if not isinstance(key, str) or not key.startswith("data_"):
+                    continue
+                subkey = key[5:]
+                if not subkey:
+                    continue
+                value = template_vars.pop(key)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    cleaned = value.strip()
+                    if not cleaned:
+                        continue
+                    if cleaned.isdigit():
+                        value = int(cleaned)
+                data_block[subkey] = value
+            if not data_block:
+                continue
+            existing = template_vars.get("data")
+            if isinstance(existing, dict):
+                existing.update(data_block)
+                template_vars["data"] = existing
+            else:
+                template_vars["data"] = data_block
     return config_data
 
 
@@ -527,7 +771,11 @@ def build_libraries_section(
         if app.config["QS_DEBUG"]:
             helpers.ts_log(f"Processing Library: {library_key} -> {library_name}", level="DEBUG")
 
-        # Process Operations Attributes
+        # Process Library Settings and Operations Attributes
+        library_settings_fields = [
+            "asset_directory",
+            "prioritize_assets",
+        ]
         operations_fields = [
             "assets_for_all",
             "assets_for_all_collections",
@@ -539,6 +787,7 @@ def build_libraries_section(
             "radarr_add_all",
             "sonarr_add_all",
         ]
+        library_settings = {}
         operations = {}
         attr_group = attributes.get(lib_id, {})
         # Begin: Mass Genre Update Section
@@ -696,6 +945,31 @@ def build_libraries_section(
             motu_list.fa.set_block_style()
             operations["mass_original_title_update"] = motu_list
 
+        for field in library_settings_fields:
+            attr_key = f"{library_type}-library_{lib_id}-attribute_{field}"
+            value = attr_group.get(attr_key, None)
+            if value in [None, ""] and field == "asset_directory":
+                legacy_attr_key = f"{library_type}-library_{lib_id}-{field}"
+                value = attr_group.get(legacy_attr_key, None)
+
+            if field == "asset_directory":
+                normalized = _normalize_asset_directory_values(value)
+
+                if normalized:
+                    asset_dirs = CommentedSeq(normalized)
+                    asset_dirs.fa.set_block_style()
+                    library_settings[field] = asset_dirs
+                continue
+
+            if field == "prioritize_assets":
+                bool_value = _coerce_bool(value)
+                if bool_value is not None:
+                    library_settings[field] = bool_value
+                continue
+
+            if value not in [None, "", False]:
+                library_settings[field] = value
+
         for field in operations_fields:
             attr_key = f"{library_type}-library_{lib_id}-attribute_{field}"
             value = attr_group.get(attr_key, None)
@@ -739,6 +1013,9 @@ def build_libraries_section(
 
         if delete_collections:
             operations["delete_collections"] = delete_collections
+
+        if library_settings:
+            entry["settings"] = library_settings
 
         if operations:
             entry["operations"] = operations
@@ -787,10 +1064,17 @@ def build_libraries_section(
                     helpers.ts_log(f"Found {len(all_children)} child template_variables: {all_children}", level="DEBUG")
 
                 if all_children:
-                    file_entry["template_variables"] = {
+                    template_vars = {
                         k: (True if isinstance(v, (bool, str)) and str(v).lower() == "true" else False if isinstance(v, (bool, str)) and str(v).lower() == "false" else v)
                         for k, v in all_children.items()
                     }
+                    if "exclude" in template_vars:
+                        exclude_values = _parse_string_list(template_vars.get("exclude"))
+                        if exclude_values:
+                            template_vars["exclude"] = exclude_values
+                        else:
+                            template_vars.pop("exclude", None)
+                    file_entry["template_variables"] = template_vars
 
                 collection_files.append(file_entry)
 
@@ -844,28 +1128,120 @@ def build_libraries_section(
                             continue
                     cleaned[k] = v
 
-                # Enforce ratingN <-> ratingN_image dependency; if either side is empty, drop both
+                def _is_empty(val):
+                    if val is None or val is False:
+                        return True
+                    if isinstance(val, str):
+                        return val.strip() == "" or val.strip().lower() == "none"
+                    return False
+
+                # Enforce ratingN <-> ratingN_image dependency; if either side is empty, drop the slot entirely,
+                # including any stale slot-specific style or offset fields left behind from a previous count.
                 for idx in ["1", "2", "3"]:
                     r_key = f"rating{idx}"
                     i_key = f"{r_key}_image"
                     r_val = cleaned.get(r_key)
                     i_val = cleaned.get(i_key)
                     if r_key in cleaned or i_key in cleaned:
-
-                        def _is_empty(val):
-                            if val is None or val is False:
-                                return True
-                            if isinstance(val, str):
-                                return val.strip() == "" or val.strip().lower() == "none"
-                            return False
-
-                        if _is_empty(r_val):
-                            cleaned.pop(r_key, None)
-                            cleaned.pop(i_key, None)
+                        if _is_empty(r_val) or _is_empty(i_val):
+                            for key in [k for k in list(cleaned.keys()) if k == r_key or k.startswith(f"{r_key}_")]:
+                                cleaned.pop(key, None)
                             continue
-                        if _is_empty(i_val):
-                            cleaned.pop(r_key, None)
-                            cleaned.pop(i_key, None)
+
+                def _offset_number(value, fallback):
+                    if isinstance(value, bool):
+                        return fallback
+                    if isinstance(value, (int, float)):
+                        return value
+                    if isinstance(value, str):
+                        stripped = value.strip()
+                        if not stripped:
+                            return fallback
+                        try:
+                            return int(stripped)
+                        except ValueError:
+                            try:
+                                return float(stripped)
+                            except ValueError:
+                                return fallback
+                    return fallback
+
+                # Compact the configured rating slots so the emitted YAML always matches the
+                # contiguous stack shown on the Quickstart canvas, even after reducing the
+                # rating count or clearing a middle slot.
+                slot_payloads = []
+                for idx in ["1", "2", "3"]:
+                    rating_key = f"rating{idx}"
+                    image_key = f"{rating_key}_image"
+                    if rating_key not in cleaned or image_key not in cleaned:
+                        continue
+                    slot_payload = {}
+                    for key in [k for k in list(cleaned.keys()) if k == rating_key or k.startswith(f"{rating_key}_")]:
+                        suffix = "" if key == rating_key else key[len(rating_key) :]
+                        slot_payload[suffix] = cleaned.pop(key)
+                    if slot_payload:
+                        slot_payloads.append(slot_payload)
+
+                back_height = _offset_number(cleaned.get("back_height"), 160)
+                back_padding = max(0, _offset_number(cleaned.get("back_padding"), 15))
+                vertical_step = back_height + (back_padding * 3)
+                center_index = (len(slot_payloads) - 1) / 2 if slot_payloads else 0
+                shared_horizontal_base = _offset_number(cleaned.get("horizontal_offset"), 15)
+                shared_vertical_base = _offset_number(cleaned.get("vertical_offset"), 0)
+                for axis in ["horizontal", "vertical"]:
+                    shared_key = f"{axis}_offset"
+                    axis_default = 15 if axis == "horizontal" else 0
+                    shared_val = cleaned.get(shared_key, axis_default)
+                    shared_number = _offset_number(shared_val, axis_default)
+                    for slot_position, slot_payload in enumerate(slot_payloads):
+                        slot_key = f"_{axis}_offset"
+                        if slot_key in slot_payload:
+                            continue
+                        if axis == "horizontal":
+                            slot_payload[slot_key] = int(round(shared_number + back_padding))
+                        else:
+                            relative_index = slot_position - center_index
+                            slot_payload[slot_key] = int(round(shared_number + (vertical_step * relative_index)))
+                    cleaned.pop(shared_key, None)
+
+                # If all explicit per-slot vertical offsets are identical, they
+                # still represent a single shared anchor from Quickstart's composite preview.
+                # Re-expand them to match the preview stack used on the canvas.
+                vertical_values = [_offset_number(slot_payload.get("_vertical_offset"), None) for slot_payload in slot_payloads]
+                horizontal_values = [_offset_number(slot_payload.get("_horizontal_offset"), None) for slot_payload in slot_payloads]
+                if len(slot_payloads) > 1 and all(value is not None for value in vertical_values):
+                    if len(set(vertical_values)) == 1:
+                        base_vertical = vertical_values[0]
+                        for slot_position, slot_payload in enumerate(slot_payloads):
+                            relative_index = slot_position - center_index
+                            slot_payload["_vertical_offset"] = int(round(base_vertical + (vertical_step * relative_index)))
+
+                if slot_payloads and all(value is not None for value in horizontal_values):
+                    if len(set(horizontal_values)) == 1:
+                        base_horizontal = horizontal_values[0]
+                        if base_horizontal == shared_horizontal_base:
+                            for slot_payload in slot_payloads:
+                                slot_payload["_horizontal_offset"] = int(round(base_horizontal + back_padding))
+
+                if len(slot_payloads) > 1 and all(value is not None for value in vertical_values):
+                    old_vertical_step = back_height + back_padding
+                    legacy_matches = True
+                    for slot_position, explicit_vertical in enumerate(vertical_values):
+                        relative_index = slot_position - center_index
+                        expected_legacy = int(round(shared_vertical_base + (old_vertical_step * relative_index)))
+                        if explicit_vertical != expected_legacy:
+                            legacy_matches = False
+                            break
+                    if legacy_matches:
+                        for slot_position, slot_payload in enumerate(slot_payloads):
+                            relative_index = slot_position - center_index
+                            slot_payload["_vertical_offset"] = int(round(shared_vertical_base + (vertical_step * relative_index)))
+
+                for slot_position, slot_payload in enumerate(slot_payloads, start=1):
+                    rating_key = f"rating{slot_position}"
+                    for suffix, value in slot_payload.items():
+                        target_key = rating_key if suffix == "" else f"{rating_key}{suffix}"
+                        cleaned[target_key] = value
 
                 if cleaned:
                     overlay_entry["template_variables"] = cleaned
@@ -897,6 +1273,8 @@ def build_libraries_section(
                     "rating1_font_color",
                     "rating1_stroke_width",
                     "rating1_stroke_color",
+                    "rating1_horizontal_offset",
+                    "rating1_vertical_offset",
                     "rating2",
                     "rating2_image",
                     "rating2_font",
@@ -904,6 +1282,8 @@ def build_libraries_section(
                     "rating2_font_color",
                     "rating2_stroke_width",
                     "rating2_stroke_color",
+                    "rating2_horizontal_offset",
+                    "rating2_vertical_offset",
                     "rating3",
                     "rating3_image",
                     "rating3_font",
@@ -911,6 +1291,8 @@ def build_libraries_section(
                     "rating3_font_color",
                     "rating3_stroke_width",
                     "rating3_stroke_color",
+                    "rating3_horizontal_offset",
+                    "rating3_vertical_offset",
                     "horizontal_position",
                     "horizontal_offset",
                     "vertical_offset",
@@ -1066,6 +1448,9 @@ def build_libraries_section(
                     tv = ov.get("template_variables")
                     if not isinstance(tv, dict):
                         continue
+                    for key, value in list(tv.items()):
+                        if value is None:
+                            tv.pop(key, None)
                     if tv.get("builder_level") == "show":
                         tv.pop("builder_level", None)
                         if not tv:
@@ -1075,11 +1460,14 @@ def build_libraries_section(
                         use_edition_val = tv.get("use_edition")
                         if isinstance(use_edition_val, str):
                             use_edition_val = use_edition_val.lower() == "true"
-                        if use_edition_val is None or use_edition_val is False:
+                        if use_edition_val is None:
+                            tv["use_edition"] = True
+                            use_edition_val = True
+                        elif use_edition_val is False:
                             tv["use_edition"] = False
                             use_edition_val = False
                         if use_edition_val is True:
-                            keep_keys = {"use_edition", "horizontal_offset", "vertical_offset"}
+                            keep_keys = {"builder_level", "use_edition", "horizontal_offset", "vertical_offset"}
                             for key in list(tv.keys()):
                                 if key not in keep_keys:
                                     tv.pop(key, None)
@@ -1430,6 +1818,7 @@ def reorder_library_section(library_data):
     - `report_path` appears first.
     - `remove_overlays` and `reset_overlays` come next.
     - `template_variables` next.
+    - `settings` appears before `operations`.
     - Keys inside `operations` are ordered as per Kometa Wiki.
     - Other keys retain their natural order.
     """
@@ -1449,7 +1838,11 @@ def reorder_library_section(library_data):
     if "template_variables" in library_data:
         reordered_data["template_variables"] = library_data["template_variables"]
 
-    # 4. Reorder operations
+    # 4. Then library settings
+    if "settings" in library_data:
+        reordered_data["settings"] = library_data["settings"]
+
+    # 5. Reorder operations
     operations_order = [
         "assets_for_all",
         "assets_for_all_collections",
@@ -1494,7 +1887,7 @@ def reorder_library_section(library_data):
                 ordered_ops[k] = v
         reordered_data["operations"] = ordered_ops
 
-    # 5. Finally add any other keys that weren't handled
+    # 6. Finally add any other keys that weren't handled
     for key, value in library_data.items():
         if key not in reordered_data:
             reordered_data[key] = value
@@ -1507,6 +1900,9 @@ def build_config(header_style="standard", config_name=None):
     Build the final configuration, including all sections and headers,
     ensuring the libraries section is properly processed.
     """
+    if not config_name and has_request_context():
+        config_name = session.get("config_name")
+
     sections = helpers.get_template_list()
     config_data = {}
     header_art = {}
@@ -1895,6 +2291,10 @@ def build_config(header_style="standard", config_name=None):
 
         # Clean the data
         cleaned_data = clean_data(data)
+        if dump_name == "anidb":
+            section = cleaned_data.get("anidb")
+            if isinstance(section, dict):
+                section.pop("enable", None)
 
         # Force long/scalar strings to emit in plain style (avoid folded multi-line) for sensitive sections
         plain_scalar_sections = {
@@ -1964,10 +2364,10 @@ def build_config(header_style="standard", config_name=None):
         if dump_name == "settings" and "asset_directory" in cleaned_data.get("settings", {}):
             if isinstance(cleaned_data["settings"]["asset_directory"], str):
                 # Convert multi-line string into a list
-                cleaned_data["settings"]["asset_directory"] = [line.strip() for line in cleaned_data["settings"]["asset_directory"].splitlines() if line.strip()]
+                cleaned_data["settings"]["asset_directory"] = _normalize_asset_directory_values(cleaned_data["settings"]["asset_directory"])
             elif isinstance(cleaned_data["settings"]["asset_directory"], list):
                 # Ensure all list items are strings
-                cleaned_data["settings"]["asset_directory"] = [str(i).strip() for i in cleaned_data["settings"]["asset_directory"]]
+                cleaned_data["settings"]["asset_directory"] = _normalize_asset_directory_values(cleaned_data["settings"]["asset_directory"])
 
         # Dump the cleaned data to YAML
         with io.StringIO() as stream:
@@ -1975,7 +2375,51 @@ def build_config(header_style="standard", config_name=None):
             section_output = stream.getvalue().strip()
             if header_style != "none":
                 section_output = inject_section_headers(section_output, header_style)
-            return f"{title}\n{section_output}\n\n"
+
+            validation_comment = build_validation_comment(dump_name)
+            blocks = []
+            if title:
+                blocks.append(title)
+            if validation_comment:
+                blocks.append(validation_comment)
+            blocks.append(section_output)
+            return "\n".join(blocks) + "\n\n"
+
+    def format_validation_timestamp(raw):
+        if not raw:
+            return ""
+        try:
+            normalized = raw.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            local = parsed.astimezone()
+            return local.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return raw
+
+    def build_validation_comment(section_key):
+        if not config_name:
+            return ""
+        stored = database.retrieve_section_data(config_name, section_key)
+        if not stored or not isinstance(stored[2], dict):
+            return ""
+        stored_validated = helpers.booler(stored[0])
+        payload = stored[2]
+        status = payload.get("validation_status")
+        if not status:
+            if stored_validated:
+                status = "validated"
+            else:
+                fallback_timestamp = payload.get("validated_at")
+                status = "failed" if fallback_timestamp else ""
+        if not status:
+            return ""
+        updated_at = payload.get("validation_updated_at") or payload.get("validated_at")
+        last_validated = format_validation_timestamp(updated_at)
+        if last_validated:
+            return f"# validation: {status} (last_validated: {last_validated})"
+        return f"# validation: {status}"
 
     ordered_sections = [
         ("libraries", "025-libraries"),
@@ -2006,6 +2450,7 @@ def build_config(header_style="standard", config_name=None):
     optimize_defaults = helpers.booler(app.config.get("QS_OPTIMIZE_DEFAULTS", True))
     if optimize_defaults:
         config_data = optimize_template_variables(config_data, library_types)
+    config_data = _collapse_collection_data_template_vars(config_data)
 
     # Apply enforce_string_fields to ensure proper formatting
     config_data = helpers.enforce_string_fields(config_data, helpers.STRING_FIELDS)
@@ -2019,11 +2464,13 @@ def build_config(header_style="standard", config_name=None):
 
     validated = False
     validation_error = None
-
-    try:
-        jsonschema.validate(yaml.load(yaml_content), schema)
+    validation_errors = []
+    parsed_yaml = yaml.load(yaml_content)
+    validator = jsonschema.Draft7Validator(schema)
+    validation_errors = sorted(validator.iter_errors(parsed_yaml), key=lambda err: list(err.path))
+    if validation_errors:
+        validation_error = validation_errors[0]
+    else:
         validated = True
-    except jsonschema.exceptions.ValidationError as e:
-        validation_error = e
 
-    return validated, validation_error, config_data, yaml_content
+    return validated, validation_error, config_data, yaml_content, validation_errors

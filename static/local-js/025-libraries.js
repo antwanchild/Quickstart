@@ -1,4 +1,4 @@
-/* global EventHandler, ValidationHandler, OverlayHandler, Sortable, showToast, setupParentChildToggleSync, bootstrap, FontFace, PathValidation */
+/* global EventHandler, ValidationHandler, OverlayHandler, Sortable, showToast, setupParentChildToggleSync, bootstrap, FontFace, PathValidation, DOMParser */
 
 document.addEventListener('DOMContentLoaded', function () {
   console.log('[DEBUG] Initializing Libraries...')
@@ -90,7 +90,7 @@ document.addEventListener('DOMContentLoaded', function () {
       if (!Array.isArray(fonts)) return
       const root = scope || document
       root.querySelectorAll('select[data-font-select]').forEach(select => {
-        const currentValue = select.value || ''
+        const currentValue = select.value || select.dataset.default || ''
         const seen = new Set()
         const merged = []
         fonts.forEach(font => {
@@ -101,7 +101,7 @@ document.addEventListener('DOMContentLoaded', function () {
         if (currentValue && !seen.has(currentValue)) {
           merged.push(currentValue)
         }
-        select.innerHTML = ''
+        select.replaceChildren()
         const placeholder = document.createElement('option')
         placeholder.value = ''
         placeholder.textContent = 'Select font'
@@ -148,10 +148,534 @@ document.addEventListener('DOMContentLoaded', function () {
           }
         })
         sortable.sort((a, b) => a.textContent.trim().localeCompare(b.textContent.trim()))
-        select.innerHTML = ''
+        select.replaceChildren()
         keep.forEach(option => select.appendChild(option))
         sortable.forEach(option => select.appendChild(option))
         select.value = currentValue
+      })
+    }
+
+    function initNumericOnlyInputs (scope) {
+      const root = scope || document
+      root.querySelectorAll('input[data-numeric-only="true"]').forEach(input => {
+        if (input.dataset.numericOnlyBound) return
+        input.addEventListener('input', () => {
+          const raw = String(input.value || '')
+          const cleaned = raw.replace(/\D+/g, '')
+          if (raw !== cleaned) {
+            input.value = cleaned
+          }
+        })
+        input.addEventListener('blur', () => {
+          const raw = String(input.value || '').trim()
+          if (raw !== '') return
+          const fallback = input.dataset.defaultValue
+          if (fallback !== undefined && String(fallback).trim() !== '') {
+            input.value = fallback
+            input.dispatchEvent(new Event('change', { bubbles: true }))
+          }
+        })
+        input.dataset.numericOnlyBound = 'true'
+      })
+    }
+
+    function initStylePreviewGrids (scope) {
+      const root = scope || document
+      root.querySelectorAll('[data-style-preview-grid]').forEach(grid => {
+        const selectId = grid.dataset.styleSelect
+        if (!selectId) return
+        const select = document.getElementById(selectId)
+        if (!select) return
+        const cards = Array.from(grid.querySelectorAll('.style-preview-card'))
+        if (!cards.length) return
+
+        function syncActive () {
+          const value = select.value || ''
+          cards.forEach(card => {
+            const isActive = card.dataset.styleValue === value
+            card.classList.toggle('active', isActive)
+            card.setAttribute('aria-pressed', isActive ? 'true' : 'false')
+          })
+        }
+
+        if (!select.dataset.stylePreviewBound) {
+          select.addEventListener('change', syncActive)
+          select.dataset.stylePreviewBound = 'true'
+        }
+
+        cards.forEach(card => {
+          if (card.dataset.stylePreviewBound) return
+          card.addEventListener('click', () => {
+            const targetValue = card.dataset.styleValue
+            if (!targetValue || select.disabled) return
+            select.value = targetValue
+            select.dispatchEvent(new Event('change', { bubbles: true }))
+          })
+          card.dataset.stylePreviewBound = 'true'
+        })
+
+        syncActive()
+      })
+    }
+
+    function initRelativeYearInputs (scope) {
+      const root = scope || document
+      root.querySelectorAll('[data-relative-year]').forEach(wrapper => {
+        if (wrapper.dataset.listenerAdded) return
+        const hiddenId = wrapper.dataset.hiddenInput
+        const hidden = hiddenId ? document.getElementById(hiddenId) : wrapper.querySelector('input[type="hidden"]')
+        const modeSelect = wrapper.querySelector('[data-relative-year-mode]')
+        const valueInput = wrapper.querySelector('[data-relative-year-value]')
+        const minYear = parseInt(wrapper.dataset.minYear || '1', 10) || 1
+        const defaultValue = String(wrapper.dataset.defaultValue || '').trim()
+
+        if (!hidden || !modeSelect || !valueInput) {
+          console.warn('[relative-year missing]', { hiddenId, hasHidden: !!hidden, hasMode: !!modeSelect, hasValue: !!valueInput })
+          return
+        }
+
+        const options = Array.from(modeSelect.options).map(option => {
+          let kind = option.dataset.kind || ''
+          if (!kind) {
+            if (option.value === 'year') {
+              kind = 'year'
+            } else if (option.value.startsWith('relative_')) {
+              kind = 'relative'
+            } else {
+              kind = 'fixed'
+            }
+          }
+          let token = option.dataset.token || ''
+          if (!token && kind === 'fixed') {
+            token = option.value
+          }
+          let prefix = option.dataset.prefix || ''
+          if (!prefix && kind === 'relative') {
+            const suffix = option.value.replace(/^relative_/, '')
+            if (suffix === 'first') {
+              prefix = 'first+'
+            } else if (suffix === 'latest') {
+              prefix = 'latest-'
+            } else if (suffix) {
+              prefix = `${suffix}-`
+            }
+          }
+          return {
+            value: option.value,
+            kind,
+            token,
+            prefix
+          }
+        })
+        const yearOption = options.find(opt => opt.kind === 'year')
+
+        function parseValue (raw) {
+          const value = String(raw || '').trim()
+          const lowered = value.toLowerCase()
+          if (!value) return { valid: false }
+          for (const opt of options) {
+            if (opt.kind !== 'fixed') continue
+            if (String(opt.token || '').toLowerCase() === lowered) {
+              return { valid: true, mode: opt.value, number: '' }
+            }
+          }
+          for (const opt of options) {
+            if (opt.kind !== 'relative') continue
+            const prefix = String(opt.prefix || '').toLowerCase()
+            if (!prefix || !lowered.startsWith(prefix)) continue
+            const remainder = lowered.slice(prefix.length)
+            if (/^\d+$/.test(remainder)) {
+              return { valid: true, mode: opt.value, number: remainder }
+            }
+          }
+          if (yearOption && /^\d+$/.test(lowered)) {
+            return { valid: true, mode: yearOption.value, number: lowered }
+          }
+          return { valid: false }
+        }
+
+        function resolveFallback () {
+          const fixed = options.find(opt => opt.kind === 'fixed')
+          if (fixed) return { mode: fixed.value, number: '' }
+          const relative = options.find(opt => opt.kind === 'relative')
+          if (relative) return { mode: relative.value, number: '1' }
+          if (yearOption) return { mode: yearOption.value, number: String(minYear) }
+          const first = options[0]
+          return { mode: first ? first.value : '', number: '' }
+        }
+
+        function resolveInitial () {
+          const current = parseValue(hidden.value)
+          if (current.valid) return current
+          const fallback = parseValue(defaultValue)
+          if (fallback.valid) return fallback
+          return resolveFallback()
+        }
+
+        function getActiveOption (mode) {
+          return options.find(opt => opt.value === mode) || null
+        }
+
+        function applyModeUI (mode) {
+          const active = getActiveOption(mode)
+          const kind = active ? active.kind : 'fixed'
+          const isFixed = kind === 'fixed'
+          valueInput.classList.toggle('d-none', isFixed)
+          if (kind === 'year') {
+            valueInput.placeholder = 'Year'
+            valueInput.min = String(minYear)
+          } else if (kind === 'relative') {
+            valueInput.placeholder = 'Offset'
+            valueInput.min = '1'
+          } else {
+            valueInput.placeholder = ''
+            valueInput.min = '1'
+          }
+        }
+
+        function updateHidden () {
+          const mode = modeSelect.value
+          const rawNum = parseInt(valueInput.value || '', 10)
+          let nextValue = ''
+          const active = getActiveOption(mode)
+          const kind = active ? active.kind : 'fixed'
+
+          if (kind === 'year') {
+            let year = Number.isFinite(rawNum) ? rawNum : minYear
+            if (year < minYear) year = minYear
+            valueInput.value = String(year)
+            nextValue = String(year)
+          } else if (kind === 'relative') {
+            let offset = Number.isFinite(rawNum) ? rawNum : 1
+            if (offset < 1) offset = 1
+            valueInput.value = String(offset)
+            const prefix = active ? String(active.prefix || '') : ''
+            nextValue = `${prefix}${offset}`
+          } else if (kind === 'fixed') {
+            valueInput.value = ''
+            nextValue = active ? String(active.token || mode) : mode
+          } else {
+            nextValue = defaultValue || (yearOption ? String(minYear) : '')
+          }
+
+          hidden.value = nextValue
+          applyModeUI(mode)
+        }
+
+        const initial = resolveInitial()
+        modeSelect.value = initial.mode
+        valueInput.value = initial.number
+        updateHidden()
+
+        modeSelect.addEventListener('change', () => updateHidden())
+        valueInput.addEventListener('input', () => updateHidden())
+        valueInput.addEventListener('blur', () => updateHidden())
+
+        wrapper.dataset.listenerAdded = 'true'
+      })
+    }
+
+    function initScheduleBuilders (scope) {
+      const root = scope || document
+      root.querySelectorAll('[data-schedule-builder]').forEach(builder => {
+        if (builder.dataset.listenerAdded) return
+        const hiddenId = builder.dataset.hiddenInput
+        const hidden = hiddenId ? document.getElementById(hiddenId) : builder.querySelector('input[type="hidden"]')
+        const modeSelect = builder.querySelector('[data-schedule-mode-select]')
+        const preview = builder.querySelector('[data-schedule-preview]')
+        const rawInput = builder.querySelector('[data-schedule-raw]')
+        const modeSections = Array.from(builder.querySelectorAll('[data-schedule-mode]'))
+        const rangeStart = builder.querySelector('[data-schedule-range-start]')
+        const rangeEnd = builder.querySelector('[data-schedule-range-end]')
+        const weeklyDays = Array.from(builder.querySelectorAll('[data-schedule-week-day]'))
+        const monthlyDay = builder.querySelector('[data-schedule-month-day]')
+        const yearlyInput = builder.querySelector('[data-schedule-yearly]')
+        const dateInput = builder.querySelector('[data-schedule-date]')
+        const hourStart = builder.querySelector('[data-schedule-hour-start]')
+        const hourEnd = builder.querySelector('[data-schedule-hour-end]')
+        const defaultValue = String(builder.dataset.defaultValue || '').trim()
+
+        if (!hidden || !modeSelect) return
+
+        function formatMonthDay (dateValue) {
+          if (!dateValue || typeof dateValue !== 'string') return ''
+          const parts = dateValue.split('-')
+          if (parts.length < 3) return ''
+          return `${parts[1]}/${parts[2]}`
+        }
+
+        function formatDateValue (dateValue) {
+          if (!dateValue || typeof dateValue !== 'string') return ''
+          const parts = dateValue.split('-')
+          if (parts.length < 3) return ''
+          return `${parts[1]}/${parts[2]}/${parts[0]}`
+        }
+
+        function setMonthDayInput (input, monthDay) {
+          if (!input) return
+          const md = String(monthDay || '').trim()
+          const match = md.match(/^(\d{1,2})\/(\d{1,2})$/)
+          if (!match) return
+          const month = match[1].padStart(2, '0')
+          const day = match[2].padStart(2, '0')
+          input.value = `2000-${month}-${day}`
+        }
+
+        function setDateInput (input, dateValue) {
+          if (!input) return
+          const raw = String(dateValue || '').trim()
+          const match = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/)
+          if (!match) return
+          const month = match[1].padStart(2, '0')
+          const day = match[2].padStart(2, '0')
+          input.value = `${match[3]}-${month}-${day}`
+        }
+
+        function parseSchedule (rawValue) {
+          const raw = String(rawValue || '').trim()
+          if (!raw) return { mode: 'range', raw: '' }
+          const lower = raw.toLowerCase()
+          if (['daily', 'never', 'non_existing'].includes(lower)) {
+            return { mode: lower, raw }
+          }
+          if (lower.startsWith('hourly(') && lower.endsWith(')')) {
+            const inner = raw.slice(7, -1).trim()
+            const parts = inner.split('-').map(val => val.trim())
+            return { mode: 'hourly', hourStart: parts[0] || '', hourEnd: parts[1] || '', raw }
+          }
+          if (lower.startsWith('weekly(') && lower.endsWith(')')) {
+            const inner = raw.slice(7, -1).trim()
+            if (inner.includes('|')) {
+              return { mode: 'weekly', days: inner.split('|').map(d => d.trim().toLowerCase()).filter(Boolean), raw }
+            }
+            return { mode: 'weekly', days: [inner.toLowerCase()], raw }
+          }
+          if (lower.startsWith('monthly(') && lower.endsWith(')')) {
+            const inner = raw.slice(8, -1).trim()
+            return { mode: 'monthly', day: inner, raw }
+          }
+          if (lower.startsWith('yearly(') && lower.endsWith(')')) {
+            const inner = raw.slice(7, -1).trim()
+            return { mode: 'yearly', monthDay: inner, raw }
+          }
+          if (lower.startsWith('date(') && lower.endsWith(')')) {
+            const inner = raw.slice(5, -1).trim()
+            return { mode: 'date', date: inner, raw }
+          }
+          if (lower.startsWith('range(') && lower.endsWith(')')) {
+            const inner = raw.slice(6, -1).trim()
+            if (inner.includes('|')) {
+              return { mode: 'custom', raw }
+            }
+            const parts = inner.split('-').map(val => val.trim())
+            return { mode: 'range', start: parts[0] || '', end: parts[1] || '', raw }
+          }
+          if (lower.startsWith('all[')) {
+            return { mode: 'custom', raw }
+          }
+          return { mode: 'custom', raw }
+        }
+
+        function setMode (mode) {
+          modeSelect.value = mode
+          modeSections.forEach(section => {
+            const active = section.dataset.scheduleMode === mode
+            section.classList.toggle('is-active', active)
+          })
+        }
+
+        function buildValueFromInputs (mode) {
+          if (mode === 'range') {
+            const start = formatMonthDay(rangeStart?.value)
+            const end = formatMonthDay(rangeEnd?.value)
+            if (start && end) return `range(${start}-${end})`
+          }
+          if (mode === 'weekly') {
+            const selected = weeklyDays.filter(day => day.checked).map(day => day.value)
+            if (selected.length) return `weekly(${selected.join('|')})`
+          }
+          if (mode === 'monthly') {
+            const day = String(monthlyDay?.value || '').trim()
+            if (day) return `monthly(${day})`
+          }
+          if (mode === 'yearly') {
+            const md = formatMonthDay(yearlyInput?.value)
+            if (md) return `yearly(${md})`
+          }
+          if (mode === 'date') {
+            const dateVal = formatDateValue(dateInput?.value)
+            if (dateVal) return `date(${dateVal})`
+          }
+          if (mode === 'hourly') {
+            const start = String(hourStart?.value || '').trim()
+            const end = String(hourEnd?.value || '').trim()
+            if (start && end) return `hourly(${start}-${end})`
+            if (start) return `hourly(${start})`
+          }
+          if (mode === 'daily') return 'daily'
+          if (mode === 'never') return 'never'
+          if (mode === 'non_existing') return 'non_existing'
+          if (mode === 'custom') {
+            return String(rawInput?.value || '').trim()
+          }
+          return ''
+        }
+
+        function updatePreview (value) {
+          if (preview) preview.textContent = value || ''
+        }
+
+        function updateFromBuilder () {
+          const mode = modeSelect.value
+          setMode(mode)
+          let nextValue = ''
+          if (mode === 'custom') {
+            nextValue = String(rawInput?.value || '').trim()
+          } else {
+            nextValue = buildValueFromInputs(mode) || defaultValue || ''
+          }
+          hidden.value = nextValue
+          updatePreview(nextValue)
+          if (rawInput && mode !== 'custom') {
+            rawInput.value = nextValue
+          }
+        }
+
+        function applyParsed (parsed) {
+          const mode = parsed.mode || 'custom'
+          setMode(mode)
+          if (mode === 'range') {
+            setMonthDayInput(rangeStart, parsed.start)
+            setMonthDayInput(rangeEnd, parsed.end)
+          } else if (mode === 'weekly') {
+            const selected = new Set((parsed.days || []).map(day => day.toLowerCase()))
+            weeklyDays.forEach(day => {
+              day.checked = selected.has(day.value)
+            })
+          } else if (mode === 'monthly') {
+            if (monthlyDay) monthlyDay.value = parsed.day || ''
+          } else if (mode === 'yearly') {
+            setMonthDayInput(yearlyInput, parsed.monthDay)
+          } else if (mode === 'date') {
+            setDateInput(dateInput, parsed.date)
+          } else if (mode === 'hourly') {
+            if (hourStart) hourStart.value = parsed.hourStart || ''
+            if (hourEnd) hourEnd.value = parsed.hourEnd || ''
+          }
+          if (rawInput) rawInput.value = parsed.raw || ''
+          updatePreview(parsed.raw || '')
+        }
+
+        const initialRaw = String(hidden.value || defaultValue || '').trim()
+        const parsed = parseSchedule(initialRaw)
+        applyParsed(parsed)
+        updateFromBuilder()
+
+        modeSelect.addEventListener('change', () => updateFromBuilder())
+        if (rangeStart) rangeStart.addEventListener('change', () => updateFromBuilder())
+        if (rangeEnd) rangeEnd.addEventListener('change', () => updateFromBuilder())
+        weeklyDays.forEach(day => {
+          day.addEventListener('change', () => updateFromBuilder())
+        })
+        if (monthlyDay) monthlyDay.addEventListener('input', () => updateFromBuilder())
+        if (yearlyInput) yearlyInput.addEventListener('change', () => updateFromBuilder())
+        if (dateInput) dateInput.addEventListener('change', () => updateFromBuilder())
+        if (hourStart) hourStart.addEventListener('input', () => updateFromBuilder())
+        if (hourEnd) hourEnd.addEventListener('input', () => updateFromBuilder())
+
+        if (rawInput) {
+          rawInput.addEventListener('change', () => {
+            const raw = String(rawInput.value || '').trim()
+            const parsedRaw = parseSchedule(raw)
+            applyParsed(parsedRaw)
+            if (parsedRaw.mode === 'custom') {
+              hidden.value = raw
+              updatePreview(raw)
+            } else {
+              updateFromBuilder()
+            }
+          })
+        }
+
+        builder.dataset.listenerAdded = 'true'
+      })
+    }
+
+    function setupTemplateStringListHandlers (scope) {
+      const root = scope || document
+      root.querySelectorAll('[data-template-string-list]').forEach(wrapper => {
+        if (wrapper.dataset.listenerAdded) return
+        const hiddenId = wrapper.dataset.hiddenInput
+        const hidden = hiddenId ? document.getElementById(hiddenId) : wrapper.querySelector('input[type="hidden"]')
+        const input = wrapper.querySelector('input[type="text"]')
+        const addBtn = wrapper.querySelector('[data-template-string-add]')
+        const list = wrapper.querySelector('[data-template-string-items]')
+
+        if (!hidden || !input || !addBtn || !list) return
+
+        function parseValues () {
+          const raw = String(hidden.value || '').trim()
+          if (!raw) return []
+          try {
+            const parsed = JSON.parse(raw)
+            if (Array.isArray(parsed)) {
+              return parsed.map(item => String(item).trim()).filter(Boolean)
+            }
+          } catch (e) {
+            // fall through to treat as single value
+          }
+          return [raw]
+        }
+
+        function renderList (values) {
+          list.replaceChildren()
+          values.forEach(value => {
+            const li = document.createElement('li')
+            li.className = 'list-group-item d-flex justify-content-between align-items-center'
+            const textSpan = document.createElement('span')
+            textSpan.textContent = value
+            const button = document.createElement('button')
+            button.type = 'button'
+            button.className = 'btn btn-sm btn-danger'
+            button.setAttribute('aria-label', 'Remove')
+            const icon = document.createElement('i')
+            icon.className = 'bi bi-x-lg'
+            button.appendChild(icon)
+            li.append(textSpan, button)
+            list.appendChild(li)
+
+            button.addEventListener('click', () => {
+              const updated = values.filter(item => item !== value)
+              hidden.value = JSON.stringify(updated)
+              renderList(updated)
+            })
+          })
+        }
+
+        function addValue () {
+          const value = input.value.trim()
+          if (!value) return
+          const current = parseValues()
+          if (current.includes(value)) return
+          current.push(value)
+          hidden.value = JSON.stringify(current)
+          renderList(current)
+          input.value = ''
+        }
+
+        const initial = parseValues()
+        hidden.value = JSON.stringify(initial)
+        renderList(initial)
+
+        addBtn.addEventListener('click', addValue)
+        input.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            addValue()
+          }
+        })
+
+        wrapper.dataset.listenerAdded = 'true'
       })
     }
 
@@ -267,7 +791,7 @@ document.addEventListener('DOMContentLoaded', function () {
         return card.label.toLowerCase().includes(query)
       })
 
-      grid.innerHTML = ''
+      grid.replaceChildren()
       if (status) {
         status.textContent = `${filtered.length} font${filtered.length === 1 ? '' : 's'}`
       }
@@ -461,16 +985,27 @@ document.addEventListener('DOMContentLoaded', function () {
       const option = libraryPicker.querySelector(`option[value="${libraryId}"]`)
       const targetInputId = toggle?.dataset.targetInput
       const targetInput = targetInputId ? document.getElementById(targetInputId) : null
+      const status = card.querySelector('[data-include-status]')
       if (!toggle || !option || toggle.dataset.listenerAdded || !targetInput) return
+
+      function syncStatus () {
+        if (!status) return
+        const included = toggle.checked
+        status.textContent = included ? 'Included in YAML' : 'Excluded from YAML'
+        status.classList.toggle('bg-success', included)
+        status.classList.toggle('bg-secondary', !included)
+      }
 
       toggle.addEventListener('change', () => {
         option.dataset.configured = toggle.checked ? 'true' : 'false'
         targetInput.value = toggle.checked ? toggle.value : ''
         refreshPickerLabels()
+        syncStatus()
         if (typeof ValidationHandler !== 'undefined' && ValidationHandler.updateValidationState) {
           ValidationHandler.updateValidationState()
         }
       })
+      syncStatus()
       toggle.dataset.listenerAdded = 'true'
     }
 
@@ -483,7 +1018,7 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     function mountCard (card, libraryId) {
-      libraryContainer.innerHTML = ''
+      libraryContainer.replaceChildren()
       card.style.display = ''
       libraryContainer.appendChild(card)
       activeLibraryId = libraryId
@@ -492,7 +1027,13 @@ document.addEventListener('DOMContentLoaded', function () {
       refreshPickerLabels()
       initTooltips(card)
       sortLanguageSelects(card)
+      initNumericOnlyInputs(card)
+      initStylePreviewGrids(card)
+      initRelativeYearInputs(card)
+      initScheduleBuilders(card)
+      initLibraryAssetDirectoryInputs(card)
       wireOffsetReset(card)
+      wireRatingsOffsetSync(card)
       initSortablesInScope(card)
       setupCustomStringListHandlers('mass_genre_update', card)
       setupCustomStringListHandlers('radarr_remove_by_tag', card)
@@ -500,10 +1041,12 @@ document.addEventListener('DOMContentLoaded', function () {
       setupCustomStringListHandlers('metadata_backup', card)
       setupCustomStringListHandlers('mass_content_rating_update', card)
       setupCustomStringListHandlers('mass_genre_mapper', card)
+      setupTemplateStringListHandlers(card)
       setupMappingListHandlers('genre_mapper', card)
       setupMappingListHandlers('content_rating_mapper', card)
       wireOverlayDetailToggles(card)
       setupParentChildToggleVisibility(card)
+      setupAddMissingDependencies(card)
       if (typeof setupParentChildToggleSync === 'function') {
         setupParentChildToggleSync()
       }
@@ -545,14 +1088,85 @@ document.addEventListener('DOMContentLoaded', function () {
           return
         }
 
-        if (el.type === 'checkbox' || el.type === 'radio') {
-          payload[el.name] = el.checked ? (el.value || 'on') : ''
+        if (el.type === 'checkbox') {
+          payload[el.name] = el.checked ? (el.value || 'true') : 'false'
+          return
+        }
+
+        if (el.type === 'radio') {
+          if (el.checked) {
+            payload[el.name] = el.value || 'on'
+          }
+          return
+        }
+
+        if (el.name.endsWith('-attribute_asset_directory')) {
+          if (!Array.isArray(payload[el.name])) payload[el.name] = []
+          payload[el.name].push(el.value ?? '')
           return
         }
 
         payload[el.name] = el.value ?? ''
       })
       return payload
+    }
+
+    function initLibraryAssetDirectoryInputs (card) {
+      card.querySelectorAll('[data-library-asset-directory-container]').forEach(container => {
+        if (container.dataset.assetDirectoryBound === 'true') return
+        container.dataset.assetDirectoryBound = 'true'
+
+        const inputName = container.dataset.inputName
+        const addBtnSelector = `[data-add-asset-directory="${container.id}"]`
+        const addBtn = card.querySelector(addBtnSelector)
+        let counter = container.querySelectorAll(`input[name="${inputName}"]`).length
+
+        const buildRow = (value = '') => {
+          counter += 1
+          const row = document.createElement('div')
+          row.className = 'input-group mb-2'
+
+          const input = document.createElement('input')
+          input.type = 'text'
+          input.className = 'form-control'
+          input.name = inputName
+          input.id = `${container.id}_${counter}`
+          input.placeholder = 'Add Asset Directory'
+          input.dataset.pathRule = 'asset_directory'
+          input.value = value
+
+          const removeBtn = document.createElement('button')
+          removeBtn.className = 'btn btn-danger library-remove-asset-directory'
+          removeBtn.type = 'button'
+          removeBtn.textContent = 'Remove'
+
+          row.append(input, removeBtn)
+          return row
+        }
+
+        if (addBtn) {
+          addBtn.addEventListener('click', () => {
+            const row = buildRow('')
+            container.appendChild(row)
+            if (typeof PathValidation !== 'undefined' && PathValidation.attach) {
+              PathValidation.attach(row)
+            }
+          })
+        }
+
+        container.addEventListener('click', event => {
+          if (!event.target.classList.contains('library-remove-asset-directory')) return
+          const fieldGroup = event.target.closest('.input-group')
+          if (!fieldGroup) return
+          let next = fieldGroup.nextElementSibling
+          while (next && next.dataset && next.dataset.pathHint) {
+            const toRemove = next
+            next = next.nextElementSibling
+            toRemove.remove()
+          }
+          container.removeChild(fieldGroup)
+        })
+      })
     }
 
     function autosaveActiveLibrary () {
@@ -603,14 +1217,17 @@ document.addEventListener('DOMContentLoaded', function () {
       if (!copyModal) return
       copyWarning.style.display = 'none'
       copySubtitle.textContent = `Mirror settings from "${sourceName}" to other ${sourceType === 'movie' ? 'movie' : 'show'} libraries`
-      copyTargetsContainer.innerHTML = ''
+      copyTargetsContainer.replaceChildren()
 
       const options = Array.from(libraryPicker.querySelectorAll('option[value]')).filter(opt =>
         opt.dataset.libraryType === sourceType && opt.value !== sourceId
       )
 
       if (!options.length) {
-        copyTargetsContainer.innerHTML = '<div class="text-muted">No other libraries of this type available.</div>'
+        const empty = document.createElement('div')
+        empty.className = 'text-muted'
+        empty.textContent = 'No other libraries of this type available.'
+        copyTargetsContainer.appendChild(empty)
       } else {
         options.forEach(opt => {
           const id = opt.value
@@ -618,10 +1235,15 @@ document.addEventListener('DOMContentLoaded', function () {
           const inputId = `copy-target-${id}`
           const item = document.createElement('label')
           item.className = 'list-group-item d-flex align-items-center gap-2'
-          item.innerHTML = `
-            <input id="${inputId}" name="copy_target" class="form-check-input me-2 copy-target-checkbox" type="checkbox" value="${id}">
-            <span>${label}</span>
-          `
+          const input = document.createElement('input')
+          input.id = inputId
+          input.name = 'copy_target'
+          input.className = 'form-check-input me-2 copy-target-checkbox'
+          input.type = 'checkbox'
+          input.value = id
+          const span = document.createElement('span')
+          span.textContent = label
+          item.append(input, span)
           copyTargetsContainer.appendChild(item)
         })
       }
@@ -686,7 +1308,7 @@ document.addEventListener('DOMContentLoaded', function () {
           })
           .then((data) => {
             // Clear all cached cards to avoid stale data
-            libraryCache.innerHTML = ''
+            libraryCache.replaceChildren()
 
             filtered.forEach(id => {
               const cached = libraryCache.querySelector(`[data-library-id="${id}"]`)
@@ -748,7 +1370,7 @@ document.addEventListener('DOMContentLoaded', function () {
           if (requestId !== loadRequestId) return
 
           if (!libraryId) {
-            libraryContainer.innerHTML = ''
+            libraryContainer.replaceChildren()
             activeLibraryId = null
             setLoading(false)
             return
@@ -772,9 +1394,10 @@ document.addEventListener('DOMContentLoaded', function () {
             })
             .then(html => {
               if (requestId !== loadRequestId) return
-              const wrapper = document.createElement('div')
-              wrapper.innerHTML = html
-              const card = wrapper.firstElementChild
+              const parser = new DOMParser()
+              const doc = parser.parseFromString(html, 'text/html')
+              const parsedCard = doc.body.firstElementChild
+              const card = parsedCard ? document.importNode(parsedCard, true) : null
               if (!card) throw new Error('Empty fragment response')
               mountCard(card, libraryId)
               setLoading(false)
@@ -834,6 +1457,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     wireOverlayDetailToggles()
     wireOverlayTemplateSections()
+    wireRatingsOffsetSync()
 
     document.addEventListener('click', (e) => {
       const btn = e.target.closest('.copy-library-btn')
@@ -849,16 +1473,16 @@ document.addEventListener('DOMContentLoaded', function () {
       const hiddenInput = document.getElementById(`${libraryId}-attribute_${prefix}_order`)
 
       if (!list || !hiddenInput) {
-        console.warn(`[WARN] Missing sortable list or hidden input for ${libraryId}-${prefix}`)
+        console.warn('[WARN] Missing sortable list or hidden input for', `${libraryId}-${prefix}`)
         return
       }
 
       let values = []
       try {
         values = JSON.parse(hiddenInput.value || '[]')
-        console.log(`[DEBUG] Parsed hidden input from #${hiddenInput.id}:`, values)
+        console.log('[DEBUG] Parsed hidden input from', hiddenInput.id, values)
       } catch (e) {
-        console.warn(`[WARN] Could not parse JSON from hidden input #${hiddenInput.id}:`, hiddenInput.value)
+        console.warn('[WARN] Could not parse JSON from hidden input', hiddenInput.id, hiddenInput.value)
       }
 
       // If no order is saved yet, default to currently checked toggles (in DOM order)
@@ -881,7 +1505,7 @@ document.addEventListener('DOMContentLoaded', function () {
         const libraryId = match[1]
         const prefix = match[2]
 
-        console.log(`[DEBUG] Initializing sortable for ${libraryId} with prefix ${prefix} (scoped)`)
+        console.log('[DEBUG] Initializing sortable for', libraryId, 'with prefix', prefix, '(scoped)')
 
         initializeSortableList(libraryId, prefix)
         bindToggleToList(libraryId, prefix)
@@ -893,7 +1517,7 @@ document.addEventListener('DOMContentLoaded', function () {
             const hiddenInput = document.getElementById(`${libraryId}-attribute_${prefix}_order`)
             const selected = [...list.querySelectorAll('li')].map(li => li.dataset.value)
             hiddenInput.value = JSON.stringify(selected)
-            console.log(`[DEBUG] Updated order for #${hiddenInput.id}:`, selected)
+            console.log('[DEBUG] Updated order for', hiddenInput.id, selected)
           }
         })
 
@@ -902,7 +1526,7 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     function renderSortableList (libraryId, prefix, list, hiddenInput, values) {
-      list.innerHTML = ''
+      list.replaceChildren()
 
       values.forEach(item => {
         const toggle = document.getElementById(`${libraryId}-attribute_${prefix}_${item}`)
@@ -916,7 +1540,9 @@ document.addEventListener('DOMContentLoaded', function () {
         const friendlyText = labelElement?.dataset.label || item
 
         const span = document.createElement('span')
-        span.innerHTML = `<i class="bi bi-grip-vertical me-2 drag-handle"></i>${friendlyText}`
+        const icon = document.createElement('i')
+        icon.className = 'bi bi-grip-vertical me-2 drag-handle'
+        span.append(icon, document.createTextNode(friendlyText))
 
         li.appendChild(span)
         list.appendChild(li)
@@ -1018,19 +1644,24 @@ function setupCustomStringListHandlers (prefix, scope) {
     if (!input || !list || !button) return
 
     function renderCustomList (values) {
-      list.innerHTML = ''
+      list.replaceChildren()
 
       values.forEach(value => {
         const li = document.createElement('li')
         li.className = 'list-group-item d-flex justify-content-between align-items-center'
-        li.innerHTML = `
-          <span>${value}</span>
-          <button type="button" class="btn btn-sm btn-danger" aria-label="Remove">
-            <i class="bi bi-x-lg"></i>
-          </button>`
+        const textSpan = document.createElement('span')
+        textSpan.textContent = value
+        const button = document.createElement('button')
+        button.type = 'button'
+        button.className = 'btn btn-sm btn-danger'
+        button.setAttribute('aria-label', 'Remove')
+        const icon = document.createElement('i')
+        icon.className = 'bi bi-x-lg'
+        button.appendChild(icon)
+        li.append(textSpan, button)
         list.appendChild(li)
 
-        li.querySelector('button').addEventListener('click', function () {
+        button.addEventListener('click', function () {
           const updated = values.filter(item => item !== value)
           hidden.value = JSON.stringify(updated)
           renderCustomList(updated) // 🔁 Rerender the new list and update the array
@@ -1043,7 +1674,7 @@ function setupCustomStringListHandlers (prefix, scope) {
     try {
       current = JSON.parse(hidden.value || '[]')
     } catch (e) {
-      console.warn(`[WARN] Could not parse hidden input for ${prefix}:`, hidden.value)
+      console.warn('[WARN] Could not parse hidden input for', prefix, hidden.value)
     }
     renderCustomList(current)
 
@@ -1053,7 +1684,7 @@ function setupCustomStringListHandlers (prefix, scope) {
       try {
         current = JSON.parse(hidden.value || '[]')
       } catch (e) {
-        console.warn(`[WARN] Could not parse hidden input for ${prefix}:`, hidden.value)
+        console.warn('[WARN] Could not parse hidden input for', prefix, hidden.value)
       }
 
       const value = input.value.trim()
@@ -1083,18 +1714,23 @@ function setupMappingListHandlers (prefix, scope) {
     if (!inputField || !outputField || !list || !addBtn) return
 
     function renderList (data) {
-      list.innerHTML = ''
+      list.replaceChildren()
       Object.entries(data).forEach(([key, value]) => {
         const li = document.createElement('li')
         li.className = 'list-group-item d-flex justify-content-between align-items-center'
         const display = value ? `${key} -> ${value}` : `${key} (remove)`
-        li.innerHTML = `
-          <span>${display}</span>
-          <button type="button" class="btn btn-sm btn-danger" aria-label="Remove">
-            <i class="bi bi-x-lg"></i>
-          </button>`
+        const textSpan = document.createElement('span')
+        textSpan.textContent = display
+        const button = document.createElement('button')
+        button.type = 'button'
+        button.className = 'btn btn-sm btn-danger'
+        button.setAttribute('aria-label', 'Remove')
+        const icon = document.createElement('i')
+        icon.className = 'bi bi-x-lg'
+        button.appendChild(icon)
+        li.append(textSpan, button)
         list.appendChild(li)
-        li.querySelector('button').addEventListener('click', () => {
+        button.addEventListener('click', () => {
           delete data[key]
           hidden.value = JSON.stringify(data)
           renderList(data)
@@ -1106,7 +1742,7 @@ function setupMappingListHandlers (prefix, scope) {
     try {
       current = JSON.parse(hidden.value || '{}') || {}
     } catch (e) {
-      console.warn(`[WARN] Could not parse hidden input for ${prefix}:`, hidden.value)
+      console.warn('[WARN] Could not parse hidden input for', prefix, hidden.value)
       current = {}
     }
     renderList(current)
@@ -1287,6 +1923,19 @@ function wireOffsetReset (scope) {
       if (group) {
         delete group.dataset.resetting
         if (changes.length) {
+          if (isRatingsOverlay) {
+            if (hInput) {
+              hInput.dispatchEvent(new Event('input', { bubbles: true }))
+              hInput.dispatchEvent(new Event('change', { bubbles: true }))
+            }
+            if (vInput) {
+              vInput.dispatchEvent(new Event('input', { bubbles: true }))
+              vInput.dispatchEvent(new Event('change', { bubbles: true }))
+            }
+            if (pInput) {
+              pInput.dispatchEvent(new Event('change', { bubbles: true }))
+            }
+          }
           const trigger = group.querySelector('input:not([disabled]), select:not([disabled]), textarea:not([disabled])')
           if (trigger) {
             trigger.dispatchEvent(new Event('change', { bubbles: true }))
@@ -1345,22 +1994,84 @@ function setupParentChildToggleVisibility (scope) {
 
     if (!childrenGroup || !wrapper) return
 
-    function updateVisibilityAndBorder () {
+    function updateVisibilityAndBorder (fromParent = false) {
       const childrenToggles = childrenGroup.querySelectorAll("input[type='checkbox']")
-      const anyChildChecked = Array.from(childrenToggles).some(el => el.checked)
-      const parentChecked = parentToggle.checked
-
-      childrenGroup.style.display = parentChecked ? 'block' : 'none'
+      const syncChildHidden = (child) => {
+        const row = child.closest('.form-check')
+        const hidden = row
+          ? row.querySelector(`input[type="hidden"][name="${child.name}"]`)
+          : document.querySelector(`input[type="hidden"][name="${child.name}"]`)
+        if (!hidden) return
+        hidden.value = child.checked ? 'true' : 'false'
+        hidden.disabled = !!child.checked
+      }
+      childrenToggles.forEach(child => {
+        if (child.dataset.initialChecked === undefined) {
+          child.dataset.initialChecked = child.checked ? 'true' : 'false'
+        }
+      })
+      let parentChecked = parentToggle.checked
+      const wasChecked = parentToggle.dataset.wasChecked === 'true'
 
       if (!parentChecked) {
         childrenToggles.forEach(child => {
+          child.dataset.lastChecked = child.checked ? 'true' : 'false'
           child.checked = false
-          const hidden = document.querySelector(`input[type="hidden"][name="${child.name}"]`)
-          if (hidden) hidden.value = 'false'
+          syncChildHidden(child)
         })
+      } else if (parentChecked && !wasChecked) {
+        childrenToggles.forEach(child => {
+          if (child.dataset.lastChecked !== undefined) {
+            child.checked = child.dataset.lastChecked === 'true'
+          } else {
+            child.checked = child.dataset.initialChecked === 'true'
+          }
+          syncChildHidden(child)
+        })
+      } else {
+        childrenToggles.forEach(child => syncChildHidden(child))
       }
 
-      if (parentChecked && anyChildChecked) {
+      const isAddMissingToggle = (child) => {
+        const id = child.id || ''
+        return id.includes('_radarr_add_missing_') || id.includes('_sonarr_add_missing_')
+      }
+      const isVisibleToggle = (child) => {
+        const id = child.id || ''
+        return id.includes('_visible_')
+      }
+      const isRequiredChild = (child) => {
+        const id = child.id || ''
+        if (!id.includes('-template_collection_')) return false
+        if (isAddMissingToggle(child) || isVisibleToggle(child)) return false
+        return id.includes('_use_')
+      }
+      const requiredChildren = Array.from(childrenToggles).filter(isRequiredChild)
+      const hasRequiredChildren = requiredChildren.length > 0
+      let anyRequiredChecked = requiredChildren.some(el => el.checked)
+      const isCollectionParent = parentToggle.id.includes('-collection_')
+      if (fromParent && parentChecked && isCollectionParent && hasRequiredChildren && !anyRequiredChecked) {
+        const candidate = requiredChildren[0]
+        if (candidate) {
+          candidate.checked = true
+          syncChildHidden(candidate)
+          anyRequiredChecked = true
+        }
+      }
+      const parentHidden = document.querySelector(`input[type="hidden"][name="${parentToggle.name}"]`)
+      if (parentChecked && hasRequiredChildren && !anyRequiredChecked) {
+        parentChecked = false
+        parentToggle.checked = false
+        parentToggle.dataset.wasChecked = 'false'
+        if (parentHidden) parentHidden.value = 'false'
+      }
+      if (parentHidden) {
+        parentHidden.disabled = parentChecked
+        if (!parentChecked) parentHidden.value = 'false'
+      }
+
+      childrenGroup.style.display = parentChecked ? 'block' : 'none'
+      if (parentChecked && (hasRequiredChildren ? anyRequiredChecked : true)) {
         wrapper.classList.add('template-toggle-group-bordered')
       } else {
         wrapper.classList.remove('template-toggle-group-bordered')
@@ -1368,15 +2079,249 @@ function setupParentChildToggleVisibility (scope) {
 
       EventHandler.updateAccordionHighlights()
       ValidationHandler.updateValidationState()
+      parentToggle.dataset.wasChecked = parentChecked ? 'true' : 'false'
     }
 
-    parentToggle.addEventListener('change', updateVisibilityAndBorder)
+    parentToggle.addEventListener('change', () => updateVisibilityAndBorder(true))
     childrenGroup.querySelectorAll("input[type='checkbox']").forEach(child =>
-      child.addEventListener('change', updateVisibilityAndBorder)
+      child.addEventListener('change', () => updateVisibilityAndBorder(false))
     )
 
-    updateVisibilityAndBorder() // Initial check
+    updateVisibilityAndBorder(false) // Initial check
     parentToggle.dataset.childVisibilityBound = 'true'
+  })
+}
+
+function wireRatingsOffsetSync (scope) {
+  const root = scope || document
+  root.querySelectorAll('.template-toggle-group[data-overlay-id="overlay_ratings"]').forEach(group => {
+    if (group.dataset.ratingsOffsetSyncBound === 'true') return
+
+    const templateName = group.dataset.overlayTemplate
+    if (!templateName) return
+
+    const sharedInputs = {
+      horizontal: group.querySelector(`[name="${templateName}[horizontal_offset]"]`),
+      vertical: group.querySelector(`[name="${templateName}[vertical_offset]"]`)
+    }
+    if (!sharedInputs.horizontal || !sharedInputs.vertical) return
+
+    const metricInputs = {
+      backHeight: group.querySelector(`[name="${templateName}[back_height]"]`),
+      backPadding: group.querySelector(`[name="${templateName}[back_padding]"]`)
+    }
+    const positionInput = group.querySelector(`[name="${templateName}[horizontal_position]"]`)
+    const slotDefs = ['rating1', 'rating2', 'rating3'].map(slot => ({
+      slot,
+      ratingInput: group.querySelector(`[name="${templateName}[${slot}]"]`),
+      imageInput: group.querySelector(`[name="${templateName}[${slot}_image]"]`),
+      horizontalInput: group.querySelector(`[name="${templateName}[${slot}_horizontal_offset]"]`),
+      verticalInput: group.querySelector(`[name="${templateName}[${slot}_vertical_offset]"]`)
+    })).filter(slot => slot.horizontalInput || slot.verticalInput || slot.ratingInput || slot.imageInput)
+    const slotInputs = {
+      horizontal: slotDefs.map(slot => slot.horizontalInput).filter(Boolean),
+      vertical: slotDefs.map(slot => slot.verticalInput).filter(Boolean)
+    }
+
+    const toNumber = (value, fallback = 0) => {
+      const n = Number(value)
+      return Number.isFinite(n) ? n : fallback
+    }
+    const normalizeValue = (value) => String(value ?? '').trim().toLowerCase()
+    const hasMeaningfulValue = (input) => {
+      if (!input) return false
+      const value = normalizeValue(input.value)
+      return value !== '' && value !== 'none'
+    }
+    const isConfiguredSlot = (slot) => hasMeaningfulValue(slot.ratingInput) && hasMeaningfulValue(slot.imageInput)
+    const getActiveSlots = () => slotDefs.filter(isConfiguredSlot)
+    const getBackPadding = () => Math.max(0, toNumber(metricInputs.backPadding?.value, 15))
+    const getVerticalStep = () => {
+      const backHeight = toNumber(metricInputs.backHeight?.value, 160)
+      const backPadding = getBackPadding()
+      return backHeight + (backPadding * 3)
+    }
+    const getHorizontalSlotOffset = (sharedValue) => {
+      return toNumber(sharedValue, 15) + getBackPadding()
+    }
+    const updateInputValue = (input, nextValue) => {
+      if (!input) return
+      const normalized = String(Math.round(nextValue))
+      if (String(input.value ?? '') === normalized) return
+      input.value = normalized
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+
+    const valuesDiffer = (input) => {
+      if (!input) return false
+      return String(input.value ?? '') !== String(input.dataset.default ?? '')
+    }
+    const hasExplicitSlotOffsets = (axis = null) => {
+      const activeSlots = getActiveSlots()
+      const inputs = axis
+        ? activeSlots.map(slot => slot[`${axis}Input`]).filter(Boolean)
+        : activeSlots.flatMap(slot => [slot.horizontalInput, slot.verticalInput]).filter(Boolean)
+      return inputs.some(valuesDiffer)
+    }
+
+    const withSyncGuard = (callback) => {
+      group.dataset.syncingRatingOffsets = 'true'
+      try {
+        callback()
+      } finally {
+        delete group.dataset.syncingRatingOffsets
+      }
+    }
+
+    const syncSharedFromSlots = (axis) => {
+      const sharedInput = sharedInputs[axis]
+      const inputs = getActiveSlots().map(slot => slot[`${axis}Input`]).filter(Boolean)
+      if (!sharedInput || !inputs.length) return
+      if (group.dataset.syncingRatingOffsets === 'true' || group.dataset.resetting === 'true') {
+        sharedInput.dataset.prevValue = String(sharedInput.value ?? '')
+        return
+      }
+      const average = Math.round(
+        inputs.reduce((sum, input) => sum + toNumber(input.value, toNumber(input.dataset.default, 0)), 0) / inputs.length
+      )
+      withSyncGuard(() => {
+        const sharedValue = axis === 'horizontal'
+          ? average - getBackPadding()
+          : average
+        sharedInput.value = String(sharedValue)
+        sharedInput.dataset.prevValue = String(sharedValue)
+        sharedInput.dispatchEvent(new Event('input', { bubbles: true }))
+        sharedInput.dispatchEvent(new Event('change', { bubbles: true }))
+      })
+    }
+
+    const syncSlotsFromShared = (axis) => {
+      const sharedInput = sharedInputs[axis]
+      const activeSlots = getActiveSlots()
+      if (!sharedInput || !activeSlots.length) return
+      if (group.dataset.syncingRatingOffsets === 'true' || group.dataset.resetting === 'true') {
+        sharedInput.dataset.prevValue = String(sharedInput.value ?? '')
+        return
+      }
+      const current = toNumber(sharedInput.value, toNumber(sharedInput.dataset.default, 0))
+      sharedInput.dataset.prevValue = String(current)
+      withSyncGuard(() => {
+        if (axis === 'horizontal') {
+          const slotOffset = getHorizontalSlotOffset(current)
+          activeSlots.forEach(slot => updateInputValue(slot.horizontalInput, slotOffset))
+          return
+        }
+        const verticalStep = getVerticalStep()
+        const centerIndex = (activeSlots.length - 1) / 2
+        activeSlots.forEach((slot, index) => {
+          updateInputValue(slot.verticalInput, current + ((index - centerIndex) * verticalStep))
+        })
+      })
+    }
+
+    const seedSharedFromSlots = () => {
+      const sharedAtDefaults = Object.values(sharedInputs).every(input => !valuesDiffer(input))
+      if (!hasExplicitSlotOffsets() || !sharedAtDefaults) return
+      if (hasExplicitSlotOffsets('horizontal')) syncSharedFromSlots('horizontal')
+      if (hasExplicitSlotOffsets('vertical')) syncSharedFromSlots('vertical')
+    }
+
+    seedSharedFromSlots()
+
+    Object.entries(sharedInputs).forEach(([axis, input]) => {
+      input.dataset.prevValue = String(input.value ?? '')
+      const syncFromShared = () => syncSlotsFromShared(axis)
+      input.addEventListener('input', syncFromShared)
+      input.addEventListener('change', syncFromShared)
+    })
+
+    if (positionInput && positionInput.dataset.ratingsPositionBound !== 'true') {
+      const refreshFromPosition = () => {
+        if (group.dataset.resetting === 'true') return
+        sharedInputs.horizontal?.dispatchEvent(new Event('change', { bubbles: true }))
+        sharedInputs.vertical?.dispatchEvent(new Event('change', { bubbles: true }))
+      }
+      positionInput.addEventListener('change', refreshFromPosition)
+      positionInput.dataset.ratingsPositionBound = 'true'
+    }
+
+    Object.entries(slotInputs).forEach(([axis, inputs]) => {
+      inputs.forEach(input => {
+        input.addEventListener('change', () => syncSharedFromSlots(axis))
+      })
+    })
+
+    const refreshDerivedOffsets = () => {
+      if (!valuesDiffer(sharedInputs.horizontal) && !valuesDiffer(sharedInputs.vertical) && !hasExplicitSlotOffsets()) {
+        return
+      }
+      syncSlotsFromShared('horizontal')
+      syncSlotsFromShared('vertical')
+    }
+
+    slotDefs.forEach(slot => {
+      if (slot.ratingInput) slot.ratingInput.addEventListener('change', refreshDerivedOffsets)
+      if (slot.imageInput) slot.imageInput.addEventListener('change', refreshDerivedOffsets)
+    })
+    if (metricInputs.backHeight) metricInputs.backHeight.addEventListener('change', refreshDerivedOffsets)
+    if (metricInputs.backPadding) metricInputs.backPadding.addEventListener('change', refreshDerivedOffsets)
+
+    group.dataset.ratingsOffsetSyncBound = 'true'
+  })
+}
+
+function setupAddMissingDependencies (scope) {
+  const root = scope || document
+  const addMissingToggles = Array.from(root.querySelectorAll('input.template-child-toggle[id*="radarr_add_missing_"], input.template-child-toggle[id*="sonarr_add_missing_"]'))
+  if (!addMissingToggles.length) return
+
+  const groupMap = new Map()
+
+  addMissingToggles.forEach(addToggle => {
+    const id = addToggle.id || ''
+    const split = id.split('-template_collection_')
+    if (split.length !== 2) return
+    const prefix = split[0]
+    const tail = split[1]
+    let useTail = null
+    const radarrMatch = tail.match(/(.+)_radarr_add_missing_(.+)$/)
+    if (radarrMatch) {
+      useTail = `${radarrMatch[1]}_use_${radarrMatch[2]}`
+    } else {
+      const sonarrMatch = tail.match(/(.+)_sonarr_add_missing_(.+)$/)
+      if (sonarrMatch) {
+        useTail = `${sonarrMatch[1]}_use_${sonarrMatch[2]}`
+      }
+    }
+    if (!useTail) return
+    const useToggle = document.getElementById(`${prefix}-template_collection_${useTail}`)
+    if (!useToggle) return
+
+    const list = groupMap.get(useToggle) || []
+    list.push(addToggle)
+    groupMap.set(useToggle, list)
+  })
+
+  const applyState = (useToggle, toggles) => {
+    const show = useToggle.checked
+    toggles.forEach(addToggle => {
+      const row = addToggle.closest('.form-check')
+      if (row) row.style.display = show ? '' : 'none'
+      addToggle.disabled = !show
+      if (!show) {
+        addToggle.checked = false
+        const hidden = document.querySelector(`input[type="hidden"][name="${addToggle.name}"]`)
+        if (hidden) hidden.value = 'false'
+      }
+    })
+  }
+
+  groupMap.forEach((toggles, useToggle) => {
+    if (useToggle.dataset.addMissingBound === 'true') return
+    useToggle.dataset.addMissingBound = 'true'
+    useToggle.addEventListener('change', () => applyState(useToggle, toggles))
+    applyState(useToggle, toggles)
   })
 }
 

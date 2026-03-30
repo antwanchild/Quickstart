@@ -1161,6 +1161,12 @@ header.fixed-top {
     border-color: rgba(239, 68, 68, 0.5);
 }
 
+.rating-mapping-option-via--interactive {
+    color: #fff7e6;
+    background: rgba(245, 158, 11, 0.18);
+    border-color: rgba(245, 158, 11, 0.55);
+}
+
 .rating-mapping-option-via--neutral {
     color: var(--theme-text-muted);
     background: rgba(148, 163, 184, 0.12);
@@ -1436,6 +1442,48 @@ header.fixed-top {
     padding: 6px;
 }
 
+.style-preview-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 12px;
+    padding: 4px 0 8px;
+}
+
+.style-preview-card {
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 10px;
+    padding: 10px;
+    text-align: left;
+    background: rgba(10, 10, 10, 0.35);
+    color: inherit;
+    cursor: pointer;
+    width: 100%;
+}
+
+.style-preview-card:hover {
+    border-color: rgba(56, 189, 248, 0.7);
+    background: rgba(10, 10, 10, 0.55);
+}
+
+.style-preview-card.active {
+    border-color: rgba(45, 212, 191, 0.9);
+    box-shadow: 0 0 0 1px rgba(45, 212, 191, 0.35);
+}
+
+.style-preview-title {
+    font-weight: 600;
+    font-size: 0.8rem;
+    margin-bottom: 6px;
+    text-transform: capitalize;
+}
+
+.style-preview-card img {
+    display: block;
+    width: 100%;
+    height: auto;
+    border-radius: 6px;
+}
+
 #final-content-wrapper.is-updating {
     display: none;
 }
@@ -1526,6 +1574,29 @@ form,
     display: flex;
     max-width: 800px;
     margin: auto;
+}
+
+.include-status {
+    font-size: 0.75rem;
+    letter-spacing: 0.2px;
+}
+
+@media (max-height: 520px) and (orientation: landscape) {
+    .container {
+        max-width: 100%;
+        padding-left: 12px;
+        padding-right: 12px;
+    }
+
+    .content-wrapper {
+        margin-top: 20px;
+    }
+
+    form,
+    #final-form,
+    .form-container {
+        max-width: 100%;
+    }
 }
 
 #final-yaml {
@@ -2917,13 +2988,98 @@ div#loading {
 }
 
 .log-level-counts {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 6px;
+  font-size: 0.75rem;
+  color: var(--theme-text-muted);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-level-buttons {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.log-level-buttons .btn {
+  width: 100%;
+}
+
+/* -------------------- */
+/* Schedule Builder     */
+/* -------------------- */
+
+.qs-season-group {
+    border: 1px solid var(--theme-border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    background: var(--theme-bg-dark);
+}
+
+.schedule-builder {
+    border: 1px solid var(--theme-border);
+    border-radius: 8px;
+    padding: 10px;
+    background: rgba(0, 0, 0, 0.15);
+}
+
+.schedule-builder-header .form-select {
+    max-width: 220px;
+}
+
+.schedule-builder-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.schedule-mode {
+    display: none;
+}
+
+.schedule-mode.is-active {
+    display: block;
+}
+
+.schedule-grid {
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    gap: 8px;
+    align-items: center;
+}
+
+.schedule-range-sep {
+    color: var(--theme-text-muted);
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.schedule-weekly {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
     gap: 6px;
+}
+
+.schedule-day {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
     font-size: 0.75rem;
     color: var(--theme-text-muted);
-    text-align: center;
-    font-variant-numeric: tabular-nums;
+}
+
+.schedule-preview code {
+    color: var(--theme-text);
+}
+
+.schedule-advanced summary {
+    cursor: pointer;
+    color: var(--theme-text-muted);
 }
 
 .log-level-counts--filtered {

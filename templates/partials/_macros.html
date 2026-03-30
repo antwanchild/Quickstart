@@ -826,12 +826,14 @@ select_input.key if yml_location == "top_level" else
 {% endmacro %}
 
 {% macro text_input_section(library, data, prefix, title, description, wiki, placeholder="", tooltip_variant="info",
-container_class="border rounded p-3 mb-2", yml_location="attribute") %}
+container_class="border rounded p-3 mb-2", yml_location="attribute", multiline=false, rows=3) %}
 {% set field_prefix = "template_variables" if yml_location == "template_variables" else "" if yml_location ==
 "top_level" else "attribute" %}
 {% set full_id = library.id ~ "-" ~ (field_prefix ~ "_" if field_prefix) ~ prefix %}
 {% set full_name = library.id ~ "-" ~ (field_prefix ~ "[" ~ prefix ~ "]" if field_prefix=="template_variables" else
-prefix) %}
+field_prefix ~ "_" ~ prefix if field_prefix else prefix) %}
+{% set legacy_name = library.id ~ "-" ~ prefix %}
+{% set field_value = data.libraries.get(full_name, data.libraries.get(legacy_name, '')) %}
 <div class="{{ container_class }}">
     <div class="input-group mb-2">
         <span class="input-group-text" id="{{ full_id }}_text">
@@ -842,9 +844,56 @@ prefix) %}
                     class="bi {% if tooltip_variant == 'danger' %}bi-exclamation-circle-fill{% else %}bi-info-circle-fill{% endif %}"></i>
             </span>
         </span>
+        {% if multiline %}
+        <textarea class="form-control" id="{{ full_id }}" name="{{ full_name }}"
+            placeholder="{{ placeholder }}" rows="{{ rows }}">{{ field_value }}</textarea>
+        {% else %}
         <input type="text" class="form-control" id="{{ full_id }}" name="{{ full_name }}"
-            placeholder="{{ placeholder }}" value="{{ data.libraries.get(full_name, '') }}">
+            placeholder="{{ placeholder }}" value="{{ field_value }}">
+        {% endif %}
     </div>
+</div>
+{% endmacro %}
+
+{% macro asset_directory_list_section(library, data, prefix, title, description, wiki, placeholder="Add Asset Directory",
+tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
+{% set full_id = library.id ~ "-attribute_" ~ prefix %}
+{% set full_name = library.id ~ "-attribute_" ~ prefix %}
+{% set legacy_name = library.id ~ "-" ~ prefix %}
+{% set raw_value = data.libraries.get(full_name, data.libraries.get(legacy_name, [])) %}
+{% if raw_value is string %}
+{% set field_values = [raw_value] if raw_value.strip() else [] %}
+{% elif raw_value is sequence and raw_value is not string %}
+{% set field_values = raw_value %}
+{% else %}
+{% set field_values = [] %}
+{% endif %}
+<div class="{{ container_class }}">
+    <label class="form-label d-flex align-items-center gap-2 flex-wrap" for="{{ full_id }}_1">
+        <a href="{{ wiki }}" target="_blank" rel="noopener noreferrer">{{ title }}</a>
+        <span class="text-{{ tooltip_variant }}" data-bs-toggle="tooltip" data-bs-html="true" title="{{ description }}">
+            <i class="bi {% if tooltip_variant == 'danger' %}bi-exclamation-circle-fill{% else %}bi-info-circle-fill{% endif %}"></i>
+        </span>
+        <a href="{{ wiki }}" target="_blank" rel="noopener noreferrer" class="text-decoration-none" data-bs-toggle="tooltip"
+            title="Open Kometa Asset Guide">
+            <i class="bi bi-box-arrow-up-right"></i>
+        </a>
+    </label>
+    <div id="{{ full_id }}_container" data-library-asset-directory-container data-input-name="{{ full_name }}">
+        {% for directory in field_values %}
+        <div class="input-group mb-2">
+            <input type="text" class="form-control" name="{{ full_name }}" id="{{ full_id }}_{{ loop.index }}"
+                data-path-rule="asset_directory" placeholder="{{ placeholder }}" value="{{ directory }}">
+            <button class="btn btn-danger library-remove-asset-directory" type="button">Remove</button>
+        </div>
+        {% endfor %}
+        <div class="input-group mb-2">
+            <input type="text" class="form-control" name="{{ full_name }}" id="{{ full_id }}_blank"
+                data-path-rule="asset_directory" placeholder="{{ placeholder }}">
+            <button class="btn btn-danger library-remove-asset-directory" type="button">Remove</button>
+        </div>
+    </div>
+    <button class="btn btn-primary" data-add-asset-directory="{{ full_id }}_container" type="button">Add Directory</button>
 </div>
 {% endmacro %}
 
@@ -933,13 +982,23 @@ prefix) %}
                     </div>
 
                     {% if collection.template_variables %}
+                    {% set is_seasonal = collection.id == 'collection_seasonal' %}
+                    {% set season = namespace(open=false) %}
                     <div class="child-toggle-wrapper ms-4 mt-2"
                         data-toggle-parent="{{ library.id }}-{{ collection.id }}" style="display: none;">
                         {% for item in collection.template_variables
                         if (not item.media_types or library.type in item.media_types)
                         and (not item.key.startswith('visible_') or telemetry.plex_pass) %}
                         {% set clean_id = collection.id.replace('collection_', '') %}
-                        {% set input_name = library.id ~ '-template_collection_' ~ clean_id ~ '_' ~ item.key %}
+                        {% set input_name = (library.id ~ '-template_collection_' ~ clean_id ~ '_' ~ item.key) if item.key is defined else '' %}
+
+                        {% if is_seasonal and item.key is defined and item.key.startswith('use_') %}
+                        {% if season.open %}
+                    </div>
+                        {% endif %}
+                    <div class="qs-season-group">
+                        {% set season.open = true %}
+                        {% endif %}
 
                         {% if item.type == 'toggle' %}
                         {% set stored_val = data['libraries'].get(input_name) %}
@@ -994,9 +1053,75 @@ prefix) %}
                                 {% endfor %}
                             </select>
                         </div>
-                        {% elif item.type == 'text_input' %}
-                        <div class="input-group mb-2">
-                            <span class="input-group-text" id="{{ input_name }}_text" style="width: 170px;">
+                        {% set preview_options = [] %}
+                        {% for val in item.options %}
+                        {% if val is mapping and val.image_url %}
+                        {% set show_preview = (val.media_types is not defined) or (library.type in val.media_types) %}
+                        {% if show_preview %}
+                        {% set _ = preview_options.append(val) %}
+                        {% endif %}
+                        {% endif %}
+                        {% endfor %}
+                        {% if preview_options %}
+                        <div class="style-preview-grid mb-2" data-style-preview-grid data-style-select="{{ input_name }}">
+                            {% for val in preview_options %}
+                            <button type="button" class="style-preview-card" data-style-value="{{ val.value }}"
+                                aria-pressed="false">
+                                <div class="style-preview-title">{{ val.label }}</div>
+                                <img src="{{ val.image_url }}" alt="{{ val.label }} style preview" loading="lazy"
+                                    {% if val.fallback_url %}
+                                    data-fallback="{{ val.fallback_url }}"
+                                    onerror="if(this.dataset.fallback){this.src=this.dataset.fallback; this.onerror=null;}"
+                                    {% endif %}>
+                            </button>
+                            {% endfor %}
+                        </div>
+                        {% endif %}
+                        {% elif item.type == 'string_list' %}
+                        {% set stored_list = data['libraries'].get(input_name) %}
+                        {% if stored_list is string %}
+                        {% set list_json = stored_list %}
+                        {% elif stored_list is sequence %}
+                        {% set list_json = stored_list | tojson %}
+                        {% else %}
+                        {% set list_json = '[]' %}
+                        {% endif %}
+                        <div class="mb-2" data-template-string-list data-hidden-input="{{ input_name }}">
+                            <div class="input-group">
+                                <span class="input-group-text" id="{{ input_name }}_text" style="width: 170px;">
+                                    {{ item.label }}
+                                    {% if item.tooltip %}
+                                    <span class="text-{{ item.tooltip_variant or 'info' }} ms-2" data-bs-toggle="tooltip"
+                                        data-bs-html="true" title="{{ item.tooltip }}">
+                                        <i
+                                            class="bi {% if item.tooltip_variant == 'danger' %}bi-exclamation-circle-fill{% else %}bi-info-circle-fill{% endif %}"></i>
+                                    </span>
+                                    {% endif %}
+                                </span>
+                                <input type="text" class="form-control" id="{{ input_name }}_input"
+                                    aria-describedby="{{ input_name }}_text"
+                                    placeholder="{{ item.placeholder | default('Add value') }}"
+                                    {% if disable_toggle %}disabled{% endif %}>
+                                <button class="btn nav-button" type="button" data-template-string-add
+                                    {% if disable_toggle %}disabled{% endif %}>Add</button>
+                            </div>
+                            <ul class="list-group mt-2" data-template-string-items></ul>
+                            <input type="hidden" id="{{ input_name }}" name="{{ input_name }}" value="{{ list_json }}">
+                        </div>
+                        {% elif item.type == 'relative_year' %}
+                        {% set stored_val = data['libraries'].get(input_name, item.default) | default('', true) %}
+                        {% set rel_options = item.relative_options if item.relative_options is defined else [
+                            {'value': 'first', 'label': 'First', 'kind': 'fixed', 'token': 'first'},
+                            {'value': 'latest', 'label': 'Latest', 'kind': 'fixed', 'token': 'latest'},
+                            {'value': 'relative_first', 'label': 'Relative First (first+#)', 'kind': 'relative', 'prefix': 'first+'},
+                            {'value': 'relative_latest', 'label': 'Relative Latest (latest-#)', 'kind': 'relative', 'prefix': 'latest-'},
+                            {'value': 'year', 'label': 'Specific Year', 'kind': 'year'}
+                        ] %}
+                        {% set label_width = item.label_width if item.label_width is defined else 170 %}
+                        <div class="input-group mb-2" data-relative-year data-hidden-input="{{ input_name }}"
+                            data-default-value="{{ item.default | default('', true) }}"
+                            data-min-year="{{ item.min | default(1) }}">
+                            <span class="input-group-text" id="{{ input_name }}_text" style="width: {{ label_width }}px;">
                                 {% if item.url %}
                                 <a href="{{ item.url }}" target="_blank">
                                     {{ item.label }}
@@ -1012,14 +1137,185 @@ prefix) %}
                                 </span>
                                 {% endif %}
                             </span>
-                            <input type="text" class="form-control" id="{{ input_name }}" name="{{ input_name }}"
+                            <select class="form-select"
+                                id="{{ input_name }}_relative_year_mode"
+                                data-relative-year-mode
+                                aria-describedby="{{ input_name }}_text"
+                                {% if disable_toggle %}disabled{% endif %}>
+                                {% for opt in rel_options %}
+                                <option value="{{ opt.value }}" data-kind="{{ opt.kind }}"
+                                    {% if opt.token is defined %}data-token="{{ opt.token }}"{% endif %}
+                                    {% if opt.prefix is defined %}data-prefix="{{ opt.prefix }}"{% endif %}>
+                                    {{ opt.label }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                            <input type="number" class="form-control"
+                                id="{{ input_name }}_relative_year_value"
+                                data-relative-year-value inputmode="numeric"
+                                min="1" step="1" data-numeric-only="true" placeholder="Year or Offset"
+                                aria-label="Year or offset" {% if disable_toggle %}disabled{% endif %}>
+                            <input type="hidden" id="{{ input_name }}" name="{{ input_name }}" value="{{ stored_val }}">
+                        </div>
+                        {% elif item.key is defined and item.key.startswith('schedule_') %}
+                        {% set schedule_label = 'Schedule' %}
+                        {% set schedule_tooltip = "Configure when this collection updates." %}
+                        {% set label_width = 140 %}
+                        {% set stored_val = data['libraries'].get(input_name, item.default) | default('', true) %}
+                        <div class="schedule-builder mb-2"
+                            data-schedule-builder
+                            data-hidden-input="{{ input_name }}"
+                            data-default-value="{{ item.default | default('', true) }}">
+                            <div class="input-group mb-2 schedule-builder-header">
+                                <span class="input-group-text" id="{{ input_name }}_text" style="width: {{ label_width }}px;">
+                                    {{ schedule_label }}
+                                    <span class="text-info ms-2" data-bs-toggle="tooltip" data-bs-html="true"
+                                        title="{{ schedule_tooltip }}">
+                                        <i class="bi bi-info-circle-fill"></i>
+                                    </span>
+                                </span>
+                                <select class="form-select"
+                                    id="{{ input_name }}_schedule_mode"
+                                    data-schedule-mode-select {% if disable_toggle %}disabled{% endif %}>
+                                    <option value="range">Range</option>
+                                    <option value="weekly">Weekly</option>
+                                    <option value="monthly">Monthly</option>
+                                    <option value="yearly">Yearly</option>
+                                    <option value="date">Date</option>
+                                    <option value="hourly">Hourly</option>
+                                    <option value="daily">Daily</option>
+                                    <option value="never">Never</option>
+                                    <option value="non_existing">Only If Missing</option>
+                                    <option value="custom">Custom (Advanced)</option>
+                                </select>
+                            </div>
+                            <div class="schedule-builder-body">
+                                <div class="schedule-mode" data-schedule-mode="range">
+                                    <div class="schedule-grid">
+                                        <input type="date" class="form-control"
+                                            id="{{ input_name }}_schedule_range_start"
+                                            data-schedule-range-start
+                                            aria-label="Range start" {% if disable_toggle %}disabled{% endif %}>
+                                        <span class="schedule-range-sep">to</span>
+                                        <input type="date" class="form-control"
+                                            id="{{ input_name }}_schedule_range_end"
+                                            data-schedule-range-end
+                                            aria-label="Range end" {% if disable_toggle %}disabled{% endif %}>
+                                    </div>
+                                    <div class="form-text">Month/day are used; year is ignored.</div>
+                                </div>
+                                <div class="schedule-mode" data-schedule-mode="weekly">
+                                    <div class="schedule-weekly">
+                                        {% for day in ['sun','mon','tue','wed','thu','fri','sat'] %}
+                                        <label class="schedule-day">
+                                            <input type="checkbox"
+                                                id="{{ input_name }}_schedule_week_{{ day }}"
+                                                value="{{ day }}" data-schedule-week-day {% if disable_toggle %}disabled{% endif %}>
+                                            <span>{{ day|capitalize }}</span>
+                                        </label>
+                                        {% endfor %}
+                                    </div>
+                                </div>
+                                <div class="schedule-mode" data-schedule-mode="monthly">
+                                    <input type="number" class="form-control"
+                                        id="{{ input_name }}_schedule_month_day"
+                                        min="1" max="31" step="1"
+                                        data-schedule-month-day placeholder="Day of month" {% if disable_toggle %}disabled{% endif %}>
+                                </div>
+                                <div class="schedule-mode" data-schedule-mode="yearly">
+                                    <input type="date" class="form-control"
+                                        id="{{ input_name }}_schedule_yearly"
+                                        data-schedule-yearly
+                                        aria-label="Yearly date" {% if disable_toggle %}disabled{% endif %}>
+                                    <div class="form-text">Month/day are used; year is ignored.</div>
+                                </div>
+                                <div class="schedule-mode" data-schedule-mode="date">
+                                    <input type="date" class="form-control"
+                                        id="{{ input_name }}_schedule_date"
+                                        data-schedule-date
+                                        aria-label="Exact date" {% if disable_toggle %}disabled{% endif %}>
+                                </div>
+                                <div class="schedule-mode" data-schedule-mode="hourly">
+                                    <div class="schedule-grid">
+                                        <input type="number" class="form-control"
+                                            id="{{ input_name }}_schedule_hour_start"
+                                            min="0" max="23" step="1"
+                                            data-schedule-hour-start placeholder="Start hour" {% if disable_toggle %}disabled{% endif %}>
+                                        <span class="schedule-range-sep">to</span>
+                                        <input type="number" class="form-control"
+                                            id="{{ input_name }}_schedule_hour_end"
+                                            min="0" max="23" step="1"
+                                            data-schedule-hour-end placeholder="End hour (optional)" {% if disable_toggle %}disabled{% endif %}>
+                                    </div>
+                                </div>
+                                <div class="schedule-mode" data-schedule-mode="daily">
+                                    <div class="form-text">Runs once per day.</div>
+                                </div>
+                                <div class="schedule-mode" data-schedule-mode="never">
+                                    <div class="form-text">Never updates automatically.</div>
+                                </div>
+                                <div class="schedule-mode" data-schedule-mode="non_existing">
+                                    <div class="form-text">Runs only if the collection does not exist.</div>
+                                </div>
+                                <div class="schedule-mode" data-schedule-mode="custom">
+                                    <div class="form-text">Use Advanced to enter a raw schedule string.</div>
+                                </div>
+                            </div>
+                            <div class="schedule-preview small text-muted mt-2">
+                                Preview: <code data-schedule-preview></code>
+                            </div>
+                            <details class="schedule-advanced mt-2">
+                                <summary>Advanced (use with caution)</summary>
+                                <div class="form-text mb-2">Only use this if you know Kometa schedule syntax.</div>
+                                <input type="text" class="form-control"
+                                    id="{{ input_name }}_schedule_raw"
+                                    data-schedule-raw
+                                    value="{{ stored_val }}" {% if disable_toggle %}disabled{% endif %}>
+                            </details>
+                            <input type="hidden" id="{{ input_name }}" name="{{ input_name }}" value="{{ stored_val }}">
+                        </div>
+                        {% elif item.type == 'text_input' %}
+                        {% set is_number_input = item.input_type is defined and item.input_type == 'number' %}
+                        {% set label_width = item.label_width if item.label_width is defined else 170 %}
+                        <div class="input-group mb-2">
+                            <span class="input-group-text" id="{{ input_name }}_text" style="width: {{ label_width }}px;">
+                                {% if item.url %}
+                                <a href="{{ item.url }}" target="_blank">
+                                    {{ item.label }}
+                                </a>
+                                {% else %}
+                                {{ item.label }}
+                                {% endif %}
+                                {% if item.tooltip %}
+                                <span class="text-{{ item.tooltip_variant or 'info' }} ms-2" data-bs-toggle="tooltip"
+                                    data-bs-html="true" title="{{ item.tooltip }}">
+                                    <i
+                                        class="bi {% if item.tooltip_variant == 'danger' %}bi-exclamation-circle-fill{% else %}bi-info-circle-fill{% endif %}"></i>
+                                </span>
+                                {% endif %}
+                            </span>
+                            <input type="{{ 'number' if is_number_input else 'text' }}" class="form-control" id="{{ input_name }}" name="{{ input_name }}"
                                 value="{{ data['libraries'].get(input_name, item.default) | default('', true) }}"
+                                {% if is_number_input %}
+                                min="{{ item.min | default(1) }}" step="{{ item.step | default(1) }}" inputmode="numeric"
+                                data-numeric-only="true"
+                                data-default-value="{{ item.default | default('', true) }}"
+                                {% else %}
                                 minlength="1" pattern="[\x20-\x7E]+"
-                                title="Only ASCII characters allowed (no accents or emojis)" {% if disable_toggle
-                                %}disabled{% endif %}>
+                                title="Only ASCII characters allowed (no accents or emojis)"
+                                {% endif %}
+                                {% if disable_toggle %}disabled{% endif %}>
                         </div>
                         {% endif %}
+
+                        {% if is_seasonal and item.key is defined and item.key.startswith('schedule_') and season.open %}
+                    </div>
+                        {% set season.open = false %}
+                        {% endif %}
                         {% endfor %}
+                        {% if is_seasonal and season.open %}
+                    </div>
+                        {% endif %}
                     </div>
                     {% endif %}
                 </div>
@@ -1331,6 +1627,7 @@ prefix) %}
                                                     {% if var_name == 'horizontal_position' %}{% set ns.position_id = template_name ~ '-' ~ var_name %}{% endif %}
                                                     {% set display_label = var_details.label or var_name.replace('_', ' ') %}
                                                     {% set display_value = selected_value %}
+                                                    {% set is_hidden_rating_anchor = overlay.id == 'overlay_ratings' and var_name in ['horizontal_offset', 'vertical_offset'] %}
                                                     {% if var_name in ['back_line_width', 'back_padding', 'back_radius', 'back_width', 'back_height'] %}
                                                         {% set min_value = 1 %}
                                                         {% set selected_num = (selected_value if selected_value is not none else var_details.default) | int %}
@@ -1340,7 +1637,7 @@ prefix) %}
                                                             {% set display_value = selected_num %}
                                                         {% endif %}
                                                     {% endif %}
-                                                    <div class="input-group mb-2">
+                                                    <div class="input-group mb-2{% if is_hidden_rating_anchor %} d-none{% endif %}">
                                                         <span class="input-group-text"
                                                             id="{{ template_name }}-{{ var_name }}_text"
                                                             style="width: 170px;">
@@ -1384,7 +1681,7 @@ prefix) %}
                                                     {% endif %}
                                                     {% set color_hex = "#%02X%02X%02X" % (r, g, b) %}
                                                     {% set color_hex_alpha = "#%02X%02X%02X%02X" % (r, g, b, (a_pct * 255 // 100)) %}
-                                                    {% if var_name in ['font_color', 'back_color', 'back_line_color', 'stroke_color'] or var_name.endswith('_font_color') or var_name.endswith('_stroke_color') %}
+                                                    {% if var_name in ['font_color', 'back_color', 'back_line_color', 'stroke_color'] or var_name.endswith('_font_color') or var_name.endswith('_stroke_color') or var_name.startswith('back_color_') %}
                                                     <div class="rgba-group mb-2">
                                                         <div class="rgba-bar-wrap mb-2">
                                                             <input type="color" class="form-control form-control-color rgba-color-picker visually-hidden"
@@ -1420,6 +1717,7 @@ prefix) %}
                                                         </div>
                                                     </div>
                                                     {% elif var_name == 'font' or var_name.endswith('_font') %}
+                                                    {% set safe_font_value = var_details.default if selected_value in [none, 'None', ''] else selected_value %}
                                                     <div class="font-row mb-2">
                                                         <div class="input-group font-input-group">
                                                             <span class="input-group-text"
@@ -1430,7 +1728,7 @@ prefix) %}
                                                             {% set fonts_list = overlay_fonts if overlay_fonts else ['Inter-Regular.ttf', 'Inter-Medium.ttf', 'Roboto-Regular.ttf'] %}
                                                             <button type="button" class="btn btn-outline-secondary font-picker-trigger"
                                                                 data-font-picker-target="{{ input_id }}">
-                                                                {{ selected_value if selected_value else 'Select font' }}
+                                                                {{ safe_font_value if safe_font_value else 'Select font' }}
                                                             </button>
                                                             <select class="form-select template-variable-text d-none"
                                                                 id="{{ input_id }}"
@@ -1438,9 +1736,9 @@ prefix) %}
                                                                 aria-describedby="{{ input_id }}_text"
                                                                 data-default="{{ var_details.default }}"
                                                                 data-font-select>
-                                                              <option value="" {% if selected_value=='' %}selected{% endif %}>Select font</option>
+                                                              <option value="" {% if safe_font_value=='' %}selected{% endif %}>Select font</option>
                                                               {% for fnt in fonts_list %}
-                                                              <option value="{{ fnt }}" {% if selected_value==fnt %}selected{% endif %}>{{ fnt }}</option>
+                                                              <option value="{{ fnt }}" {% if safe_font_value==fnt %}selected{% endif %}>{{ fnt }}</option>
                                                               {% endfor %}
                                                             </select>
                                                         </div>
@@ -1448,6 +1746,7 @@ prefix) %}
                                                             data-font-preview data-preview-for="{{ input_id }}">AaBb123</span>
                                                     </div>
                                                           {% else %}
+                                                    {% set safe_text_value = '' if selected_value in [none, 'None'] else selected_value %}
                                                     <div class="input-group mb-2">
                                                         <span class="input-group-text"
                                                             id="{{ input_id }}_text"
@@ -1458,7 +1757,7 @@ prefix) %}
                                                             id="{{ input_id }}"
                                                             name="{{ template_name }}[{{ var_name }}]"
                                                             aria-describedby="{{ input_id }}_text"
-                                                            value="{{ selected_value }}"
+                                                            value="{{ safe_text_value }}"
                                                             data-default="{{ var_details.default }}"
                                                             {% if var_name == 'text' and overlay.id in ['overlay_aspect', 'overlay_video_format'] %}data-skip-yaml="true"{% endif %}>
                                                     </div>
