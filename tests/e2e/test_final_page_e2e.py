@@ -46,8 +46,28 @@ def _wait_for_run_now_enabled(page):
     )
 
 
+def _allow_final_gate(qs_module, monkeypatch):
+    monkeypatch.setattr(
+        qs_module,
+        "_build_final_gate",
+        lambda *_args, **_kwargs: {
+            "stage": "kometa",
+            "todo_count": 0,
+            "todo_blockers": [],
+            "dependency_cards": [],
+            "setup_blockers": [],
+            "bulk_validation_fresh": True,
+            "bulk_validation_at": qs_module.utc_now_iso(),
+            "validation_ttl_hours": 12,
+            "can_build_config": True,
+            "config_valid": True,
+        },
+    )
+
+
 @pytest.mark.e2e
 def test_run_now_queued_toast(page, live_server, monkeypatch, qs_module):
+    _allow_final_gate(qs_module, monkeypatch)
     monkeypatch.setattr(
         qs_module.output,
         "build_config",
@@ -67,7 +87,7 @@ def test_run_now_queued_toast(page, live_server, monkeypatch, qs_module):
         lambda route: route.fulfill(status=202, json={"status": "queued", "maintenance_window": "01:00-02:00"}),
     )
 
-    page.goto(f"{live_server}/step/900-final", wait_until="domcontentloaded")
+    page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
 
     _wait_for_run_now_enabled(page)
     run_now = page.locator("#run-now")
@@ -80,6 +100,7 @@ def test_run_now_queued_toast(page, live_server, monkeypatch, qs_module):
 
 @pytest.mark.e2e
 def test_stop_modal_and_state_reset(page, live_server, monkeypatch, qs_module):
+    _allow_final_gate(qs_module, monkeypatch)
     monkeypatch.setattr(
         qs_module.output,
         "build_config",
@@ -97,7 +118,7 @@ def test_stop_modal_and_state_reset(page, live_server, monkeypatch, qs_module):
     page.route("**/start-kometa", lambda route: route.fulfill(status=200, json={"status": "Kometa started", "pid": 111}))
     page.route("**/stop-kometa", lambda route: route.fulfill(status=200, json={"success": True, "message": "Kometa stopped"}))
 
-    page.goto(f"{live_server}/step/900-final", wait_until="domcontentloaded")
+    page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
 
     _wait_for_run_now_enabled(page)
     run_now = page.locator("#run-now")
@@ -117,6 +138,7 @@ def test_stop_modal_and_state_reset(page, live_server, monkeypatch, qs_module):
 
 @pytest.mark.e2e
 def test_reconnect_after_refresh_shows_running(page, live_server, monkeypatch, qs_module):
+    _allow_final_gate(qs_module, monkeypatch)
     monkeypatch.setattr(
         qs_module.output,
         "build_config",
@@ -150,7 +172,7 @@ def test_reconnect_after_refresh_shows_running(page, live_server, monkeypatch, q
         ),
     )
 
-    page.goto(f"{live_server}/step/900-final", wait_until="domcontentloaded")
+    page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
     stop_btn = page.locator("#stop-now")
     run_now = page.locator("#run-now")
     expect(stop_btn).to_be_visible()
@@ -196,6 +218,7 @@ def test_maintenance_pause_resume_toasts(page, live_server):
 
 @pytest.mark.e2e
 def test_queued_run_auto_start_toast(page, live_server, monkeypatch, qs_module):
+    _allow_final_gate(qs_module, monkeypatch)
     monkeypatch.setattr(
         qs_module.output,
         "build_config",
@@ -261,7 +284,7 @@ def test_queued_run_auto_start_toast(page, live_server, monkeypatch, qs_module):
 
     page.route("**/kometa-status", handle_status)
 
-    page.goto(f"{live_server}/step/900-final", wait_until="domcontentloaded")
+    page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
     _wait_for_run_now_enabled(page)
     run_now = page.locator("#run-now")
     run_now.click()

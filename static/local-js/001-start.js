@@ -76,8 +76,12 @@ function setButtonSpinner (button, text) {
 /* ============================== */
 
 document.addEventListener('DOMContentLoaded', function () {
+  const configSwitchSelect = document.getElementById('configSwitchSelect')
   const configSelector = document.getElementById('configSelector')
+  const activeConfigInput = document.getElementById('qs-active-config-input')
   const newConfigInput = document.getElementById('newConfigName')
+  const saveConfigRow = document.getElementById('saveConfigRow')
+  const saveConfigButton = document.getElementById('saveConfigButton')
   const resetConfigButton = document.getElementById('resetConfigButton')
   const deleteConfigButton = document.getElementById('deleteConfigButton')
   const renameConfigButton = document.getElementById('renameConfigButton')
@@ -87,6 +91,22 @@ document.addEventListener('DOMContentLoaded', function () {
   const bulkDeleteSelectAll = document.getElementById('bulkDeleteSelectAll')
   const bulkDeleteCount = document.getElementById('bulkDeleteCount')
   const confirmBulkDeleteButton = document.getElementById('confirmBulkDeleteButton')
+  const orphanedArtifactsModalEl = document.getElementById('orphanedArtifactsModal')
+  const orphanedArtifactsList = document.getElementById('orphanedArtifactsList')
+  const orphanedArtifactsSelectAll = document.getElementById('orphanedArtifactsSelectAll')
+  const orphanedArtifactsCount = document.getElementById('orphanedArtifactsCount')
+  const orphanedArtifactsStatus = document.getElementById('orphanedArtifactsStatus')
+  const orphanedArtifactsSuccess = document.getElementById('orphanedArtifactsSuccess')
+  const orphanedArtifactsError = document.getElementById('orphanedArtifactsError')
+  const cancelOrphanedArtifactsDelete = document.getElementById('cancelOrphanedArtifactsDelete')
+  const confirmOrphanedArtifactsDelete = document.getElementById('confirmOrphanedArtifactsDelete')
+  const orphanedArtifactsRestoreModalEl = document.getElementById('orphanedArtifactsRestoreModal')
+  const orphanedArtifactsRestoreList = document.getElementById('orphanedArtifactsRestoreList')
+  const orphanedArtifactsRestoreStatus = document.getElementById('orphanedArtifactsRestoreStatus')
+  const orphanedArtifactsRestoreSuccess = document.getElementById('orphanedArtifactsRestoreSuccess')
+  const orphanedArtifactsRestoreError = document.getElementById('orphanedArtifactsRestoreError')
+  const cancelOrphanedArtifactsRestore = document.getElementById('cancelOrphanedArtifactsRestore')
+  const confirmOrphanedArtifactsRestore = document.getElementById('confirmOrphanedArtifactsRestore')
   const configActionModalElement = document.getElementById('configActionModal')
   const renameConfigModalEl = document.getElementById('renameConfigModal')
   const renameConfigCurrentName = document.getElementById('renameConfigCurrentName')
@@ -126,6 +146,7 @@ document.addEventListener('DOMContentLoaded', function () {
   if (configActionModalElement) configActionModal = new bootstrap.Modal(configActionModalElement)
 
   let currentAction = ''
+  let orphanedRestoreTarget = ''
   let importToken = null
   let importReportHeader = ''
   let importReportBody = ''
@@ -158,6 +179,7 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   function updateButtonState () {
+    if (!configSelector) return
     const isAddConfig = configSelector.value === 'add_config'
     const onlyAddConfigAvailable = configSelector.options.length === 1 && isAddConfig
 
@@ -167,52 +189,121 @@ document.addEventListener('DOMContentLoaded', function () {
 
     const box = document.getElementById('newConfigInput')
     if (box) box.classList.toggle('d-none', !(isAddConfig || onlyAddConfigAvailable))
+
+    const showSave = isAddConfig || onlyAddConfigAvailable
+    if (saveConfigRow) saveConfigRow.classList.toggle('d-none', !showSave)
+
+    if (saveConfigButton) {
+      const proposed = sanitizeConfigName((newConfigInput && newConfigInput.value) || '').trim()
+      saveConfigButton.disabled = !showSave || !proposed
+    }
   }
 
   function updateConfigBadge (name) {
-    const badgeBtn = document.querySelector('.config-badge-button[data-current]')
-    if (!badgeBtn || !name) return
-    badgeBtn.dataset.current = name
-    const label = badgeBtn.querySelector('span')
-    if (!label) return
-    label.textContent = `Config: ${name}`
-    const icon = document.createElement('i')
-    icon.className = 'bi bi-chevron-down ms-1'
-    label.appendChild(icon)
+    if (!name) return
+    document.querySelectorAll('.qs-config-switch-trigger[data-current]').forEach((badgeBtn) => {
+      badgeBtn.dataset.current = name
+    })
+    document.querySelectorAll('.qs-main-page-meta-value').forEach((label) => {
+      label.textContent = name
+    })
   }
 
-  async function syncSelectedConfig () {
-    if (!configSelector) return
-    const selected = configSelector.value
-    if (!selected || selected === 'add_config') return
+  function updateHeaderConfigName (name) {
+    if (!name) return
+    document.querySelectorAll('.qs-main-page-meta-value').forEach((node) => {
+      node.textContent = name
+    })
+  }
 
-    if (window.pageInfo && window.pageInfo.config_name === selected) {
-      updateConfigBadge(selected)
-      return
-    }
+  function getConfigAdminSelectors () {
+    return [configSelector, configSwitchSelect].filter(Boolean)
+  }
 
-    try {
-      const res = await fetch('/switch-config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: selected })
-      })
-      const data = await res.json()
-      if (!res.ok || !data.success) {
-        throw new Error(data.message || 'Failed to switch configs.')
+  function upsertConfigOption (name) {
+    if (!name) return null
+    const selectors = getConfigAdminSelectors()
+    let createdOption = null
+
+    selectors.forEach((select) => {
+      const existing = Array.from(select.options).find(option => option.value === name)
+      if (existing) {
+        if (!createdOption) createdOption = existing
+        return
       }
-      if (window.pageInfo) window.pageInfo.config_name = data.name
-      updateConfigBadge(data.name)
-    } catch (err) {
-      showToast('error', err.message || 'Failed to switch configs.')
+
+      const option = document.createElement('option')
+      option.value = name
+      option.textContent = name
+      select.appendChild(option)
+      if (!createdOption) createdOption = option
+    })
+
+    return createdOption
+  }
+
+  function setSelectedConfigOption (name) {
+    if (!name) return
+    if (activeConfigInput) {
+      activeConfigInput.value = name
     }
+    if (configSelector) {
+      configSelector.value = name
+    }
+    if (configSwitchSelect) {
+      configSwitchSelect.value = name
+    }
+  }
+
+  function removeConfigOption (name) {
+    if (!name) return
+    getConfigAdminSelectors().forEach((select) => {
+      const optionToRemove = select.querySelector(`option[value="${name}"]`)
+      if (optionToRemove) optionToRemove.remove()
+    })
+  }
+
+  function refreshWorkspaceStatusNow () {
+    if (window.QSWorkspaceStatus && typeof window.QSWorkspaceStatus.refresh === 'function') {
+      window.QSWorkspaceStatus.refresh({ immediate: true })
+    }
+    document.dispatchEvent(new CustomEvent('qs:workspace-data-changed', { detail: { source: 'start-config-activate', delayMs: 0 } }))
+  }
+
+  function applyActiveConfigUi (name) {
+    if (!name) return
+    if (window.pageInfo) window.pageInfo.config_name = name
+    updateConfigBadge(name)
+    updateHeaderConfigName(name)
+    upsertConfigOption(name)
+    setSelectedConfigOption(name)
+    updateButtonState()
+    refreshWorkspaceStatusNow()
+  }
+
+  async function activateConfig (name) {
+    const normalized = sanitizeConfigName(name)
+    if (!normalized) {
+      throw new Error('Please enter a valid config name.')
+    }
+    const res = await fetch('/activate-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: normalized })
+    })
+    const data = await res.json()
+    if (!res.ok || !data.success) {
+      throw new Error(data.message || 'Failed to activate config.')
+    }
+    return data
   }
 
   updateButtonState()
-  configSelector.addEventListener('change', () => {
-    updateButtonState()
-    syncSelectedConfig()
-  })
+  if (configSelector) {
+    configSelector.addEventListener('change', () => {
+      updateButtonState()
+    })
+  }
 
   document.querySelectorAll('[data-action]').forEach(button => {
     button.addEventListener('click', function () {
@@ -236,8 +327,9 @@ document.addEventListener('DOMContentLoaded', function () {
   })
 
   function getAvailableConfigs () {
-    if (!configSelector) return []
-    const names = Array.from(configSelector.options)
+    const sourceSelect = configSelector || configSwitchSelect
+    if (!sourceSelect) return []
+    const names = Array.from(sourceSelect.options)
       .map(option => option.value)
       .filter(value => value && value !== 'add_config')
     return Array.from(new Set(names))
@@ -283,6 +375,264 @@ document.addEventListener('DOMContentLoaded', function () {
     row.appendChild(input)
     row.appendChild(label)
     return row
+  }
+
+  function setOrphanedArtifactsError (message) {
+    setInlineAlert(orphanedArtifactsError, message)
+  }
+
+  function setOrphanedArtifactsRestoreError (message) {
+    setInlineAlert(orphanedArtifactsRestoreError, message)
+  }
+
+  function setInlineAlert (element, message) {
+    if (!element) return
+    if (!message) {
+      element.classList.add('d-none')
+      element.textContent = ''
+      return
+    }
+    element.classList.remove('d-none')
+    element.textContent = message
+  }
+
+  function setOrphanedArtifactsBusy (isBusy) {
+    if (confirmOrphanedArtifactsDelete) confirmOrphanedArtifactsDelete.disabled = isBusy || confirmOrphanedArtifactsDelete.disabled
+    if (cancelOrphanedArtifactsDelete) cancelOrphanedArtifactsDelete.disabled = isBusy
+    if (orphanedArtifactsSelectAll) orphanedArtifactsSelectAll.disabled = isBusy || orphanedArtifactsSelectAll.disabled
+    if (orphanedArtifactsModalEl) {
+      orphanedArtifactsModalEl.querySelectorAll('.btn-close, .orphaned-artifact-checkbox, .orphaned-artifact-restore')
+        .forEach(el => { el.disabled = isBusy })
+    }
+    if (!isBusy) updateOrphanedArtifactsState()
+  }
+
+  function setOrphanedArtifactsRestoreBusy (isBusy) {
+    if (confirmOrphanedArtifactsRestore) confirmOrphanedArtifactsRestore.disabled = isBusy || confirmOrphanedArtifactsRestore.disabled
+    if (cancelOrphanedArtifactsRestore) cancelOrphanedArtifactsRestore.disabled = isBusy
+    if (orphanedArtifactsRestoreModalEl) {
+      orphanedArtifactsRestoreModalEl.querySelectorAll('.btn-close, .orphaned-artifact-version-radio')
+        .forEach(el => { el.disabled = isBusy })
+    }
+    if (!isBusy) updateOrphanedArtifactsRestoreState()
+  }
+
+  function updateOrphanedArtifactsState () {
+    if (!orphanedArtifactsList || !confirmOrphanedArtifactsDelete) return
+    const allBoxes = orphanedArtifactsList.querySelectorAll('.orphaned-artifact-checkbox')
+    const checked = orphanedArtifactsList.querySelectorAll('.orphaned-artifact-checkbox:checked')
+
+    if (orphanedArtifactsCount) orphanedArtifactsCount.textContent = String(checked.length)
+    confirmOrphanedArtifactsDelete.disabled = checked.length === 0
+
+    if (orphanedArtifactsSelectAll) {
+      orphanedArtifactsSelectAll.checked = allBoxes.length > 0 && checked.length === allBoxes.length
+      orphanedArtifactsSelectAll.indeterminate = checked.length > 0 && checked.length < allBoxes.length
+      orphanedArtifactsSelectAll.disabled = allBoxes.length === 0
+    }
+  }
+
+  function buildArtifactBadge (text, className) {
+    const badge = document.createElement('span')
+    badge.className = `badge ${className}`
+    badge.textContent = text
+    return badge
+  }
+
+  function buildOrphanedArtifactRow (item, index) {
+    const row = document.createElement('div')
+    row.className = 'form-check bulk-delete-item orphaned-artifact-item'
+
+    const input = document.createElement('input')
+    input.type = 'checkbox'
+    input.className = 'form-check-input orphaned-artifact-checkbox'
+    input.value = item.name
+    input.id = `orphaned-artifact-${index}-${String(item.name || '').replace(/[^a-zA-Z0-9_-]/g, '_')}`
+    input.addEventListener('change', updateOrphanedArtifactsState)
+
+    const label = document.createElement('label')
+    label.className = 'form-check-label orphaned-artifact-label'
+    label.setAttribute('for', input.id)
+
+    const titleRow = document.createElement('div')
+    titleRow.className = 'd-flex flex-wrap align-items-center gap-2'
+
+    const title = document.createElement('span')
+    title.className = 'fw-semibold'
+    title.textContent = item.name
+    titleRow.appendChild(title)
+
+    if (item.has_current_file) titleRow.appendChild(buildArtifactBadge('current yaml', 'bg-primary-subtle text-primary-emphasis'))
+    if (item.has_kometa_copy) titleRow.appendChild(buildArtifactBadge('kometa copy', 'bg-info-subtle text-info-emphasis'))
+    if (item.has_archive_dir) {
+      const archiveText = item.archive_count === 1 ? '1 archive' : `${item.archive_count} archives`
+      titleRow.appendChild(buildArtifactBadge(archiveText, 'bg-warning-subtle text-warning-emphasis'))
+    }
+
+    const meta = document.createElement('div')
+    meta.className = 'small text-muted mt-1 orphaned-artifact-meta'
+    meta.textContent = Array.isArray(item.paths) && item.paths.length
+      ? item.paths.join(' • ')
+      : 'No filesystem paths reported.'
+
+    const actions = document.createElement('div')
+    actions.className = 'mt-2'
+    const restoreButton = document.createElement('button')
+    restoreButton.type = 'button'
+    restoreButton.className = 'btn btn-sm btn-outline-primary orphaned-artifact-restore'
+    restoreButton.dataset.name = item.name
+    restoreButton.textContent = 'Restore...'
+    actions.appendChild(restoreButton)
+
+    label.appendChild(titleRow)
+    label.appendChild(meta)
+    label.appendChild(actions)
+    row.appendChild(input)
+    row.appendChild(label)
+    return row
+  }
+
+  function updateOrphanedArtifactsRestoreState () {
+    if (!confirmOrphanedArtifactsRestore || !orphanedArtifactsRestoreList) return
+    const selected = orphanedArtifactsRestoreList.querySelector('.orphaned-artifact-version-radio:checked')
+    confirmOrphanedArtifactsRestore.disabled = !selected
+  }
+
+  function buildOrphanedArtifactVersionRow (item, index) {
+    const row = document.createElement('div')
+    row.className = 'form-check bulk-delete-item orphaned-artifact-version-item'
+
+    const input = document.createElement('input')
+    input.type = 'radio'
+    input.name = 'orphanedArtifactVersion'
+    input.className = 'form-check-input orphaned-artifact-version-radio'
+    input.value = item.path
+    input.id = `orphaned-artifact-version-${index}`
+    if (index === 0) input.checked = true
+    input.addEventListener('change', updateOrphanedArtifactsRestoreState)
+
+    const label = document.createElement('label')
+    label.className = 'form-check-label orphaned-artifact-label'
+    label.setAttribute('for', input.id)
+
+    const titleRow = document.createElement('div')
+    titleRow.className = 'd-flex flex-wrap align-items-center gap-2'
+
+    const title = document.createElement('span')
+    title.className = 'fw-semibold'
+    title.textContent = item.kind === 'current' ? 'Current saved config' : item.filename
+    titleRow.appendChild(title)
+    titleRow.appendChild(buildArtifactBadge(item.kind === 'current' ? 'current' : 'archive', item.kind === 'current' ? 'bg-primary-subtle text-primary-emphasis' : 'bg-warning-subtle text-warning-emphasis'))
+
+    const meta = document.createElement('div')
+    meta.className = 'small text-muted mt-1 orphaned-artifact-meta'
+    const sizeLabel = Number.isFinite(item.size) ? `${item.size} bytes` : 'size unavailable'
+    meta.textContent = `${item.modified_at || 'unknown time'} • ${sizeLabel} • ${item.path}`
+
+    label.appendChild(titleRow)
+    label.appendChild(meta)
+    row.appendChild(input)
+    row.appendChild(label)
+    return row
+  }
+
+  async function openOrphanedArtifactsRestore (name) {
+    if (!orphanedArtifactsRestoreModalEl || !orphanedArtifactsRestoreList) return
+    orphanedRestoreTarget = String(name || '').trim()
+    if (!orphanedRestoreTarget) return
+    setInlineAlert(orphanedArtifactsRestoreStatus, '')
+    setInlineAlert(orphanedArtifactsRestoreSuccess, '')
+    setOrphanedArtifactsRestoreError('')
+    orphanedArtifactsRestoreList.replaceChildren()
+    if (confirmOrphanedArtifactsRestore) {
+      confirmOrphanedArtifactsRestore.disabled = true
+      confirmOrphanedArtifactsRestore.textContent = 'Restore Selected Version'
+    }
+    if (cancelOrphanedArtifactsRestore) cancelOrphanedArtifactsRestore.disabled = false
+    orphanedArtifactsRestoreModalEl.querySelectorAll('.btn-close').forEach(el => { el.disabled = false })
+
+    const title = document.getElementById('orphanedArtifactsRestoreModalLabel')
+    if (title) title.innerHTML = `<i class="bi bi-arrow-counterclockwise me-2"></i>Restore ${orphanedRestoreTarget}`
+
+    const loading = document.createElement('div')
+    loading.className = 'small text-muted'
+    loading.textContent = 'Loading saved versions...'
+    orphanedArtifactsRestoreList.appendChild(loading)
+
+    const modal = bootstrap.Modal.getOrCreateInstance(orphanedArtifactsRestoreModalEl)
+    modal.show()
+
+    try {
+      const res = await fetch(`/orphaned-config-artifacts/versions?name=${encodeURIComponent(orphanedRestoreTarget)}`)
+      const data = await res.json()
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || 'Failed to load saved versions.')
+      }
+      orphanedArtifactsRestoreList.replaceChildren()
+      const versions = Array.isArray(data.versions) ? data.versions : []
+      if (!versions.length) {
+        const empty = document.createElement('div')
+        empty.className = 'small text-muted'
+        empty.textContent = 'No saved versions were found for this config bundle.'
+        orphanedArtifactsRestoreList.appendChild(empty)
+        updateOrphanedArtifactsRestoreState()
+        return
+      }
+      versions.forEach((item, index) => {
+        orphanedArtifactsRestoreList.appendChild(buildOrphanedArtifactVersionRow(item, index))
+      })
+      updateOrphanedArtifactsRestoreState()
+    } catch (err) {
+      orphanedArtifactsRestoreList.replaceChildren()
+      setOrphanedArtifactsRestoreError(err.message || 'Failed to load saved versions.')
+      updateOrphanedArtifactsRestoreState()
+    }
+  }
+
+  async function renderOrphanedArtifactsList () {
+    if (!orphanedArtifactsList) return
+    orphanedArtifactsList.replaceChildren()
+    setInlineAlert(orphanedArtifactsStatus, '')
+    setInlineAlert(orphanedArtifactsSuccess, '')
+    setOrphanedArtifactsError('')
+    if (confirmOrphanedArtifactsDelete) confirmOrphanedArtifactsDelete.textContent = 'Delete Selected'
+    if (cancelOrphanedArtifactsDelete) cancelOrphanedArtifactsDelete.disabled = false
+    if (orphanedArtifactsModalEl) {
+      orphanedArtifactsModalEl.querySelectorAll('.btn-close').forEach(el => { el.disabled = false })
+    }
+
+    const loading = document.createElement('div')
+    loading.className = 'small text-muted'
+    loading.textContent = 'Scanning config storage...'
+    orphanedArtifactsList.appendChild(loading)
+
+    try {
+      const res = await fetch('/orphaned-config-artifacts')
+      const data = await res.json()
+      if (!res.ok || !data.success) {
+        throw new Error((data.errors && data.errors[0]) || data.message || 'Failed to inspect config storage.')
+      }
+
+      orphanedArtifactsList.replaceChildren()
+      const items = Array.isArray(data.orphans) ? data.orphans : []
+      if (!items.length) {
+        const empty = document.createElement('div')
+        empty.className = 'text-muted small'
+        empty.textContent = 'No orphaned config bundles found.'
+        orphanedArtifactsList.appendChild(empty)
+        updateOrphanedArtifactsState()
+        return
+      }
+
+      items.forEach((item, index) => {
+        orphanedArtifactsList.appendChild(buildOrphanedArtifactRow(item, index))
+      })
+      updateOrphanedArtifactsState()
+    } catch (err) {
+      orphanedArtifactsList.replaceChildren()
+      setOrphanedArtifactsError(err.message || 'Failed to inspect config storage.')
+      updateOrphanedArtifactsState()
+    }
   }
 
   function renderBulkDeleteList () {
@@ -392,11 +742,15 @@ document.addEventListener('DOMContentLoaded', function () {
         })
         .then(() => {
           showToast('success', `Config '${selectedConfig}' deleted successfully.`)
-          const optionToRemove = configSelector.querySelector(`option[value="${selectedConfig}"]`)
-          if (optionToRemove) {
-            const nextOption = optionToRemove.nextElementSibling || optionToRemove.previousElementSibling
-            optionToRemove.remove()
-            configSelector.value = nextOption ? nextOption.value : 'add_config'
+          const nextOption = configSelector
+            ? (configSelector.querySelector(`option[value="${selectedConfig}"]`)?.nextElementSibling ||
+                configSelector.querySelector(`option[value="${selectedConfig}"]`)?.previousElementSibling)
+            : null
+          removeConfigOption(selectedConfig)
+          if (nextOption && nextOption.value) {
+            setSelectedConfigOption(nextOption.value)
+          } else if (configSelector) {
+            configSelector.value = 'add_config'
           }
           updateButtonState()
           if (configActionModal) configActionModal.hide()
@@ -412,6 +766,123 @@ document.addEventListener('DOMContentLoaded', function () {
     newConfigInput.addEventListener('input', function () {
       newConfigInput.value = sanitizeConfigName(newConfigInput.value)
       checkDuplicateConfigName()
+      updateButtonState()
+    })
+    newConfigInput.addEventListener('keydown', function (event) {
+      if (event.key !== 'Enter') return
+      event.preventDefault()
+      if (saveConfigButton && !saveConfigButton.disabled) {
+        saveConfigButton.click()
+      }
+    })
+  }
+
+  if (orphanedArtifactsModalEl) {
+    orphanedArtifactsModalEl.addEventListener('show.bs.modal', renderOrphanedArtifactsList)
+  }
+
+  if (orphanedArtifactsSelectAll) {
+    orphanedArtifactsSelectAll.addEventListener('change', () => {
+      if (!orphanedArtifactsList) return
+      const checkboxes = orphanedArtifactsList.querySelectorAll('.orphaned-artifact-checkbox')
+      checkboxes.forEach(box => { box.checked = orphanedArtifactsSelectAll.checked })
+      updateOrphanedArtifactsState()
+    })
+  }
+
+  if (confirmOrphanedArtifactsDelete) {
+    confirmOrphanedArtifactsDelete.addEventListener('click', async () => {
+      if (!orphanedArtifactsList) return
+      const selected = Array.from(orphanedArtifactsList.querySelectorAll('.orphaned-artifact-checkbox:checked'))
+        .map(box => box.value)
+      if (!selected.length) {
+        showToast('error', 'Select at least one orphaned config bundle to delete.')
+        return
+      }
+
+      setInlineAlert(orphanedArtifactsSuccess, '')
+      setOrphanedArtifactsError('')
+      setInlineAlert(orphanedArtifactsStatus, `Deleting ${selected.length} orphaned config bundle(s)...`)
+      setOrphanedArtifactsBusy(true)
+      setButtonSpinner(confirmOrphanedArtifactsDelete, 'Deleting...')
+
+      try {
+        const res = await fetch('/orphaned-config-artifacts/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ names: selected })
+        })
+        const data = await res.json()
+        if (!res.ok || !data.success) {
+          throw new Error((data.errors && data.errors[0]) || data.message || 'Failed to delete orphaned config bundles.')
+        }
+        setInlineAlert(orphanedArtifactsStatus, '')
+        await renderOrphanedArtifactsList()
+        setInlineAlert(orphanedArtifactsSuccess, `Deleted ${data.deleted.length} orphaned config bundle(s).`)
+        confirmOrphanedArtifactsDelete.textContent = 'Delete Selected'
+        setOrphanedArtifactsBusy(false)
+        showToast('success', `Deleted ${data.deleted.length} orphaned config bundle(s).`)
+      } catch (err) {
+        setInlineAlert(orphanedArtifactsStatus, '')
+        setOrphanedArtifactsBusy(false)
+        confirmOrphanedArtifactsDelete.textContent = 'Delete Selected'
+        setOrphanedArtifactsError(err.message || 'Failed to delete orphaned config bundles.')
+        showToast('error', err.message || 'Failed to delete orphaned config bundles.')
+      }
+    })
+  }
+
+  if (orphanedArtifactsList) {
+    orphanedArtifactsList.addEventListener('click', (event) => {
+      const button = event.target.closest('.orphaned-artifact-restore')
+      if (!button) return
+      event.preventDefault()
+      event.stopPropagation()
+      openOrphanedArtifactsRestore(button.dataset.name)
+    })
+  }
+
+  if (confirmOrphanedArtifactsRestore) {
+    confirmOrphanedArtifactsRestore.addEventListener('click', async () => {
+      if (!orphanedArtifactsRestoreList || !orphanedRestoreTarget) return
+      const selected = orphanedArtifactsRestoreList.querySelector('.orphaned-artifact-version-radio:checked')
+      if (!selected) {
+        setOrphanedArtifactsRestoreError('Select a saved version to restore.')
+        return
+      }
+
+      setInlineAlert(orphanedArtifactsRestoreSuccess, '')
+      setOrphanedArtifactsRestoreError('')
+      setInlineAlert(orphanedArtifactsRestoreStatus, `Restoring '${orphanedRestoreTarget}' from disk...`)
+      setOrphanedArtifactsRestoreBusy(true)
+      setButtonSpinner(confirmOrphanedArtifactsRestore, 'Restoring...')
+
+      try {
+        const res = await fetch('/orphaned-config-artifacts/restore', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: orphanedRestoreTarget, path: selected.value })
+        })
+        const data = await res.json()
+        if (!res.ok || !data.success) {
+          throw new Error(data.message || 'Failed to restore config bundle.')
+        }
+        setInlineAlert(orphanedArtifactsRestoreStatus, '')
+        setInlineAlert(orphanedArtifactsRestoreSuccess, `Restored '${data.config_name}'. Reloading the workspace...`)
+        setButtonIconAndText(confirmOrphanedArtifactsRestore, 'bi bi-check2', 'Restored')
+        showToast('success', `Restored '${data.config_name}' from disk.`)
+        window.setTimeout(() => {
+          const modal = bootstrap.Modal.getInstance(orphanedArtifactsRestoreModalEl)
+          if (modal) modal.hide()
+        }, 1400)
+        window.setTimeout(() => window.location.reload(), 2600)
+      } catch (err) {
+        setInlineAlert(orphanedArtifactsRestoreStatus, '')
+        setOrphanedArtifactsRestoreBusy(false)
+        confirmOrphanedArtifactsRestore.textContent = 'Restore Selected Version'
+        setOrphanedArtifactsRestoreError(err.message || 'Failed to restore config bundle.')
+        showToast('error', err.message || 'Failed to restore config bundle.')
+      }
     })
   }
 
@@ -546,6 +1017,39 @@ document.addEventListener('DOMContentLoaded', function () {
     }
   }
 
+  if (saveConfigButton) {
+    saveConfigButton.addEventListener('click', async () => {
+      if (!newConfigInput) return
+
+      const proposed = sanitizeConfigName(newConfigInput.value)
+      newConfigInput.value = proposed
+      removeValidationMessages(newConfigInput)
+      if (!proposed) {
+        applyValidationStyles(newConfigInput, 'error', 'Enter a config name.')
+        showToast('error', 'Please enter a config name.')
+        updateButtonState()
+        return
+      }
+
+      saveConfigButton.disabled = true
+      const originalHtml = saveConfigButton.innerHTML
+      saveConfigButton.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Saving...'
+      try {
+        const data = await activateConfig(proposed)
+        applyActiveConfigUi(data.name)
+        if (newConfigInput) removeValidationMessages(newConfigInput)
+        showToast('success', data.created ? `Config '${data.name}' created.` : `Config '${data.name}' loaded.`)
+        window.setTimeout(() => window.location.reload(), 200)
+      } catch (err) {
+        applyValidationStyles(newConfigInput, 'error', err.message || 'Unable to save config.')
+        showToast('error', err.message || 'Unable to save config.')
+      } finally {
+        saveConfigButton.innerHTML = originalHtml
+        updateButtonState()
+      }
+    })
+  }
+
   function setImportCredentialFlags (options) {
     importNeedsPlexCredentials = Boolean(options && options.needsPlex)
     importNeedsTmdbCredentials = Boolean(options && options.needsTmdb)
@@ -596,7 +1100,6 @@ document.addEventListener('DOMContentLoaded', function () {
     anidb: 'AniDB',
     webhooks: 'Webhooks',
     settings: 'Settings',
-    playlist_files: 'Playlists',
     libraries: 'Libraries'
   }
 
@@ -604,7 +1107,6 @@ document.addEventListener('DOMContentLoaded', function () {
     'plex',
     'tmdb',
     'libraries',
-    'playlist_files',
     'tautulli',
     'github',
     'omdb',
@@ -621,7 +1123,7 @@ document.addEventListener('DOMContentLoaded', function () {
     'settings'
   ]
 
-  const mergeDefaultSelected = new Set(['libraries', 'playlist_files', 'settings'])
+  const mergeDefaultSelected = new Set(['libraries', 'settings'])
 
   function renderMergeSections (sections) {
     if (!importMergeSection || !importMergeSectionList) return
@@ -1234,13 +1736,17 @@ document.addEventListener('DOMContentLoaded', function () {
       confirmImportButton.disabled = true
       confirmImportButton.textContent = 'Importing...'
 
-      function showImportRedirectOverlay (message, detail) {
+      function showImportRedirectOverlay (message, detail, options = {}) {
         const existing = document.getElementById('qs-import-redirect')
         if (existing) {
           const msgEl = existing.querySelector('.qs-import-redirect-message')
           const detailEl = existing.querySelector('.qs-import-redirect-detail')
+          const spinner = existing.querySelector('.qs-import-redirect-spinner')
+          const actionsEl = existing.querySelector('.qs-import-redirect-actions')
           if (msgEl) msgEl.textContent = message || msgEl.textContent
           if (detailEl) detailEl.textContent = detail || detailEl.textContent
+          if (spinner) spinner.classList.toggle('d-none', Boolean(options.done))
+          renderImportRedirectActions(actionsEl, options.actions || [])
           return
         }
 
@@ -1264,32 +1770,37 @@ document.addEventListener('DOMContentLoaded', function () {
         card.style.cssText = 'background:#0f1113;border:1px solid #2b2f33;max-width:520px;width:100%;'
 
         const spinner = document.createElement('div')
-        spinner.className = 'spinner-border text-info mb-3'
+        spinner.className = 'spinner-border text-info mb-3 qs-import-redirect-spinner'
         spinner.setAttribute('role', 'status')
         spinner.setAttribute('aria-hidden', 'true')
+        spinner.classList.toggle('d-none', Boolean(options.done))
 
         const messageEl = document.createElement('div')
         messageEl.className = 'fw-semibold mb-1 qs-import-redirect-message'
-        messageEl.textContent = message || 'Import complete. Redirecting...'
+        messageEl.textContent = message || 'Import complete.'
 
         const detailEl = document.createElement('div')
         detailEl.className = 'small text-muted mb-3 qs-import-redirect-detail'
         detailEl.style.whiteSpace = 'pre-line'
-        detailEl.textContent = detail || 'Loading Final Validation. This can take up to 30 seconds.'
+        detailEl.textContent = detail || 'Validating imported config...'
 
         const button = document.createElement('button')
         button.type = 'button'
         button.className = 'btn btn-sm btn-outline-info qs-import-redirect-btn d-none'
-        button.textContent = 'Go to Final Validation'
+        button.textContent = 'Open Start'
 
-        card.append(spinner, messageEl, detailEl, button)
+        const actionsEl = document.createElement('div')
+        actionsEl.className = 'qs-import-redirect-actions d-flex flex-wrap justify-content-center gap-2 mb-3'
+        renderImportRedirectActions(actionsEl, options.actions || [])
+
+        card.append(spinner, messageEl, detailEl, actionsEl, button)
         overlay.appendChild(card)
 
         document.body.appendChild(overlay)
         const redirectBtn = overlay.querySelector('.qs-import-redirect-btn')
         if (redirectBtn) {
           redirectBtn.addEventListener('click', () => {
-            window.location = '/step/900-final'
+            window.location = '/step/001-start'
           })
           setTimeout(() => {
             if (document.getElementById('qs-import-redirect')) {
@@ -1297,6 +1808,93 @@ document.addEventListener('DOMContentLoaded', function () {
             }
           }, 60000)
         }
+      }
+
+      function renderImportRedirectActions (container, actions) {
+        if (!container) return
+        container.replaceChildren()
+        if (!Array.isArray(actions) || !actions.length) {
+          container.classList.add('d-none')
+          return
+        }
+        container.classList.remove('d-none')
+        actions.forEach(action => {
+          if (!action || !action.href || !action.label) return
+          const link = document.createElement('a')
+          link.className = action.className || 'btn btn-sm btn-outline-warning'
+          link.href = action.href
+          link.textContent = action.label
+          container.appendChild(link)
+        })
+      }
+
+      function summarizeBulkValidation (data) {
+        const summary = data && data.summary ? data.summary : {}
+        const counts = window.QSBulkValidation && typeof window.QSBulkValidation.getSummaryCounts === 'function'
+          ? window.QSBulkValidation.getSummaryCounts(summary)
+          : {
+              validated: Number(summary.validated || 0),
+              failed: Number(summary.failed || 0),
+              skipped: Number(summary.skipped || 0)
+            }
+        return `Validation complete. ${counts.validated} passed, ${counts.failed} failed, ${counts.skipped} skipped.`
+      }
+
+      function summarizeImportResult (data) {
+        const sections = Array.isArray(data.imported_sections) ? data.imported_sections.length : 0
+        const skippedSections = Array.isArray(data.skipped_sections) ? data.skipped_sections.length : 0
+        const copiedFonts = Array.isArray(data.fonts_copied) ? data.fonts_copied.length : 0
+        const skippedFonts = Array.isArray(data.fonts_skipped) ? data.fonts_skipped.length : 0
+        const mapping = data.mapping_summary && typeof data.mapping_summary === 'object' ? data.mapping_summary : {}
+        const mapped = Number(mapping.mapped || 0)
+        const ignored = Number(mapping.ignored || 0)
+        const parts = [`${sections} section${sections === 1 ? '' : 's'} imported`]
+        if (skippedSections) parts.push(`${skippedSections} skipped`)
+        if (mapped || ignored) parts.push(`${mapped} mapped, ${ignored} ignored`)
+        if (copiedFonts || skippedFonts) parts.push(`${copiedFonts} font${copiedFonts === 1 ? '' : 's'} copied, ${skippedFonts} skipped`)
+        return parts.join(' • ')
+      }
+
+      function stepLabelForValidationKey (stepKey) {
+        const labels = {
+          '010-plex': 'Plex',
+          '020-tmdb': 'TMDb',
+          '025-libraries': 'Libraries',
+          '030-tautulli': 'Tautulli',
+          '040-github': 'GitHub',
+          '050-omdb': 'OMDb',
+          '060-mdblist': 'MDBList',
+          '070-notifiarr': 'Notifiarr',
+          '080-gotify': 'Gotify',
+          '085-ntfy': 'ntfy',
+          '090-webhooks': 'Webhooks',
+          '100-anidb': 'AniDB',
+          '110-radarr': 'Radarr',
+          '120-sonarr': 'Sonarr',
+          '130-trakt': 'Trakt',
+          '140-mal': 'MyAnimeList',
+          '150-settings': 'Settings'
+        }
+        return labels[stepKey] || String(stepKey || '').replace(/^\d+-/, '')
+      }
+
+      function validationFailureActions (data) {
+        const results = data && data.results && typeof data.results === 'object' ? data.results : {}
+        return Object.keys(results)
+          .filter(stepKey => results[stepKey] && results[stepKey].status === 'failed')
+          .slice(0, 4)
+          .map(stepKey => ({
+            href: `/step/${encodeURIComponent(stepKey)}`,
+            label: stepLabelForValidationKey(stepKey),
+            className: 'btn btn-sm btn-outline-warning'
+          }))
+      }
+
+      async function runImportBulkValidation () {
+        if (!window.QSBulkValidation || typeof window.QSBulkValidation.run !== 'function') {
+          throw new Error('Bulk validation is unavailable.')
+        }
+        return window.QSBulkValidation.run({ source: 'import-confirm', silentToast: true })
       }
       try {
         const libraryMapping = {}
@@ -1326,26 +1924,39 @@ document.addEventListener('DOMContentLoaded', function () {
         if (!res.ok || !data.success) {
           throw new Error(data.message || 'Import failed.')
         }
-        let msg = `Imported config '${data.config_name}'.`
-        if (Array.isArray(data.fonts_copied) && data.fonts_copied.length) {
-          msg += ` Fonts added: ${data.fonts_copied.length}.`
-        }
-        const skippedExisting = Array.isArray(data.fonts_skipped_existing) ? data.fonts_skipped_existing : []
-        const skippedFailed = Array.isArray(data.fonts_skipped_failed) ? data.fonts_skipped_failed : []
-        if (skippedExisting.length) {
-          msg += ` Fonts skipped (already exists): ${skippedExisting.length}.`
-        }
-        if (skippedFailed.length) {
-          msg += ` Fonts skipped (copy failed): ${skippedFailed.length}.`
-        }
-        if (!skippedExisting.length && !skippedFailed.length && Array.isArray(data.fonts_skipped) && data.fonts_skipped.length) {
-          msg += ` Fonts skipped: ${data.fonts_skipped.length}.`
-        }
-        const guidance = 'Import complete. Go to Final Validation and click Validate Configured Services to check all services, then fix any failures (especially interactive pages).'
-        showImportRedirectOverlay(msg, `${guidance}\nLoading Final Validation. This can take up to 30 seconds.`)
+        const msg = `Imported config '${data.config_name}'.`
+        const importSummaryText = summarizeImportResult(data)
         const modal = bootstrap.Modal.getInstance(importConfigModalEl)
         if (modal) modal.hide()
-        setTimeout(() => { window.location = '/step/900-final' }, 1200)
+        showImportRedirectOverlay(msg, `${importSummaryText}\nValidating imported config...`)
+        try {
+          const validationData = await runImportBulkValidation()
+          const actions = validationFailureActions(validationData)
+          if (actions.length) {
+            actions.push({ href: '/step/001-start', label: 'Open Start', className: 'btn btn-sm btn-outline-info' })
+            showImportRedirectOverlay(
+              'Import complete.',
+              `${importSummaryText}\n${summarizeBulkValidation(validationData)} Review failed pages below.`,
+              { done: true, actions }
+            )
+          } else {
+            showImportRedirectOverlay(
+              'Import complete.',
+              `${importSummaryText}\n${summarizeBulkValidation(validationData)} Reloading Start...`,
+              { done: true }
+            )
+            setTimeout(() => { window.location = '/step/001-start' }, 900)
+          }
+        } catch (validationErr) {
+          showImportRedirectOverlay(
+            'Import complete.',
+            `${importSummaryText}\n${validationErr.message || 'Validation failed.'}`,
+            {
+              done: true,
+              actions: [{ href: '/step/001-start', label: 'Open Start', className: 'btn btn-sm btn-outline-info' }]
+            }
+          )
+        }
       } catch (err) {
         const message = err.message || 'Import failed.'
         if (/import token is invalid/i.test(message)) {
@@ -1369,6 +1980,10 @@ document.addEventListener('DOMContentLoaded', function () {
   const statusMsg = document.getElementById('test-lib-status-message')
   const cloneBtn = document.getElementById('clone-test-lib-btn')
   const purgeBtn = document.getElementById('purge-test-lib-btn')
+  const testLibAccordionItem = document.getElementById('test-lib-accordion-item')
+  const testLibSummaryPill = document.getElementById('test-lib-summary-pill')
+  const testLibIntroCopyPending = document.getElementById('test-lib-intro-copy-pending')
+  const testLibIntroCopyReady = document.getElementById('test-lib-intro-copy-ready')
   const updateRow = document.getElementById('test-lib-update-row')
   const localShaEl = document.getElementById('test-lib-local-sha')
   const remoteShaEl = document.getElementById('test-lib-remote-sha')
@@ -1377,18 +1992,6 @@ document.addEventListener('DOMContentLoaded', function () {
   const finalPathInput = document.getElementById('test-lib-final-path')
   const savePathsBtn = document.getElementById('test-lib-paths-apply')
   const pathsStatus = document.getElementById('test-lib-paths-status')
-  const testLibAccordion = document.getElementById('test-lib-accordion-collapse')
-
-  function setTestLibAccordionExpanded (shouldExpand) {
-    if (!testLibAccordion) return
-    if (typeof bootstrap !== 'undefined' && bootstrap.Collapse) {
-      const instance = bootstrap.Collapse.getOrCreateInstance(testLibAccordion, { toggle: false })
-      if (shouldExpand) instance.show()
-      else instance.hide()
-    } else {
-      testLibAccordion.classList.toggle('show', Boolean(shouldExpand))
-    }
-  }
 
   // Progress block (existing or injected)
   let progWrap = document.getElementById('test-lib-progress')
@@ -1543,8 +2146,28 @@ document.addEventListener('DOMContentLoaded', function () {
     progTxt.textContent = ''
   }
 
+  function setTestLibSummaryState (state, text) {
+    const normalized = state === 'ready' ? 'ready' : 'pending'
+    const label = text || (normalized === 'ready' ? 'Ready' : 'Setup needed')
+    if (testLibAccordionItem) {
+      testLibAccordionItem.dataset.testLibState = normalized
+    }
+    if (testLibSummaryPill) {
+      testLibSummaryPill.textContent = label
+      testLibSummaryPill.classList.remove('start-app-state-ready', 'start-app-state-pending')
+      testLibSummaryPill.classList.add(normalized === 'ready' ? 'start-app-state-ready' : 'start-app-state-pending')
+    }
+    if (testLibIntroCopyPending) {
+      testLibIntroCopyPending.classList.toggle('d-none', normalized === 'ready')
+    }
+    if (testLibIntroCopyReady) {
+      testLibIntroCopyReady.classList.toggle('d-none', normalized !== 'ready')
+    }
+  }
+
   function setScenarioNotFound (pathValue, opts = {}) {
     const showUnrecognized = Boolean(opts.unrecognized)
+    setTestLibSummaryState('pending', 'Setup needed')
     testLibStatus.classList.remove('d-none', 'alert-success', 'alert-danger')
     testLibStatus.classList.add('alert-warning')
     statusMsg.replaceChildren()
@@ -1568,10 +2191,10 @@ document.addEventListener('DOMContentLoaded', function () {
     cloneBtn.classList.remove('d-none')
     purgeBtn.classList.add('d-none')
     updateRow?.classList.add('d-none')
-    setTestLibAccordionExpanded(true)
   }
 
   function setScenarioFoundZip (data, pathValue) {
+    setTestLibSummaryState('ready', 'Ready')
     testLibStatus.classList.remove('d-none', 'alert-warning', 'alert-danger')
     testLibStatus.classList.add('alert-success')
     statusMsg.replaceChildren()
@@ -1601,7 +2224,6 @@ document.addEventListener('DOMContentLoaded', function () {
     } else {
       updateRow?.classList.add('d-none')
     }
-    setTestLibAccordionExpanded(false)
   }
 
   async function refreshStatus () {
@@ -1652,7 +2274,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
         if (res.success) {
           showToast('success', res.message)
-          setScenarioNotFound(`<br><code>${res.message.replace('Test libraries deleted at: ', '')}</code>`)
+          setScenarioNotFound(res.message.replace('Test libraries deleted at: ', ''))
           setButtonIdle(prevText || 'Download Test Libraries')
           resetProgress()
         } else {
@@ -1762,8 +2384,9 @@ document.addEventListener('DOMContentLoaded', function () {
       try {
         let done = false
         while (!done) {
-          const prog = await fetch(`/clone-test-libraries-progress?job_id=${encodeURIComponent(jobId)}`).then(r => r.json())
-          if (!prog.success) throw new Error(prog.message || 'Progress error')
+          const jobRes = await fetch(`/background-jobs/${encodeURIComponent(jobId)}`).then(r => r.json())
+          if (!jobRes.success || !jobRes.job) throw new Error(jobRes.error || jobRes.message || 'Progress error')
+          const prog = jobRes.job
 
           const phase = prog.phase
           if (phase === 'download') {
@@ -1812,6 +2435,7 @@ document.addEventListener('DOMContentLoaded', function () {
         await refreshStatus()
         showToast('success', 'Test libraries installed/updated successfully.')
       } catch (err) {
+        setTestLibSummaryState('pending', 'Setup needed')
         testLibStatus.classList.remove('alert-success', 'alert-warning')
         testLibStatus.classList.add('alert-danger')
         const errorStrong = document.createElement('strong')
@@ -1891,10 +2515,10 @@ document.addEventListener('DOMContentLoaded', function () {
       setProgress(40, 'Resuming download…', { indeterminate: true })
       startElapsedTimer(Number.isFinite(startedAtMs) ? startedAtMs : undefined)
 
-      fetch(`/clone-test-libraries-progress?job_id=${encodeURIComponent(jobId)}`)
+      fetch(`/background-jobs/${encodeURIComponent(jobId)}`)
         .then(r => r.json())
         .then(data => {
-          if (!data.success) throw new Error(data.message || 'Unknown job')
+          if (!data.success || !data.job) throw new Error(data.error || data.message || 'Unknown job')
           return pollJob(jobId)
         })
         .catch(() => {
@@ -1911,14 +2535,14 @@ document.addEventListener('DOMContentLoaded', function () {
     if (stored.jobId && !running) {
       resumeJob(stored.jobId, stored.startedAt)
     } else {
-      fetch('/clone-test-libraries-active')
+      fetch('/background-jobs/active?job_type=test_library_install')
         .then(r => r.json())
         .then(data => {
-          if (!data.success || !data.active || !data.job_id || running) return
-          const startedAtSec = Number(data.started_at)
+          if (!data.success || !data.active || !data.job || !data.job.job_id || running) return
+          const startedAtSec = Number(data.job.started_epoch)
           const startedAtMs = Number.isFinite(startedAtSec) ? startedAtSec * 1000 : undefined
-          storeJob(data.job_id, startedAtMs)
-          resumeJob(data.job_id, startedAtMs)
+          storeJob(data.job.job_id, startedAtMs)
+          resumeJob(data.job.job_id, startedAtMs)
         })
         .catch(() => {})
     }

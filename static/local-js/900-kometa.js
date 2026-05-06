@@ -1,11 +1,14 @@
-/* global $, bootstrap, showToast */
+/* global $, bootstrap, showToast, showNavigationLoadingOverlay, hideNavigationLoadingOverlay */
 
 // Global flag so other handlers know an update is in progress
 let KOMETA_UPDATING = false
 let KOMETA_VALIDATED = false
 let KOMETA_VALIDATION_IN_PROGRESS = false
 let KOMETA_UPDATE_AVAILABLE = false
+let KOMETA_UPDATE_CHECK_SKIPPED = false
+let KOMETA_UPDATE_CHECK_COMPLETED = false
 let KOMETA_INSTALLED = false
+let KOMETA_LOCAL_CHECK_COMPLETED = false
 // Polling handles (hoist to top so all handlers see them safely)
 let kometaInterval = null
 let kometaStatusInterval = null
@@ -14,6 +17,7 @@ let kometaPollingStarted = false
 let autoScrollEnabled = true
 let tailSize = '2000'
 let KOMETA_STATUS = null
+let KOMETA_PENDING_START = false
 let logPollingPaused = false
 let logFilter = ''
 let lastLogText = ''
@@ -21,7 +25,16 @@ let lastLogStatsTotal = null
 let logStatsPollCounter = 0
 let lastLogscanPayload = null
 let logscanPollCounter = 0
+let finalLogscanAnalyzeTriggered = false
 let lastRunProgressPayload = null
+let logscanAnalyzeInFlight = false
+let runProgressInFlight = false
+let activeRunCommandOverride = null
+let activeRunCommandMode = null
+const KOMETA_BRANCH_OVERRIDE_STORAGE_KEY = 'qs-kometa-branch-override'
+let kometaUpdatePollInterval = null
+let kometaUpdateJobId = null
+let kometaUpdateLogIndex = 0
 
 const _qsEnvEl = document.getElementById('qs-env')
 const runningOn = (_qsEnvEl && _qsEnvEl.dataset.runningOn) ? _qsEnvEl.dataset.runningOn : ''
@@ -59,6 +72,15 @@ $(document).ready(function () {
   const $logscanSections = $('#logscan-sections')
   const $updateKometaBtn = $('#update-kometa-btn')
   const $forceUpdateToggle = $('#force-kometa-update')
+  const $kometaBranchOverride = $('#kometa-branch-override')
+  const $kometaBranchSelection = $('#kometa-branch-selection')
+  const $kometaEffectiveBranch = $('#kometa-effective-branch')
+  const $kometaUpdatePhaseBadge = $('#kometa-update-phase-badge')
+  const $kometaLocalVersionStatus = $('#kometa-local-version-status')
+  const $kometaRemoteVersionStatus = $('#kometa-remote-version-status')
+  const $kometaVersionSourceUrl = $('#kometa-version-source-url')
+  const $kometaZipSourceUrl = $('#kometa-zip-source-url')
+  const $kometaMaintenancePageBadge = $('#kometa-maintenance-page-badge')
   const $runStatusRow = $('#run-status-row')
   const $runStatusTimer = $('#run-status-timer')
   const $runStatusMetrics = $('#run-status-metrics')
@@ -83,6 +105,46 @@ $(document).ready(function () {
   const headerGridProgress = document.getElementById('header-style-grid-progress')
   const headerGridProgressBar = headerGridProgress ? headerGridProgress.querySelector('.progress-bar') : null
   const headerStyleLabel = document.getElementById('header-style-label')
+  const kometaActionsHeading = document.getElementById('kometa-actions-heading')
+  const kometaActionsCollapse = document.getElementById('kometa-actions-collapse')
+  const kometaActionsToggle = document.getElementById('kometa-actions-toggle')
+  const kometaBranchOverrideWarning = document.getElementById('kometa-branch-override-warning')
+  const runCommandCollapse = document.getElementById('run-command-output-collapse')
+  let headerStyleSubmitting = false
+  let kometaLocalVersionStatus = 'Unknown'
+  let kometaRemoteVersionStatus = ''
+  let kometaRemoteVersionChecked = false
+  let kometaRemoteVersionSkipped = false
+  let kometaUpdatePhaseStatus = 'idle'
+
+  function syncKometaMaintenancePageBadge (data) {
+    if (!$kometaMaintenancePageBadge.length) return
+    const paused = Boolean(data && data.maintenance_paused)
+    const pending = Boolean(data && data.pending_start)
+    const active = Boolean(data && data.maintenance_active)
+    const windowLabel = data && data.maintenance_window ? ` (${data.maintenance_window})` : ''
+    let label = ''
+
+    if (paused) {
+      label = `Paused for Plex maintenance${windowLabel}`
+    } else if (pending) {
+      label = `Queued for Plex maintenance${windowLabel}`
+    } else if (active) {
+      label = `Plex maintenance active${windowLabel}`
+    }
+
+    if (label) {
+      $kometaMaintenancePageBadge.removeClass('d-none')
+      const textEl = $kometaMaintenancePageBadge.find('span').last()
+      if (textEl.length) textEl.text(label)
+    } else {
+      $kometaMaintenancePageBadge.addClass('d-none')
+    }
+  }
+
+  document.addEventListener('qs:maintenance-status', function (event) {
+    syncKometaMaintenancePageBadge(event.detail || null)
+  })
 
   function readMetaFlag (id, datasetKey, attrKey) {
     const el = document.getElementById(id)
@@ -99,14 +161,198 @@ $(document).ready(function () {
     el.setAttribute(`data-${attrKey}`, serialized)
   }
 
+  function setHeaderRollupBadge (id, state, label) {
+    const badge = document.getElementById(id)
+    if (!badge) return
+    badge.textContent = label
+    badge.classList.remove(
+      'qs-validation-rollup-badge--unknown',
+      'qs-validation-rollup-badge--ok',
+      'qs-validation-rollup-badge--warn',
+      'qs-validation-rollup-badge--error'
+    )
+    const normalized = ['unknown', 'ok', 'warn', 'error'].includes(state) ? state : 'unknown'
+    badge.classList.add(`qs-validation-rollup-badge--${normalized}`)
+  }
+
+  function prettifyFlag (value) {
+    const raw = String(value || '').trim()
+    if (!raw) return 'Default'
+    const noPrefix = raw.replace(/^--/, '')
+    return noPrefix.replace(/-/g, ' ')
+  }
+
+  function updateSectionStyleHeaderBadge (value) {
+    const label = formatHeaderStyleLabel(value)
+    setHeaderRollupBadge('header-style-rollup-badge', 'ok', label || 'Active')
+  }
+
+  function updateConfigOutputHeaderBadges () {
+    const yamlText = $yamlOutput.length ? String($yamlOutput.val() || '') : ''
+    const lineCount = computeYamlLineCount(yamlText)
+    setHeaderRollupBadge('config-output-lines-badge', lineCount > 0 ? 'ok' : 'unknown', `${lineCount} lines`)
+    if (!yamlText.trim()) {
+      setHeaderRollupBadge('config-output-rollup-badge', 'unknown', 'No YAML')
+      return
+    }
+    setHeaderRollupBadge('config-output-rollup-badge', showYAML ? 'ok' : 'error', showYAML ? 'Validated' : 'Needs fixes')
+  }
+
+  function updateModeHeaderBadge () {
+    const showCli = $('#show-cli-toggle').is(':checked')
+    setHeaderRollupBadge('heading-mode-rollup-badge', showCli ? 'ok' : 'unknown', showCli ? 'CLI labels' : 'Friendly')
+  }
+
+  function updateRunOptionHeaderBadge () {
+    const mainOption = $('input[name="run-option"]:checked').val() || ''
+    const selectedLibs = $('#library-multiselect').length ? ($('#library-multiselect').val() || []) : []
+    if (mainOption === '--run-libraries') {
+      if (!selectedLibs.length) {
+        setHeaderRollupBadge('heading-runopt-rollup-badge', 'warn', 'Libraries needed')
+      } else {
+        setHeaderRollupBadge('heading-runopt-rollup-badge', 'ok', `${selectedLibs.length} libraries`)
+      }
+      return
+    }
+    if (mainOption === '--times') {
+      const timesInput = $('#times-input').val().trim()
+      if (!timesInput) {
+        setHeaderRollupBadge('heading-runopt-rollup-badge', 'warn', 'Times needed')
+        return
+      }
+      setHeaderRollupBadge('heading-runopt-rollup-badge', isValidTimesFormat(timesInput) ? 'ok' : 'error', isValidTimesFormat(timesInput) ? 'Times set' : 'Invalid times')
+      return
+    }
+    if (mainOption === '--run') {
+      setHeaderRollupBadge('heading-runopt-rollup-badge', 'ok', 'Run now')
+      return
+    }
+    setHeaderRollupBadge('heading-runopt-rollup-badge', 'unknown', 'Scheduled')
+  }
+
+  function updateModeFlagsHeaderBadge () {
+    const modeFlag = $('input[name="mode-flag"]:checked').val() || ''
+    setHeaderRollupBadge('heading-modeflags-rollup-badge', modeFlag ? 'ok' : 'unknown', prettifyFlag(modeFlag))
+  }
+
+  function updateLogFlagsHeaderBadge () {
+    const logFlag = $('input[name="log-flag"]:checked').val() || ''
+    setHeaderRollupBadge('heading-logflags-rollup-badge', logFlag ? 'ok' : 'unknown', prettifyFlag(logFlag))
+  }
+
+  function updateOtherFlagsHeaderBadge () {
+    const coreCount = [
+      'delete-collections', 'delete-labels', 'read-only-config', 'low-priority',
+      'no-report', 'no-missing', 'no-countdown', 'ignore-ghost',
+      'ignore-schedules', 'no-verify-ssl', 'tests'
+    ].filter(opt => $(`#opt-${opt}`).is(':checked')).length
+    const extrasCount = ($('#opt-timeout').is(':checked') ? 1 : 0) +
+      ($('#opt-divider').is(':checked') ? 1 : 0) +
+      ($('#opt-width').is(':checked') ? 1 : 0)
+    const total = coreCount + extrasCount
+    if (!total) {
+      setHeaderRollupBadge('heading-otherflags-rollup-badge', 'unknown', 'Default')
+      return
+    }
+    setHeaderRollupBadge('heading-otherflags-rollup-badge', 'ok', `${total} enabled`)
+  }
+
+  function updateRunCommandHeaderBadge () {
+    if (!showYAML) {
+      setHeaderRollupBadge('run-command-rollup-badge', 'error', 'Fix validation')
+      return
+    }
+    if (KOMETA_VALIDATION_IN_PROGRESS) {
+      setHeaderRollupBadge('run-command-rollup-badge', 'unknown', 'Checking Kometa')
+      return
+    }
+    if (KOMETA_UPDATING) {
+      setHeaderRollupBadge('run-command-rollup-badge', 'unknown', 'Updating Kometa')
+      return
+    }
+    if (!KOMETA_VALIDATED) {
+      setHeaderRollupBadge('run-command-rollup-badge', 'warn', 'Validate Kometa')
+      return
+    }
+    if (KOMETA_STATUS === 'running') {
+      setHeaderRollupBadge('run-command-rollup-badge', 'warn', 'Run in progress')
+      return
+    }
+    setHeaderRollupBadge('run-command-rollup-badge', isRunCommandValid() ? 'ok' : 'warn', isRunCommandValid() ? 'Ready' : 'Incomplete')
+  }
+
+  function updateLogscanHeaderBadge (data) {
+    const source = data || lastLogscanPayload
+    if (!source) {
+      setHeaderRollupBadge('logscan-rollup-badge', 'unknown', 'Pending')
+      return
+    }
+    if (source.error) {
+      setHeaderRollupBadge('logscan-rollup-badge', 'error', 'Unavailable')
+      return
+    }
+    const recCount = Array.isArray(source.recommendations) ? source.recommendations.length : 0
+    const missingCount = Array.isArray(source.missing_people) ? source.missing_people.length : 0
+    const issueCount = recCount + missingCount
+    if (!issueCount) {
+      setHeaderRollupBadge('logscan-rollup-badge', 'ok', 'No issues')
+      return
+    }
+    setHeaderRollupBadge('logscan-rollup-badge', 'warn', `${issueCount} items`)
+  }
+
+  function syncFinalAccordionRollups () {
+    updateModeHeaderBadge()
+    updateRunOptionHeaderBadge()
+    updateModeFlagsHeaderBadge()
+    updateLogFlagsHeaderBadge()
+    updateOtherFlagsHeaderBadge()
+    updateConfigOutputHeaderBadges()
+    updateRunCommandHeaderBadge()
+    updateLogscanHeaderBadge()
+    syncKometaBranchRollupBadge()
+  }
+
+  function getFinalGateState () {
+    const el = document.getElementById('final-gate-state')
+    if (!el) {
+      return {
+        stage: 'config',
+        autoValidate: false,
+        configValid: false
+      }
+    }
+    return {
+      stage: String(el.dataset.stage || 'config'),
+      todoCount: Number(el.dataset.todoCount || 0),
+      autoValidate: el.dataset.autoValidate === 'true',
+      configValid: el.dataset.configValid === 'true',
+      bulkFresh: el.dataset.bulkFresh === 'true'
+    }
+  }
+
   function updateValidationGate () {
+    const finalGate = getFinalGateState()
+    if (finalGate.stage === 'todo' || finalGate.stage === 'freshness') {
+      showYAML = false
+      $('#validation-messages').hide()
+      $('#no-validation-warning, #yaml-warnings, #yaml-warning-msg, #validation-error').addClass('d-none')
+      $('#download-btn, #download-redacted-btn').addClass('d-none')
+      $('#run-controls-container').addClass('d-none')
+      $('#run-now').prop('disabled', true)
+      $('#run-now-label').text('Run Now')
+      updateRunNowState()
+      syncFinalAccordionRollups()
+      return
+    }
+
     const plexValid = readMetaFlag('plex_valid', 'plexValid', 'plex-valid')
     const tmdbValid = readMetaFlag('tmdb_valid', 'tmdbValid', 'tmdb-valid')
     const libsValid = readMetaFlag('libs_valid', 'libsValid', 'libs-valid')
     const settValid = readMetaFlag('sett_valid', 'settValid', 'sett-valid')
     const yamlValid = readMetaFlag('yaml_valid', 'yamlValid', 'yaml-valid')
 
-    showYAML = plexValid && tmdbValid && libsValid && settValid && yamlValid
+    showYAML = finalGate.configValid || (plexValid && tmdbValid && libsValid && settValid && yamlValid)
 
     const validationMessages = []
     const rowFor = (label, href) => {
@@ -129,7 +375,11 @@ $(document).ready(function () {
     $('#run-now-label').text('Run Now')
 
     if (!showYAML) {
-      $('#validation-messages').html(validationMessages.join('<br>')).show()
+      if (validationMessages.length) {
+        $('#validation-messages').html(validationMessages.join('<br>')).show()
+      } else {
+        $('#validation-messages').hide()
+      }
       $('#no-validation-warning, #yaml-warnings, #yaml-warning-msg, #validation-error').removeClass('d-none')
       $('#download-btn, #download-redacted-btn').addClass('d-none')
       $('#run-controls-container').addClass('d-none') // Hide run section
@@ -143,6 +393,7 @@ $(document).ready(function () {
     }
 
     updateRunNowState()
+    syncFinalAccordionRollups()
   }
 
   updateValidationGate()
@@ -167,13 +418,14 @@ $(document).ready(function () {
     if (!$yamlLineCount.length || !$yamlOutput.length) return
     const lineCount = computeYamlLineCount($yamlOutput.val())
     $yamlLineCount.text(`Line count (includes comments and blank lines): ${lineCount}`)
+    updateConfigOutputHeaderBadges()
   }
 
   updateYamlLineCount()
   $yamlOutput.on('input', updateYamlLineCount)
 
   function normalizeFontName (value) {
-    return String(value || '').trim()
+    return String(value || '').trim().replace(/_/g, ' ')
   }
 
   function formatHeaderStyleLabel (value) {
@@ -185,6 +437,7 @@ $(document).ready(function () {
   function updateHeaderStyleLabel (value) {
     if (!headerStyleLabel) return
     headerStyleLabel.textContent = formatHeaderStyleLabel(value)
+    updateSectionStyleHeaderBadge(value)
   }
 
   function setActiveGridCard (fontName) {
@@ -304,6 +557,16 @@ $(document).ready(function () {
     headerSelect.addEventListener('change', () => setActiveGridCard(headerSelect.value))
   }
   updateHeaderStyleLabel(headerSelect ? headerSelect.value : '')
+  $('#open-kometa-actions-button').on('click', function () {
+    if (KOMETA_STATUS === 'running') return
+    if (!kometaActionsCollapse || typeof bootstrap === 'undefined' || !bootstrap.Collapse) return
+    bootstrap.Collapse.getOrCreateInstance(kometaActionsCollapse, { toggle: false }).show()
+  })
+  $('#open-kometa-actions-panel-button').on('click', function () {
+    if (KOMETA_STATUS === 'running') return
+    if (!kometaActionsCollapse || typeof bootstrap === 'undefined' || !bootstrap.Collapse) return
+    bootstrap.Collapse.getOrCreateInstance(kometaActionsCollapse, { toggle: false }).show()
+  })
 
   function updateLibraryVisibility (mainOption) {
     const librarySection = $('#library-multiselect').closest('.mb-2')
@@ -444,6 +707,7 @@ $(document).ready(function () {
     updateLabels(otherFlags, 'opt-')
 
     $('[data-bs-toggle="tooltip"]').tooltip({ html: true })
+    syncFinalAccordionRollups()
   }
 
   updateFlagLabels(false) // Default to friendly labels
@@ -457,21 +721,134 @@ $(document).ready(function () {
     return Boolean(cmd) && !cmd.startsWith('??')
   }
 
+  function setRunCommandPlaceholderState () {
+    const $panel = $('#run-command-panel-message')
+    const $panelTitle = $('#run-command-panel-title')
+    const $panelText = $('#run-command-panel-text')
+    const $panelButton = $('#open-kometa-actions-panel-button')
+    const $box = $('#run-command-box')
+
+    if (!$panel.length) return
+
+    let title = 'Run command is not ready yet'
+    let message = 'Open Prepare Kometa to install, validate, or update the local Kometa setup before running.'
+    let showButton = true
+
+    if (!showYAML) {
+      title = 'Fix validation before building the run command'
+      message = 'Resolve the current validation issues first. The run command will appear after the config validates cleanly.'
+      showButton = false
+    } else if (KOMETA_STATUS === 'running') {
+      title = 'Kometa is currently running'
+      message = 'Run output and stop controls are active below. Prepare Kometa is locked until the current run finishes.'
+      showButton = false
+    } else if (KOMETA_UPDATING) {
+      title = 'Kometa update in progress'
+      message = 'Wait for the current install or update to finish. The run command will appear automatically afterward.'
+    } else if (KOMETA_VALIDATION_IN_PROGRESS) {
+      title = 'Preparing Kometa'
+      message = 'Quickstart is validating the Kometa folder and environment now. The run command will appear automatically when ready.'
+    } else if (!KOMETA_LOCAL_CHECK_COMPLETED) {
+      title = 'Checking Kometa state'
+      message = 'Quickstart is probing the local Kometa path. Wait for that check to finish, then prepare Kometa if needed.'
+      showButton = false
+    } else if (!KOMETA_INSTALLED) {
+      title = 'Install Kometa to build the run command'
+      message = 'Kometa is not installed in the selected path yet. Open Prepare Kometa to install it first.'
+    } else if (!KOMETA_VALIDATED) {
+      title = 'Validate Kometa to build the run command'
+      message = 'Next step: open Prepare Kometa, let Quickstart validate the Kometa folder and environment, then this command will be generated here.'
+    }
+
+    $panelTitle.text(title)
+    $panelText.text(message)
+    $panelButton.toggleClass('d-none', !showButton)
+    $panel.removeClass('d-none')
+    $box.addClass('d-none').removeClass('fade-in')
+  }
+
+  function clearRunCommandPlaceholderState () {
+    $('#run-command-panel-message').addClass('d-none')
+    $('#run-command-placeholder').addClass('d-none')
+    $('#open-kometa-actions-button').addClass('d-none')
+    $('#run-command-box').removeClass('d-none')
+    $('#run-command-box .form-label').removeClass('d-none')
+    $('#run-command-box pre').removeClass('d-none')
+    $('#copy-command').removeClass('d-none')
+  }
+
+  function getRunCommandModeLabel (mode) {
+    const normalized = String(mode || 'current').trim().toLowerCase()
+    if (normalized === 'recovery') return 'Recovery Command'
+    if (normalized === 'logged') return 'Last Logged Command'
+    return 'Command'
+  }
+
+  function getRunCommandModeBadgeLabel (mode) {
+    const normalized = String(mode || 'current').trim().toLowerCase()
+    if (normalized === 'recovery') return 'Recovery Active'
+    if (normalized === 'logged') return 'Logged Active'
+    return 'Current Active'
+  }
+
+  function getRunCommandModeBadgeClass (mode) {
+    const normalized = String(mode || 'current').trim().toLowerCase()
+    if (normalized === 'recovery') return 'text-bg-warning'
+    if (normalized === 'logged') return 'text-bg-secondary'
+    return 'text-bg-primary'
+  }
+
+  function applyActiveRunCommandState (command, mode) {
+    const normalizedMode = String(mode || 'current').trim().toLowerCase() || 'current'
+    activeRunCommandOverride = command || null
+    activeRunCommandMode = normalizedMode
+
+    if (command) {
+      $('#run-command-output').text(command)
+    }
+
+    $('#run-command-label').text(getRunCommandModeLabel(normalizedMode))
+    $('#run-command-active-badge')
+      .removeClass('d-none text-bg-warning text-bg-secondary text-bg-primary')
+      .addClass(getRunCommandModeBadgeClass(normalizedMode))
+      .text(getRunCommandModeBadgeLabel(normalizedMode))
+  }
+
+  function clearActiveRunCommandState () {
+    activeRunCommandOverride = null
+    activeRunCommandMode = null
+    $('#run-command-label').text('Command')
+    $('#run-command-active-badge')
+      .addClass('d-none')
+      .removeClass('text-bg-warning text-bg-secondary text-bg-primary')
+      .text('Recovery Active')
+  }
+
   function updateRunNowState () {
     const $runNow = $('#run-now')
-    if (!$runNow.length) return
+    if (!$runNow.length) {
+      updateRunCommandHeaderBadge()
+      syncIncompleteRunActions()
+      return
+    }
 
     if (!showYAML || KOMETA_VALIDATION_IN_PROGRESS || KOMETA_UPDATING || KOMETA_STATUS === 'running' || !KOMETA_VALIDATED) {
       $runNow.prop('disabled', true)
+      updateRunCommandHeaderBadge()
+      syncIncompleteRunActions()
       return
     }
 
     if (!isRunCommandValid()) {
       $runNow.prop('disabled', true)
+      updateRunCommandHeaderBadge()
+      syncIncompleteRunActions()
       return
     }
 
     $runNow.prop('disabled', false)
+    updateRunCommandHeaderBadge()
+    syncIncompleteRunActions()
   }
 
   function buildCommand () {
@@ -506,6 +883,7 @@ $(document).ready(function () {
         $('#times-error').removeClass('d-none')
         runCmdOutput.text('⚠️ Invalid time format. Use pipe-separated 24h times like 06:00|15:00.')
         updateRunNowState()
+        syncFinalAccordionRollups()
         return false
       } else {
         $('#times-error').addClass('d-none')
@@ -520,6 +898,7 @@ $(document).ready(function () {
       if (!selectedLibs.length) {
         runCmdOutput.text('⚠️ Please select at least one library when using --run-libraries.')
         updateRunNowState()
+        syncFinalAccordionRollups()
         return false
       }
       cli += ` "${selectedLibs.join('|')}"`
@@ -552,6 +931,7 @@ $(document).ready(function () {
         $('#timeout-error').removeClass('d-none')
         runCmdOutput.text('⚠️ Invalid timeout. Please enter a positive whole number.')
         updateRunNowState()
+        syncFinalAccordionRollups()
         return false
       } else {
         $('#timeout-error').addClass('d-none')
@@ -567,6 +947,7 @@ $(document).ready(function () {
         $('#width-error').removeClass('d-none')
         runCmdOutput.text('⚠️ Width must be a number between 90 and 300.')
         updateRunNowState()
+        syncFinalAccordionRollups()
         return false
       } else {
         $('#width-error').addClass('d-none')
@@ -580,6 +961,7 @@ $(document).ready(function () {
         $('#divider-error').removeClass('d-none')
         runCmdOutput.text('⚠️ Divider must be a single character.')
         updateRunNowState()
+        syncFinalAccordionRollups()
         return false
       } else {
         $('#divider-error').addClass('d-none')
@@ -587,8 +969,12 @@ $(document).ready(function () {
       }
     }
 
-    runCmdOutput.text(cli)
+    runCmdOutput.data('built-command', cli)
+    if (!activeRunCommandOverride) {
+      runCmdOutput.text(cli)
+    }
     updateRunNowState()
+    syncFinalAccordionRollups()
     return true
   }
 
@@ -616,9 +1002,14 @@ $(document).ready(function () {
     if (checkbox.length) checkbox.on('change', buildCommand)
   })
 
-  function validateKometaRoot () {
+  function validateKometaRoot (options = {}) {
     if (KOMETA_VALIDATION_IN_PROGRESS) return
     KOMETA_VALIDATION_IN_PROGRESS = true
+    setKometaUpdatePhaseBadge('validating')
+    if (typeof showNavigationLoadingOverlay === 'function') {
+      showNavigationLoadingOverlay('kometa-check')
+    }
+    syncKometaRollupBadge()
     const $logBox = $('#kometa-validation-log')
     const $spinner = $('#spinner_validate')
     const $runNow = $('#run-now')
@@ -627,11 +1018,19 @@ $(document).ready(function () {
     const configName = $out.data('config-filename')
     const defaultRootPosix = ($out.data('kometa-root-default') || '').toString().trim()
     const defaultRootDisplay = ($out.data('kometa-root-default-display') || defaultRootPosix)
+    const appendStatus = Boolean(options.appendStatus)
 
-    $logBox.text(
-      '🔄 Please wait while we validate your Kometa installation...\n' +
-      'This may take a few seconds as we verify the folder structure, Python environment, and Kometa information.\n\n'
-    )
+    if (appendStatus) {
+      $logBox.append(
+        '\n🔄 Re-validating Kometa after update...\n' +
+        'This may take a few seconds as we verify the folder structure, Python environment, and Kometa information.\n\n'
+      )
+    } else {
+      $logBox.text(
+        '🔄 Please wait while we validate your Kometa installation...\n' +
+        'This may take a few seconds as we verify the folder structure, Python environment, and Kometa information.\n\n'
+      )
+    }
     if ($spinner.length) $spinner.show()
     $runNow.prop('disabled', true)
 
@@ -642,32 +1041,13 @@ $(document).ready(function () {
       // ✅ send the *normalized* path to the backend
       data: JSON.stringify({ path: defaultRootPosix, config_name: configName }),
       success: (res) => {
+        KOMETA_LOCAL_CHECK_COMPLETED = true
         if (Array.isArray(res.log)) res.log.forEach(line => $logBox.append(`${line}\n`))
 
         if (res.success) {
           KOMETA_INSTALLED = true
           $logBox.append('✅ Kometa root validated successfully.\n')
           if (res.kometa_version) $logBox.append(`📦 Local Kometa version: ${res.kometa_version}\n`)
-
-          if (res.remote_version && res.local_version) {
-            const hadUpdate = KOMETA_UPDATE_AVAILABLE
-            if (res.kometa_update_available) {
-              KOMETA_UPDATE_AVAILABLE = true
-              $logBox.append(`⬆️ Update available: ${res.local_version} → ${res.remote_version}\n`)
-              $('#kometa-update-box').removeClass('d-none')
-              $('#kometa-local-version').text(res.local_version)
-              $('#kometa-remote-version').text(res.remote_version)
-              syncUpdateButtonLabel()
-              if (!hadUpdate) {
-                showToast('warning', `Kometa update available: ${res.local_version} → ${res.remote_version}.`)
-              }
-            } else {
-              KOMETA_UPDATE_AVAILABLE = false
-              $logBox.append('✅ Kometa is up to date.\n')
-              $('#kometa-update-box').addClass('d-none')
-              syncUpdateButtonLabel()
-            }
-          }
 
           // ✅ Prefer display paths for UI; keep posix for internal if needed
           const kometaRootDisplay = (res.kometa_root_display || res.kometa_root || defaultRootDisplay)
@@ -687,12 +1067,14 @@ $(document).ready(function () {
           $('#kometa-install-path').text(kometaRootDisplay)
 
           // Rebuild command and reveal run section only when all validations pass
-          const allValid =
+          const finalGate = getFinalGateState()
+          const allValid = showYAML && (finalGate.configValid || (
             $('#plex_valid').data('plex-valid') === 'True' &&
             $('#tmdb_valid').data('tmdb-valid') === 'True' &&
             $('#libs_valid').data('libs-valid') === 'True' &&
             $('#sett_valid').data('sett-valid') === 'True' &&
             $('#yaml_valid').data('yaml-valid') === 'True'
+          ))
 
           $('#run-command-output').text('')
           try { buildCommand() } catch (_) { }
@@ -705,16 +1087,21 @@ $(document).ready(function () {
             hideRunCommandSectionUntilValidated()
             $runNow.prop('disabled', true)
           }
+          if (!KOMETA_UPDATING) setKometaUpdatePhaseBadge(KOMETA_VALIDATED ? 'ready' : 'idle')
         } else {
           KOMETA_INSTALLED = false
           KOMETA_VALIDATED = false
+          if (!KOMETA_UPDATING) setKometaUpdatePhaseBadge('failed')
           hideRunCommandSectionUntilValidated()
           $runNow.prop('disabled', true)
         }
 
         if ($spinner.length) $spinner.hide()
+        syncUpdateButtonLabel()
+        syncKometaRollupBadge()
       },
       error: (xhr) => {
+        KOMETA_LOCAL_CHECK_COMPLETED = true
         const msg = xhr?.responseJSON?.error || 'The Kometa root path is invalid or inaccessible. Please try again.'
         $logBox.append(`❌ ${msg}\n`)
         const lowered = String(msg || '').toLowerCase()
@@ -722,16 +1109,123 @@ $(document).ready(function () {
           KOMETA_INSTALLED = false
         }
         KOMETA_VALIDATED = false
+        if (!KOMETA_UPDATING) setKometaUpdatePhaseBadge('failed')
         hideRunCommandSectionUntilValidated()
         $runNow.prop('disabled', true)
         if ($spinner.length) $spinner.hide()
+        syncKometaRollupBadge()
       },
       complete: () => {
         KOMETA_VALIDATION_IN_PROGRESS = false
         updateRunNowState()
         syncUpdateButtonLabel()
+        syncKometaRollupBadge()
+        if (typeof hideNavigationLoadingOverlay === 'function') {
+          hideNavigationLoadingOverlay()
+        }
       }
     })
+  }
+
+  function probeKometaRoot () {
+    const $out = $('#run-command-output')
+    const defaultRootPosix = ($out.data('kometa-root-default') || '').toString().trim()
+    const defaultRootDisplay = ($out.data('kometa-root-default-display') || defaultRootPosix)
+    if (!defaultRootPosix) return Promise.resolve(null)
+
+    return $.ajax({
+      type: 'POST',
+      url: '/probe-kometa-root',
+      contentType: 'application/json',
+      data: JSON.stringify({ path: defaultRootPosix }),
+      success: (res) => {
+        KOMETA_LOCAL_CHECK_COMPLETED = true
+        KOMETA_INSTALLED = !!res.kometa_installed
+        if (Array.isArray(res.log)) res.log.forEach(line => appendKometaStatusLine(line))
+
+        const kometaRootDisplay = (res.kometa_root_display || res.kometa_root || defaultRootDisplay)
+        const venvPythonDisplay = (res.venv_python_display || res.venv_python || 'python3')
+        const kometaRootPosix = (res.kometa_root || defaultRootPosix)
+        const venvPythonPosix = (res.venv_python || venvPythonDisplay)
+
+        $out.data('kometa-root', kometaRootDisplay)
+        $out.data('venv-python', venvPythonDisplay)
+        $out.data('kometa-root-posix', kometaRootPosix)
+        $out.data('venv-python-posix', venvPythonPosix)
+        $('#kometa-install-path').text(kometaRootDisplay)
+        syncKometaSourceStatus({ localVersion: res.kometa_version || 'Unknown' })
+
+        if (!KOMETA_INSTALLED) {
+          KOMETA_VALIDATED = false
+          hideRunCommandSectionUntilValidated()
+        }
+
+        syncUpdateButtonLabel()
+        syncKometaRollupBadge()
+      },
+      error: (xhr) => {
+        KOMETA_LOCAL_CHECK_COMPLETED = true
+        KOMETA_INSTALLED = false
+        KOMETA_VALIDATED = false
+        const msg = xhr?.responseJSON?.error || 'Unable to probe the Kometa path.'
+        appendKometaStatusLine(`❌ ${msg}`)
+        syncKometaSourceStatus({ localVersion: 'Unknown' })
+        hideRunCommandSectionUntilValidated()
+        syncUpdateButtonLabel()
+        syncKometaRollupBadge()
+      }
+    })
+  }
+
+  function checkKometaUpdate (forceRefresh = false) {
+    const $out = $('#run-command-output')
+    const defaultRootPosix = ($out.data('kometa-root-default') || '').toString().trim()
+    const branchOverride = getKometaBranchOverride()
+    if (!defaultRootPosix) return Promise.resolve(null)
+
+    return fetch('/check-kometa-update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: defaultRootPosix, force: forceRefresh, branch_override: branchOverride })
+    })
+      .then(async res => {
+        const data = await res.json()
+        if (!res.ok) throw new Error(data.error || 'Failed to check Kometa update status.')
+        return data
+      })
+      .then(data => {
+        KOMETA_LOCAL_CHECK_COMPLETED = true
+        KOMETA_INSTALLED = !!data.kometa_installed
+        KOMETA_UPDATE_CHECK_COMPLETED = !!data.update_check_completed
+        KOMETA_UPDATE_CHECK_SKIPPED = !!data.kometa_update_check_skipped
+        KOMETA_UPDATE_AVAILABLE = !!data.kometa_update_available
+        if (Array.isArray(data.log)) data.log.forEach(line => appendKometaStatusLine(line))
+        syncKometaSourceStatus({
+          localVersion: data.local_version || kometaLocalVersionStatus,
+          remoteVersion: data.remote_version || '',
+          checked: Boolean(data.update_check_completed),
+          skipped: Boolean(data.kometa_update_check_skipped)
+        })
+
+        if (data.local_version && data.remote_version && data.kometa_update_available) {
+          $('#kometa-update-box').removeClass('d-none')
+          $('#kometa-local-version').text(data.local_version)
+          $('#kometa-remote-version').text(data.remote_version)
+        } else {
+          $('#kometa-update-box').addClass('d-none')
+        }
+
+        syncUpdateButtonLabel()
+        syncKometaRollupBadge()
+        return data
+      })
+      .catch(err => {
+        appendKometaStatusLine(`❌ ${err.message || 'Failed to check Kometa update status.'}`)
+        syncKometaSourceStatus({ checked: false, skipped: false, remoteVersion: '' })
+        syncUpdateButtonLabel()
+        syncKometaRollupBadge()
+        throw err
+      })
   }
 
   if ($('#run-command-output').length > 0) {
@@ -749,31 +1243,12 @@ $(document).ready(function () {
     new bootstrap.Tooltip(tooltipTriggerEl, { html: true })
   })
 
-  $('#copy-command').on('click', function () {
-    const command = $('#run-command-output').text().trim()
-    if (!command || command.startsWith('⚠️')) return
-
-    // Try clipboard API
+  function copyTextToClipboard (text) {
+    if (!text) return Promise.reject(new Error('Empty text'))
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(command).then(() => {
-        showCopySuccess()
-      }).catch(() => {
-        fallbackCopy(command)
-      })
-    } else {
-      fallbackCopy(command)
+      return navigator.clipboard.writeText(text)
     }
-
-    function showCopySuccess () {
-      $('#copy-icon').removeClass('bi-clipboard').addClass('bi-check2')
-      $('#copy-text').text('Copied')
-      setTimeout(() => {
-        $('#copy-icon').removeClass('bi-check2').addClass('bi-clipboard')
-        $('#copy-text').text('Copy')
-      }, 1500)
-    }
-
-    function fallbackCopy (text) {
+    return new Promise((resolve, reject) => {
       const textarea = document.createElement('textarea')
       textarea.value = text
       textarea.setAttribute('readonly', '')
@@ -781,40 +1256,569 @@ $(document).ready(function () {
       textarea.style.left = '-9999px'
       document.body.appendChild(textarea)
       textarea.select()
-
       try {
         const success = document.execCommand('copy')
-        if (success) {
-          showCopySuccess()
-        } else {
-          showToast('error', 'Copy failed. Please copy manually.')
-        }
+        document.body.removeChild(textarea)
+        if (success) resolve()
+        else reject(new Error('Copy failed'))
       } catch (err) {
-        showToast('error', 'Copy failed. Please copy manually.')
+        document.body.removeChild(textarea)
+        reject(err)
       }
+    })
+  }
 
-      document.body.removeChild(textarea)
+  function syncKometaUpdateAttention () {
+    if (kometaActionsHeading && kometaActionsToggle) {
+      const isCollapsed = kometaActionsToggle.classList.contains('collapsed')
+      const needsAttention = KOMETA_UPDATE_AVAILABLE && isCollapsed
+      kometaActionsHeading.classList.toggle('kometa-update-attention', needsAttention)
+      kometaActionsToggle.classList.toggle('kometa-update-attention', needsAttention)
     }
+    syncKometaRollupBadge()
+  }
+
+  function getKometaBranchOverride () {
+    const raw = ($kometaBranchOverride.val() || '').toString().trim().toLowerCase()
+    return ['master', 'develop', 'nightly'].includes(raw) ? raw : ''
+  }
+
+  function getQuickstartBranch () {
+    return ($updateKometaBtn.data('qs-branch') || 'master').toString().trim().toLowerCase()
+  }
+
+  function getAutoKometaBranch () {
+    return getQuickstartBranch() === 'master' ? 'master' : 'nightly'
+  }
+
+  function getEffectiveKometaBranch () {
+    return getKometaBranchOverride() || getAutoKometaBranch()
+  }
+
+  function getKometaVersionSourceUrlValue (branch) {
+    return `https://raw.githubusercontent.com/Kometa-Team/Kometa/${branch}/VERSION`
+  }
+
+  function getKometaZipSourceUrlValue (branch) {
+    return `https://codeload.github.com/kometa-team/Kometa/zip/refs/heads/${branch}`
+  }
+
+  function loadSavedKometaBranchOverride () {
+    try {
+      const saved = window.localStorage.getItem(KOMETA_BRANCH_OVERRIDE_STORAGE_KEY) || ''
+      if (['master', 'develop', 'nightly'].includes(saved)) {
+        $kometaBranchOverride.val(saved)
+      } else {
+        $kometaBranchOverride.val('')
+      }
+    } catch (_) {
+      $kometaBranchOverride.val('')
+    }
+  }
+
+  function saveKometaBranchOverride () {
+    try {
+      const value = getKometaBranchOverride()
+      if (value) window.localStorage.setItem(KOMETA_BRANCH_OVERRIDE_STORAGE_KEY, value)
+      else window.localStorage.removeItem(KOMETA_BRANCH_OVERRIDE_STORAGE_KEY)
+    } catch (_) {}
+  }
+
+  function syncKometaSourceStatus (options = {}) {
+    if (Object.prototype.hasOwnProperty.call(options, 'localVersion')) {
+      kometaLocalVersionStatus = options.localVersion || 'Unknown'
+    }
+    if (Object.prototype.hasOwnProperty.call(options, 'remoteVersion')) {
+      kometaRemoteVersionStatus = options.remoteVersion || ''
+    }
+    if (Object.prototype.hasOwnProperty.call(options, 'checked')) {
+      kometaRemoteVersionChecked = Boolean(options.checked)
+    }
+    if (Object.prototype.hasOwnProperty.call(options, 'skipped')) {
+      kometaRemoteVersionSkipped = Boolean(options.skipped)
+    }
+
+    const selected = getKometaBranchOverride()
+    const effective = getEffectiveKometaBranch()
+    const selectionLabel = selected ? `Override (${selected})` : 'Auto'
+
+    $kometaBranchSelection.text(selectionLabel)
+    $kometaEffectiveBranch.text(effective)
+    $kometaLocalVersionStatus.text(kometaLocalVersionStatus || 'Unknown')
+
+    if (kometaRemoteVersionSkipped) {
+      $kometaRemoteVersionStatus.text('Skipped while running')
+    } else if (kometaRemoteVersionChecked) {
+      $kometaRemoteVersionStatus.text(kometaRemoteVersionStatus || 'Unknown')
+    } else {
+      $kometaRemoteVersionStatus.text('Not checked')
+    }
+
+    $kometaVersionSourceUrl.text(getKometaVersionSourceUrlValue(effective))
+    $kometaZipSourceUrl.text(getKometaZipSourceUrlValue(effective))
+    syncKometaBranchRollupBadge()
+  }
+
+  function setKometaUpdatePhaseBadge (phase) {
+    if (!$kometaUpdatePhaseBadge.length) return
+
+    const phaseMap = {
+      idle: { label: 'Idle', klass: 'text-bg-secondary' },
+      checking: { label: 'Checking', klass: 'text-bg-info' },
+      queued: { label: 'Starting', klass: 'text-bg-primary' },
+      downloading: { label: 'Downloading', klass: 'text-bg-primary' },
+      extracting: { label: 'Extracting', klass: 'text-bg-warning' },
+      preserving: { label: 'Preserving data', klass: 'text-bg-warning' },
+      venv: { label: 'Preparing venv', klass: 'text-bg-info' },
+      dependencies: { label: 'Installing deps', klass: 'text-bg-warning' },
+      validating: { label: 'Validating', klass: 'text-bg-info' },
+      ready: { label: 'Ready', klass: 'text-bg-success' },
+      failed: { label: 'Failed', klass: 'text-bg-danger' }
+    }
+
+    const normalized = Object.prototype.hasOwnProperty.call(phaseMap, phase) ? phase : 'idle'
+    const next = phaseMap[normalized]
+    kometaUpdatePhaseStatus = normalized
+    $kometaUpdatePhaseBadge
+      .removeClass('text-bg-secondary text-bg-info text-bg-primary text-bg-warning text-bg-success text-bg-danger')
+      .addClass(next.klass)
+      .text(next.label)
+  }
+
+  function inferKometaUpdatePhaseFromLine (line) {
+    const text = String(line || '').trim()
+    if (!text) return null
+    const lower = text.toLowerCase()
+
+    if (
+      lower.startsWith('❌') ||
+      lower.includes(' update failed') ||
+      lower.includes('error occurred during kometa update') ||
+      lower.includes('aborting extraction') ||
+      lower.includes('failed to fetch kometa update progress')
+    ) {
+      return 'failed'
+    }
+    if (
+      lower.includes('kometa root validated successfully') ||
+      lower.includes('kometa root is valid and ready') ||
+      lower.includes('kometa update completed successfully') ||
+      lower.includes('kometa is already up to date') ||
+      lower.includes('kometa updated via zip')
+    ) {
+      return 'ready'
+    }
+    if (
+      lower.includes('re-validating kometa after update') ||
+      lower.includes('please wait while we validate') ||
+      lower.includes('validate your kometa installation')
+    ) {
+      return 'validating'
+    }
+    if (lower.includes('installing requirements') || lower.includes('upgrading pip')) {
+      return 'dependencies'
+    }
+    if (
+      lower.includes('creating virtual environment') ||
+      lower.includes('existing kometa-venv looks invalid') ||
+      lower.includes('venv python') ||
+      lower.includes('pyvenv.cfg')
+    ) {
+      return 'venv'
+    }
+    if (
+      lower.includes('backed up kometa logs/cache') ||
+      lower.includes('restored kometa logs/cache') ||
+      lower.includes('kometa backup')
+    ) {
+      return 'preserving'
+    }
+    if (
+      (lower.includes('removed ') && lower.includes('existing entr')) ||
+      lower.includes('removing existing kometa contents') ||
+      lower.includes('existing path still present after cleanup') ||
+      lower.includes('extracted version file') ||
+      lower.includes('extracted to:')
+    ) {
+      return 'extracting'
+    }
+    if (lower.includes('downloading ') && lower.includes('.zip')) {
+      return 'downloading'
+    }
+    if (
+      lower.includes('resolving upstream sha') ||
+      (lower.includes('upstream ') && lower.includes(' sha')) ||
+      lower.includes('refreshing kometa status') ||
+      lower.includes('checking kometa') ||
+      lower.includes('kometa branch selected') ||
+      lower.includes('quickstart branch:') ||
+      lower.includes('remote version source') ||
+      lower.includes('kometa branch override selected') ||
+      lower.includes('kometa branch selection: auto')
+    ) {
+      return 'checking'
+    }
+
+    return null
+  }
+
+  function updateKometaUpdatePhaseFromLine (line) {
+    const phase = inferKometaUpdatePhaseFromLine(line)
+    if (phase) setKometaUpdatePhaseBadge(phase)
+  }
+
+  function setKometaStatusLog (lines, phase = null) {
+    const $logBox = $('#kometa-validation-log')
+    const text = Array.isArray(lines) ? lines.join('\n') : String(lines || '')
+    $logBox.text(text ? `${text}\n` : '')
+    if ($logBox[0]) $logBox[0].scrollTop = $logBox[0].scrollHeight
+    if (phase) setKometaUpdatePhaseBadge(phase)
+  }
+
+  function appendKometaStatusLine (line) {
+    const $logBox = $('#kometa-validation-log')
+    $logBox.append(`${line}\n`)
+    if ($logBox[0]) $logBox[0].scrollTop = $logBox[0].scrollHeight
+    updateKometaUpdatePhaseFromLine(line)
+  }
+
+  function syncKometaBranchOverrideWarning () {
+    if (!kometaBranchOverrideWarning) return
+    kometaBranchOverrideWarning.classList.toggle('d-none', !getKometaBranchOverride())
+  }
+
+  function invalidateKometaUpdateStatus () {
+    KOMETA_UPDATE_AVAILABLE = false
+    KOMETA_UPDATE_CHECK_COMPLETED = false
+    KOMETA_UPDATE_CHECK_SKIPPED = false
+    kometaRemoteVersionStatus = ''
+    kometaRemoteVersionChecked = false
+    kometaRemoteVersionSkipped = false
+    $('#kometa-update-box').addClass('d-none')
+    syncKometaSourceStatus()
+    syncUpdateButtonLabel()
+    syncKometaRollupBadge()
+  }
+
+  function runKometaStatusPass (forceRefresh = false) {
+    const selection = getKometaBranchOverride()
+    const effective = getEffectiveKometaBranch()
+    const lines = [
+      '🔄 Refreshing Kometa status...',
+      `ℹ️ Selected Kometa branch mode: ${selection || 'auto'}`,
+      `ℹ️ Effective Kometa branch: ${effective}`,
+      `🌐 Remote VERSION source: ${getKometaVersionSourceUrlValue(effective)}`,
+      `📥 Kometa ZIP source: ${getKometaZipSourceUrlValue(effective)}`,
+      '',
+      '🔍 Checking Kometa path and local install state...'
+    ]
+    setKometaStatusLog(lines, 'checking')
+    invalidateKometaUpdateStatus()
+    return probeKometaRoot()
+      .then((res) => {
+        if (!res || !res.kometa_installed) {
+          appendKometaStatusLine('')
+          appendKometaStatusLine('ℹ️ Remote update check skipped because Kometa is not installed.')
+          if (!KOMETA_UPDATING) setKometaUpdatePhaseBadge('idle')
+          return res
+        }
+        appendKometaStatusLine('')
+        appendKometaStatusLine('🔎 Checking Kometa update status...')
+        return checkKometaUpdate(forceRefresh)
+      })
+      .then((result) => {
+        if (!KOMETA_UPDATING) setKometaUpdatePhaseBadge(KOMETA_INSTALLED ? 'ready' : 'idle')
+        return result
+      })
+      .catch(() => {
+        if (!KOMETA_UPDATING) setKometaUpdatePhaseBadge('failed')
+        return null
+      })
+  }
+
+  function stopKometaUpdatePolling () {
+    if (kometaUpdatePollInterval) {
+      clearInterval(kometaUpdatePollInterval)
+      kometaUpdatePollInterval = null
+    }
+  }
+
+  function pollKometaUpdateProgress () {
+    if (!kometaUpdateJobId) return Promise.resolve(null)
+    return fetch(`/background-jobs/${encodeURIComponent(kometaUpdateJobId)}?since=${encodeURIComponent(String(kometaUpdateLogIndex))}`)
+      .then(async res => {
+        const data = await res.json()
+        if (!res.ok || !data.success || !data.job) throw new Error(data.error || 'Failed to fetch Kometa update progress.')
+        return data
+      })
+      .then(data => {
+        const job = data.job || {}
+        if (job.phase === 'queued') setKometaUpdatePhaseBadge('queued')
+        if (job.phase === 'error') setKometaUpdatePhaseBadge('failed')
+        const lines = Array.isArray(data.lines) ? data.lines : []
+        lines.forEach(line => appendKometaStatusLine(line))
+        if (typeof data.next_index === 'number') kometaUpdateLogIndex = data.next_index
+        if (data.done) {
+          stopKometaUpdatePolling()
+        }
+        return Object.assign({}, job, {
+          lines,
+          next_index: data.next_index,
+          done: data.done
+        })
+      })
+  }
+
+  function getKometaRollupStatus () {
+    if (KOMETA_UPDATING) return { state: 'unknown', label: 'Updating...' }
+    if (KOMETA_VALIDATION_IN_PROGRESS) return { state: 'unknown', label: 'Checking...' }
+    if (!KOMETA_LOCAL_CHECK_COMPLETED) return { state: 'unknown', label: 'Not checked' }
+    if (!KOMETA_INSTALLED) return { state: 'error', label: 'Install needed' }
+    if (!KOMETA_UPDATE_CHECK_COMPLETED) {
+      return { state: KOMETA_VALIDATED ? 'ok' : 'warn', label: KOMETA_VALIDATED ? 'Prepared' : 'Prepare needed' }
+    }
+    if (KOMETA_UPDATE_CHECK_SKIPPED) return { state: 'unknown', label: 'Skipped while running' }
+    if (KOMETA_UPDATE_AVAILABLE) return { state: 'warn', label: 'Update available' }
+    return { state: 'ok', label: 'Up to date' }
+  }
+
+  function syncKometaRollupBadge () {
+    const badge = document.getElementById('kometa-update-rollup-badge')
+    if (!badge) return
+    const { state, label } = getKometaRollupStatus()
+    badge.textContent = label
+    badge.classList.remove(
+      'qs-validation-rollup-badge--unknown',
+      'qs-validation-rollup-badge--ok',
+      'qs-validation-rollup-badge--warn',
+      'qs-validation-rollup-badge--error'
+    )
+    badge.classList.add(`qs-validation-rollup-badge--${state}`)
+  }
+
+  function syncKometaBranchRollupBadge () {
+    const badge = document.getElementById('kometa-branch-rollup-badge')
+    if (!badge) return
+
+    const selected = getKometaBranchOverride()
+    const effective = getEffectiveKometaBranch()
+    const label = (selected || 'auto').toUpperCase()
+
+    badge.textContent = label
+    badge.classList.remove('text-bg-secondary', 'text-bg-warning', 'text-dark')
+    if (selected) {
+      badge.classList.add('text-bg-warning', 'text-dark')
+      badge.setAttribute('title', `Kometa branch override selected: ${selected}. Effective branch: ${effective}.`)
+    } else {
+      badge.classList.add('text-bg-secondary')
+      badge.setAttribute('title', `Kometa branch mode: auto. Effective branch: ${effective}.`)
+    }
+  }
+
+  if (kometaActionsCollapse) {
+    kometaActionsCollapse.addEventListener('shown.bs.collapse', syncKometaUpdateAttention)
+    kometaActionsCollapse.addEventListener('hidden.bs.collapse', syncKometaUpdateAttention)
+  }
+
+  function setKometaPrepareRunningState (isRunning) {
+    const accordion = document.getElementById('kometa-actions-accordion')
+    if (accordion) accordion.classList.toggle('opacity-50', Boolean(isRunning))
+    if (!kometaActionsCollapse || !kometaActionsToggle) return
+    if (isRunning && kometaActionsCollapse.classList.contains('show') && typeof bootstrap !== 'undefined' && bootstrap.Collapse) {
+      bootstrap.Collapse.getOrCreateInstance(kometaActionsCollapse, { toggle: false }).hide()
+    }
+    if (isRunning) {
+      kometaActionsToggle.classList.add('collapsed')
+      kometaActionsToggle.setAttribute('aria-expanded', 'false')
+      kometaActionsToggle.setAttribute('title', 'Kometa is running. Prepare Kometa is locked until the run finishes.')
+      kometaActionsToggle.disabled = true
+      kometaActionsToggle.classList.add('disabled')
+    } else {
+      kometaActionsToggle.removeAttribute('title')
+      kometaActionsToggle.disabled = false
+      kometaActionsToggle.classList.remove('disabled')
+    }
+  }
+
+  function showCopyButtonSuccess (iconSelector, textSelector) {
+    const $icon = $(iconSelector)
+    const $text = $(textSelector)
+    $icon.removeClass('bi-files bi-clipboard').addClass('bi-check2')
+    $text.text('Copied')
+    setTimeout(() => {
+      $icon.removeClass('bi-check2').addClass('bi-files')
+      $text.text('Copy')
+    }, 1500)
+  }
+
+  $('#copy-command').on('click', function () {
+    const command = $('#run-command-output').text().trim()
+    if (!command || command.startsWith('⚠️')) return
+
+    copyTextToClipboard(command)
+      .then(() => showCopyButtonSuccess('#copy-icon', '#copy-text'))
+      .catch(() => showToast('error', 'Copy failed. Please copy manually.'))
   })
+
+  $('#copy-recovery-command').on('click', function () {
+    const command = $('#recovery-command-output').text().trim()
+    if (!command) return
+    copyTextToClipboard(command)
+      .then(() => showCopyButtonSuccess('#copy-recovery-icon', '#copy-recovery-text'))
+      .catch(() => showToast('error', 'Copy failed. Please copy manually.'))
+  })
+
+  function getCurrentRunCommand () {
+    return $('#run-command-output').text().trim()
+  }
+
+  function getRecoveryRunCommand () {
+    return $('#recovery-command-output').text().trim()
+  }
+
+  function syncIncompleteRunActions () {
+    const $runRecovery = $('#run-recovery-command')
+    if (!$runRecovery.length) return
+
+    const $incompleteAlert = $('#incomplete-run-alert')
+    const recoveryCommand = getRecoveryRunCommand()
+    const alertVisible = $incompleteAlert.length > 0 && !$incompleteAlert.hasClass('d-none')
+    const recoveryRunnable = Boolean(recoveryCommand) &&
+      alertVisible &&
+      !KOMETA_VALIDATION_IN_PROGRESS &&
+      !KOMETA_UPDATING &&
+      !KOMETA_PENDING_START &&
+      KOMETA_STATUS !== 'running'
+
+    $runRecovery.toggleClass('d-none', !alertVisible)
+    $runRecovery.prop('disabled', !recoveryRunnable)
+    if (recoveryRunnable) {
+      $runRecovery.removeAttr('title')
+    } else if (!alertVisible) {
+      $runRecovery.attr('title', 'Recovery actions are only available when an incomplete-run recovery command is visible.')
+    } else if (KOMETA_VALIDATION_IN_PROGRESS) {
+      $runRecovery.attr('title', 'Wait for Kometa validation to finish before starting a recovery run.')
+    } else if (KOMETA_UPDATING) {
+      $runRecovery.attr('title', 'Wait for the Kometa update to finish before starting a recovery run.')
+    } else if (KOMETA_PENDING_START) {
+      $runRecovery.attr('title', 'A Kometa start is already queued for the next Plex maintenance window.')
+    } else if (KOMETA_STATUS === 'running') {
+      $runRecovery.attr('title', 'Kometa is already running.')
+    } else {
+      $runRecovery.attr('title', 'No recovery command is available for this incomplete run.')
+    }
+  }
+
+  function startKometaCommand (command, opts = {}) {
+    const startMode = opts.startMode || 'current'
+    const requireValidated = opts.requireValidated !== false
+    const startMessage = opts.startMessage || 'Starting Kometa...\n'
+
+    if (KOMETA_UPDATING) {
+      showToast('warning', 'Kometa is updating. Please wait for it to finish before running.')
+      return
+    }
+
+    if (KOMETA_VALIDATION_IN_PROGRESS) {
+      showToast('info', 'Kometa validation is still running. Please wait.')
+      return
+    }
+
+    if (requireValidated && !KOMETA_VALIDATED) {
+      showToast('warning', 'Kometa has not been validated yet.')
+      return
+    }
+
+    if (!command || command.startsWith('⚠️')) {
+      showToast('error', 'Cannot run invalid command.')
+      return
+    }
+
+    $('#run-now').prop('disabled', true)
+    $('#run-now-label').text('Running...')
+    $('#run-recovery-command').prop('disabled', true)
+    $('#stop-now').removeClass('d-none')
+    $('#run-output').removeClass('d-none')
+    $('#run-output-log').text(startMessage)
+
+    fetch('/start-kometa', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command, start_mode: startMode })
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (data.error) {
+          clearActiveRunCommandState()
+          try { buildCommand() } catch (_) {}
+          $('#run-output-log').text(`❌ ${data.error}`)
+          $('#run-now').prop('disabled', false)
+          $('#run-now-label').text('Run Now')
+          $('#stop-now').addClass('d-none')
+          syncIncompleteRunActions()
+          return
+        }
+
+        if (data.status === 'queued') {
+          applyActiveRunCommandState(command, startMode)
+          KOMETA_PENDING_START = true
+          const windowLabel = data.maintenance_window ? ` (${data.maintenance_window})` : ''
+          const nowLabel = (typeof window.QS_formatTimestamp === 'function') ? window.QS_formatTimestamp() : new Date().toLocaleString()
+          const message = `Plex maintenance active${windowLabel} at ${nowLabel}. Kometa will start automatically when it ends.`
+          showToast('warning', message)
+          $('#run-output-log').text(`${message}\n`)
+          $('#run-now').prop('disabled', true).html('<i class="bi bi-hourglass-split me-1"></i> Waiting...')
+          $('#stop-now').addClass('d-none')
+          if (kometaStatusInterval) clearInterval(kometaStatusInterval)
+          kometaStatusInterval = setInterval(checkKometaStatus, 5000)
+          syncIncompleteRunActions()
+          return
+        }
+
+        applyActiveRunCommandState(command, startMode)
+
+        setTimeout(() => {
+          kometaPollingStarted = false
+          startPollingIfNeeded()
+        }, 5500)
+      })
+      .catch(() => {
+        clearActiveRunCommandState()
+        try { buildCommand() } catch (_) {}
+        $('#run-output-log').append('\n⚠️ Failed to start Kometa.')
+        $('#run-now').prop('disabled', false)
+        $('#run-now-label').text('Run Now')
+        $('#stop-now').addClass('d-none')
+        syncIncompleteRunActions()
+      })
+  }
 
   function hideRunCommandSectionUntilValidated () {
     const accordion = $('#run-command-output-accordion')
-    const box = $('#run-command-box')
-    accordion.addClass('d-none')
-    box.removeClass('fade-in').addClass('d-none') // Hide instantly
+    accordion.removeClass('d-none')
+    $('#run-command-output-collapse').removeClass('show')
+    $('#run-command-output-heading .accordion-button').addClass('collapsed').attr('aria-expanded', 'false')
+    setRunCommandPlaceholderState()
     $('#run-now').prop('disabled', true).html('<i class="bi bi-hourglass-split me-1"></i> Waiting...')
   }
 
-  function showRunCommandSectionAfterValidated () {
+  function revealRunCommandSection () {
     const accordion = $('#run-command-output-accordion')
     const box = $('#run-command-box')
 
+    clearRunCommandPlaceholderState()
     accordion.removeClass('d-none')
+    $('#run-command-output-collapse').addClass('show')
+    $('#run-command-output-heading .accordion-button').removeClass('collapsed').attr('aria-expanded', 'true')
     box.removeClass('d-none') // Reveal element (opacity still 0)
     setTimeout(() => {
       box.addClass('fade-in') // Let browser register change, then fade in
     }, 10)
+  }
 
+  function showRunCommandSectionAfterValidated () {
+    clearRunCommandPlaceholderState()
+    revealRunCommandSection()
     $('#run-now').html('<i class="bi bi-play-fill me-1"></i> Run Now')
     try { buildCommand() } catch (_) {}
     updateRunNowState()
@@ -966,12 +1970,13 @@ $(document).ready(function () {
             const total = typeof payload.playlist_total_seconds === 'number' ? payload.playlist_total_seconds : null
             const running = Boolean(payload.playlist_running)
             const elapsed = typeof payload.playlist_elapsed_seconds === 'number' ? payload.playlist_elapsed_seconds : null
+            const detected = Boolean(payload.playlists_detected)
             if (running) {
               const label = elapsed != null ? formatRunSeconds(elapsed) : 'Running'
               return `<td class="text-end"><span class="badge text-bg-primary">${label || 'Running'}</span></td>`
             }
-            if (total != null && total > 0) {
-              return `<td class="text-end"><span class="badge text-bg-success">${formatRunSeconds(total)}</span></td>`
+            if (total != null && (total > 0 || detected)) {
+              return `<td class="text-end"><span class="badge text-bg-success">${formatRunSeconds(total) || '0s'}</span></td>`
             }
             if (payload.run_finished) {
               return '<td class="text-end"><span class="badge text-bg-secondary">Not Configured</span></td>'
@@ -1033,7 +2038,8 @@ $(document).ready(function () {
         })
         if (phasesToShow.some(phase => phase.key === 'playlists')) {
           const playlistTotal = typeof payload.playlist_total_seconds === 'number' ? payload.playlist_total_seconds : null
-          if (playlistTotal != null) {
+          const playlistDetected = Boolean(payload.playlists_detected)
+          if (playlistTotal != null && (playlistTotal > 0 || playlistDetected)) {
             totals.set('playlists', playlistTotal)
           }
         }
@@ -1051,6 +2057,12 @@ $(document).ready(function () {
         })
         const totalCells = phasesToShow.map(phase => {
           const totalSeconds = totals.get(phase.key)
+          if (phase.key === 'playlists' && typeof totalSeconds === 'number' && Number.isFinite(totalSeconds)) {
+            const detected = Boolean(payload.playlists_detected)
+            if (totalSeconds > 0 || detected) {
+              return `<td class="text-end"><span class="badge text-bg-success">${formatRunSeconds(totalSeconds) || '0s'}</span></td>`
+            }
+          }
           if (typeof totalSeconds === 'number' && totalSeconds > 0) {
             return `<td class="text-end"><span class="badge text-bg-success">${formatRunSeconds(totalSeconds)}</span></td>`
           }
@@ -1065,7 +2077,19 @@ $(document).ready(function () {
     container.classList.remove('d-none')
   }
 
+  function clearRunProgress (resetCache = false) {
+    const container = document.getElementById('run-progress')
+    if (container) {
+      container.classList.add('d-none')
+    }
+    if (resetCache) {
+      lastRunProgressPayload = null
+    }
+  }
+
   function fetchRunProgress () {
+    if (runProgressInFlight) return Promise.resolve(null)
+    runProgressInFlight = true
     return fetch('/logscan/progress')
       .then(res => {
         if (!res.ok) return null
@@ -1073,23 +2097,24 @@ $(document).ready(function () {
       })
       .then(data => {
         if (!data) {
-          if (lastRunProgressPayload) {
+          if (KOMETA_STATUS === 'running' && lastRunProgressPayload) {
             renderRunProgress(lastRunProgressPayload)
           } else {
-            const container = document.getElementById('run-progress')
-            if (container) container.classList.add('d-none')
+            clearRunProgress(false)
           }
           return
         }
         renderRunProgress(data)
       })
       .catch(() => {
-        if (lastRunProgressPayload) {
+        if (KOMETA_STATUS === 'running' && lastRunProgressPayload) {
           renderRunProgress(lastRunProgressPayload)
         } else {
-          const container = document.getElementById('run-progress')
-          if (container) container.classList.add('d-none')
+          clearRunProgress(false)
         }
+      })
+      .finally(() => {
+        runProgressInFlight = false
       })
   }
 
@@ -1098,7 +2123,7 @@ $(document).ready(function () {
     const label = force
       ? (KOMETA_INSTALLED ? 'Force Update Kometa' : 'Force Install Kometa')
       : (KOMETA_INSTALLED
-          ? (KOMETA_UPDATE_AVAILABLE ? 'Update Available' : 'Check for Kometa Updates')
+          ? (KOMETA_UPDATE_AVAILABLE ? 'Update Available' : (KOMETA_UPDATE_CHECK_COMPLETED ? 'Up to date' : 'Check for Kometa Updates'))
           : 'Install Kometa')
     return `<i class="bi bi-arrow-clockwise me-1"></i> ${label}`
   }
@@ -1107,6 +2132,7 @@ $(document).ready(function () {
     if ($updateKometaBtn.length) {
       $updateKometaBtn.html(getUpdateButtonLabel())
     }
+    syncKometaUpdateAttention()
   }
 
   function callUpdateKometa () {
@@ -1120,12 +2146,43 @@ $(document).ready(function () {
     const $runNow = $('#run-now')
     const $stopNow = $('#stop-now')
     const $runBox = $('#run-command-box')
-    const branch = $btn.data('branch') || 'master'
+    const qsBranch = $btn.data('qs-branch') || 'master'
+    const branchOverride = getKometaBranchOverride()
     const forceUpdate = $forceUpdateToggle.is(':checked')
+
+    if (KOMETA_INSTALLED && !forceUpdate && !KOMETA_UPDATE_AVAILABLE) {
+      $btn.prop('disabled', true).html('<i class="bi bi-arrow-repeat me-1"></i> Checking...')
+      $forceUpdateToggle.prop('disabled', true)
+      $kometaBranchOverride.prop('disabled', true)
+      runKometaStatusPass(true)
+        .then((data) => {
+          if (!data) return
+          if (data.kometa_update_available) {
+            showToast('warning', `Kometa update available: ${data.local_version} → ${data.remote_version}.`)
+          } else if (!data.kometa_update_check_skipped) {
+            showToast('success', 'Kometa is already up to date.')
+          }
+        })
+        .catch(() => {
+          showToast('error', 'Failed to check Kometa update status.')
+        })
+        .finally(() => {
+          $btn.prop('disabled', false)
+          $forceUpdateToggle.prop('disabled', false)
+          $kometaBranchOverride.prop('disabled', false)
+          syncUpdateButtonLabel()
+        })
+      return
+    }
 
     KOMETA_UPDATING = true
     KOMETA_VALIDATED = false
+    KOMETA_UPDATE_CHECK_SKIPPED = false
+    KOMETA_UPDATE_CHECK_COMPLETED = false
+    setKometaUpdatePhaseBadge('queued')
+    syncKometaRollupBadge()
     hideRunCommandSectionUntilValidated()
+    syncFinalAccordionRollups()
     const prevRunNowHtml = $runNow.html()
     const prevRunNowDisabled = $runNow.prop('disabled')
 
@@ -1138,6 +2195,7 @@ $(document).ready(function () {
       : (KOMETA_INSTALLED ? 'Checking for updates...' : 'Installing...')
     $btn.prop('disabled', true).html(`<i class="bi bi-arrow-repeat me-1"></i> ${inProgressLabel}`)
     $forceUpdateToggle.prop('disabled', true)
+    $kometaBranchOverride.prop('disabled', true)
     $logBox.append('\nInitializing/Updating Kometa...\n')
     if ($logBox[0]) $logBox[0].scrollTop = $logBox[0].scrollHeight
 
@@ -1152,14 +2210,19 @@ $(document).ready(function () {
     let postUpdateLabel = null
     const cleanupUI = () => {
       clearInterval(heartbeatId)
+      stopKometaUpdatePolling()
+      kometaUpdateJobId = null
+      kometaUpdateLogIndex = 0
       KOMETA_UPDATING = false
       $runBox.removeClass('opacity-50 position-relative')
       $runNow.prop('disabled', prevRunNowDisabled).html(prevRunNowHtml)
       $stopNow.prop('disabled', false)
       $btn.prop('disabled', false)
       $forceUpdateToggle.prop('disabled', false)
+      $kometaBranchOverride.prop('disabled', false)
       syncUpdateButtonLabel()
       updateRunNowState()
+      syncFinalAccordionRollups()
       if (postUpdateLabel) {
         $btn.html(postUpdateLabel)
         setTimeout(syncUpdateButtonLabel, 6000)
@@ -1169,25 +2232,76 @@ $(document).ready(function () {
     fetch('/update-kometa', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ branch, force: forceUpdate })
+      body: JSON.stringify({ branch: qsBranch, branch_override: branchOverride, force: forceUpdate, background: true })
     })
       .then(async res => {
         const data = await res.json()
         if (res.status === 409) {
+          setKometaUpdatePhaseBadge('failed')
           showToast('warning', data.error || 'Kometa is running; stop it before updating.')
           $logBox.append(`${data.error || 'Update blocked: Kometa running.'}\n`)
           if ($logBox[0]) $logBox[0].scrollTop = $logBox[0].scrollHeight
           return { success: false, log: data.log || [], blocked: true }
         }
+        if (!res.ok) {
+          throw new Error(data.error || 'Kometa update failed to start.')
+        }
         return data
       })
       .then(data => {
         if (!data) return
-        if (Array.isArray(data.log)) {
-          data.log.forEach(line => $logBox.append(`${line}\n`))
-          if ($logBox[0]) $logBox[0].scrollTop = $logBox[0].scrollHeight
+        if (data.success && data.job_id) {
+          kometaUpdateJobId = data.job_id
+          kometaUpdateLogIndex = 0
+          stopKometaUpdatePolling()
+          const finalize = (progress) => {
+            if (!progress || !progress.done) return false
+            KOMETA_LOCAL_CHECK_COMPLETED = false
+            KOMETA_UPDATE_AVAILABLE = false
+            $('#kometa-update-box').addClass('d-none')
+            syncUpdateButtonLabel()
+            const elapsed = formatElapsed(Date.now() - startTs)
+            if (progress.update_success) {
+              if (progress.up_to_date) {
+                showToast('info', 'Kometa is already up to date.')
+                postUpdateLabel = '<i class="bi bi-check-circle me-1"></i> Up to date'
+                appendKometaStatusLine('Kometa is already up to date.')
+                setKometaUpdatePhaseBadge('ready')
+              } else {
+                showToast('success', `Kometa update completed in ${elapsed}.`)
+                appendKometaStatusLine('Kometa update completed successfully.')
+                setKometaUpdatePhaseBadge('validating')
+              }
+              validateKometaRoot({ appendStatus: true })
+            } else {
+              showToast('error', 'Kometa update failed.')
+              appendKometaStatusLine('Kometa update failed.')
+              setKometaUpdatePhaseBadge('failed')
+              validateKometaRoot({ appendStatus: true })
+            }
+            cleanupUI()
+            syncKometaRollupBadge()
+            return true
+          }
+          return pollKometaUpdateProgress()
+            .then(progress => {
+              if (finalize(progress)) return
+              kometaUpdatePollInterval = setInterval(() => {
+                pollKometaUpdateProgress()
+                  .then(finalize)
+                  .catch(err => {
+                    console.error(err)
+                    appendKometaStatusLine(`❌ ${err.message || 'Failed to fetch Kometa update progress.'}`)
+                    setKometaUpdatePhaseBadge('failed')
+                    stopKometaUpdatePolling()
+                    cleanupUI()
+                    syncKometaRollupBadge()
+                  })
+              }, 800)
+            })
         }
         if (data.success) {
+          KOMETA_LOCAL_CHECK_COMPLETED = false
           KOMETA_UPDATE_AVAILABLE = false
           $('#kometa-update-box').addClass('d-none')
           syncUpdateButtonLabel()
@@ -1201,11 +2315,11 @@ $(document).ready(function () {
             $logBox.append('Kometa update completed successfully.\n')
           }
           if ($logBox[0]) $logBox[0].scrollTop = $logBox[0].scrollHeight
-          validateKometaRoot()
+          validateKometaRoot({ appendStatus: true })
         } else if (!data.blocked) {
           showToast('error', data.error || 'Kometa update failed.')
           $logBox.append('Kometa update failed.\n')
-          validateKometaRoot()
+          validateKometaRoot({ appendStatus: true })
           if ($logBox[0]) $logBox[0].scrollTop = $logBox[0].scrollHeight
         }
       })
@@ -1213,10 +2327,10 @@ $(document).ready(function () {
         console.error(err)
         showToast('error', 'Error during Kometa update.')
         $logBox.append('Error occurred during Kometa update.\n')
+        setKometaUpdatePhaseBadge('failed')
         if ($logBox[0]) $logBox[0].scrollTop = $logBox[0].scrollHeight
-      })
-      .finally(() => {
         cleanupUI()
+        syncKometaRollupBadge()
       })
   }
 
@@ -1225,7 +2339,17 @@ $(document).ready(function () {
   $forceUpdateToggle.on('change', function () {
     if (!KOMETA_UPDATING) syncUpdateButtonLabel()
   })
+  $kometaBranchOverride.on('change', function () {
+    saveKometaBranchOverride()
+    syncKometaBranchOverrideWarning()
+    if (!KOMETA_UPDATING) runKometaStatusPass(true)
+  })
+  loadSavedKometaBranchOverride()
+  syncKometaBranchOverrideWarning()
+  syncKometaSourceStatus()
+  setKometaUpdatePhaseBadge(kometaUpdatePhaseStatus)
   syncUpdateButtonLabel()
+  syncKometaRollupBadge()
 
   // Sync visibility for timeout and divider on page load
   $('#opt-timeout-container').toggleClass('d-none', !$('#opt-timeout').is(':checked'))
@@ -1602,6 +2726,7 @@ $(document).ready(function () {
       $logscanSummary.text('')
       $logscanRecommendations.html('<div class="text-muted">Logscan unavailable.</div>')
       $logscanMissing.addClass('d-none').empty()
+      updateLogscanHeaderBadge({ error: true })
       return
     }
 
@@ -1693,13 +2818,17 @@ $(document).ready(function () {
     } else {
       $logscanMissing.addClass('d-none')
     }
+
+    updateLogscanHeaderBadge(data)
   }
 
-  function fetchLogscanAnalysis () {
+  function fetchLogscanAnalysis (force = false) {
     if (!$logscanPanel.length) return
     logscanPollCounter += 1
-    const shouldFetch = (logscanPollCounter % 5 === 0) || !lastLogscanPayload
-    if (!shouldFetch) return
+    const shouldFetch = force || (logscanPollCounter % 5 === 0) || !lastLogscanPayload
+    if (!shouldFetch || logscanAnalyzeInFlight) return
+
+    logscanAnalyzeInFlight = true
 
     fetch('/logscan/analyze')
       .then(res => res.json())
@@ -1710,6 +2839,10 @@ $(document).ready(function () {
       .catch(err => {
         console.error('Error fetching logscan analysis:', err)
         $logscanRecommendations.html('<div class="text-muted">Logscan unavailable.</div>')
+        updateLogscanHeaderBadge({ error: true })
+      })
+      .finally(() => {
+        logscanAnalyzeInFlight = false
       })
   }
 
@@ -1782,16 +2915,63 @@ $(document).ready(function () {
   // Keep the run area hidden until Kometa validation completes.
   hideRunCommandSectionUntilValidated()
   checkKometaStatus()
+    .catch(() => null)
+    .finally(() => {
+      if (!document.getElementById('kometa-validation-log')) return
+      if (KOMETA_STATUS === 'running') return
+      Promise.resolve(runKometaStatusPass(false))
+        .finally(() => {
+          const stage = getFinalGateState().stage
+          if (stage === 'todo' || stage === 'freshness') return
+          if (KOMETA_STATUS === 'running' || KOMETA_UPDATING || KOMETA_VALIDATION_IN_PROGRESS) return
+          validateKometaRoot({ appendStatus: true })
+        })
+    })
 
-  // First-run: validate Kometa root once the log box is present.
-  if (document.getElementById('kometa-validation-log')) {
-    validateKometaRoot()
+  if (kometaActionsCollapse) {
+    kometaActionsCollapse.addEventListener('show.bs.collapse', () => {
+      const stage = getFinalGateState().stage
+      if (stage === 'todo' || stage === 'freshness') return
+      if (KOMETA_STATUS === 'running') {
+        if (typeof bootstrap !== 'undefined' && bootstrap.Collapse) {
+          bootstrap.Collapse.getOrCreateInstance(kometaActionsCollapse, { toggle: false }).hide()
+        }
+        return
+      }
+      if (!KOMETA_INSTALLED || KOMETA_VALIDATED || KOMETA_VALIDATION_IN_PROGRESS || KOMETA_UPDATING) return
+      validateKometaRoot()
+    })
+  }
+
+  if (runCommandCollapse) {
+    runCommandCollapse.addEventListener('show.bs.collapse', () => {
+      if (KOMETA_STATUS === 'running') {
+        clearRunCommandPlaceholderState()
+        return
+      }
+      if (!KOMETA_VALIDATED) {
+        setRunCommandPlaceholderState()
+      }
+    })
   }
 
   if (document.getElementById('header-style')) {
     document.getElementById('header-style').addEventListener('change', function () {
-      showToast('info', 'Updating header style. Please wait for the page to reload...')
-      if (headerStyleWait) headerStyleWait.classList.remove('d-none')
+      if (headerStyleSubmitting) return
+      headerStyleSubmitting = true
+      showToast('info', 'Regenerating section style. Please wait for the page to reload...')
+      if (typeof showNavigationLoadingOverlay === 'function') {
+        showNavigationLoadingOverlay('header-style')
+      }
+      if (headerStyleWait) {
+        headerStyleWait.textContent = 'Regenerating section style and YAML...'
+        headerStyleWait.classList.remove('d-none')
+      }
+      if (headerGrid) {
+        headerGrid.querySelectorAll('.header-style-card').forEach(card => {
+          card.disabled = true
+        })
+      }
       if (finalContentWrapper) finalContentWrapper.classList.add('is-updating')
       setTimeout(() => {
         document.getElementById('configForm').submit()
@@ -1858,6 +3038,7 @@ $(document).ready(function () {
     missing_plex_validation: 'Plex not validated',
     no_libraries: 'No libraries selected',
     invalid_paths: 'Invalid paths',
+    missing_library_defaults: 'Missing library defaults',
     missing_placeholder_imdb: 'Missing placeholder IMDb ID',
     invalid_fields: 'Invalid fields',
     no_webhooks: 'No webhooks configured',
@@ -1932,15 +3113,18 @@ $(document).ready(function () {
   }
 
   const validateAllBtn = document.getElementById('validate-all-services')
-  const validateAllSpinner = document.getElementById('validate-all-spinner')
   const validateAllStatus = document.getElementById('validate-all-status')
   const validateAllStatusTime = document.getElementById('validate-all-status-time')
+  const validateAllStatusBulk = document.getElementById('validate-all-status-bulk')
+  const validateAllStatusBulkTime = document.getElementById('validate-all-status-bulk-time')
   const validationStatusLastRun = document.getElementById('validation-status-last-run')
+  let previouslyBlocked = false
+  let previousStatuses = {}
+
   if (validateAllBtn) {
-    validateAllBtn.addEventListener('click', function () {
-      if (validateAllBtn.disabled) return
-      const previouslyBlocked = !showYAML
-      const previousStatuses = {}
+    document.addEventListener('qs:bulk-validation-start', function () {
+      previouslyBlocked = !showYAML
+      previousStatuses = {}
       document.querySelectorAll('[data-validation-key]').forEach(row => {
         const key = row.dataset.validationKey
         const pill = row.querySelector('.validation-status-pill')
@@ -1948,169 +3132,153 @@ $(document).ready(function () {
           previousStatuses[key] = pill.classList.contains('rating-mapping-option-via--validated')
         }
       })
-      validateAllBtn.disabled = true
-      if (validateAllSpinner) validateAllSpinner.classList.remove('d-none')
+
       if (validateAllStatus) {
-        validateAllStatus.classList.add('d-none', 'text-danger')
-        validateAllStatus.classList.remove('text-success')
+        validateAllStatus.classList.add('d-none')
+        validateAllStatus.classList.remove('text-danger', 'text-success', 'text-warning')
         validateAllStatus.textContent = 'Validating configured services...'
         validateAllStatus.classList.remove('d-none')
       }
-
-      fetch('/validate_all_services', { method: 'POST' })
-        .then(async (res) => {
-          let data = null
-          try {
-            data = await res.json()
-          } catch (err) {
-            data = null
-          }
-
-          if (!res.ok) {
-            const message = (data && (data.message || data.error)) || `Request failed (${res.status}).`
-            throw new Error(message)
-          }
-
-          if (!data || !data.success) {
-            throw new Error((data && (data.message || data.error)) || 'Validation failed. Please try again.')
-          }
-
-          const results = data.results || {}
-          const gateTargets = {
-            '010-plex': { id: 'plex_valid', datasetKey: 'plexValid', attrKey: 'plex-valid' },
-            '020-tmdb': { id: 'tmdb_valid', datasetKey: 'tmdbValid', attrKey: 'tmdb-valid' },
-            '025-libraries': { id: 'libs_valid', datasetKey: 'libsValid', attrKey: 'libs-valid' },
-            '150-settings': { id: 'sett_valid', datasetKey: 'settValid', attrKey: 'sett-valid' }
-          }
-          Object.keys(results).forEach(key => updateValidationRow(key, results[key]))
-          Object.keys(results).forEach(key => {
-            const target = gateTargets[key]
-            const result = results[key]
-            if (!target || !result) return
-            if (result.status === 'validated') {
-              setMetaFlag(target.id, target.datasetKey, target.attrKey, true)
-            } else if (result.status === 'failed' || result.status === 'skipped') {
-              setMetaFlag(target.id, target.datasetKey, target.attrKey, false)
-            }
-          })
-          const summary = data.summary || {}
-          const ok = summary.validated || 0
-          const failed = summary.failed || 0
-          const skipped = summary.skipped || 0
-          showToast('info', `Validate all complete. Validated: ${ok} • Failed: ${failed} • Skipped: ${skipped}`)
-          if (validateAllStatus) {
-            // Per-row Validation Results show details; no per-summary label mapping needed.
-            // Note: summary details are shown per-row in the Validation Results column.
-            validateAllStatus.classList.remove('d-none', 'text-danger')
-            validateAllStatus.classList.add('text-success')
-            const summaryText = data.summary_text || `Completed. Validated: ${ok} • Failed: ${failed} • Skipped: ${skipped}.`
-            validateAllStatus.textContent = summaryText
-            const summaryUpdatedAt = data.summary_updated_at || new Date().toISOString()
-            if (validateAllStatusTime) {
-              validateAllStatusTime.dataset.validationIso = summaryUpdatedAt
-              const parsed = new Date(summaryUpdatedAt)
-              if (!Number.isNaN(parsed.getTime())) {
-                validateAllStatusTime.textContent = formatLocalTimestamp(parsed)
-              }
-            }
-            if (validationStatusLastRun) {
-              validationStatusLastRun.dataset.validationIso = summaryUpdatedAt
-              const parsed = new Date(summaryUpdatedAt)
-              if (!Number.isNaN(parsed.getTime())) {
-                validationStatusLastRun.textContent = formatLocalTimestamp(parsed)
-              }
-            }
-          }
-          updateValidationGate()
-          const anyNewlyValidated = Object.keys(results).some(key => results[key]?.status === 'validated' && !previousStatuses[key])
-          if (previouslyBlocked && showYAML) {
-            showToast('info', 'Validation complete. Refreshing YAML output...')
-            setTimeout(() => window.location.reload(), 300)
-            return
-          }
-          if (anyNewlyValidated) {
-            showToast('info', 'Validation updated. Refreshing YAML output...')
-            setTimeout(() => window.location.reload(), 300)
-          }
-        })
-        .catch((err) => {
-          const message = err && err.message ? err.message : 'Validate all failed. Please try again.'
-          showToast('error', message)
-          if (validateAllStatus) {
-            validateAllStatus.classList.remove('d-none', 'text-success')
-            validateAllStatus.classList.add('text-danger')
-            validateAllStatus.textContent = message
-          }
-        })
-        .finally(() => {
-          validateAllBtn.disabled = false
-          if (validateAllSpinner) validateAllSpinner.classList.add('d-none')
-        })
     })
+
+    document.addEventListener('qs:bulk-validation-complete', function (event) {
+      const data = (event && event.detail) ? event.detail : {}
+      const results = data.results || {}
+      const gateTargets = {
+        '010-plex': { id: 'plex_valid', datasetKey: 'plexValid', attrKey: 'plex-valid' },
+        '020-tmdb': { id: 'tmdb_valid', datasetKey: 'tmdbValid', attrKey: 'tmdb-valid' },
+        '025-libraries': { id: 'libs_valid', datasetKey: 'libsValid', attrKey: 'libs-valid' },
+        '150-settings': { id: 'sett_valid', datasetKey: 'settValid', attrKey: 'sett-valid' }
+      }
+
+      Object.keys(results).forEach(key => updateValidationRow(key, results[key]))
+      Object.keys(results).forEach(key => {
+        const target = gateTargets[key]
+        const result = results[key]
+        if (!target || !result) return
+        if (result.status === 'validated') {
+          setMetaFlag(target.id, target.datasetKey, target.attrKey, true)
+        } else if (result.status === 'failed' || result.status === 'skipped') {
+          setMetaFlag(target.id, target.datasetKey, target.attrKey, false)
+        }
+      })
+
+      const summary = data.summary || {}
+      const ok = summary.validated || 0
+      const failed = summary.failed || 0
+      const skipped = summary.skipped || 0
+      const summaryUpdatedAt = data.summary_updated_at || new Date().toISOString()
+      if (validateAllStatus) {
+        validateAllStatus.classList.remove('d-none', 'text-danger', 'text-success', 'text-warning')
+        if (failed > 0) {
+          validateAllStatus.classList.add('text-danger')
+        } else if (skipped > 0) {
+          validateAllStatus.classList.add('text-warning')
+        } else {
+          validateAllStatus.classList.add('text-success')
+        }
+        const currentSummaryText = `Current. Validated: ${ok} • Failed: ${failed} • Pending: ${skipped}.`
+        validateAllStatus.textContent = currentSummaryText
+        if (validateAllStatusTime) {
+          validateAllStatusTime.dataset.validationIso = summaryUpdatedAt
+          const parsed = new Date(summaryUpdatedAt)
+          if (!Number.isNaN(parsed.getTime())) {
+            validateAllStatusTime.textContent = formatLocalTimestamp(parsed)
+          }
+        }
+        if (validationStatusLastRun) {
+          validationStatusLastRun.dataset.validationIso = summaryUpdatedAt
+          const parsed = new Date(summaryUpdatedAt)
+          if (!Number.isNaN(parsed.getTime())) {
+            validationStatusLastRun.textContent = formatLocalTimestamp(parsed)
+          }
+        }
+      }
+      if (validateAllStatusBulk) {
+        validateAllStatusBulk.classList.remove('d-none')
+        validateAllStatusBulk.textContent = data.summary_text || `Completed. Validated: ${ok} • Failed: ${failed} • Skipped: ${skipped}.`
+      }
+      if (validateAllStatusBulkTime) {
+        validateAllStatusBulkTime.dataset.validationIso = summaryUpdatedAt
+        const parsed = new Date(summaryUpdatedAt)
+        if (!Number.isNaN(parsed.getTime())) {
+          validateAllStatusBulkTime.textContent = formatLocalTimestamp(parsed)
+        }
+      }
+
+      updateValidationGate()
+      const anyNewlyValidated = Object.keys(results).some(key => results[key]?.status === 'validated' && !previousStatuses[key])
+      if (previouslyBlocked && showYAML) {
+        showToast('info', 'Validation complete. Refreshing YAML output...')
+        setTimeout(() => window.location.reload(), 300)
+        return
+      }
+      if (anyNewlyValidated) {
+        showToast('info', 'Validation updated. Refreshing YAML output...')
+        setTimeout(() => window.location.reload(), 300)
+      }
+    })
+
+    document.addEventListener('qs:bulk-validation-error', function (event) {
+      const detail = (event && event.detail) ? event.detail : {}
+      const message = detail.message || 'Validate all failed. Please try again.'
+      if (validateAllStatus) {
+        validateAllStatus.classList.remove('d-none', 'text-success', 'text-warning')
+        validateAllStatus.classList.add('text-danger')
+        validateAllStatus.textContent = message
+      }
+    })
+
+    if (window.QSBulkValidation && typeof window.QSBulkValidation.getSummaryState === 'function') {
+      const badge = document.getElementById('validation-status-rollup-badge')
+      if (badge) {
+        const initialSummary = {
+          validated: Number(badge.dataset.validated || 0),
+          failed: Number(badge.dataset.failed || 0),
+          skipped: Number(badge.dataset.skipped || 0)
+        }
+        const state = window.QSBulkValidation.getSummaryState(initialSummary)
+        badge.classList.remove(
+          'qs-validation-rollup-badge--unknown',
+          'qs-validation-rollup-badge--ok',
+          'qs-validation-rollup-badge--warn',
+          'qs-validation-rollup-badge--error'
+        )
+        badge.classList.add(`qs-validation-rollup-badge--${state}`)
+      }
+    }
+
+    if (getFinalGateState().autoValidate && window.QSBulkValidation && typeof window.QSBulkValidation.run === 'function') {
+      window.QSBulkValidation.run({ source: 'final-freshness', silentToast: true })
+        .then(() => {
+          showToast('info', 'Validate All complete. Refreshing Kometa...')
+          setTimeout(() => window.location.reload(), 300)
+        })
+        .catch(() => {})
+    }
   }
 
   $('#run-now').on('click', function () {
-    if (KOMETA_UPDATING) {
-      showToast('warning', 'Kometa is updating. Please wait for it to finish before running.')
-      return
-    }
-
-    if (KOMETA_VALIDATION_IN_PROGRESS) {
-      showToast('info', 'Kometa validation is still running. Please wait.')
-      return
-    }
-
-    if (!KOMETA_VALIDATED) {
-      showToast('warning', 'Kometa has not been validated yet.')
-      return
-    }
-
-    const command = $('#run-command-output').text().trim()
-    if (!command || command.startsWith('⚠️')) {
-      showToast('error', 'Cannot run invalid command.')
-      return
-    }
-
-    $('#run-now').prop('disabled', true)
-    $('#run-now-label').text('Running...')
-    $('#stop-now').removeClass('d-none') // SHOW stop button here
-    $('#run-output').removeClass('d-none')
-    $('#run-output-log').text('Starting Kometa...\n')
-
-    fetch('/start-kometa', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ command })
+    startKometaCommand(getCurrentRunCommand(), {
+      startMode: 'current',
+      requireValidated: true,
+      startMessage: 'Starting Kometa...\n'
     })
-      .then(res => res.json())
-      .then(data => {
-        if (data.error) {
-          $('#run-output-log').text(`❌ ${data.error}`)
-          $('#run-now').prop('disabled', false)
-          $('#run-now-label').text('Run Now')
-          $('#stop-now').addClass('d-none')
-          return
-        }
+  })
 
-        if (data.status === 'queued') {
-          const windowLabel = data.maintenance_window ? ` (${data.maintenance_window})` : ''
-          const nowLabel = (typeof window.QS_formatTimestamp === 'function') ? window.QS_formatTimestamp() : new Date().toLocaleString()
-          const message = `Plex maintenance active${windowLabel} at ${nowLabel}. Kometa will start automatically when it ends.`
-          showToast('warning', message)
-          $('#run-output-log').text(`${message}\n`)
-          $('#run-now').prop('disabled', true).html('<i class="bi bi-hourglass-split me-1"></i> Waiting...')
-          $('#stop-now').addClass('d-none')
-          if (kometaStatusInterval) clearInterval(kometaStatusInterval)
-          kometaStatusInterval = setInterval(checkKometaStatus, 5000)
-          return
-        }
-
-        // ✅ Delay polling slightly to allow Kometa to start
-        setTimeout(() => {
-          kometaPollingStarted = false
-          startPollingIfNeeded()
-        }, 5500) // <-- 1.5 second delay
-      })
+  $('#run-recovery-command').on('click', function () {
+    const command = getRecoveryRunCommand()
+    const startMode = String($(this).data('start-mode') || 'recovery').trim().toLowerCase() || 'recovery'
+    const contextMismatch = String($(this).data('context-mismatch') || '').toLowerCase() === 'true'
+    if (contextMismatch) {
+      const confirmed = window.confirm('This incomplete run was recorded under a different config than the one currently loaded. Run the recovery command anyway?')
+      if (!confirmed) return
+    }
+    startKometaCommand(command, {
+      startMode,
+      requireValidated: false,
+      startMessage: startMode === 'logged' ? 'Starting last logged Kometa command...\n' : 'Starting Kometa recovery command...\n'
+    })
   })
 
   // Stop button click handler
@@ -2226,10 +3394,12 @@ $(document).ready(function () {
       .then(res => res.json())
       .then(data => {
         KOMETA_STATUS = data.status || null
+        KOMETA_PENDING_START = Boolean(data.pending_start && data.status !== 'running')
         const $updateBtn = $updateKometaBtn
         const $forceUpdate = $forceUpdateToggle
         const $runNow = $('#run-now')
         const $stopNow = $('#stop-now')
+        setKometaPrepareRunningState(data.status === 'running')
 
         // Disable update if Kometa is running or an update is in progress
         const shouldDisableUpdate = (data.status === 'running') || KOMETA_UPDATING
@@ -2252,6 +3422,10 @@ $(document).ready(function () {
         }
 
         if (data.pending_start && data.status !== 'running') {
+          applyActiveRunCommandState(
+            data.pending_command || activeRunCommandOverride || getRecoveryRunCommand(),
+            data.pending_start_mode || activeRunCommandMode || 'recovery'
+          )
           const windowLabel = data.maintenance_window ? ` (${data.maintenance_window})` : ''
           const nowLabel = (typeof window.QS_formatTimestamp === 'function') ? window.QS_formatTimestamp() : new Date().toLocaleString()
           const message = `Plex maintenance active${windowLabel} at ${nowLabel}. Kometa will start automatically when it ends.`
@@ -2261,6 +3435,7 @@ $(document).ready(function () {
           if (!$('#run-output-log').text().includes('Plex maintenance')) {
             $('#run-output-log').append(`\n${message}`)
           }
+          syncIncompleteRunActions()
           if (kometaStatusInterval) clearInterval(kometaStatusInterval)
           kometaStatusInterval = setInterval(checkKometaStatus, 5000)
           return
@@ -2270,17 +3445,26 @@ $(document).ready(function () {
         if (KOMETA_UPDATING) {
           $runNow.prop('disabled', true).html('<i class="bi bi-hourglass me-1"></i> Updating...')
           $stopNow.prop('disabled', true)
+          syncIncompleteRunActions()
           return // don't do the rest while we're mid-update
         }
 
         // Handle Kometa process states
         if (data.status === 'running') {
+          applyActiveRunCommandState(
+            data.active_command || activeRunCommandOverride || getCurrentRunCommand(),
+            data.start_mode || activeRunCommandMode || 'current'
+          )
+          KOMETA_PENDING_START = false
+          finalLogscanAnalyzeTriggered = false
+          $('#incomplete-run-alert').addClass('d-none')
           // Kometa is actively running → keep Run disabled, allow Stop
+          revealRunCommandSection()
           $runNow.prop('disabled', true).html('<i class="bi bi-play-fill me-1"></i> Run Now')
           $stopNow.removeClass('d-none').prop('disabled', false)
           $('#run-output').removeClass('d-none')
+          syncIncompleteRunActions()
           startPollingIfNeeded()
-          fetchKometaLog()
           return
         }
 
@@ -2288,25 +3472,32 @@ $(document).ready(function () {
         if (typeof kometaInterval !== 'undefined' && kometaInterval) clearInterval(kometaInterval)
         if (typeof kometaStatusInterval !== 'undefined' && kometaStatusInterval) clearInterval(kometaStatusInterval)
         stopProgressPolling()
-        if (lastRunProgressPayload) {
-          renderRunProgress(lastRunProgressPayload)
-        }
+        clearRunProgress(true)
+        clearActiveRunCommandState()
+        try { buildCommand() } catch (_) {}
 
         $runNow.html('<i class="bi bi-play-fill me-1"></i> Run Now')
         $stopNow.addClass('d-none').prop('disabled', false)
         updateRunNowState()
 
         if (data.status === 'done') {
+          KOMETA_PENDING_START = false
+          if (!finalLogscanAnalyzeTriggered) {
+            finalLogscanAnalyzeTriggered = true
+            fetchLogscanAnalysis(true)
+          }
           if (data.return_code === 0) {
             $('#run-output-log').append('\n✅ Kometa finished successfully.')
           } else {
             $('#run-output-log').append(`\n⚠️ Kometa exited with code ${data.return_code}. Check logs for details.`)
           }
         } else if (data.status === 'not started') {
+          KOMETA_PENDING_START = false
           $('#run-output-log').append('\n🟥 Kometa is not running.')
         }
       })
       .catch(err => {
+        KOMETA_PENDING_START = false
         console.error('Error checking Kometa status:', err)
         $('#run-output-log').append('\n⚠️ Failed to check Kometa status.')
       })

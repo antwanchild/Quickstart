@@ -2,10 +2,42 @@ import json
 import os
 import pickle
 import sqlite3
-from flask import current_app as app
+from flask import current_app as app, has_app_context
 from contextlib import closing
 
 from modules import helpers
+
+TRANSIENT_SECTION_KEYS = {
+    "configSelector",
+    "config_name",
+    "newConfigName",
+    "importMode",
+}
+
+
+def _strip_transient_section_keys(value):
+    changed = False
+
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            if key in TRANSIENT_SECTION_KEYS:
+                changed = True
+                continue
+            cleaned_item, item_changed = _strip_transient_section_keys(item)
+            cleaned[key] = cleaned_item
+            changed = changed or item_changed
+        return cleaned, changed
+
+    if isinstance(value, list):
+        cleaned = []
+        for item in value:
+            cleaned_item, item_changed = _strip_transient_section_keys(item)
+            cleaned.append(cleaned_item)
+            changed = changed or item_changed
+        return cleaned, changed
+
+    return value, False
 
 
 def get_database_path():
@@ -57,7 +89,16 @@ def retrieve_section_data(name, section):
             row = cursor.fetchone()
             if row:
                 unpickled = pickle.loads(row["data"])
-                if app.config["QS_DEBUG"]:
+                cleaned_data, changed = _strip_transient_section_keys(unpickled)
+                if changed:
+                    cursor.execute(
+                        """UPDATE section_data
+                            SET data = ?
+                            WHERE name == ? AND section == ?""",
+                        (pickle.dumps(cleaned_data), name, section),
+                    )
+                    unpickled = cleaned_data
+                if has_app_context() and app.config["QS_DEBUG"]:
                     helpers.ts_log(f"Retrieved data for name={name}, section={section}: {unpickled}", level="DEBUG")
                 return (
                     helpers.booler(row["validated"]),
@@ -81,6 +122,8 @@ def retrieve_config_sections(name):
             for row in rows:
                 try:
                     data_blob = pickle.loads(row["data"]) if row["data"] is not None else None
+                    if data_blob is not None:
+                        data_blob, _changed = _strip_transient_section_keys(data_blob)
                 except Exception:
                     data_blob = None
                 sections.append(
@@ -92,6 +135,35 @@ def retrieve_config_sections(name):
                     }
                 )
     return sections
+
+
+def sanitize_all_section_data():
+    updated = 0
+    with sqlite3.connect(get_database_path(), detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES) as connection:
+        connection.row_factory = sqlite3.Row
+        with closing(connection.cursor()) as cursor:
+            cursor.execute(persisted_section_table_create())
+            cursor.execute("""SELECT name, section, data FROM section_data""")
+            rows = cursor.fetchall()
+            for row in rows:
+                raw_data = row["data"]
+                if raw_data is None:
+                    continue
+                try:
+                    data_blob = pickle.loads(raw_data)
+                except Exception:
+                    continue
+                cleaned_blob, changed = _strip_transient_section_keys(data_blob)
+                if not changed:
+                    continue
+                cursor.execute(
+                    """UPDATE section_data
+                        SET data = ?
+                        WHERE name == ? AND section == ?""",
+                    (pickle.dumps(cleaned_blob), row["name"], row["section"]),
+                )
+                updated += 1
+    return updated
 
 
 def retrieve_validated_map(name, sections=None):
@@ -130,6 +202,7 @@ def get_unique_config_names():
     with sqlite3.connect(get_database_path(), detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES) as connection:
         connection.row_factory = sqlite3.Row
         with closing(connection.cursor()) as cursor:
+            cursor.execute(persisted_section_table_create())
             cursor.execute("SELECT DISTINCT name FROM section_data ORDER BY name ASC")
             return [row["name"] for row in cursor.fetchall()]
 
@@ -155,6 +228,8 @@ def get_last_used_config_name():
 def log_runs_table_create():
     return """CREATE TABLE IF NOT EXISTS log_runs (
         run_key TEXT PRIMARY KEY,
+        tool_name TEXT,
+        started_at TEXT,
         finished_at TEXT,
         run_time_seconds INTEGER,
         kometa_version TEXT,
@@ -175,7 +250,11 @@ def log_runs_table_create():
         trace_count INTEGER,
         analysis_counts TEXT,
         library_counts TEXT,
+        maintenance_summary TEXT,
+        maintenance_had_pause INTEGER,
+        quiet_period_summary TEXT,
         quickstart_run_marker INTEGER,
+        start_mode TEXT,
         config_line_count INTEGER,
         cache_line_count INTEGER,
         created_at TEXT
@@ -193,6 +272,8 @@ def _ensure_log_runs_columns(cursor):
         if name:
             existing.add(name)
     columns = {
+        "tool_name": "TEXT",
+        "started_at": "TEXT",
         "config_name": "TEXT",
         "config_hash": "TEXT",
         "run_command": "TEXT",
@@ -201,7 +282,11 @@ def _ensure_log_runs_columns(cursor):
         "recommendations": "TEXT",
         "analysis_counts": "TEXT",
         "library_counts": "TEXT",
+        "maintenance_summary": "TEXT",
+        "maintenance_had_pause": "INTEGER",
+        "quiet_period_summary": "TEXT",
         "quickstart_run_marker": "INTEGER",
+        "start_mode": "TEXT",
         "config_line_count": "INTEGER",
         "cache_line_count": "INTEGER",
     }
@@ -216,6 +301,7 @@ def save_log_run(summary, recommendations=None):
     run_key = summary.get("run_key")
     if not run_key:
         return False
+    tool_name = str(summary.get("tool_name") or "kometa").strip().lower() or "kometa"
 
     counts = summary.get("log_counts") or {}
     section_runtimes = summary.get("section_runtimes")
@@ -231,7 +317,15 @@ def save_log_run(summary, recommendations=None):
     library_counts = summary.get("library_counts")
     if isinstance(library_counts, dict):
         library_counts = json.dumps(library_counts, ensure_ascii=True)
+    maintenance_summary = summary.get("maintenance_summary")
+    if isinstance(maintenance_summary, dict):
+        maintenance_summary = json.dumps(maintenance_summary, ensure_ascii=True)
+    maintenance_had_pause = 1 if (summary.get("maintenance_had_pause") or (summary.get("maintenance_summary") or {}).get("had_pause")) else 0
+    quiet_period_summary = summary.get("quiet_period_summary")
+    if isinstance(quiet_period_summary, dict):
+        quiet_period_summary = json.dumps(quiet_period_summary, ensure_ascii=True)
     quickstart_run_marker = 1 if summary.get("quickstart_run_marker") else 0
+    start_mode = str(summary.get("start_mode") or "").strip().lower() or None
     config_line_count = summary.get("config_line_count")
     cache_line_count = summary.get("cache_line_count")
     with sqlite3.connect(get_database_path(), detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES) as connection:
@@ -241,6 +335,8 @@ def save_log_run(summary, recommendations=None):
             cursor.execute(
                 """INSERT OR IGNORE INTO log_runs (
                     run_key,
+                    tool_name,
+                    started_at,
                     finished_at,
                     run_time_seconds,
                     kometa_version,
@@ -261,13 +357,19 @@ def save_log_run(summary, recommendations=None):
                     trace_count,
                     analysis_counts,
                     library_counts,
+                    maintenance_summary,
+                    maintenance_had_pause,
+                    quiet_period_summary,
                     quickstart_run_marker,
+                    start_mode,
                     config_line_count,
                     cache_line_count,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_key,
+                    tool_name,
+                    summary.get("started_at"),
                     summary.get("finished_at"),
                     summary.get("run_time_seconds"),
                     summary.get("kometa_version"),
@@ -288,7 +390,11 @@ def save_log_run(summary, recommendations=None):
                     counts.get("trace", 0),
                     analysis_counts,
                     library_counts,
+                    maintenance_summary,
+                    maintenance_had_pause,
+                    quiet_period_summary,
                     quickstart_run_marker,
+                    start_mode,
                     config_line_count,
                     cache_line_count,
                     summary.get("created_at"),
@@ -307,55 +413,106 @@ def clear_log_runs():
     return True
 
 
+def _decode_log_run_row(row):
+    if not row:
+        return None
+    decoded = dict(row)
+    section_runtimes = decoded.get("section_runtimes")
+    if isinstance(section_runtimes, str):
+        try:
+            decoded["section_runtimes"] = json.loads(section_runtimes)
+        except json.JSONDecodeError:
+            decoded["section_runtimes"] = None
+    recommendations = decoded.get("recommendations")
+    if isinstance(recommendations, str):
+        try:
+            recommendations = json.loads(recommendations)
+        except json.JSONDecodeError:
+            recommendations = None
+    if isinstance(recommendations, list):
+        decoded["recommendations_count"] = len(recommendations)
+    else:
+        decoded["recommendations_count"] = 0
+    analysis_counts = decoded.get("analysis_counts")
+    if isinstance(analysis_counts, str):
+        try:
+            decoded["analysis_counts"] = json.loads(analysis_counts)
+        except json.JSONDecodeError:
+            decoded["analysis_counts"] = None
+    library_counts = decoded.get("library_counts")
+    if isinstance(library_counts, str):
+        try:
+            decoded["library_counts"] = json.loads(library_counts)
+        except json.JSONDecodeError:
+            decoded["library_counts"] = None
+    maintenance_summary = decoded.get("maintenance_summary")
+    if isinstance(maintenance_summary, str):
+        try:
+            decoded["maintenance_summary"] = json.loads(maintenance_summary)
+        except json.JSONDecodeError:
+            decoded["maintenance_summary"] = None
+    quiet_period_summary = decoded.get("quiet_period_summary")
+    if isinstance(quiet_period_summary, str):
+        try:
+            decoded["quiet_period_summary"] = json.loads(quiet_period_summary)
+        except json.JSONDecodeError:
+            decoded["quiet_period_summary"] = None
+    decoded["maintenance_had_pause"] = bool(decoded.get("maintenance_had_pause"))
+    decoded["quickstart_run_marker"] = bool(decoded.get("quickstart_run_marker"))
+    decoded["start_mode"] = str(decoded.get("start_mode") or "").strip().lower() or None
+    decoded["tool_name"] = str(decoded.get("tool_name") or "kometa").strip().lower() or "kometa"
+    return decoded
+
+
 def get_log_runs(limit=100):
     with sqlite3.connect(get_database_path(), detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES) as connection:
         connection.row_factory = sqlite3.Row
         with closing(connection.cursor()) as cursor:
             _ensure_log_runs_columns(cursor)
+            query = """SELECT run_key, tool_name, started_at, finished_at, run_time_seconds, kometa_version, kometa_newest_version,
+                               config_name, config_hash, run_command, command_signature, section_runtimes,
+                               recommendations, log_mtime, log_size, debug_count, info_count, warning_count,
+                               error_count, critical_count, trace_count, analysis_counts, library_counts,
+                               maintenance_summary, maintenance_had_pause, quiet_period_summary, quickstart_run_marker, start_mode,
+                               config_line_count, cache_line_count, created_at
+                        FROM log_runs
+                        ORDER BY created_at DESC"""
+            params = ()
+            if limit is not None:
+                query += "\n                   LIMIT ?"
+                params = (limit,)
+            cursor.execute(query, params)
+            rows = [_decode_log_run_row(row) for row in cursor.fetchall()]
+            for row in rows:
+                row.pop("recommendations", None)
+    return [row for row in rows if row]
+
+
+def get_log_run(run_key):
+    with sqlite3.connect(get_database_path(), detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES) as connection:
+        connection.row_factory = sqlite3.Row
+        with closing(connection.cursor()) as cursor:
+            _ensure_log_runs_columns(cursor)
             cursor.execute(
-                """SELECT run_key, finished_at, run_time_seconds, kometa_version, kometa_newest_version,
+                """SELECT run_key, tool_name, started_at, finished_at, run_time_seconds, kometa_version, kometa_newest_version,
                           config_name, config_hash, run_command, command_signature, section_runtimes,
                           recommendations, log_mtime, log_size, debug_count, info_count, warning_count,
                           error_count, critical_count, trace_count, analysis_counts, library_counts,
-                          quickstart_run_marker, config_line_count, cache_line_count, created_at
+                          maintenance_summary, maintenance_had_pause, quiet_period_summary, quickstart_run_marker, start_mode,
+                          config_line_count, cache_line_count, created_at
                    FROM log_runs
-                   ORDER BY created_at DESC
-                   LIMIT ?""",
-                (limit,),
+                   WHERE run_key == ?
+                   LIMIT 1""",
+                (run_key,),
             )
-            rows = [dict(row) for row in cursor.fetchall()]
-            for row in rows:
-                section_runtimes = row.get("section_runtimes")
-                if isinstance(section_runtimes, str):
-                    try:
-                        row["section_runtimes"] = json.loads(section_runtimes)
-                    except json.JSONDecodeError:
-                        row["section_runtimes"] = None
-                recommendations = row.get("recommendations")
-                if isinstance(recommendations, str):
-                    try:
-                        recommendations = json.loads(recommendations)
-                    except json.JSONDecodeError:
-                        recommendations = None
-                if isinstance(recommendations, list):
-                    row["recommendations_count"] = len(recommendations)
-                else:
-                    row["recommendations_count"] = 0
-                row.pop("recommendations", None)
-                analysis_counts = row.get("analysis_counts")
-                if isinstance(analysis_counts, str):
-                    try:
-                        row["analysis_counts"] = json.loads(analysis_counts)
-                    except json.JSONDecodeError:
-                        row["analysis_counts"] = None
-                library_counts = row.get("library_counts")
-                if isinstance(library_counts, str):
-                    try:
-                        row["library_counts"] = json.loads(library_counts)
-                    except json.JSONDecodeError:
-                        row["library_counts"] = None
-                row["quickstart_run_marker"] = bool(row.get("quickstart_run_marker"))
-    return rows
+            row = cursor.fetchone()
+            if not row:
+                return None
+            decoded = _decode_log_run_row(row)
+            if decoded:
+                decoded.pop("recommendations", None)
+            return decoded
+    return None
 
 
 def get_log_runs_count():
@@ -387,6 +544,15 @@ def get_log_run_recommendations(run_key):
                 except json.JSONDecodeError:
                     recs = None
             return recs if isinstance(recs, list) else []
+
+
+def delete_log_run(run_key):
+    with sqlite3.connect(get_database_path(), detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES) as connection:
+        connection.row_factory = sqlite3.Row
+        with closing(connection.cursor()) as cursor:
+            _ensure_log_runs_columns(cursor)
+            cursor.execute("DELETE FROM log_runs WHERE run_key == ?", (run_key,))
+            return cursor.rowcount > 0
 
 
 ANALYTICS_DEFAULT_PREFS = {

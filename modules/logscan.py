@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import shlex
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -12,7 +12,7 @@ import requests
 
 # Create logger
 mylogger = logging.getLogger("logscan")
-mylogger.setLevel(logging.DEBUG)  # Set the logging level to DEBUG
+mylogger.setLevel(logging.INFO)
 
 
 # --- PMS security vulnerability helpers (non-invasive; keep existing checks as-is) ---
@@ -46,7 +46,7 @@ PEOPLE_README_URLS = [
 PEOPLE_MISSING_WARNING_REGEX = (
     r"Collection Warning: No Poster Found at "
     r"(https://raw\.githubusercontent\.com/"
-    r"(?:Kometa-Team/People-Images|meisnate12/Plex-Meta-Manager-People(?:-[^/]+)?)"
+    r"(?:Kometa-Team/People-Images(?:-[^/]+)?|meisnate12/Plex-Meta-Manager-People(?:-[^/]+)?)"
     r"/[^\s\]]+)"
 )
 PEOPLE_MISSING_WARNING_RE = re.compile(PEOPLE_MISSING_WARNING_REGEX, re.IGNORECASE)
@@ -71,6 +71,7 @@ class LogscanAnalyzer:
         self.current_kometa_version = None
         self.kometa_newest_version = None
         self.run_time = None
+        self.started_at = None
         self.finished_at = None
         self.plex_timeout = None
         self.checkfiles_flg = None
@@ -126,13 +127,13 @@ class LogscanAnalyzer:
             if divider_match:
                 divider = divider_match.group(1)
                 self.global_divider = divider
-                mylogger.info(f"Divider found and set to: {divider}")
+                mylogger.debug(f"Divider found and set to: {divider}")
                 return  # Exit the function once a divider is found
 
         # If no match is found for any pattern, keep existing divider or fallback
         if not getattr(self, "global_divider", None):
             self.global_divider = "="
-            mylogger.info(f"Divider not found, using default divider: {self.global_divider}")
+            mylogger.debug(f"Divider not found, using default divider: {self.global_divider}")
 
     def extract_memory_value(self, content):
         """
@@ -191,11 +192,11 @@ class LogscanAnalyzer:
             scheduled_run_time_match = re.search(pattern, content)
             if scheduled_run_time_match:
                 scheduled_run_time = scheduled_run_time_match.group(2)
-                mylogger.info(f"Scheduled run time found: {scheduled_run_time}")
+                mylogger.debug(f"Scheduled run time found: {scheduled_run_time}")
                 return scheduled_run_time
 
         # If no match is found
-        mylogger.info("Scheduled run time not found in content.")
+        mylogger.debug("Scheduled run time not found in content.")
         return None
 
     def extract_maintenance_times(self, content):
@@ -207,10 +208,10 @@ class LogscanAnalyzer:
         if maintenance_times_match:
             start_time = maintenance_times_match.group(1)
             end_time = maintenance_times_match.group(2)
-            mylogger.info(f"Scheduled maintenance times found: Start time: {start_time}, End time: {end_time}")
+            mylogger.debug(f"Scheduled maintenance times found: Start time: {start_time}, End time: {end_time}")
             return start_time, end_time
         else:
-            mylogger.info("Scheduled maintenance times not found in content.")
+            mylogger.debug("Scheduled maintenance times not found in content.")
             return None, None
 
     def contains_overlay_path(self, content):
@@ -461,7 +462,7 @@ class LogscanAnalyzer:
                     "url": url,
                     "etag": response.headers.get("ETag"),
                     "last_modified": response.headers.get("Last-Modified"),
-                    "fetched_at": datetime.utcnow().isoformat(),
+                    "fetched_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "content": response.text,
                 }
                 self._save_people_cache(cache_path, payload)
@@ -735,16 +736,21 @@ class LogscanAnalyzer:
     def _parse_run_time_from_line(self, line):
         if not line:
             return None
-        match = re.search(r"Run Time:\s*(\d+):(\d{1,2}):(\d{1,2})", line)
+        match = re.search(
+            r"Run Time:\s*(?:(\d+)\s+day(?:s)?(?:,\s*|\s+))?(\d+):(\d{1,2}):(\d{1,2})",
+            line,
+            re.IGNORECASE,
+        )
         if not match:
             return None
         try:
-            hours = int(match.group(1))
-            minutes = int(match.group(2))
-            seconds = int(match.group(3))
+            days = int(match.group(1) or 0)
+            hours = int(match.group(2))
+            minutes = int(match.group(3))
+            seconds = int(match.group(4))
         except ValueError:
             return None
-        return timedelta(hours=hours, minutes=minutes, seconds=seconds)
+        return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
 
     def extract_last_lines(self, content):
         lines = content.splitlines()
@@ -758,7 +764,9 @@ class LogscanAnalyzer:
                 continue
             if fallback_index is None:
                 fallback_index = idx
-            if "Finished:" in line or "Start Time:" in line or (idx > 0 and "Finished " in lines[idx - 1]):
+            previous_line = lines[idx - 1] if idx > 0 else ""
+            previous_is_finished_run = re.search(r"\bFinished\s+Run\b", previous_line, re.IGNORECASE)
+            if "Finished:" in line or "Start Time:" in line or previous_is_finished_run:
                 run_time_index = idx
                 run_time_is_final = True
                 break
@@ -775,6 +783,9 @@ class LogscanAnalyzer:
         parsed_run_time = self._parse_run_time_from_line(run_time_line)
         if parsed_run_time and run_time_is_final:
             self.run_time = parsed_run_time
+            start_match = re.search(r"Start Time:\s*(.*?)\s+Finished:", run_time_line)
+            if start_match:
+                self.started_at = start_match.group(1).strip()
             timestamp_match = re.search(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),", run_time_line)
             if timestamp_match:
                 self.finished_at = timestamp_match.group(1).strip()
@@ -1805,7 +1816,7 @@ class LogscanAnalyzer:
             # Split the message into lines and log the first line with a label
             lines = message.split("\n")
             first_line = lines[0] if lines else ""
-            mylogger.info(f"Kometa Recommendation {idx}: {first_line}")
+            mylogger.debug(f"Kometa Recommendation {idx}: {first_line}")
 
             # Append both the first line and the full recommendation message to the list
             recommendation_messages.append({"first_line": first_line, "message": message})
@@ -1953,11 +1964,6 @@ class LogscanAnalyzer:
         # Sort recommendations based on the custom key
         sorted_recommendations = sorted(recommendations, key=sort_key)
 
-        # Print or log the sorted recommendations for debugging
-        # mylogger.info("Sorted Recommendations:")
-        for rec in sorted_recommendations:
-            mylogger.info(rec.get("first_line", "No first line available"))
-
         return sorted_recommendations
 
     def extract_plex_config(self, content):
@@ -1970,7 +1976,7 @@ class LogscanAnalyzer:
         start_marker = "Plex Configuration"
         # end_markers = [" Scanning Metadata and", "Library Connection Failed"]
         end_markers = [" Scanning ", "Library Connection Failed"]
-        mylogger.info(f"extract_plex_config")
+        mylogger.debug("extract_plex_config")
 
         i = 0
         while i < len(lines):
@@ -1991,15 +1997,15 @@ class LogscanAnalyzer:
                         good_version = "1.40.3.8555-fef15d30c"
 
                         if stable_version < my_server_version < good_version:
-                            mylogger.info(
+                            mylogger.debug(
                                 f"Server Name: {my_server_name} has Version: {my_server_version}. Potential Rounding Issue because > {stable_version} and < {good_version}"
                             )
                             # Store the server version globally in a list
                             self.server_versions.append((my_server_name, my_server_version))
                         elif my_server_version >= good_version:
-                            mylogger.info(f"Server Name: {my_server_name} has Version: {my_server_version}. ALL GOOD")
+                            mylogger.debug(f"Server Name: {my_server_name} has Version: {my_server_version}. ALL GOOD")
                         else:
-                            mylogger.info(f"Server Name: {my_server_name} has Version: {my_server_version}. ALL GOOD")
+                            mylogger.debug(f"Server Name: {my_server_name} has Version: {my_server_version}. ALL GOOD")
 
             i += 1
 
@@ -2065,7 +2071,7 @@ class LogscanAnalyzer:
 
         # Log if server info extraction failed for all lines
         if not server_info:
-            mylogger.info("Failed to extract server info from config_section")
+            mylogger.debug("Failed to extract server info from config_section")
 
         return server_info, all_lines
 
@@ -2214,6 +2220,15 @@ class LogscanAnalyzer:
         if parsed:
             return parsed.strftime("%Y-%m-%d %H:%M:%S")
         return finished_at
+
+    def _normalize_started_at(self, started_at):
+        parsed = self._parse_finished_datetime(started_at)
+        now = datetime.now()
+        if parsed and parsed > now + timedelta(days=1):
+            parsed = None
+        if parsed:
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        return started_at
 
     def _parse_hms_to_seconds(self, value):
         if not value:
@@ -2381,7 +2396,7 @@ class LogscanAnalyzer:
             return "metadata"
         return None
 
-    def extract_progress(self, content, library_list=None, selected_libraries=None, previous=None, run_started_at=None):
+    def extract_progress(self, content, library_list=None, selected_libraries=None, previous=None, run_started_at=None, now_ts=None, is_running=False):
         library_entries = []
         if library_list:
             for entry in library_list:
@@ -2514,6 +2529,13 @@ class LogscanAnalyzer:
         lines = content.splitlines()
 
         effective_started_at = run_started_at
+        effective_now = now_ts
+        if effective_now is not None:
+            try:
+                if effective_now.tzinfo is not None:
+                    effective_now = effective_now.astimezone().replace(tzinfo=None)
+            except Exception:
+                effective_now = None
         if effective_started_at is None:
             marker_re = re.compile(r"\[Quickstart\]\s+Run marker:\s+started=([^\s]+)")
             for line in lines:
@@ -2643,7 +2665,7 @@ class LogscanAnalyzer:
             msg = raw_line.split("|", 1)[1].strip() if "|" in raw_line else raw_line.strip()
             msg = self._strip_divider_wrappers(msg)
 
-            if "kometa.py" in raw_line and playlists_header_re.match(msg):
+            if playlists_header_re.match(msg):
                 playlists_detected = True
                 playlist_running = True
                 if playlist_started_at is None and line_ts:
@@ -2652,7 +2674,7 @@ class LogscanAnalyzer:
                     processing_started_at = line_ts
                 continue
 
-            if "kometa.py" in raw_line and playlist_runtime_re.search(msg):
+            if playlist_runtime_re.search(msg):
                 playlists_detected = True
                 match = playlist_runtime_re.search(msg)
                 if match:
@@ -2661,7 +2683,7 @@ class LogscanAnalyzer:
                         playlist_total_seconds += int(seconds)
                 continue
 
-            if "kometa.py" in raw_line and playlist_finished_re.search(msg):
+            if playlist_finished_re.search(msg):
                 playlists_detected = True
                 if playlist_started_at is None and line_ts:
                     playlist_started_at = line_ts
@@ -2818,6 +2840,20 @@ class LogscanAnalyzer:
                 break
 
         section_runtimes = self.extract_section_runtimes(content)
+        # Fallback for playlist timing when runtime lines do not match the
+        # stricter live parser patterns (for example continuation lines).
+        if playlist_total_seconds <= 0 and isinstance(section_runtimes, dict):
+            playlist_runtime_total = 0
+            for section_name, seconds in section_runtimes.items():
+                if not isinstance(section_name, str):
+                    continue
+                if "playlist" not in section_name.lower():
+                    continue
+                if isinstance(seconds, (int, float)):
+                    playlist_runtime_total += int(seconds)
+            if playlist_runtime_total > 0:
+                playlist_total_seconds = playlist_runtime_total
+                playlists_detected = True
         phases_completed = []
         for section_name in section_runtimes.keys():
             phase = self._map_section_to_phase(section_name)
@@ -2901,15 +2937,16 @@ class LogscanAnalyzer:
                 _finish_phase(name, phase_key, last_ts)
 
         current_phase_elapsed = None
-        if current_library and last_ts:
+        live_reference_ts = effective_now if is_running and effective_now is not None else last_ts
+        if current_library and live_reference_ts:
             open_phase = phase_open.get(current_library)
             if open_phase:
                 start_ts = phase_start.get((current_library, open_phase))
                 if start_ts:
                     effective_start = start_ts
-                    if last_log_cutoff and start_ts < last_log_cutoff:
+                    if last_log_cutoff and start_ts < last_log_cutoff and live_reference_ts > last_log_cutoff:
                         effective_start = last_log_cutoff
-                    delta = max(0, int((last_ts - effective_start).total_seconds()))
+                    delta = max(0, int((live_reference_ts - effective_start).total_seconds()))
                     base = 0
                     if current_library in library_durations:
                         base = int(library_durations[current_library].get(open_phase, 0) or 0)
@@ -2922,15 +2959,17 @@ class LogscanAnalyzer:
                 preparation_locked = True
         elif not preparation_locked and preparation_seconds is None:
             prep_start = effective_started_at or first_log_ts
-            if prep_start and last_ts and last_ts > prep_start:
-                preparation_elapsed_seconds = max(0, int((last_ts - prep_start).total_seconds()))
+            prep_reference_ts = effective_now if is_running and effective_now is not None else last_ts
+            if prep_start and prep_reference_ts and prep_reference_ts > prep_start:
+                preparation_elapsed_seconds = max(0, int((prep_reference_ts - prep_start).total_seconds()))
 
         playlist_elapsed_seconds = None
-        if playlist_running and last_ts and playlist_started_at:
+        playlist_reference_ts = effective_now if is_running and effective_now is not None else last_ts
+        if playlist_running and playlist_reference_ts and playlist_started_at:
             effective_start = playlist_started_at
-            if last_log_cutoff and playlist_started_at < last_log_cutoff:
+            if last_log_cutoff and playlist_started_at < last_log_cutoff and playlist_reference_ts > last_log_cutoff:
                 effective_start = last_log_cutoff
-            delta = max(0, int((last_ts - effective_start).total_seconds()))
+            delta = max(0, int((playlist_reference_ts - effective_start).total_seconds()))
             playlist_elapsed_seconds = playlist_total_seconds + delta
 
         if finished_run_seen:
@@ -3010,6 +3049,292 @@ class LogscanAnalyzer:
             return None
         match = re.search(r"\[Quickstart\]\s+Run marker:.*", content)
         return match.group(0) if match else None
+
+    def extract_quickstart_marker_fields(self, content):
+        marker = self.extract_quickstart_marker(content)
+        if not marker:
+            return {}
+        fields = {}
+        for match in re.finditer(r"(\w+)=([^\s]+)", marker):
+            key = str(match.group(1) or "").strip().lower()
+            value = str(match.group(2) or "").strip()
+            if key:
+                fields[key] = value
+        start_mode = str(fields.get("start_mode") or "").strip().lower()
+        if start_mode not in {"current", "recovery", "logged"}:
+            fields["start_mode"] = ""
+        else:
+            fields["start_mode"] = start_mode
+        return fields
+
+    def extract_quickstart_marker_capabilities(self, content):
+        capabilities = {"maintenance_markers": False}
+        marker = self.extract_quickstart_marker(content)
+        if not marker:
+            return capabilities
+        if re.search(r"\bmaintenance_markers=1\b", marker):
+            capabilities["maintenance_markers"] = True
+        return capabilities
+
+    def _parse_log_timestamp(self, line):
+        if not line or not line.startswith("["):
+            return None
+        match = re.match(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d{3}\]", line)
+        if not match:
+            return None
+        try:
+            return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+    def extract_maintenance_summary(self, content):
+        summary = {
+            "had_pause": False,
+            "pause_count": 0,
+            "pause_seconds": 0,
+            "open_pause": False,
+            "window": None,
+            "events": [],
+        }
+        if not content:
+            return summary
+
+        marker_re = re.compile(
+            r"\[Quickstart\]\s+Maintenance marker:\s+event=(paused|resumed)\s+at=([^\s]+)" r"(?:\s+local_at=([^\s]+))?(?:\s+window=([^\s]+))?(?:\s+paused_seconds=(\d+))?",
+            re.IGNORECASE,
+        )
+        open_pause_at = None
+        open_pause_window = None
+        open_pause_local_at = None
+
+        for line in content.splitlines():
+            match = marker_re.search(line)
+            if not match:
+                continue
+            event = str(match.group(1) or "").strip().lower()
+            raw_ts = str(match.group(2) or "").strip()
+            local_at = str(match.group(3) or "").strip() or None
+            window = str(match.group(4) or "").strip() or None
+            paused_seconds_raw = match.group(5)
+            event_ts = None
+            try:
+                event_ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                if event_ts.tzinfo is not None:
+                    event_ts = event_ts.astimezone(timezone.utc)
+            except Exception:
+                event_ts = None
+            paused_seconds = None
+            if paused_seconds_raw is not None:
+                try:
+                    paused_seconds = max(0, int(paused_seconds_raw))
+                except Exception:
+                    paused_seconds = None
+
+            summary["events"].append(
+                {
+                    "event": event,
+                    "at": raw_ts,
+                    "local_at": local_at,
+                    "window": window,
+                    "paused_seconds": paused_seconds,
+                }
+            )
+            if window:
+                summary["window"] = window
+
+            if event == "paused":
+                summary["had_pause"] = True
+                summary["pause_count"] += 1
+                open_pause_at = event_ts
+                open_pause_window = window
+                open_pause_local_at = local_at
+                continue
+
+            if event == "resumed":
+                summary["had_pause"] = True
+                if paused_seconds is None and open_pause_at and event_ts:
+                    try:
+                        paused_seconds = max(0, int((event_ts - open_pause_at).total_seconds()))
+                    except Exception:
+                        paused_seconds = None
+                if paused_seconds is not None:
+                    summary["pause_seconds"] += paused_seconds
+                open_pause_at = None
+                open_pause_window = None
+                open_pause_local_at = None
+
+        if open_pause_at is not None:
+            summary["open_pause"] = True
+            summary["had_pause"] = True
+            if not summary["window"] and open_pause_window:
+                summary["window"] = open_pause_window
+            if summary["events"] and not summary["events"][-1].get("local_at") and open_pause_local_at:
+                summary["events"][-1]["local_at"] = open_pause_local_at
+
+        return summary
+
+    def extract_quiet_period_summary(self, content, maintenance_summary=None):
+        summary = {
+            "longest_gap_seconds": 0,
+            "longest_gap_started_at": None,
+            "longest_gap_ended_at": None,
+            "longest_gap_start_line": None,
+            "longest_gap_end_line": None,
+            "longest_gap_last_line": None,
+            "longest_gap_first_line": None,
+            "gaps_over_300": 0,
+            "gaps_over_900": 0,
+            "gaps_over_1800": 0,
+            "longest_gap_maintenance_overlap": "unknown",
+            "longest_unexplained_gap_seconds": 0,
+            "longest_unexplained_gap_started_at": None,
+            "longest_unexplained_gap_ended_at": None,
+            "longest_unexplained_gap_start_line": None,
+            "longest_unexplained_gap_end_line": None,
+            "longest_unexplained_gap_last_line": None,
+            "longest_unexplained_gap_first_line": None,
+            "longest_unexplained_gap_maintenance_overlap": "unknown",
+            "confirmed_maintenance_gaps_over_300": 0,
+            "unexplained_gaps_over_300": 0,
+            "notable_gaps": [],
+        }
+        if not content:
+            return summary
+
+        capabilities = self.extract_quickstart_marker_capabilities(content)
+        maintenance_supported = bool(capabilities.get("maintenance_markers"))
+        timestamp_entries = []
+        for line_number, line in enumerate(content.splitlines(), start=1):
+            line_ts = self._parse_log_timestamp(line)
+            if line_ts is not None:
+                timestamp_entries.append(
+                    {
+                        "timestamp": line_ts,
+                        "line_number": line_number,
+                        "line": line.strip(),
+                    }
+                )
+        if len(timestamp_entries) < 2:
+            if maintenance_supported:
+                summary["longest_gap_maintenance_overlap"] = "none"
+            return summary
+
+        maintenance_summary = maintenance_summary if isinstance(maintenance_summary, dict) else {}
+        maintenance_intervals = []
+        open_start = None
+        for event in maintenance_summary.get("events") or []:
+            if not isinstance(event, dict):
+                continue
+            local_at = str(event.get("local_at") or "").strip()
+            event_name = str(event.get("event") or "").strip().lower()
+            event_ts = None
+            if local_at:
+                try:
+                    event_ts = datetime.fromisoformat(local_at)
+                except Exception:
+                    event_ts = None
+            if event_ts is None:
+                continue
+            if event_name == "paused":
+                open_start = event_ts
+            elif event_name == "resumed" and open_start is not None:
+                maintenance_intervals.append((open_start, event_ts))
+                open_start = None
+        if open_start is not None:
+            maintenance_intervals.append((open_start, None))
+
+        def _get_gap_overlap(start_ts, end_ts):
+            overlap = False
+            for interval_start, interval_end in maintenance_intervals:
+                if interval_end is None:
+                    if end_ts > interval_start:
+                        overlap = True
+                        break
+                    continue
+                if start_ts < interval_end and end_ts > interval_start:
+                    overlap = True
+                    break
+            if overlap:
+                return "confirmed"
+            if maintenance_supported:
+                return "none"
+            return "unknown"
+
+        longest_start = None
+        longest_end = None
+        longest_previous_entry = None
+        longest_current_entry = None
+        longest_unexplained_start = None
+        longest_unexplained_end = None
+        longest_unexplained_previous_entry = None
+        longest_unexplained_current_entry = None
+        for previous_entry, current_entry in zip(timestamp_entries, timestamp_entries[1:]):
+            previous_ts = previous_entry["timestamp"]
+            current_ts = current_entry["timestamp"]
+            gap_seconds = max(0, int((current_ts - previous_ts).total_seconds()))
+            if gap_seconds <= 0:
+                continue
+            if gap_seconds >= 300:
+                summary["gaps_over_300"] += 1
+            if gap_seconds >= 900:
+                summary["gaps_over_900"] += 1
+            if gap_seconds >= 1800:
+                summary["gaps_over_1800"] += 1
+            overlap_label = _get_gap_overlap(previous_ts, current_ts)
+            gap_detail = {
+                "gap_seconds": gap_seconds,
+                "started_at": previous_ts.isoformat(),
+                "ended_at": current_ts.isoformat(),
+                "start_line": previous_entry.get("line_number"),
+                "end_line": current_entry.get("line_number"),
+                "last_line": previous_entry.get("line"),
+                "first_line": current_entry.get("line"),
+                "maintenance_overlap": overlap_label,
+            }
+            if gap_seconds >= 300:
+                summary["notable_gaps"].append(gap_detail)
+                if overlap_label == "confirmed":
+                    summary["confirmed_maintenance_gaps_over_300"] += 1
+                else:
+                    summary["unexplained_gaps_over_300"] += 1
+            if gap_seconds > summary["longest_gap_seconds"]:
+                summary["longest_gap_seconds"] = gap_seconds
+                longest_start = previous_ts
+                longest_end = current_ts
+                longest_previous_entry = previous_entry
+                longest_current_entry = current_entry
+            if overlap_label != "confirmed" and gap_seconds > summary["longest_unexplained_gap_seconds"]:
+                summary["longest_unexplained_gap_seconds"] = gap_seconds
+                longest_unexplained_start = previous_ts
+                longest_unexplained_end = current_ts
+                longest_unexplained_previous_entry = previous_entry
+                longest_unexplained_current_entry = current_entry
+
+        if longest_start is not None and longest_end is not None:
+            summary["longest_gap_started_at"] = longest_start.isoformat()
+            summary["longest_gap_ended_at"] = longest_end.isoformat()
+            if longest_previous_entry:
+                summary["longest_gap_start_line"] = longest_previous_entry.get("line_number")
+                summary["longest_gap_last_line"] = longest_previous_entry.get("line")
+            if longest_current_entry:
+                summary["longest_gap_end_line"] = longest_current_entry.get("line_number")
+                summary["longest_gap_first_line"] = longest_current_entry.get("line")
+            summary["longest_gap_maintenance_overlap"] = _get_gap_overlap(longest_start, longest_end)
+
+        if longest_unexplained_start is not None and longest_unexplained_end is not None:
+            summary["longest_unexplained_gap_started_at"] = longest_unexplained_start.isoformat()
+            summary["longest_unexplained_gap_ended_at"] = longest_unexplained_end.isoformat()
+            if longest_unexplained_previous_entry:
+                summary["longest_unexplained_gap_start_line"] = longest_unexplained_previous_entry.get("line_number")
+                summary["longest_unexplained_gap_last_line"] = longest_unexplained_previous_entry.get("line")
+            if longest_unexplained_current_entry:
+                summary["longest_unexplained_gap_end_line"] = longest_unexplained_current_entry.get("line_number")
+                summary["longest_unexplained_gap_first_line"] = longest_unexplained_current_entry.get("line")
+            summary["longest_unexplained_gap_maintenance_overlap"] = _get_gap_overlap(longest_unexplained_start, longest_unexplained_end)
+        elif maintenance_supported and summary["longest_gap_seconds"] > 0:
+            summary["longest_unexplained_gap_maintenance_overlap"] = "none"
+
+        return summary
 
     def extract_config_line_count(self, content):
         if not content:
@@ -3164,6 +3489,7 @@ class LogscanAnalyzer:
         command_signature=None,
         section_runtimes=None,
     ):
+        started_at = self._normalize_started_at(self.started_at)
         finished_at = self.finished_at
         if not finished_at and finished_runs:
             last_run = finished_runs[-1]
@@ -3211,6 +3537,7 @@ class LogscanAnalyzer:
 
         return {
             "run_key": run_key,
+            "started_at": started_at,
             "finished_at": finished_at,
             "run_time_seconds": run_time_seconds,
             "run_complete": run_complete,
@@ -3226,13 +3553,14 @@ class LogscanAnalyzer:
             "log_mtime": log_mtime,
             "log_size": log_size,
             "log_counts": counts,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
 
     def analyze_content(self, content, log_path=None, config_name=None, config_path=None, include_people_scan=True):
         self.reset_server_versions()
         self.checkfiles_flg = None
         self.run_time = None
+        self.started_at = None
         self.finished_at = None
         self.plex_timeout = None
         self.current_kometa_version = None
@@ -3264,9 +3592,12 @@ class LogscanAnalyzer:
 
         analysis_counts = self.extract_analyze_issue_counts(cleaned_content)
         quickstart_marker = self.extract_quickstart_marker(raw_content)
+        quickstart_marker_fields = self.extract_quickstart_marker_fields(raw_content)
         config_line_count = self.extract_config_line_count(raw_content)
         cache_line_count = sum(1 for line in raw_content.splitlines() if "from Cache" in line)
         library_counts = self.extract_library_counts(cleaned_content)
+        maintenance_summary = self.extract_maintenance_summary(raw_content)
+        quiet_period_summary = self.extract_quiet_period_summary(raw_content, maintenance_summary=maintenance_summary)
 
         missing_people = []
         missing_people_message = None
@@ -3306,7 +3637,10 @@ class LogscanAnalyzer:
         if summary:
             summary["analysis_counts"] = analysis_counts
             summary["quickstart_run_marker"] = bool(quickstart_marker)
+            summary["start_mode"] = quickstart_marker_fields.get("start_mode") or None
             summary["library_counts"] = library_counts
+            summary["maintenance_summary"] = maintenance_summary
+            summary["quiet_period_summary"] = quiet_period_summary
             summary["config_line_count"] = config_line_count
             summary["cache_line_count"] = cache_line_count
         if summary and not summary.get("run_complete"):

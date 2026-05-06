@@ -1,5 +1,6 @@
 <!DOCTYPE html>
-<html lang="en" data-bs-theme="dark" data-theme="{{ config.get('QS_THEME', 'kometa') }}">
+<html lang="en" data-bs-theme="dark" data-theme="{{ config.get('QS_THEME', 'kometa') }}"
+  data-qs-template="{{ page_info.get('template_name', '') if page_info else '' }}">
 
 <head>
   <meta charset="UTF-8" />
@@ -52,44 +53,38 @@
     window.QS_OPTIMIZE_DEFAULTS = "{{ 'true' if config.get('QS_OPTIMIZE_DEFAULTS', True) else 'false' }}";
     window.QS_CONFIG_HISTORY = "{{ config.get('QS_CONFIG_HISTORY', 0) }}";
     window.QS_KOMETA_LOG_KEEP = "{{ config.get('QS_KOMETA_LOG_KEEP', 0) }}";
+    window.QS_IMAGEMAID_LOG_KEEP = "{{ config.get('QS_IMAGEMAID_LOG_KEEP', 0) }}";
     window.QS_TEST_LIBS_PATH = {{ config.get('QS_TEST_LIBS_PATH', '') | tojson }};
     window.QS_TEST_LIBS_TMP = {{ config.get('QS_TEST_LIBS_TMP', '') | tojson }};
     window.QS_SESSION_LIFETIME_DAYS = "{{ config.get('QS_SESSION_LIFETIME_DAYS', 30) }}";
     window.QS_FLASK_SESSION_DIR = {{ config.get('QS_FLASK_SESSION_DIR', '') | tojson }};
     window.QS_RESTART_NOTICE = {{ config.get('QS_RESTART_NOTICE') | tojson }};
+    window.QS_CURRENT_TEMPLATE = {{ (page_info.get('template_name', '') if page_info else '') | tojson }};
+    window.QS_REQUIRED_KEYS = {{ (required_keys if required_keys is defined else []) | tojson }};
+    window.QS_OPTIONAL_KEYS = {{ (optional_keys if optional_keys is defined else []) | tojson }};
+    window.QS_REVIEW_KEYS = {{ (review_keys if review_keys is defined else []) | tojson }};
+    window.QS_TAUTULLI_REQUIREMENT_REASONS = {{ (tautulli_requirement_reasons if tautulli_requirement_reasons is defined else []) | tojson }};
+    window.QS_OMDB_REQUIREMENT_REASONS = {{ (omdb_requirement_reasons if omdb_requirement_reasons is defined else []) | tojson }};
+    window.QS_MDBLIST_REQUIREMENT_REASONS = {{ (mdblist_requirement_reasons if mdblist_requirement_reasons is defined else []) | tojson }};
+    window.QS_ANIDB_REQUIREMENT_REASONS = {{ (anidb_requirement_reasons if anidb_requirement_reasons is defined else []) | tojson }};
+    window.QS_RADARR_REQUIREMENT_REASONS = {{ (radarr_requirement_reasons if radarr_requirement_reasons is defined else []) | tojson }};
+    window.QS_SONARR_REQUIREMENT_REASONS = {{ (sonarr_requirement_reasons if sonarr_requirement_reasons is defined else []) | tojson }};
+    window.QS_TRAKT_REQUIREMENT_REASONS = {{ (trakt_requirement_reasons if trakt_requirement_reasons is defined else []) | tojson }};
+    window.QS_MAL_REQUIREMENT_REASONS = {{ (mal_requirement_reasons if mal_requirement_reasons is defined else []) | tojson }};
   </script>
   <script type="text/javascript" src="{{ url_for('static', filename='local-js/000-base.js') }}"></script>
   <script type="text/javascript" src="{{ url_for('static', filename='local-js/pathValidation.js') }}"></script>
   <script type="text/javascript" src="{{ url_for('static', filename='local-js/urlValidation.js') }}"></script>
   <div class="header-container text-center">
     <img src="{{ url_for('static', filename='images/logo.webp') }}" alt="QUICKSTART" class="header-image" />
-    <div id="qs-running-badge" class="d-none mt-2">
-      <span class="badge rounded-pill text-bg-success px-3 py-2">
-        <i class="bi bi-play-circle me-1"></i> Kometa running
-      </span>
-    </div>
-    <div id="qs-maintenance-badge" class="d-none mt-2">
-      <span class="badge rounded-pill text-bg-warning text-dark px-3 py-2">
-        <i class="bi bi-pause-circle me-1"></i> Kometa paused for Plex maintenance
-      </span>
-    </div>
-    <div id="qs-maintenance-unavailable-badge" class="d-none mt-2">
-      <span class="badge rounded-pill text-bg-warning text-dark px-3 py-2">
-        <i class="bi bi-exclamation-triangle me-1"></i> Plex maintenance window unavailable
-      </span>
-    </div>
-    <div id="qs-queued-badge" class="d-none mt-2">
-      <span class="badge rounded-pill text-bg-info text-dark px-3 py-2">
-        <i class="bi bi-hourglass-split me-1"></i> Kometa start queued
-      </span>
-    </div>
   </div>
 
-  <div class="container">
-    <div class="content-wrapper">
+  <div class="qs-page-shell">
+    <div class="qs-page-container">
+      <div class="content-wrapper qs-content-wrapper">
       <!-- New Version Available Message for user-->
       {% if version_info and version_info.update_available %}
-      <div class="alert alert-danger text-center" role="alert" style="max-width: 900px; margin: 0 auto;">
+      <div class="alert alert-danger text-center qs-wide-alert" id="quickstart-update-alert" data-qs-update-alert role="alert">
         <i class="bi bi-arrow-up-circle"></i>
         A new version of Quickstart (<strong>{{ version_info.remote_version }}</strong>) is available!
 
@@ -128,10 +123,10 @@
         </a>
         {% endif %}
       </div>
-      <br>
+      <br data-qs-update-alert-spacer>
       {% endif %}
       <!-- Early Development Warning -->
-      <div class="alert alert-warning text-center early-warning" role="alert" style="max-width: 900px; margin: 0 auto;">
+      <div class="alert alert-warning text-center early-warning qs-wide-alert" data-qs-update-alert-anchor role="alert">
         <b>Quickstart is in early development.</b> Please provide feedback via the
         <a href="https://discord.com/channels/822460010649878528/1335372922306695198"
           target="_blank">quickstart-feedback Discord channel.</a>
@@ -139,11 +134,16 @@
       <hr class="hr page-top-divider">
 
       {% block content %}{% endblock %}
+      </div>
     </div>
   </div>
 
   <script type="text/javascript"
+    src="{{ url_for('static', filename='local-js/001-start.js') }}"></script>
+  {% if page_info['template_name'] != '001-start' %}
+  <script type="text/javascript"
     src="{{ url_for('static', filename='local-js/' + page_info['template_name'] + '.js') }}"></script>
+  {% endif %}
 
   <!-- Footer -->
   <footer class="footer bg-dark text-light py-3">

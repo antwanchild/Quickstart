@@ -3,6 +3,7 @@ import os
 import secrets
 import json
 import datetime
+import copy
 
 from flask import current_app as app
 from flask import session
@@ -12,6 +13,32 @@ from urllib.parse import urlparse
 from werkzeug.datastructures import MultiDict
 
 from modules import database, helpers, iso, url_validation
+
+_ISO_639_1_LANGUAGES = None
+_ISO_3166_1_REGIONS = None
+_ISO_639_2_LANGUAGES = None
+_DUMMY_CONFIG_CACHE = None
+
+TRANSIENT_FORM_FIELDS = {
+    "configSelector",
+    "config_name",
+    "newConfigName",
+    "importMode",
+}
+
+
+def _get_iso_reference_lists():
+    global _ISO_639_1_LANGUAGES
+    global _ISO_3166_1_REGIONS
+    global _ISO_639_2_LANGUAGES
+
+    if _ISO_639_1_LANGUAGES is None:
+        _ISO_639_1_LANGUAGES = [(la.alpha2, la.name) for la in iso.languages]
+    if _ISO_3166_1_REGIONS is None:
+        _ISO_3166_1_REGIONS = [(c.alpha2, c.name) for c in iso.countries]
+    if _ISO_639_2_LANGUAGES is None:
+        _ISO_639_2_LANGUAGES = [(la.alpha3, la.name) for la in iso.languages]
+    return _ISO_639_1_LANGUAGES, _ISO_3166_1_REGIONS, _ISO_639_2_LANGUAGES
 
 
 def extract_names(raw_source):
@@ -55,6 +82,8 @@ def clean_form_data(form_data):
     clean_data = {}
 
     for key, value in form_data.items():
+        if key in TRANSIENT_FORM_FIELDS:
+            continue
         # Handle asset_directory as a list
         if key == "asset_directory" or key.endswith("-attribute_asset_directory"):
             if isinstance(value, list):
@@ -211,8 +240,8 @@ def save_settings(raw_source, form_data):
 
             # Apply incoming values for the affected libraries
             for k, v in incoming_libraries.items():
-                # Treat empty include toggle as removal
-                if k.endswith("-library") and (v in [None, False, ""]):
+                # Treat empty include/playlist toggles as removal
+                if (k.endswith("-library") or k.endswith("-playlist")) and (v in [None, False, "", "false"]):
                     continue
                 merged_libraries[k] = v
 
@@ -244,7 +273,7 @@ def save_settings(raw_source, form_data):
             except Exception:
                 existing_validated_at = None
         if helpers.booler(data.get("validated")) and not existing_validated_at:
-            data["validated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+            data["validated_at"] = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
         elif existing_validated_at and "validated_at" not in data:
             data["validated_at"] = existing_validated_at
 
@@ -260,7 +289,7 @@ def save_settings(raw_source, form_data):
             data["validated"] = user_entered
     validated = data.get("validated", False)
     if source_name == "anidb" and validated and not data.get("validated_at"):
-        data["validated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        data["validated_at"] = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
     # Save to DB
     database.save_section_data(
@@ -278,8 +307,13 @@ def save_settings(raw_source, form_data):
 def get_stored_plex_credentials(name):
     """Retrieve stored Plex URL & token from the database."""
     try:
-        settings = retrieve_settings(name)  # Fetch full settings
-        plex_settings = settings.get("plex", {})  # Extract nested 'plex' dictionary
+        ensure_session_config_name()
+        source, source_name = extract_names(name)
+        db_data = database.retrieve_section_data(name=session["config_name"], section=source_name)
+        payload = db_data[2] if isinstance(db_data, tuple) and len(db_data) >= 3 and isinstance(db_data[2], dict) else {}
+        plex_settings = payload.get("plex", {})
+        if not plex_settings:
+            plex_settings = get_dummy_data("plex")
         plex_url = plex_settings.get("url")  # Correct key inside 'plex'
         plex_token = plex_settings.get("token")  # Correct key inside 'plex'
 
@@ -293,8 +327,8 @@ def get_stored_plex_credentials(name):
     return None, None
 
 
-def update_stored_plex_libraries(name, movie_libraries, show_libraries, music_libraries):
-    """Update the stored Plex libraries in the database and preserve `validated`."""
+def update_stored_plex_libraries(name, movie_libraries, show_libraries, music_libraries, user_list=None):
+    """Update stored Plex cache fields in the database and preserve `validated`."""
     try:
         # Fetch existing settings from DB before updating
         settings_before = retrieve_settings(name)
@@ -312,6 +346,9 @@ def update_stored_plex_libraries(name, movie_libraries, show_libraries, music_li
         settings_before["plex"]["tmp_movie_libraries"] = ",".join(movie_libraries) if movie_libraries else ""
         settings_before["plex"]["tmp_show_libraries"] = ",".join(show_libraries) if show_libraries else ""
         settings_before["plex"]["tmp_music_libraries"] = ",".join(music_libraries) if music_libraries else ""
+        if user_list is not None:
+            cleaned_users = [str(user).strip() for user in user_list if str(user).strip()]
+            settings_before["plex"]["tmp_user_list"] = ",".join(cleaned_users)
 
         # Convert to a format that `save_settings()` expects
         settings_formatted = settings_before["plex"]  # Pass only the `plex` section
@@ -392,9 +429,10 @@ def retrieve_settings(target):
                 data[source_name][prefix][variable] = data[source_name].pop(key)
 
     data["code_verifier"] = secrets.token_urlsafe(100)[:128]
-    data["iso_639_1_languages"] = [(la.alpha2, la.name) for la in iso.languages]
-    data["iso_3166_1_regions"] = [(c.alpha2, c.name) for c in iso.countries]
-    data["iso_639_2_languages"] = [(la.alpha3, la.name) for la in iso.languages]
+    iso_639_1_languages, iso_3166_1_regions, iso_639_2_languages = _get_iso_reference_lists()
+    data["iso_639_1_languages"] = iso_639_1_languages
+    data["iso_3166_1_regions"] = iso_3166_1_regions
+    data["iso_639_2_languages"] = iso_639_2_languages
 
     return data
 
@@ -420,19 +458,21 @@ def get_dummy_data(target):
     Load dummy data from config.yml.template while handling duplicate keys gracefully.
     """
 
-    yaml = YAML(typ="safe", pure=True)  # Safe loading mode
+    global _DUMMY_CONFIG_CACHE
 
-    helpers.ensure_json_schema()
+    if _DUMMY_CONFIG_CACHE is None:
+        yaml = YAML(typ="safe", pure=True)  # Safe loading mode
+        helpers.ensure_json_schema()
 
-    try:
-        with open(os.path.join(helpers.JSON_SCHEMA_DIR, "config.yml.template"), "r") as file:
-            base_config = yaml.load(file)
-    except DuplicateKeyError as e:
-        helpers.ts_log(f"Duplicate key detected in config.yml.template: {e}", level="WARNING")
-        return {}  # Return empty data instead of crashing
+        try:
+            with open(os.path.join(helpers.JSON_SCHEMA_DIR, "config.yml.template"), "r") as file:
+                _DUMMY_CONFIG_CACHE = yaml.load(file) or {}
+        except DuplicateKeyError as e:
+            helpers.ts_log(f"Duplicate key detected in config.yml.template: {e}", level="WARNING")
+            _DUMMY_CONFIG_CACHE = {}
 
-    # Safely retrieve target data
-    return base_config.get(target, {})
+    # Return a copy so callers can mutate safely without mutating cache
+    return copy.deepcopy(_DUMMY_CONFIG_CACHE.get(target, {}))
 
 
 def check_minimum_settings():

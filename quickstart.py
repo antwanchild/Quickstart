@@ -1,4 +1,5 @@
 import argparse
+import gzip
 import io
 import json
 import os
@@ -43,6 +44,7 @@ from flask import (
     send_file,
     send_from_directory,
     abort,
+    has_request_context,
 )
 from waitress import serve
 from ruamel.yaml import YAML
@@ -57,9 +59,62 @@ from flask_session import Session
 from modules import validations, output, persistence, helpers, database, logscan, importer, path_validation, url_validation
 from typing import Dict, Any
 
-# A very simple in-memory progress store
-CLONE_PROGRESS: Dict[str, Dict[str, Any]] = {}
-ACTIVE_TEST_LIB_JOB: Dict[str, Any] = {}
+# Shared in-memory background job store
+BACKGROUND_JOBS: Dict[str, Dict[str, Any]] = {}
+ACTIVE_BACKGROUND_JOBS: Dict[str, str] = {}
+BACKGROUND_JOBS_LOCK = threading.Lock()
+JOB_TARGET_PAGES = {
+    "logscan_reingest": "/logscan-trends",
+    "kometa_update": "/step/900-kometa",
+    "test_library_install": "/step/001-start",
+    "imagemaid_update": "/step/915-imagemaid",
+}
+ACTIVE_WORK_POLICIES = {
+    "kometa_run": [
+        {
+            "kind": "process",
+            "id": "imagemaid_run",
+            "message": "Cannot start Kometa while ImageMaid is running.",
+            "target_page": JOB_TARGET_PAGES.get("imagemaid_update"),
+        },
+        {
+            "kind": "job",
+            "id": "kometa_update",
+            "message": "Cannot start Kometa while a Kometa update is running.",
+            "target_page": JOB_TARGET_PAGES.get("kometa_update"),
+        },
+    ],
+    "kometa_update": [
+        {
+            "kind": "process",
+            "id": "kometa_run",
+            "message": "Cannot update Kometa while Kometa is running.",
+            "target_page": JOB_TARGET_PAGES.get("kometa_update"),
+        }
+    ],
+    "imagemaid_run": [
+        {
+            "kind": "process",
+            "id": "kometa_run",
+            "message": "Cannot start ImageMaid while Kometa is running.",
+            "target_page": JOB_TARGET_PAGES.get("kometa_update"),
+        },
+        {
+            "kind": "job",
+            "id": "imagemaid_update",
+            "message": "Cannot start ImageMaid while an ImageMaid update is running.",
+            "target_page": JOB_TARGET_PAGES.get("imagemaid_update"),
+        },
+    ],
+    "imagemaid_update": [
+        {
+            "kind": "process",
+            "id": "imagemaid_run",
+            "message": "Cannot update ImageMaid while ImageMaid is running.",
+            "target_page": JOB_TARGET_PAGES.get("imagemaid_update"),
+        }
+    ],
+}
 LOG_STATS_CACHE = {"mtime": None, "size": None, "stats": None}
 LOGSCAN_ANALYSIS_CACHE = {"mtime": None, "size": None, "data": None}
 LOGSCAN_PROGRESS_CACHE = {"mtime": None, "size": None, "data": None}
@@ -76,11 +131,12 @@ MAINTENANCE_STATE = {
 }
 MAINTENANCE_STATE_LOCK = threading.Lock()
 MAINTENANCE_GUARD_INTERVAL = 45
-PENDING_KOMETA_START = {"command": None, "config_name": None, "requested_at": None}
+IMAGEMAID_STARTUP_GRACE_SECONDS = 10
+PENDING_KOMETA_START = {"command": None, "config_name": None, "requested_at": None, "start_mode": "current"}
 PENDING_KOMETA_START_LOCK = threading.Lock()
 
 VALIDATION_DOC_BASE = "/step/"
-VALIDATION_DOC_FALLBACK = "/step/900-final"
+VALIDATION_DOC_FALLBACK = "/step/900-kometa"
 VALIDATION_DOCS = {
     "settings": f"{VALIDATION_DOC_BASE}150-settings",
     "libraries": f"{VALIDATION_DOC_BASE}025-libraries",
@@ -108,6 +164,7 @@ VALIDATION_REASON_LABELS = {
     "missing_plex_validation": "Plex not validated",
     "no_libraries": "No libraries selected",
     "invalid_paths": "Invalid paths",
+    "missing_library_defaults": "Missing library defaults",
     "missing_placeholder_imdb": "Missing placeholder IMDb ID",
     "invalid_fields": "Invalid fields",
     "no_webhooks": "No webhooks configured",
@@ -118,11 +175,262 @@ VALIDATION_REASON_LABELS = {
     "account_locked": "Account locked",
     "validation_error": "Validation error",
 }
+
+
+def _copy_background_job(job):
+    if not isinstance(job, dict):
+        return None
+    copied = dict(job)
+    if isinstance(copied.get("summary"), dict):
+        copied["summary"] = dict(copied["summary"])
+    if isinstance(copied.get("meta"), dict):
+        copied["meta"] = dict(copied["meta"])
+    if isinstance(copied.get("logs"), list):
+        copied["logs"] = list(copied["logs"])
+    return copied
+
+
+def _create_background_job(job_type, job_id=None, trigger="manual", phase="queued", status="running", target_page=None, **extra):
+    normalized_type = str(job_type or "").strip()
+    if not normalized_type:
+        raise ValueError("job_type is required")
+    normalized_job_id = str(job_id or uuid.uuid4()).strip()
+    payload = {
+        "job_id": normalized_job_id,
+        "job_type": normalized_type,
+        "trigger": str(trigger or "manual").strip() or "manual",
+        "status": str(status or "running").strip() or "running",
+        "phase": str(phase or "").strip() or None,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "target_page": target_page or JOB_TARGET_PAGES.get(normalized_type),
+        "summary": {},
+        "meta": {},
+    }
+    payload.update(extra)
+    with BACKGROUND_JOBS_LOCK:
+        BACKGROUND_JOBS[normalized_job_id] = payload
+        if payload["status"] in {"queued", "running"}:
+            ACTIVE_BACKGROUND_JOBS[normalized_type] = normalized_job_id
+    return _copy_background_job(payload)
+
+
+def _get_background_job(job_id):
+    normalized_job_id = str(job_id or "").strip()
+    if not normalized_job_id:
+        return None
+    with BACKGROUND_JOBS_LOCK:
+        payload = BACKGROUND_JOBS.get(normalized_job_id)
+        return _copy_background_job(payload)
+
+
+def _get_active_background_job(job_type):
+    normalized_type = str(job_type or "").strip()
+    if not normalized_type:
+        return None
+    with BACKGROUND_JOBS_LOCK:
+        job_id = ACTIVE_BACKGROUND_JOBS.get(normalized_type)
+        payload = BACKGROUND_JOBS.get(job_id) if job_id else None
+        return _copy_background_job(payload)
+
+
+def _get_active_background_jobs():
+    with BACKGROUND_JOBS_LOCK:
+        jobs = []
+        for job_id in ACTIVE_BACKGROUND_JOBS.values():
+            payload = BACKGROUND_JOBS.get(job_id)
+            if payload:
+                jobs.append(_copy_background_job(payload))
+        return jobs
+
+
+def _update_background_job(job_id, **updates):
+    normalized_job_id = str(job_id or "").strip()
+    if not normalized_job_id:
+        return None
+    with BACKGROUND_JOBS_LOCK:
+        payload = BACKGROUND_JOBS.get(normalized_job_id)
+        if not payload:
+            return None
+        payload.update(updates)
+        job_type = payload.get("job_type")
+        status = str(payload.get("status") or "").strip().lower()
+        if job_type:
+            if status in {"queued", "running"}:
+                ACTIVE_BACKGROUND_JOBS[job_type] = normalized_job_id
+            elif ACTIVE_BACKGROUND_JOBS.get(job_type) == normalized_job_id:
+                ACTIVE_BACKGROUND_JOBS.pop(job_type, None)
+        return _copy_background_job(payload)
+
+
+def _clear_active_background_job(job_type, job_id=None):
+    normalized_type = str(job_type or "").strip()
+    normalized_job_id = str(job_id or "").strip() or None
+    if not normalized_type:
+        return
+    with BACKGROUND_JOBS_LOCK:
+        active_job_id = ACTIVE_BACKGROUND_JOBS.get(normalized_type)
+        if normalized_job_id and active_job_id != normalized_job_id:
+            return
+        ACTIVE_BACKGROUND_JOBS.pop(normalized_type, None)
+
+
+def _ensure_background_job(job_type, job_id=None, create_if_missing=False, **defaults):
+    normalized_type = str(job_type or "").strip()
+    if not normalized_type:
+        return None
+    candidate_id = str(job_id or "").strip() or None
+    if candidate_id:
+        existing = _get_background_job(candidate_id)
+        if existing:
+            return existing
+    active = _get_active_background_job(normalized_type)
+    if active:
+        return active
+    if not create_if_missing:
+        return None
+    return _create_background_job(normalized_type, job_id=candidate_id, **defaults)
+
+
+def _complete_background_job(job_id, phase="done", summary=None, **updates):
+    payload = {"status": "complete", "phase": phase, "finished_at": datetime.now(timezone.utc).isoformat()}
+    if summary is not None:
+        payload["summary"] = summary
+    payload.update(updates)
+    return _update_background_job(job_id, **payload)
+
+
+def _fail_background_job(job_id, error, phase="error", **updates):
+    payload = {
+        "status": "error",
+        "phase": phase,
+        "error": str(error or "Unknown error"),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+    payload.update(updates)
+    return _update_background_job(job_id, **payload)
+
+
+def _get_active_work_blocker(subject):
+    normalized_subject = str(subject or "").strip()
+    if not normalized_subject:
+        return None
+
+    for rule in ACTIVE_WORK_POLICIES.get(normalized_subject, []):
+        kind = str(rule.get("kind") or "").strip().lower()
+        identifier = str(rule.get("id") or "").strip()
+        if not identifier:
+            continue
+
+        if kind == "job":
+            active_job = _get_active_background_job(identifier)
+            if active_job:
+                blocker = dict(rule)
+                blocker["job"] = active_job
+                blocker["blocked_by"] = identifier
+                blocker["status"] = active_job.get("status")
+                blocker["phase"] = active_job.get("phase")
+                blocker["job_id"] = active_job.get("job_id")
+                return blocker
+        elif kind == "process":
+            process_lookup = {
+                "kometa_run": (helpers.is_kometa_running, helpers.get_kometa_pid),
+                "imagemaid_run": (helpers.is_imagemaid_running, helpers.get_imagemaid_pid),
+            }
+            resolver = process_lookup.get(identifier)
+            if resolver:
+                is_running, get_pid = resolver
+                if is_running():
+                    blocker = dict(rule)
+                    blocker["blocked_by"] = identifier
+                    blocker["pid"] = get_pid()
+                    return blocker
+
+    return None
+
+
 VALIDATION_KEY_SUGGESTIONS = {
     "settings": {
         "playlist_sync_to_user": "playlist_sync_to_users",
     }
 }
+QS_REQUIRED_STEP_KEYS = ["001-start", "010-plex", "020-tmdb", "025-libraries", "150-settings"]
+QS_REVIEW_STEP_KEYS = ["900-kometa", "905-analytics", "910-sponsor", "915-imagemaid"]
+QS_VALIDATION_STEP_KEYS = {
+    "010-plex",
+    "020-tmdb",
+    "025-libraries",
+    "030-tautulli",
+    "040-github",
+    "050-omdb",
+    "060-mdblist",
+    "070-notifiarr",
+    "080-gotify",
+    "085-ntfy",
+    "090-webhooks",
+    "100-anidb",
+    "110-radarr",
+    "120-sonarr",
+    "130-trakt",
+    "140-mal",
+    "150-settings",
+}
+QS_STATUS_ORDER = {"unknown": 0, "ok": 1, "warn": 2, "error": 3}
+QS_WARN_REASONS = {
+    "missing_credentials",
+    "missing_tokens",
+    "no_libraries",
+    "missing_settings",
+    "disabled",
+    "no_webhooks",
+}
+QS_ERROR_REASONS = {
+    "missing_plex_validation",
+    "token_invalid",
+    "account_locked",
+    "validation_error",
+    "invalid_paths",
+    "invalid_fields",
+    "missing_library_defaults",
+    "missing_placeholder_imdb",
+}
+QS_TAUTULLI_REQUIRED_STEP_KEY = "030-tautulli"
+QS_OMDB_REQUIRED_STEP_KEY = "050-omdb"
+QS_MDBLIST_REQUIRED_STEP_KEY = "060-mdblist"
+QS_ANIDB_REQUIRED_STEP_KEY = "100-anidb"
+QS_RADARR_REQUIRED_STEP_KEY = "110-radarr"
+QS_SONARR_REQUIRED_STEP_KEY = "120-sonarr"
+QS_TRAKT_REQUIRED_STEP_KEY = "130-trakt"
+QS_MAL_REQUIRED_STEP_KEY = "140-mal"
+QS_TAUTULLI_DEP_COLLECTION_IDS = {"collection_tautulli"}
+QS_TRAKT_DEP_COLLECTION_IDS = {"collection_trakt"}
+QS_MAL_DEP_COLLECTION_IDS = {"collection_myanimelist"}
+QS_OMDB_DEP_SOURCE_PREFIXES = ("omdb",)
+QS_MDBLIST_DEP_SOURCE_PREFIXES = ("mdb",)
+QS_ANIDB_DEP_SOURCE_PREFIXES = ("anidb",)
+QS_MDBLIST_OVERLAY_IMAGE_VALUES = {"letterboxd", "metacritic", "rt_tomato", "rt_popcorn", "mdb"}
+QS_ANIDB_OVERLAY_IMAGE_VALUES = {"anidb"}
+QS_TRAKT_OVERLAY_IMAGE_VALUES = {"trakt"}
+QS_MAL_OVERLAY_IMAGE_VALUES = {"mal"}
+QS_RADARR_DEP_ATTRIBUTE_PREFIXES = ("radarr_add_all", "radarr_remove_by_tag")
+QS_RADARR_DEP_COLLECTION_PREFIXES = ("collection_radarr_",)
+QS_RADARR_DEP_TEMPLATE_COLLECTION_PREFIXES = ("radarr_add_missing_",)
+QS_SONARR_DEP_ATTRIBUTE_PREFIXES = ("sonarr_add_all", "sonarr_remove_by_tag")
+QS_SONARR_DEP_COLLECTION_PREFIXES = ("collection_sonarr_",)
+QS_SONARR_DEP_TEMPLATE_COLLECTION_PREFIXES = ("sonarr_add_missing_",)
+QS_MAL_DEP_ATTRIBUTE_OPERATIONS = {
+    "mass_genre_update",
+    "mass_content_rating_update",
+    "mass_original_title_update",
+    "mass_studio_update",
+    "mass_originally_available_update",
+    "mass_added_at_update",
+    "mass_audience_rating_update",
+    "mass_critic_rating_update",
+    "mass_user_rating_update",
+}
+QS_MAL_DEP_ATTRIBUTE_VALUES = {"mal", "mal_english", "mal_japanese"}
+QS_FINAL_VALIDATION_TTL_HOURS = 12
 
 
 def utc_now_iso():
@@ -179,6 +487,1046 @@ def build_validation_summary(errors):
         )
 
     return summary
+
+
+def _normalize_status(value):
+    status = str(value or "").strip().lower()
+    if status in ("unknown", "ok", "warn", "error"):
+        return status
+    return "warn"
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_truthy_setting_value(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "0", "false", "none", "null", "[]", "{}"}:
+            return False
+        return True
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    return bool(value)
+
+
+def _parse_json_array(value):
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, str):
+        return []
+    text = value.strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _library_prefix_from_key(key):
+    if not isinstance(key, str) or not key.startswith(("mov-library_", "sho-library_")):
+        return None
+    for marker in (
+        "-movie-template_",
+        "-show-template_",
+        "-season-template_",
+        "-episode-template_",
+        "-movie-overlay_",
+        "-show-overlay_",
+        "-season-overlay_",
+        "-episode-overlay_",
+    ):
+        if marker in key:
+            return key.split(marker, 1)[0]
+    if "-template_" in key:
+        return key.split("-template_", 1)[0]
+    if "-attribute_" in key:
+        return key.split("-attribute_", 1)[0]
+    if "-collection_" in key:
+        return key.split("-collection_", 1)[0]
+    if "-overlay_" in key:
+        return key.split("-overlay_", 1)[0]
+    if "-top_level_" in key:
+        return key.split("-top_level_", 1)[0]
+    if key.endswith("-library"):
+        return key[: -len("-library")]
+    return None
+
+
+def _active_library_prefixes(libraries_data):
+    if not isinstance(libraries_data, dict):
+        return set()
+
+    active_prefixes = set()
+    for raw_key, raw_value in libraries_data.items():
+        key = str(raw_key or "").strip().lower()
+        if not key.endswith("-library"):
+            continue
+        prefix = _library_prefix_from_key(key)
+        if prefix and _is_truthy_setting_value(raw_value):
+            active_prefixes.add(prefix)
+    return active_prefixes
+
+
+def _dependency_reason_label(libraries_data, prefix):
+    library_name = libraries_data.get(f"{prefix}-library") if isinstance(libraries_data, dict) else None
+    if isinstance(library_name, str) and library_name.strip():
+        return library_name.strip()
+    return prefix
+
+
+def _append_dependency_reason(reasons, seen, libraries_data, prefix, detail):
+    label = _dependency_reason_label(libraries_data, prefix)
+    reason = f"{label}: {detail}"
+    normalized = reason.lower()
+    if normalized in seen:
+        return
+    seen.add(normalized)
+    reasons.append(reason)
+
+
+def _libraries_data_collection_dependency_reasons(libraries_data, collection_ids, detail):
+    if not isinstance(libraries_data, dict):
+        return []
+
+    active_prefixes = _active_library_prefixes(libraries_data)
+    reasons = []
+    seen = set()
+
+    for raw_key, raw_value in libraries_data.items():
+        key = str(raw_key or "").strip().lower()
+        if not key or "-collection_" not in key or not _is_truthy_setting_value(raw_value):
+            continue
+
+        prefix = _library_prefix_from_key(key)
+        if prefix and prefix not in active_prefixes:
+            continue
+
+        collection_id = f"collection_{key.rsplit('-collection_', 1)[1]}"
+        if collection_id in collection_ids:
+            _append_dependency_reason(reasons, seen, libraries_data, prefix or "library", detail)
+
+    return reasons
+
+
+def _libraries_data_template_collection_dependency_reasons(libraries_data, child_ids, detail):
+    if not isinstance(libraries_data, dict):
+        return []
+
+    active_prefixes = _active_library_prefixes(libraries_data)
+    reasons = []
+    seen = set()
+    normalized_child_ids = tuple(str(child_id or "").strip().lower() for child_id in child_ids if str(child_id or "").strip())
+    if not normalized_child_ids:
+        return reasons
+
+    for raw_key, raw_value in libraries_data.items():
+        key = str(raw_key or "").strip().lower()
+        if not key or "-template_collection_" not in key or not _is_truthy_setting_value(raw_value):
+            continue
+
+        prefix = _library_prefix_from_key(key)
+        if prefix and prefix not in active_prefixes:
+            continue
+
+        matched_child_id = None
+        for child_id in normalized_child_ids:
+            if re.search(rf"-template_collection_[a-z0-9_]+_{re.escape(child_id)}$", key):
+                matched_child_id = child_id
+                break
+        if matched_child_id:
+            _append_dependency_reason(reasons, seen, libraries_data, prefix or "library", detail)
+
+    return reasons
+
+
+def _libraries_data_service_dependency_reasons(libraries_data, attribute_prefixes, collection_prefixes, template_collection_prefixes=()):
+    if not isinstance(libraries_data, dict):
+        return []
+
+    active_prefixes = _active_library_prefixes(libraries_data)
+    reasons = []
+    seen = set()
+    normalized_attribute_prefixes = tuple(str(prefix or "").strip().lower() for prefix in attribute_prefixes if str(prefix or "").strip())
+    normalized_collection_prefixes = tuple(str(prefix or "").strip().lower() for prefix in collection_prefixes if str(prefix or "").strip())
+    normalized_template_collection_prefixes = tuple(str(prefix or "").strip().lower() for prefix in template_collection_prefixes if str(prefix or "").strip())
+
+    for raw_key, raw_value in libraries_data.items():
+        key = str(raw_key or "").strip().lower()
+        if not key or not _is_truthy_setting_value(raw_value):
+            continue
+
+        prefix = _library_prefix_from_key(key)
+        if prefix and prefix not in active_prefixes:
+            continue
+
+        if "-attribute_" in key:
+            attribute_key = key.split("-attribute_", 1)[1]
+            matched_attribute = next(
+                (attr_prefix for attr_prefix in normalized_attribute_prefixes if attribute_key == attr_prefix or attribute_key.startswith(f"{attr_prefix}_")),
+                None,
+            )
+            if matched_attribute:
+                detail = f"{matched_attribute} configured" if attribute_key.endswith("_custom") else f"{attribute_key} enabled"
+                _append_dependency_reason(reasons, seen, libraries_data, prefix or "library", detail)
+                continue
+
+        if "-collection_" in key:
+            collection_id = f"collection_{key.rsplit('-collection_', 1)[1]}"
+            if any(collection_id.startswith(collection_prefix) for collection_prefix in normalized_collection_prefixes):
+                detail = f"{collection_id} enabled"
+                _append_dependency_reason(reasons, seen, libraries_data, prefix or "library", detail)
+                continue
+
+        if "-template_collection_" in key:
+            matched_child_key = None
+            for template_prefix in normalized_template_collection_prefixes:
+                match = re.search(
+                    rf"-template_collection_[a-z0-9_]+_({re.escape(template_prefix)}[a-z0-9_]*)$",
+                    key,
+                )
+                if match:
+                    matched_child_key = match.group(1)
+                    break
+            if matched_child_key:
+                detail = f"{matched_child_key} enabled"
+                _append_dependency_reason(reasons, seen, libraries_data, prefix or "library", detail)
+
+    return reasons
+
+
+def _libraries_data_overlay_rating_dependency_reasons(libraries_data, image_values):
+    if not isinstance(libraries_data, dict):
+        return []
+
+    active_prefixes = _active_library_prefixes(libraries_data)
+    reasons = []
+    seen = set()
+    normalized_images = {str(value or "").strip().lower() for value in image_values if str(value or "").strip()}
+    if not normalized_images:
+        return reasons
+
+    for raw_key, raw_value in libraries_data.items():
+        key = str(raw_key or "").strip().lower()
+        selected_image = str(raw_value or "").strip().lower()
+        if selected_image not in normalized_images:
+            continue
+
+        match = re.match(
+            r"^(?P<prefix>(?:mov|sho)-library_[a-z0-9_]+)-(?P<builder>movie|show|season|episode)-template_overlay_ratings\[rating[123]_image\]$",
+            key,
+        )
+        if not match:
+            continue
+
+        prefix = match.group("prefix")
+        builder = match.group("builder")
+        if prefix not in active_prefixes:
+            continue
+
+        overlay_toggle_key = f"{prefix}-{builder}-overlay_ratings"
+        if not _is_truthy_setting_value(libraries_data.get(overlay_toggle_key)):
+            continue
+
+        detail = f"{builder} ratings overlay uses {selected_image}"
+        _append_dependency_reason(reasons, seen, libraries_data, prefix, detail)
+
+    return reasons
+
+
+def _attribute_dependency_source_reasons(libraries_data, source_prefixes):
+    if not isinstance(libraries_data, dict):
+        return []
+
+    active_prefixes = _active_library_prefixes(libraries_data)
+    reasons = []
+    seen = set()
+    normalized_prefixes = tuple(str(prefix or "").strip().lower() for prefix in source_prefixes if str(prefix or "").strip())
+    if not normalized_prefixes:
+        return reasons
+
+    def matches_source(source_value):
+        normalized = str(source_value or "").strip().lower()
+        if not normalized:
+            return False
+        return any(normalized == prefix or normalized.startswith(f"{prefix}_") for prefix in normalized_prefixes)
+
+    def extract_operation_and_source(key):
+        attr_body = key.split("-attribute_", 1)[1] if "-attribute_" in key else ""
+        if not attr_body or attr_body.endswith("_order"):
+            return None, None
+        parts = [part for part in attr_body.split("_") if part]
+        if len(parts) < 3:
+            return None, None
+        for split_index in range(2, len(parts)):
+            operation = "_".join(parts[:split_index])
+            source_value = "_".join(parts[split_index:])
+            if operation.startswith("mass_") and matches_source(source_value):
+                return operation, source_value
+        return None, None
+
+    for raw_key, raw_value in libraries_data.items():
+        key = str(raw_key or "").strip().lower()
+        if not key or "-attribute_" not in key:
+            continue
+
+        prefix = _library_prefix_from_key(key)
+        if prefix and prefix not in active_prefixes:
+            continue
+
+        operation, source_value = extract_operation_and_source(key)
+        if operation and source_value and _is_truthy_setting_value(raw_value):
+            detail = f"{operation} uses {source_value}"
+            _append_dependency_reason(reasons, seen, libraries_data, prefix or "library", detail)
+            continue
+
+        order_match = re.search(r"-attribute_(mass_[a-z0-9_]+)_order$", key)
+        if not order_match:
+            continue
+
+        operation = order_match.group(1)
+        matched_sources = []
+        for entry in _parse_json_array(raw_value):
+            source_value = str(entry or "").strip().lower()
+            if matches_source(source_value):
+                matched_sources.append(source_value)
+        if matched_sources:
+            joined_sources = ", ".join(sorted(set(matched_sources)))
+            detail = f"{operation} order includes {joined_sources}"
+            _append_dependency_reason(reasons, seen, libraries_data, prefix or "library", detail)
+
+    return reasons
+
+
+def _config_dependency_reasons(section_rows, dependency_resolver):
+    if not isinstance(section_rows, dict):
+        return []
+    libraries_row = section_rows.get("libraries")
+    if not isinstance(libraries_row, dict):
+        return []
+    libraries_payload = libraries_row.get("data")
+    if not isinstance(libraries_payload, dict):
+        return []
+    libraries_data = libraries_payload.get("libraries", {})
+    return dependency_resolver(libraries_data)
+
+
+def _libraries_data_requires_mal(libraries_data):
+    return bool(_libraries_data_mal_dependency_reasons(libraries_data))
+
+
+def _libraries_data_tautulli_dependency_reasons(libraries_data):
+    return _libraries_data_collection_dependency_reasons(
+        libraries_data,
+        QS_TAUTULLI_DEP_COLLECTION_IDS,
+        "Tautulli Charts collection enabled",
+    )
+
+
+def _libraries_data_trakt_dependency_reasons(libraries_data):
+    collection_reasons = _libraries_data_collection_dependency_reasons(
+        libraries_data,
+        QS_TRAKT_DEP_COLLECTION_IDS,
+        "Trakt Charts collection enabled",
+    )
+    overlay_reasons = _libraries_data_overlay_rating_dependency_reasons(
+        libraries_data,
+        QS_TRAKT_OVERLAY_IMAGE_VALUES,
+    )
+    return collection_reasons + [reason for reason in overlay_reasons if reason not in collection_reasons]
+
+
+def _libraries_data_omdb_dependency_reasons(libraries_data):
+    return _attribute_dependency_source_reasons(
+        libraries_data,
+        QS_OMDB_DEP_SOURCE_PREFIXES,
+    )
+
+
+def _libraries_data_mdblist_dependency_reasons(libraries_data):
+    attribute_reasons = _attribute_dependency_source_reasons(
+        libraries_data,
+        QS_MDBLIST_DEP_SOURCE_PREFIXES,
+    )
+    overlay_reasons = _libraries_data_overlay_rating_dependency_reasons(
+        libraries_data,
+        QS_MDBLIST_OVERLAY_IMAGE_VALUES,
+    )
+    return attribute_reasons + [reason for reason in overlay_reasons if reason not in attribute_reasons]
+
+
+def _libraries_data_anidb_dependency_reasons(libraries_data):
+    attribute_reasons = _attribute_dependency_source_reasons(
+        libraries_data,
+        QS_ANIDB_DEP_SOURCE_PREFIXES,
+    )
+    overlay_reasons = _libraries_data_overlay_rating_dependency_reasons(
+        libraries_data,
+        QS_ANIDB_OVERLAY_IMAGE_VALUES,
+    )
+    return attribute_reasons + [reason for reason in overlay_reasons if reason not in attribute_reasons]
+
+
+def _libraries_data_radarr_dependency_reasons(libraries_data):
+    return _libraries_data_service_dependency_reasons(
+        libraries_data,
+        QS_RADARR_DEP_ATTRIBUTE_PREFIXES,
+        QS_RADARR_DEP_COLLECTION_PREFIXES,
+        QS_RADARR_DEP_TEMPLATE_COLLECTION_PREFIXES,
+    )
+
+
+def _libraries_data_sonarr_dependency_reasons(libraries_data):
+    return _libraries_data_service_dependency_reasons(
+        libraries_data,
+        QS_SONARR_DEP_ATTRIBUTE_PREFIXES,
+        QS_SONARR_DEP_COLLECTION_PREFIXES,
+        QS_SONARR_DEP_TEMPLATE_COLLECTION_PREFIXES,
+    )
+
+
+def _libraries_data_mal_dependency_reasons(libraries_data):
+    if not isinstance(libraries_data, dict):
+        return []
+
+    active_prefixes = _active_library_prefixes(libraries_data)
+    reasons = []
+    seen = set()
+
+    for raw_key, raw_value in libraries_data.items():
+        key = str(raw_key or "").strip().lower()
+        if not key:
+            continue
+
+        prefix = _library_prefix_from_key(key)
+        if prefix and prefix not in active_prefixes:
+            continue
+
+        if "-collection_" in key and _is_truthy_setting_value(raw_value):
+            collection_id = f"collection_{key.rsplit('-collection_', 1)[1]}"
+            if collection_id in QS_MAL_DEP_COLLECTION_IDS:
+                _append_dependency_reason(reasons, seen, libraries_data, prefix or "library", "MyAnimeList Charts collection enabled")
+                continue
+
+        attr_match = re.search(r"-attribute_(mass_[a-z0-9_]+)_(mal(?:_english|_japanese)?)$", key)
+        if attr_match and _is_truthy_setting_value(raw_value):
+            operation = attr_match.group(1)
+            source_value = attr_match.group(2)
+            if operation in QS_MAL_DEP_ATTRIBUTE_OPERATIONS and source_value in QS_MAL_DEP_ATTRIBUTE_VALUES:
+                detail = f"{operation} uses {source_value}"
+                _append_dependency_reason(reasons, seen, libraries_data, prefix or "library", detail)
+                continue
+
+        order_match = re.search(r"-attribute_(mass_[a-z0-9_]+)_order$", key)
+        if not order_match:
+            continue
+        operation = order_match.group(1)
+        if operation not in QS_MAL_DEP_ATTRIBUTE_OPERATIONS:
+            continue
+        matched_sources = []
+        for entry in _parse_json_array(raw_value):
+            source_value = str(entry or "").strip().lower()
+            if source_value in QS_MAL_DEP_ATTRIBUTE_VALUES:
+                matched_sources.append(source_value)
+        if matched_sources:
+            joined_sources = ", ".join(sorted(set(matched_sources)))
+            detail = f"{operation} order includes {joined_sources}"
+            _append_dependency_reason(reasons, seen, libraries_data, prefix or "library", detail)
+
+    overlay_reasons = _libraries_data_overlay_rating_dependency_reasons(
+        libraries_data,
+        QS_MAL_OVERLAY_IMAGE_VALUES,
+    )
+    return reasons + [reason for reason in overlay_reasons if reason not in reasons]
+
+
+def _config_requires_mal(section_rows):
+    if not isinstance(section_rows, dict):
+        return False
+    libraries_row = section_rows.get("libraries")
+    if not isinstance(libraries_row, dict):
+        return False
+    libraries_payload = libraries_row.get("data")
+    if not isinstance(libraries_payload, dict):
+        return False
+    libraries_data = libraries_payload.get("libraries", {})
+    return _libraries_data_requires_mal(libraries_data)
+
+
+def _config_tautulli_dependency_reasons(section_rows):
+    return _config_dependency_reasons(section_rows, _libraries_data_tautulli_dependency_reasons)
+
+
+def _config_omdb_dependency_reasons(section_rows):
+    return _config_dependency_reasons(section_rows, _libraries_data_omdb_dependency_reasons)
+
+
+def _config_mdblist_dependency_reasons(section_rows):
+    return _config_dependency_reasons(section_rows, _libraries_data_mdblist_dependency_reasons)
+
+
+def _config_anidb_dependency_reasons(section_rows):
+    return _config_dependency_reasons(section_rows, _libraries_data_anidb_dependency_reasons)
+
+
+def _config_radarr_dependency_reasons(section_rows):
+    return _config_dependency_reasons(section_rows, _libraries_data_radarr_dependency_reasons)
+
+
+def _config_sonarr_dependency_reasons(section_rows):
+    return _config_dependency_reasons(section_rows, _libraries_data_sonarr_dependency_reasons)
+
+
+def _config_trakt_dependency_reasons(section_rows):
+    return _config_dependency_reasons(section_rows, _libraries_data_trakt_dependency_reasons)
+
+
+def _config_mal_dependency_reasons(section_rows):
+    return _config_dependency_reasons(section_rows, _libraries_data_mal_dependency_reasons)
+
+
+def _worst_status(statuses):
+    worst = "ok"
+    for status in statuses:
+        normalized = _normalize_status(status)
+        if QS_STATUS_ORDER.get(normalized, 1) > QS_STATUS_ORDER.get(worst, 1):
+            worst = normalized
+    return worst
+
+
+def _derive_live_final_validation_status(step_statuses, template_keys):
+    validation_states = []
+    for key in template_keys:
+        if key not in QS_VALIDATION_STEP_KEYS:
+            continue
+        if key not in step_statuses:
+            continue
+        validation_states.append(_normalize_status(step_statuses.get(key)))
+
+    if not validation_states:
+        return "warn"
+    if any(state == "error" for state in validation_states):
+        return "error"
+    if any(state == "warn" for state in validation_states):
+        return "warn"
+    if any(state == "ok" for state in validation_states):
+        return "ok"
+    return "warn"
+
+
+def _build_live_validation_rollup(step_statuses, template_keys):
+    counts = {"validated": 0, "failed": 0, "skipped": 0, "unknown": 0}
+    for key in template_keys:
+        if key not in QS_VALIDATION_STEP_KEYS:
+            continue
+        state = _normalize_status(step_statuses.get(key))
+        if state == "ok":
+            counts["validated"] += 1
+        elif state == "error":
+            counts["failed"] += 1
+        elif state == "warn":
+            counts["skipped"] += 1
+        else:
+            counts["unknown"] += 1
+
+    if counts["failed"] > 0:
+        state = "error"
+    elif counts["skipped"] > 0:
+        state = "warn"
+    elif counts["validated"] > 0:
+        state = "ok"
+    else:
+        state = "unknown"
+
+    summary_text = f"Current. Validated: {counts['validated']} \u2022 " f"Failed: {counts['failed']} \u2022 " f"Pending: {counts['skipped']}"
+    if counts["unknown"] > 0:
+        summary_text += f" \u2022 Not checked: {counts['unknown']}"
+    summary_text += "."
+
+    return {"counts": counts, "state": state, "summary_text": summary_text}
+
+
+def _latest_iso_timestamp(values):
+    latest_dt = None
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if latest_dt is None or parsed > latest_dt:
+            latest_dt = parsed
+    return latest_dt.isoformat().replace("+00:00", "Z") if latest_dt else None
+
+
+def _format_validation_age(iso_text):
+    text = str(iso_text or "").strip()
+    if not text:
+        return "Never", "never"
+    try:
+        dt_value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return "Unknown", "never"
+    if dt_value.tzinfo is None:
+        dt_value = dt_value.replace(tzinfo=timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    delta = now_utc - dt_value.astimezone(timezone.utc)
+    if delta.total_seconds() < 0:
+        delta = timedelta(0)
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return "Just now", "fresh"
+    if seconds < 3600:
+        return f"{max(1, seconds // 60)}m ago", "fresh"
+    if seconds < 86400:
+        hours = max(1, seconds // 3600)
+        return f"{hours}h ago", "stale"
+    days = max(1, seconds // 86400)
+    return f"{days}d ago", "stale"
+
+
+def _parse_iso_datetime(iso_text):
+    text = str(iso_text or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _bulk_validation_is_fresh(iso_text, ttl_hours=QS_FINAL_VALIDATION_TTL_HOURS):
+    parsed = _parse_iso_datetime(iso_text)
+    if parsed is None:
+        return False
+    return datetime.now(timezone.utc) - parsed <= timedelta(hours=ttl_hours)
+
+
+def _build_final_gate(workspace_status, template_list, validation_bulk_rollup_at):
+    label_map = {file.rsplit(".", 1)[0]: display_name for file, display_name in template_list or []}
+    step_statuses = workspace_status.get("step_statuses", {}) if isinstance(workspace_status, dict) else {}
+    required_keys = workspace_status.get("required_keys", []) if isinstance(workspace_status, dict) else []
+    optional_keys = workspace_status.get("optional_keys", []) if isinstance(workspace_status, dict) else []
+
+    blockers = []
+    seen = set()
+    for key in required_keys:
+        state = step_statuses.get(key, "warn")
+        if state == "ok":
+            continue
+        blockers.append({"key": key, "label": label_map.get(key, key), "state": state, "group": "required"})
+        seen.add(key)
+
+    for key in optional_keys:
+        state = step_statuses.get(key, "unknown")
+        if state not in {"warn", "error"} or key in seen:
+            continue
+        blockers.append({"key": key, "label": label_map.get(key, key), "state": state, "group": "optional"})
+        seen.add(key)
+
+    dependency_defs = [
+        ("tautulli", QS_TAUTULLI_REQUIRED_STEP_KEY, "Tautulli", "tautulli_requirement_reasons", "qs-tautulli-required-hint"),
+        ("omdb", QS_OMDB_REQUIRED_STEP_KEY, "OMDb", "omdb_requirement_reasons", "qs-omdb-required-hint"),
+        ("mdblist", QS_MDBLIST_REQUIRED_STEP_KEY, "MDBList", "mdblist_requirement_reasons", "qs-mdblist-required-hint"),
+        ("anidb", QS_ANIDB_REQUIRED_STEP_KEY, "AniDB", "anidb_requirement_reasons", "qs-anidb-required-hint"),
+        ("radarr", QS_RADARR_REQUIRED_STEP_KEY, "Radarr", "radarr_requirement_reasons", "qs-radarr-required-hint"),
+        ("sonarr", QS_SONARR_REQUIRED_STEP_KEY, "Sonarr", "sonarr_requirement_reasons", "qs-sonarr-required-hint"),
+        ("trakt", QS_TRAKT_REQUIRED_STEP_KEY, "Trakt", "trakt_requirement_reasons", "qs-trakt-required-hint"),
+        ("mal", QS_MAL_REQUIRED_STEP_KEY, "MyAnimeList", "mal_requirement_reasons", "qs-mal-required-hint"),
+    ]
+    dependency_cards = []
+    for provider, step_key, label, reasons_key, css_class in dependency_defs:
+        reasons = workspace_status.get(reasons_key, []) if isinstance(workspace_status, dict) else []
+        if not reasons or step_statuses.get(step_key) == "ok":
+            continue
+        dependency_cards.append(
+            {
+                "provider": provider,
+                "key": step_key,
+                "label": label,
+                "title": f"{label} required by",
+                "reasons": reasons,
+                "state": step_statuses.get(step_key, "warn"),
+                "css_class": css_class,
+            }
+        )
+    dependency_keys = {card["key"] for card in dependency_cards}
+    setup_blockers = [blocker for blocker in blockers if blocker.get("key") not in dependency_keys]
+
+    bulk_fresh = _bulk_validation_is_fresh(validation_bulk_rollup_at)
+    if blockers:
+        stage = "todo"
+    elif not bulk_fresh:
+        stage = "freshness"
+    else:
+        stage = "config"
+
+    return {
+        "stage": stage,
+        "todo_count": len(blockers),
+        "todo_blockers": blockers,
+        "dependency_cards": dependency_cards,
+        "setup_blockers": setup_blockers,
+        "bulk_validation_fresh": bulk_fresh,
+        "bulk_validation_at": validation_bulk_rollup_at or "",
+        "validation_ttl_hours": QS_FINAL_VALIDATION_TTL_HOURS,
+        "can_build_config": not blockers and bulk_fresh,
+        "config_valid": False,
+    }
+
+
+def _is_nonblank_setting(value):
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return True
+    text = str(value).strip()
+    if not text:
+        return False
+    return text.lower() not in {"none", "null", "false"}
+
+
+def _is_meaningful_optional_status_input(value):
+    if not _is_nonblank_setting(value):
+        return False
+    text = str(value).strip().lower()
+    # UI template placeholders can be persisted as defaults; they should not
+    # make an optional page look user-configured in the workspace menu.
+    return not (text.startswith("enter ") and any(token in text for token in ("token", "api key", "url", "client")))
+
+
+def _has_meaningful_optional_input(template_key, payload):
+    if not isinstance(payload, dict):
+        return False
+
+    # Playlists intentionally treat pass-through differently (handled in its own branch).
+    if template_key == "027-playlist_files":
+        return True
+
+    if template_key == "100-anidb":
+        anidb = payload.get("anidb", {})
+        return isinstance(anidb, dict) and helpers.booler(anidb.get("enable"))
+
+    simple_key_requirements = {
+        "030-tautulli": ("tautulli", ("url", "apikey")),
+        "040-github": ("github", ("token",)),
+        "050-omdb": ("omdb", ("apikey",)),
+        "060-mdblist": ("mdblist", ("apikey",)),
+        "070-notifiarr": ("notifiarr", ("apikey",)),
+        "080-gotify": ("gotify", ("url", "token")),
+        "085-ntfy": ("ntfy", ("url", "token", "topic")),
+        "090-webhooks": ("webhooks", ("notifiarr", "gotify", "ntfy", "slack", "discord", "webhook", "url")),
+        "110-radarr": ("radarr", ("url", "token")),
+        "120-sonarr": ("sonarr", ("url", "token")),
+    }
+
+    req = simple_key_requirements.get(template_key)
+    if req:
+        section_name, keys = req
+        section_data = payload.get(section_name, {})
+        if isinstance(section_data, dict):
+            if template_key == "090-webhooks":
+                return any(_is_meaningful_optional_status_input(value) for value in section_data.values())
+            return any(_is_meaningful_optional_status_input(section_data.get(key)) for key in keys)
+        return False
+
+    if template_key == "130-trakt":
+        trakt = payload.get("trakt", {})
+        if not isinstance(trakt, dict):
+            return False
+        auth = trakt.get("authorization", {}) if isinstance(trakt.get("authorization"), dict) else {}
+        return any(
+            _is_meaningful_optional_status_input(value)
+            for value in (
+                trakt.get("client_id"),
+                trakt.get("client_secret"),
+                trakt.get("pin"),
+                auth.get("access_token"),
+                auth.get("refresh_token"),
+            )
+        )
+
+    if template_key == "140-mal":
+        mal = payload.get("mal", {})
+        if not isinstance(mal, dict):
+            return False
+        auth = mal.get("authorization", {}) if isinstance(mal.get("authorization"), dict) else {}
+        return any(
+            _is_meaningful_optional_status_input(value)
+            for value in (
+                mal.get("client_id"),
+                mal.get("client_secret"),
+                mal.get("localhost_url"),
+                auth.get("access_token"),
+                auth.get("refresh_token"),
+            )
+        )
+
+    # For unknown validation-backed optional steps, keep prior behavior.
+    return True
+
+
+def _derive_step_status(template_key, group, section_rows, config_exists):
+    if template_key == "001-start":
+        return "ok" if config_exists else "error"
+
+    if template_key == "900-kometa":
+        return "warn"
+
+    if template_key in {"905-analytics", "910-sponsor"}:
+        return "ok"
+
+    section_name = template_key.split("-", 1)[1] if "-" in template_key else template_key
+    section_entry = section_rows.get(section_name) if isinstance(section_rows, dict) else None
+    section_entry = section_entry if isinstance(section_entry, dict) else {}
+    section_row_present = bool(section_entry)
+
+    validated = helpers.booler(section_entry.get("validated", False))
+    user_entered = helpers.booler(section_entry.get("user_entered", False))
+    payload = section_entry.get("data")
+    payload = payload if isinstance(payload, dict) else {}
+    validation_status = str(payload.get("validation_status") or "").strip().lower()
+    validation_reason = str(payload.get("validation_reason") or "").strip().lower()
+    was_previously_validated = bool(payload.get("validated_at"))
+    if template_key == "027-playlist_files":
+        playlist_payload = payload.get("playlist_files", payload if isinstance(payload, dict) else {})
+        if isinstance(playlist_payload, dict) and isinstance(playlist_payload.get("playlist_files"), dict):
+            playlist_payload = playlist_payload.get("playlist_files", {})
+        playlist_libraries = ""
+        if isinstance(playlist_payload, dict):
+            raw_libraries = playlist_payload.get("libraries")
+            if isinstance(raw_libraries, list):
+                selected_libraries = [str(item).strip() for item in raw_libraries if str(item).strip()]
+            else:
+                playlist_libraries = str(raw_libraries or "")
+                selected_libraries = [item.strip() for item in playlist_libraries.split(",") if item.strip()]
+        else:
+            selected_libraries = []
+
+        if validation_status == "failed":
+            return "error"
+        if selected_libraries:
+            # Playlist selection itself is the completion signal for this optional page.
+            return "ok"
+
+        # If user has visited/passed-through this page (even with no libraries selected),
+        # treat it as intentionally acknowledged/valid.
+        was_visited = section_row_present and (user_entered or bool(validation_status) or bool(payload.get("validation_updated_at")) or bool(payload.get("validated_at")))
+        if was_visited:
+            return "ok"
+        return "unknown"
+
+    if template_key in QS_VALIDATION_STEP_KEYS:
+        if group == "optional" and not _has_meaningful_optional_input(template_key, payload):
+            return "unknown"
+
+        if validated or validation_status == "validated":
+            return "ok"
+
+        if validation_status == "failed":
+            return "error"
+
+        if validation_status == "skipped":
+            if template_key == "027-playlist_files" and validation_reason == "no_libraries":
+                return "unknown"
+            if validation_reason in QS_ERROR_REASONS:
+                return "error"
+            if group == "optional":
+                # Optional sections should remain neutral when users simply pass through
+                # or when validation is skipped due to missing optional inputs.
+                return "unknown"
+            if validation_reason in QS_WARN_REASONS:
+                return "warn"
+            return "warn" if group == "required" else ("warn" if user_entered else "ok")
+
+        if group == "required":
+            if not user_entered:
+                return "error"
+            if was_previously_validated:
+                return "error"
+            return "warn"
+
+        if not user_entered and not was_previously_validated and not validation_status:
+            return "unknown"
+        if was_previously_validated:
+            return "error"
+        return "warn" if user_entered else "ok"
+
+    if group == "required":
+        return "warn" if user_entered else "error"
+    if group == "optional":
+        return "warn" if user_entered else "unknown"
+    return "ok"
+
+
+def _build_workspace_status_context(config_name, template_list, available_configs=None):
+    template_keys = []
+    for file_entry, _ in template_list or []:
+        template_key = file_entry.rsplit(".", 1)[0]
+        template_keys.append(template_key)
+
+    section_rows = {}
+    if config_name:
+        try:
+            for row in database.retrieve_config_sections(config_name):
+                section_name = row.get("section")
+                if section_name:
+                    section_rows[section_name] = row
+        except Exception:
+            section_rows = {}
+
+    available_set = set(available_configs or [])
+    config_exists = bool(config_name) and (config_name in available_set or bool(section_rows))
+
+    required_seed = set(QS_REQUIRED_STEP_KEYS)
+    tautulli_requirement_reasons = _config_tautulli_dependency_reasons(section_rows) if QS_TAUTULLI_REQUIRED_STEP_KEY in template_keys else []
+    omdb_requirement_reasons = _config_omdb_dependency_reasons(section_rows) if QS_OMDB_REQUIRED_STEP_KEY in template_keys else []
+    mdblist_requirement_reasons = _config_mdblist_dependency_reasons(section_rows) if QS_MDBLIST_REQUIRED_STEP_KEY in template_keys else []
+    anidb_requirement_reasons = _config_anidb_dependency_reasons(section_rows) if QS_ANIDB_REQUIRED_STEP_KEY in template_keys else []
+    radarr_requirement_reasons = _config_radarr_dependency_reasons(section_rows) if QS_RADARR_REQUIRED_STEP_KEY in template_keys else []
+    sonarr_requirement_reasons = _config_sonarr_dependency_reasons(section_rows) if QS_SONARR_REQUIRED_STEP_KEY in template_keys else []
+    trakt_requirement_reasons = _config_trakt_dependency_reasons(section_rows) if QS_TRAKT_REQUIRED_STEP_KEY in template_keys else []
+    mal_requirement_reasons = _config_mal_dependency_reasons(section_rows) if QS_MAL_REQUIRED_STEP_KEY in template_keys else []
+    if QS_TAUTULLI_REQUIRED_STEP_KEY in template_keys and tautulli_requirement_reasons:
+        required_seed.add(QS_TAUTULLI_REQUIRED_STEP_KEY)
+    if QS_OMDB_REQUIRED_STEP_KEY in template_keys and omdb_requirement_reasons:
+        required_seed.add(QS_OMDB_REQUIRED_STEP_KEY)
+    if QS_MDBLIST_REQUIRED_STEP_KEY in template_keys and mdblist_requirement_reasons:
+        required_seed.add(QS_MDBLIST_REQUIRED_STEP_KEY)
+    if QS_ANIDB_REQUIRED_STEP_KEY in template_keys and anidb_requirement_reasons:
+        required_seed.add(QS_ANIDB_REQUIRED_STEP_KEY)
+    if QS_RADARR_REQUIRED_STEP_KEY in template_keys and radarr_requirement_reasons:
+        required_seed.add(QS_RADARR_REQUIRED_STEP_KEY)
+    if QS_SONARR_REQUIRED_STEP_KEY in template_keys and sonarr_requirement_reasons:
+        required_seed.add(QS_SONARR_REQUIRED_STEP_KEY)
+    if QS_TRAKT_REQUIRED_STEP_KEY in template_keys and trakt_requirement_reasons:
+        required_seed.add(QS_TRAKT_REQUIRED_STEP_KEY)
+    if QS_MAL_REQUIRED_STEP_KEY in template_keys and mal_requirement_reasons:
+        required_seed.add(QS_MAL_REQUIRED_STEP_KEY)
+    review_seed = set(QS_REVIEW_STEP_KEYS)
+
+    required_keys = [key for key in template_keys if key in required_seed]
+    review_keys = [key for key in template_keys if key in review_seed]
+    optional_keys = [key for key in template_keys if key not in required_seed and key not in review_seed]
+
+    step_statuses = {}
+    for template_key in template_keys:
+        if template_key == "900-kometa":
+            continue
+        if template_key in required_keys:
+            group = "required"
+        elif template_key in optional_keys:
+            group = "optional"
+        else:
+            group = "review"
+        step_statuses[template_key] = _derive_step_status(template_key, group, section_rows, config_exists)
+    if "900-kometa" in template_keys:
+        step_statuses["900-kometa"] = _derive_live_final_validation_status(step_statuses, template_keys)
+
+    required_rollup = _worst_status(step_statuses.get(key, "warn") for key in required_keys) if required_keys else "ok"
+    review_rollup = _worst_status(step_statuses.get(key, "ok") for key in review_keys) if review_keys else "ok"
+
+    optional_status_values = [step_statuses.get(key, "unknown") for key in optional_keys]
+    if not optional_status_values:
+        optional_rollup = "ok"
+    elif any(status == "error" for status in optional_status_values):
+        optional_rollup = "error"
+    elif any(status == "warn" for status in optional_status_values):
+        optional_rollup = "warn"
+    elif any(status == "unknown" for status in optional_status_values):
+        optional_rollup = "unknown"
+    else:
+        optional_rollup = "ok"
+
+    section_statuses = {
+        "required": required_rollup,
+        "optional": optional_rollup,
+        "review": review_rollup,
+    }
+
+    jump_to_validations = {}
+    for key in QS_VALIDATION_STEP_KEYS:
+        if key in step_statuses:
+            jump_to_validations[key] = step_statuses.get(key) == "ok"
+
+    required_total = len(required_keys)
+    required_ready = sum(1 for key in required_keys if step_statuses.get(key) == "ok")
+    required_percent = round((required_ready / required_total) * 100) if required_total else 0
+
+    optional_total = len(optional_keys)
+    optional_configured = sum(1 for key in optional_keys if step_statuses.get(key) != "unknown")
+    optional_issue_count = sum(1 for key in optional_keys if step_statuses.get(key) in {"warn", "error"})
+
+    optional_summary = f"Optional {optional_configured}/{optional_total} configured" if optional_total else "No optional pages"
+    if optional_issue_count > 0:
+        optional_summary += f" • {optional_issue_count} issue{'s' if optional_issue_count != 1 else ''}"
+
+    validation_timestamps = []
+    for row in section_rows.values():
+        if not isinstance(row, dict):
+            continue
+        data = row.get("data")
+        if not isinstance(data, dict):
+            continue
+        for key in ("validation_updated_at", "validated_at"):
+            value = data.get(key)
+            if value:
+                validation_timestamps.append(value)
+        if row.get("section") == "validation_summary":
+            summary_updated = data.get("updated_at")
+            if summary_updated:
+                validation_timestamps.append(summary_updated)
+    latest_validation_at = _latest_iso_timestamp(validation_timestamps)
+    validation_age_label, validation_freshness = _format_validation_age(latest_validation_at)
+
+    readiness = {
+        "required_total": required_total,
+        "required_ready": required_ready,
+        "required_percent": required_percent,
+        "required_state": required_rollup,
+        "optional_total": optional_total,
+        "optional_configured": optional_configured,
+        "optional_issue_count": optional_issue_count,
+        "optional_summary": optional_summary,
+        "latest_validation_at": latest_validation_at,
+        "validation_age_label": validation_age_label,
+        "validation_freshness": validation_freshness,
+    }
+
+    return {
+        "step_statuses": step_statuses,
+        "section_statuses": section_statuses,
+        "jump_to_validations": jump_to_validations,
+        "required_keys": required_keys,
+        "optional_keys": optional_keys,
+        "review_keys": review_keys,
+        "tautulli_requirement_reasons": tautulli_requirement_reasons,
+        "omdb_requirement_reasons": omdb_requirement_reasons,
+        "mdblist_requirement_reasons": mdblist_requirement_reasons,
+        "anidb_requirement_reasons": anidb_requirement_reasons,
+        "radarr_requirement_reasons": radarr_requirement_reasons,
+        "sonarr_requirement_reasons": sonarr_requirement_reasons,
+        "trakt_requirement_reasons": trakt_requirement_reasons,
+        "mal_requirement_reasons": mal_requirement_reasons,
+        "readiness": readiness,
+    }
 
 
 def _calculate_process_cpu_percent(proc):
@@ -301,11 +1649,17 @@ def _get_maintenance_window_live():
     return start_hour * 60, end_hour * 60, window_str
 
 
-def _set_pending_kometa_start(command, config_name):
+def _normalize_kometa_start_mode(raw_mode):
+    mode = str(raw_mode or "current").strip().lower()
+    return mode if mode in {"current", "recovery", "logged"} else "current"
+
+
+def _set_pending_kometa_start(command, config_name, start_mode="current"):
     with PENDING_KOMETA_START_LOCK:
         PENDING_KOMETA_START["command"] = command
         PENDING_KOMETA_START["config_name"] = config_name
         PENDING_KOMETA_START["requested_at"] = datetime.now(timezone.utc).isoformat()
+        PENDING_KOMETA_START["start_mode"] = _normalize_kometa_start_mode(start_mode)
 
 
 def _peek_pending_kometa_start():
@@ -323,6 +1677,7 @@ def _pop_pending_kometa_start():
         PENDING_KOMETA_START["command"] = None
         PENDING_KOMETA_START["config_name"] = None
         PENDING_KOMETA_START["requested_at"] = None
+        PENDING_KOMETA_START["start_mode"] = "current"
         return pending
 
 
@@ -331,6 +1686,7 @@ def _clear_pending_kometa_start():
         PENDING_KOMETA_START["command"] = None
         PENDING_KOMETA_START["config_name"] = None
         PENDING_KOMETA_START["requested_at"] = None
+        PENDING_KOMETA_START["start_mode"] = "current"
 
 
 def _find_running_kometa_processes():
@@ -357,6 +1713,33 @@ def _find_running_kometa_processes():
 
 def _find_running_kometa_process():
     procs = _find_running_kometa_processes()
+    return procs[0] if procs else None
+
+
+def _find_running_imagemaid_processes():
+    imagemaid_root = None
+    try:
+        imagemaid_root = str(helpers.get_imagemaid_root_path())
+    except Exception:
+        imagemaid_root = None
+    matches = []
+    for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
+        try:
+            cmdline = proc.info.get("cmdline") or []
+            joined = " ".join(cmdline)
+        except Exception:
+            continue
+        if "imagemaid.py" not in joined:
+            continue
+        has_root = bool(imagemaid_root and imagemaid_root in joined)
+        create_time = proc.info.get("create_time") or 0
+        matches.append((has_root, create_time, proc))
+    matches.sort(key=lambda item: (1 if item[0] else 0, item[1]), reverse=True)
+    return [entry[2] for entry in matches]
+
+
+def _find_running_imagemaid_process():
+    procs = _find_running_imagemaid_processes()
     return procs[0] if procs else None
 
 
@@ -391,7 +1774,7 @@ def _stop_process_tree(proc):
     return alive
 
 
-def _launch_kometa_command(command, config_name=None):
+def _launch_kometa_command(command, config_name=None, start_mode="current"):
     if not command:
         return False, "No command provided"
 
@@ -433,7 +1816,74 @@ def _launch_kometa_command(command, config_name=None):
     with open(helpers.get_kometa_pid_file(), "w", encoding="utf-8") as f:
         f.write(str(proc.pid))
 
-    _schedule_quickstart_run_marker(kometa_root, config_name)
+    _schedule_quickstart_run_marker(kometa_root, config_name, start_mode=_normalize_kometa_start_mode(start_mode))
+    return True, proc.pid
+
+
+def _launch_imagemaid_command(command, mode=None, config_name=None):
+    if not command:
+        return False, "No command provided"
+
+    imagemaid_root = helpers.get_imagemaid_root_path()
+    is_win = sys.platform.startswith("win")
+    venv_python = imagemaid_root / "imagemaid-venv" / ("Scripts" if is_win else "bin") / ("python.exe" if is_win else "python3")
+    imagemaid_py = imagemaid_root / "imagemaid.py"
+
+    if not imagemaid_py.exists():
+        return False, f"imagemaid.py not found at: {imagemaid_py}"
+    if not venv_python.exists():
+        return False, f"ImageMaid venv python not found at: {venv_python}"
+
+    if isinstance(command, (list, tuple)):
+        command_parts = [str(part) for part in command]
+    else:
+        command_parts = shlex.split(command, posix=not is_win)
+        cleaned = []
+        for part in command_parts:
+            text = str(part)
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+                text = text[1:-1]
+            cleaned.append(text)
+        command_parts = cleaned
+
+    if command_parts and os.path.basename(command_parts[0]).lower() in {"python", "python3", "python.exe"}:
+        command_parts[0] = str(venv_python)
+    else:
+        command_parts.insert(0, str(venv_python))
+
+    if not any(p.endswith("imagemaid.py") for p in command_parts):
+        command_parts.insert(1, str(imagemaid_py))
+
+    helpers.ts_log(f"argv={command_parts!r}", level="DEBUG")
+    launch_log_path = Path(helpers.get_imagemaid_launch_log_file())
+    launch_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with launch_log_path.open("w", encoding="utf-8", errors="replace") as launch_log:
+        launch_log.write(f"[Quickstart] ImageMaid launch started at {datetime.now().isoformat()}\n")
+        launch_log.flush()
+
+        proc = subprocess.Popen(
+            command_parts,
+            cwd=str(imagemaid_root),
+            stdout=launch_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+        with open(helpers.get_imagemaid_pid_file(), "w", encoding="utf-8") as f:
+            f.write(str(proc.pid))
+
+        time.sleep(1.0)
+        return_code = proc.poll()
+        if return_code is not None:
+            launch_log.flush()
+            try:
+                os.remove(helpers.get_imagemaid_pid_file())
+            except Exception:
+                pass
+            return False, f"ImageMaid exited immediately with code {return_code}. Review the run log for details."
+
+    _schedule_quickstart_imagemaid_run_marker(imagemaid_root, mode=mode, config_name=config_name)
     return True, proc.pid
 
 
@@ -463,7 +1913,7 @@ def _extract_selected_libraries(command):
     return run_option, selected
 
 
-def _update_run_context(command):
+def _update_run_context(command, config_name=None, start_mode="current"):
     run_option, selected = _extract_selected_libraries(command)
     config_path = None
     run_mode = "all"
@@ -486,9 +1936,14 @@ def _update_run_context(command):
         kometa_root = helpers.get_kometa_root_path()
         config_path = _extract_kometa_config_path(parts, kometa_root)
     with RUN_CONTEXT_LOCK:
+        RUN_CONTEXT["command"] = command
         RUN_CONTEXT["run_option"] = run_option
         RUN_CONTEXT["selected_libraries"] = selected
         RUN_CONTEXT["run_mode"] = run_mode
+        RUN_CONTEXT["start_mode"] = _normalize_kometa_start_mode(start_mode)
+        if config_name is None and has_request_context():
+            config_name = session.get("config_name")
+        RUN_CONTEXT["config_name"] = config_name
         RUN_CONTEXT["config_path"] = str(config_path) if config_path else None
         RUN_CONTEXT["started_at"] = datetime.now()
         RUN_CONTEXT["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -575,8 +2030,9 @@ def _maintenance_guard_loop(app_in):
                 if pending and not active and start_min is not None and end_min is not None:
                     pending = _pop_pending_kometa_start()
                     if pending:
-                        _update_run_context(pending.get("command"))
-                        ok, result = _launch_kometa_command(pending.get("command"), pending.get("config_name"))
+                        start_mode = _normalize_kometa_start_mode(pending.get("start_mode"))
+                        _update_run_context(pending.get("command"), config_name=pending.get("config_name"), start_mode=start_mode)
+                        ok, result = _launch_kometa_command(pending.get("command"), pending.get("config_name"), start_mode=start_mode)
                         if ok:
                             helpers.ts_log("Kometa started after Plex maintenance window ended.", level="INFO")
                             with MAINTENANCE_STATE_LOCK:
@@ -603,6 +2059,10 @@ def _maintenance_guard_loop(app_in):
                     if _suspend_process_tree(proc):
                         window_label = f" ({window_str})" if window_str else ""
                         helpers.ts_log(f"Kometa paused due to Plex maintenance window{window_label}.", level="INFO")
+                        try:
+                            _write_quickstart_maintenance_marker(helpers.get_kometa_root_path(), "paused", window=window_str)
+                        except Exception:
+                            pass
                         with MAINTENANCE_STATE_LOCK:
                             MAINTENANCE_STATE["paused"] = True
                             MAINTENANCE_STATE["paused_since"] = datetime.now(timezone.utc).isoformat()
@@ -610,33 +2070,178 @@ def _maintenance_guard_loop(app_in):
 
             with MAINTENANCE_STATE_LOCK:
                 was_paused = MAINTENANCE_STATE["paused"]
+                paused_since = MAINTENANCE_STATE["paused_since"]
             if was_paused:
                 if _resume_process_tree(proc):
                     window_label = f" ({window_str})" if window_str else ""
                     helpers.ts_log(f"Plex maintenance ended{window_label}. Kometa resumed.", level="INFO")
+                    paused_seconds = None
+                    if paused_since:
+                        try:
+                            paused_at = datetime.fromisoformat(str(paused_since).replace("Z", "+00:00"))
+                            if paused_at.tzinfo is None:
+                                paused_at = paused_at.replace(tzinfo=timezone.utc)
+                            paused_seconds = max(0, int((datetime.now(timezone.utc) - paused_at).total_seconds()))
+                        except Exception:
+                            paused_seconds = None
+                    try:
+                        _write_quickstart_maintenance_marker(
+                            helpers.get_kometa_root_path(),
+                            "resumed",
+                            window=window_str,
+                            paused_seconds=paused_seconds,
+                        )
+                    except Exception:
+                        pass
                     with MAINTENANCE_STATE_LOCK:
                         MAINTENANCE_STATE["paused"] = False
                         MAINTENANCE_STATE["paused_since"] = None
 
 
-def _write_quickstart_run_marker(kometa_root, config_name=None):
+def _write_quickstart_run_marker(kometa_root, config_name=None, start_mode="current"):
     try:
-        log_dir = Path(kometa_root) / "config" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "meta.log"
         version_info = app.config.get("VERSION_CHECK") or {}
         qs_version = version_info.get("local_version") or "unknown"
         qs_branch = version_info.get("branch") or "unknown"
         safe_config = (config_name or "default").strip() or "default"
-        timestamp = datetime.now(timezone.utc).isoformat()
-        marker = f"[Quickstart] Run marker: started={timestamp} " f"config={safe_config} quickstart={qs_version} branch={qs_branch}"
-        with log_path.open("a", encoding="utf-8", errors="ignore") as handle:
-            handle.write(marker + "\n")
+        safe_start_mode = _normalize_kometa_start_mode(start_mode)
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        marker = (
+            f"[Quickstart] Run marker: started={timestamp} "
+            f"config={safe_config} quickstart={qs_version} branch={qs_branch} "
+            f"maintenance_markers=1 start_mode={safe_start_mode}"
+        )
+        _append_quickstart_meta_log_line(kometa_root, marker)
     except Exception:
         pass
 
 
-def _schedule_quickstart_run_marker(kometa_root, config_name=None, timeout_seconds=20):
+def _append_quickstart_meta_log_line(kometa_root, line):
+    if not line:
+        return False
+    try:
+        log_dir = Path(kometa_root) / "config" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "meta.log"
+        with log_path.open("a", encoding="utf-8", errors="ignore") as handle:
+            handle.write(str(line).rstrip() + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def _append_quickstart_imagemaid_log_line(imagemaid_root, line, log_path=None):
+    if not line:
+        return False
+    try:
+        root = Path(imagemaid_root)
+        log_dir = root / "config" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        target = Path(log_path) if log_path else (log_dir / "imagemaid.log")
+        with target.open("a", encoding="utf-8", errors="ignore") as handle:
+            handle.write(str(line).rstrip() + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def _write_quickstart_maintenance_marker(kometa_root, event, window=None, paused_seconds=None):
+    event_name = str(event or "").strip().lower()
+    if event_name not in {"paused", "resumed"}:
+        return False
+    local_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    parts = [
+        "[Quickstart] Maintenance marker:",
+        f"event={event_name}",
+        f"at={datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}",
+        f"local_at={local_at}",
+    ]
+    if window:
+        parts.append(f"window={str(window).strip()}")
+    if event_name == "resumed" and isinstance(paused_seconds, (int, float)):
+        parts.append(f"paused_seconds={max(0, int(paused_seconds))}")
+    return _append_quickstart_meta_log_line(kometa_root, " ".join(parts))
+
+
+def _write_quickstart_imagemaid_run_marker(imagemaid_root, mode=None, config_name=None, log_path=None):
+    try:
+        version_info = app.config.get("VERSION_CHECK") or {}
+        qs_version = version_info.get("local_version") or "unknown"
+        qs_branch = version_info.get("branch") or "unknown"
+        safe_mode = (mode or "report").strip().lower() or "report"
+        safe_config = (config_name or "default").strip() or "default"
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        marker = f"[Quickstart] Run marker: started={timestamp} " f"config={safe_config} quickstart={qs_version} branch={qs_branch} " f"tool=imagemaid mode={safe_mode}"
+        return _append_quickstart_imagemaid_log_line(imagemaid_root, marker, log_path=log_path)
+    except Exception:
+        return False
+
+
+def _write_quickstart_stop_marker(kometa_root, config_name=None, reason="user_stop"):
+    try:
+        version_info = app.config.get("VERSION_CHECK") or {}
+        qs_version = version_info.get("local_version") or "unknown"
+        qs_branch = version_info.get("branch") or "unknown"
+        safe_config = (config_name or "default").strip() or "default"
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        marker = (
+            f"[Quickstart] Run event: event=stopped at={timestamp} "
+            f"config={safe_config} quickstart={qs_version} branch={qs_branch} "
+            f"tool=kometa reason={str(reason or 'user_stop').strip() or 'user_stop'}"
+        )
+        return _append_quickstart_meta_log_line(kometa_root, marker)
+    except Exception:
+        return False
+
+
+def _write_quickstart_imagemaid_stop_marker(imagemaid_root, mode=None, config_name=None, log_path=None, reason="user_stop"):
+    try:
+        version_info = app.config.get("VERSION_CHECK") or {}
+        qs_version = version_info.get("local_version") or "unknown"
+        qs_branch = version_info.get("branch") or "unknown"
+        safe_mode = (mode or "report").strip().lower() or "report"
+        safe_config = (config_name or "default").strip() or "default"
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        marker = (
+            f"[Quickstart] Run event: event=stopped at={timestamp} "
+            f"config={safe_config} quickstart={qs_version} branch={qs_branch} "
+            f"tool=imagemaid mode={safe_mode} reason={str(reason or 'user_stop').strip() or 'user_stop'}"
+        )
+        return _append_quickstart_imagemaid_log_line(imagemaid_root, marker, log_path=log_path)
+    except Exception:
+        return False
+
+
+def _write_quickstart_imagemaid_maintenance_marker(imagemaid_root, event, mode=None, config_name=None, window=None, log_path=None):
+    event_name = str(event or "").strip().lower()
+    if event_name not in {"blocked_start"}:
+        return False
+    try:
+        version_info = app.config.get("VERSION_CHECK") or {}
+        qs_version = version_info.get("local_version") or "unknown"
+        qs_branch = version_info.get("branch") or "unknown"
+        safe_mode = (mode or "report").strip().lower() or "report"
+        safe_config = (config_name or "default").strip() or "default"
+        local_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        parts = [
+            "[Quickstart] Maintenance marker:",
+            f"event={event_name}",
+            f"at={datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}",
+            f"local_at={local_at}",
+            f"config={safe_config}",
+            "tool=imagemaid",
+            f"mode={safe_mode}",
+            f"quickstart={qs_version}",
+            f"branch={qs_branch}",
+        ]
+        if window:
+            parts.append(f"window={str(window).strip()}")
+        return _append_quickstart_imagemaid_log_line(imagemaid_root, " ".join(parts), log_path=log_path)
+    except Exception:
+        return False
+
+
+def _schedule_quickstart_run_marker(kometa_root, config_name=None, timeout_seconds=20, start_mode="current"):
     log_path = Path(kometa_root) / "config" / "logs" / "meta.log"
     state = {"mtime": None, "size": None}
     if log_path.exists():
@@ -655,16 +2260,16 @@ def _schedule_quickstart_run_marker(kometa_root, config_name=None, timeout_secon
                     stat = log_path.stat()
                     if state["mtime"] is None:
                         if stat.st_size > 0:
-                            _write_quickstart_run_marker(kometa_root, config_name)
+                            _write_quickstart_run_marker(kometa_root, config_name, start_mode=start_mode)
                             return
                     else:
                         if stat.st_mtime != state["mtime"] and stat.st_size > 0:
-                            _write_quickstart_run_marker(kometa_root, config_name)
+                            _write_quickstart_run_marker(kometa_root, config_name, start_mode=start_mode)
                             return
             except OSError:
                 pass
             time.sleep(0.5)
-        _write_quickstart_run_marker(kometa_root, config_name)
+        _write_quickstart_run_marker(kometa_root, config_name, start_mode=start_mode)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -892,12 +2497,58 @@ DEFAULT_IMAGE_MAP = {
     "season": os.path.join(IMAGES_FOLDER, "default-season_preview.png"),
     "episode": os.path.join(IMAGES_FOLDER, "default-episode_preview.png"),
 }
+BUILTIN_PREVIEW_IMAGES = (
+    "overlay_alignment_guide.png",
+    "overlay_alignment_guide_episodes.png",
+)
+BUILTIN_PREVIEW_IMAGES_BY_TYPE = {
+    "movie": ("overlay_alignment_guide.png",),
+    "show": ("overlay_alignment_guide.png",),
+    "season": ("overlay_alignment_guide.png",),
+    "episode": ("overlay_alignment_guide_episodes.png",),
+}
 PREVIEW_FOLDER = os.path.join(helpers.CONFIG_DIR, "previews")
 os.makedirs(PREVIEW_FOLDER, exist_ok=True)
 OVERLAY_CACHE_FOLDER = os.path.join(helpers.CONFIG_DIR, "cache", "overlays")
 os.makedirs(OVERLAY_CACHE_FOLDER, exist_ok=True)
 OVERLAY_CACHE_TTL_SECONDS = 60 * 60 * 24 * 30
 _FONT_CACHE: list[str] = []
+
+
+def _list_preview_images_for_type(image_type: str) -> list[str]:
+    """Return built-in guide images plus uploaded images for a preview image type."""
+    builtin_candidates = BUILTIN_PREVIEW_IMAGES_BY_TYPE.get(image_type, ())
+    builtins = [name for name in builtin_candidates if os.path.exists(os.path.join(IMAGES_FOLDER, name))]
+    uploads_dir = UPLOAD_FOLDERS.get(image_type)
+    uploads: list[str] = []
+    if uploads_dir and os.path.exists(uploads_dir):
+        uploads = sorted(
+            [img for img in os.listdir(uploads_dir) if any(img.lower().endswith(f".{ext}") for ext in helpers.ALLOWED_EXTENSIONS)],
+            key=str.casefold,
+        )
+    return builtins + [img for img in uploads if img not in builtins]
+
+
+def _build_preview_image_data() -> dict[str, list[str]]:
+    return {img_type: _list_preview_images_for_type(img_type) for img_type in UPLOAD_FOLDERS}
+
+
+def _resolve_preview_base_image_path(img_type: str, selected_image: str) -> str:
+    if not selected_image or selected_image == "default":
+        return DEFAULT_IMAGE_MAP.get(img_type, DEFAULT_IMAGE_MAP["movie"])
+
+    if selected_image in BUILTIN_PREVIEW_IMAGES and selected_image not in BUILTIN_PREVIEW_IMAGES_BY_TYPE.get(img_type, ()):
+        return DEFAULT_IMAGE_MAP.get(img_type, DEFAULT_IMAGE_MAP["movie"])
+
+    static_candidate = _safe_join(IMAGES_FOLDER, selected_image)
+    if static_candidate and static_candidate.exists():
+        return str(static_candidate)
+
+    upload_candidate = _safe_join(UPLOAD_FOLDERS[img_type], selected_image)
+    if upload_candidate and upload_candidate.exists():
+        return str(upload_candidate)
+
+    return DEFAULT_IMAGE_MAP.get(img_type, DEFAULT_IMAGE_MAP["movie"])
 
 
 # Font discovery (TTF/OTF) across common static dirs
@@ -955,7 +2606,7 @@ threading.Thread(target=start_update_thread, daemon=True).start()
 def inject_version_info():
     """Ensure latest version info is injected dynamically in templates"""
     return {
-        "version_info": helpers.check_for_update(),
+        "version_info": app.config.get("VERSION_CHECK") or {},
         "overlay_fonts": list_overlay_fonts(),
     }
 
@@ -976,6 +2627,10 @@ try:
     app.config["QS_KOMETA_LOG_KEEP"] = max(0, int(str(os.getenv("QS_KOMETA_LOG_KEEP", "0")).strip()))
 except (TypeError, ValueError):
     app.config["QS_KOMETA_LOG_KEEP"] = 0
+try:
+    app.config["QS_IMAGEMAID_LOG_KEEP"] = max(0, int(str(os.getenv("QS_IMAGEMAID_LOG_KEEP", "0")).strip()))
+except (TypeError, ValueError):
+    app.config["QS_IMAGEMAID_LOG_KEEP"] = 0
 default_test_libs_path = os.path.join(helpers.CONFIG_DIR, "plex_test_libraries")
 default_test_libs_tmp = os.path.join(helpers.CONFIG_DIR, "tmp")
 app.config["QS_TEST_LIBS_PATH"] = os.getenv("QS_TEST_LIBS_PATH", default_test_libs_path).strip() or default_test_libs_path
@@ -1047,6 +2702,14 @@ logscan_reingest_state = {
     "status": "idle",
     "job_id": None,
 }
+
+# Bump this integer when a release needs a one-time Analytics reset + log reingest
+# on startup. Quickstart persists the highest successful level to config/.env so
+# skipped releases still catch up automatically.
+REQUIRED_LOGSCAN_MIGRATION_LEVEL = 2
+LOGSCAN_STARTUP_MIGRATIONS_ENV = "QS_LOGSCAN_STARTUP_MIGRATIONS"
+LOGSCAN_MIGRATION_LEVEL_DONE_ENV = "QS_LOGSCAN_MIGRATION_LEVEL_DONE"
+LOGSCAN_STARTUP_MIGRATION_JOB_ID = "startup-logscan-migration"
 
 session_ttl = _get_session_lifetime_seconds()
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(seconds=session_ttl)
@@ -1125,6 +2788,26 @@ def update_quickstart():
         return jsonify({"success": False, "log": logs}), 500
 
 
+@app.route("/check-quickstart-update", methods=["POST"])
+def check_quickstart_update():
+    try:
+        version_info = helpers.check_for_update()
+        app.config["VERSION_CHECK"] = version_info
+        return jsonify({"success": True, "version_info": version_info})
+    except Exception as e:
+        helpers.ts_log(f"Quickstart update check failed: {e}", level="ERROR")
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "message": "Failed to check for Quickstart updates.",
+                    "version_info": app.config.get("VERSION_CHECK") or {},
+                }
+            ),
+            500,
+        )
+
+
 # Initialize Flask-Session
 server_session = Session(app)
 server_thread = None
@@ -1133,9 +2816,12 @@ shutdown_event = threading.Event()
 # Track current run context for progress UI.
 RUN_CONTEXT_LOCK = threading.Lock()
 RUN_CONTEXT = {
+    "command": None,
     "selected_libraries": None,
     "run_option": None,
     "run_mode": "all",
+    "start_mode": "current",
+    "config_name": None,
     "config_path": None,
     "started_at": None,
     "updated_at": None,
@@ -1144,6 +2830,9 @@ RUN_CONTEXT = {
 
 # Ensure json-schema files are up to date at startup
 helpers.ensure_json_schema()
+sanitized_section_count = database.sanitize_all_section_data()
+if sanitized_section_count:
+    helpers.ts_log(f"Sanitized transient config-manager fields from {sanitized_section_count} persisted section(s).", level="INFO")
 
 parser = argparse.ArgumentParser(description="Run Quickstart Flask App")
 parser.add_argument("--port", type=int, help="Specify the port number to run the server")
@@ -1410,13 +3099,7 @@ def list_uploaded_images():
     if image_type not in UPLOAD_FOLDERS:
         return jsonify({"status": "error", "message": "Invalid image type"}), 400
 
-    uploads_dir = UPLOAD_FOLDERS[image_type]
-    if not os.path.exists(uploads_dir):
-        return jsonify({"images": []})
-
-    images = [img for img in os.listdir(uploads_dir) if any(img.lower().endswith(f".{ext}") for ext in helpers.ALLOWED_EXTENSIONS)]
-
-    return jsonify({"status": "success", "images": images})
+    return jsonify({"status": "success", "images": _list_preview_images_for_type(image_type)})
 
 
 @app.route("/generate_preview", methods=["POST"])
@@ -1490,14 +3173,11 @@ def generate_preview():
     preview_filepath = os.path.join(PREVIEW_FOLDER, preview_filename)
 
     # Resolve base image
-    if not selected_image or selected_image == "default":
-        base_image_path = DEFAULT_IMAGE_MAP.get(img_type, DEFAULT_IMAGE_MAP["movie"])
-        if not os.path.exists(base_image_path):
-            fallback_size = (1920, 1080) if img_type == "episode" else (1000, 1500)
-            base_img = Image.new("RGBA", fallback_size, (128, 128, 128, 255))
-            base_img.save(base_image_path)
-    else:
-        base_image_path = os.path.join(UPLOAD_FOLDERS[img_type], selected_image)
+    base_image_path = _resolve_preview_base_image_path(img_type, selected_image)
+    if not os.path.exists(base_image_path):
+        fallback_size = (1920, 1080) if img_type == "episode" else (1000, 1500)
+        base_img = Image.new("RGBA", fallback_size, (128, 128, 128, 255))
+        base_img.save(base_image_path)
 
     if not os.path.exists(base_image_path):
         return jsonify({"status": "error", "message": "Selected image not found."}), 400
@@ -1737,6 +3417,9 @@ def clear_data_section(name, section):
 @app.route("/clear_data/<name>")
 def clear_data(name):
     database.reset_data(name)
+    cleanup = helpers.delete_config_artifacts(name, kometa_root=app.config.get("KOMETA_ROOT", "."))
+    for msg in cleanup.get("errors", []):
+        helpers.ts_log(msg, level="WARNING")
     flash("SQLite storage cleared successfully.", "success")
     return redirect(url_for("start"))
 
@@ -1753,7 +3436,41 @@ def switch_config():
         return jsonify(success=False, message="Config not found."), 404
 
     session["config_name"] = name
-    return jsonify(success=True, name=name)
+    try:
+        menu_templates = helpers.get_menu_list()
+        workspace_status = _build_workspace_status_context(name, menu_templates, available_configs=available)
+    except Exception:
+        workspace_status = {}
+    return jsonify(success=True, name=name, workspace_status=workspace_status)
+
+
+@app.route("/activate-config", methods=["POST"])
+def activate_config():
+    data = request.get_json(silent=True) or {}
+    requested_name = data.get("name")
+    name = _sanitize_config_name(requested_name)
+    if not name:
+        return jsonify(success=False, message="Config name is required."), 400
+
+    available = database.get_unique_config_names() or []
+    created = name not in available
+
+    session["config_name"] = name
+
+    if created:
+        seed_payload = {
+            "start": {"config_name": name},
+            "validated_at": utc_now_iso(),
+        }
+        database.save_section_data(
+            name=name,
+            section="start",
+            validated=True,
+            user_entered=True,
+            data=seed_payload,
+        )
+
+    return jsonify(success=True, name=name, created=created)
 
 
 @app.route("/bulk-delete-configs", methods=["POST"])
@@ -1772,6 +3489,9 @@ def bulk_delete_configs():
     for name in cleaned:
         if name in available:
             database.reset_data(name)
+            cleanup = helpers.delete_config_artifacts(name, kometa_root=app.config.get("KOMETA_ROOT", "."))
+            for msg in cleanup.get("errors", []):
+                helpers.ts_log(msg, level="WARNING")
             deleted.append(name)
 
     remaining = database.get_unique_config_names() or []
@@ -1781,6 +3501,612 @@ def bulk_delete_configs():
         current = session["config_name"]
 
     return jsonify(success=True, deleted=deleted, remaining=remaining, current=current)
+
+
+@app.route("/orphaned-config-artifacts", methods=["GET"])
+def orphaned_config_artifacts():
+    result = helpers.list_orphaned_config_artifacts(kometa_root=app.config.get("KOMETA_ROOT", "."))
+    status_code = 200 if not result.get("errors") else 500
+    return jsonify(success=not bool(result.get("errors")), orphans=result.get("orphans", []), errors=result.get("errors", [])), status_code
+
+
+@app.route("/orphaned-config-artifacts/versions", methods=["GET"])
+def orphaned_config_artifact_versions():
+    name = request.args.get("name")
+    normalized = helpers.normalize_config_name_for_storage(name)
+    inventory = helpers.list_orphaned_config_artifacts(kometa_root=app.config.get("KOMETA_ROOT", "."))
+    if inventory.get("errors"):
+        return jsonify(success=False, message="Unable to inspect config storage.", errors=inventory["errors"]), 500
+
+    orphan_names = {item.get("name") for item in inventory.get("orphans", []) if item.get("name")}
+    if normalized not in orphan_names:
+        return jsonify(success=False, message="Config bundle is not currently orphaned."), 404
+
+    result = helpers.list_orphaned_config_versions(normalized)
+    return jsonify(success=True, name=normalized, versions=result.get("versions", []))
+
+
+@app.route("/orphaned-config-artifacts/restore", methods=["POST"])
+def restore_orphaned_config_artifact():
+    data = request.get_json(silent=True) or {}
+    name = helpers.normalize_config_name_for_storage(data.get("name"))
+    selected_path = data.get("path")
+    if not name or not isinstance(selected_path, str) or not selected_path.strip():
+        return jsonify(success=False, message="Config bundle name and version path are required."), 400
+
+    available = database.get_unique_config_names() or []
+    if any(existing.lower() == name.lower() for existing in available):
+        return jsonify(success=False, message="Config already exists in the database."), 400
+
+    inventory = helpers.list_orphaned_config_artifacts(kometa_root=app.config.get("KOMETA_ROOT", "."))
+    if inventory.get("errors"):
+        return jsonify(success=False, message="Unable to inspect config storage.", errors=inventory["errors"]), 500
+
+    orphan_names = {item.get("name") for item in inventory.get("orphans", []) if item.get("name")}
+    if name not in orphan_names:
+        return jsonify(success=False, message="Config bundle is not currently orphaned."), 404
+
+    versions = helpers.list_orphaned_config_versions(name).get("versions", [])
+    version_lookup = {entry.get("path"): entry for entry in versions if entry.get("path")}
+    if selected_path not in version_lookup:
+        return jsonify(success=False, message="Selected version is not available for restore."), 400
+
+    try:
+        source_path = Path(selected_path).resolve()
+        yaml_text = source_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return jsonify(success=False, message=f"Unable to read the selected config version: {exc}"), 400
+
+    config_data = importer.load_yaml_config(yaml_text)
+    if not config_data:
+        return jsonify(success=False, message="Selected config version could not be parsed as YAML."), 400
+
+    payload, report = importer.prepare_import_payload(config_data, set(), set())
+    if not payload:
+        return jsonify(success=False, message="Selected config version has no importable Quickstart sections."), 400
+
+    for section, data_blob in payload.items():
+        database.save_section_data(
+            name=name,
+            section=section,
+            validated=False,
+            user_entered=True,
+            data=data_blob,
+        )
+
+    config_dir = Path(helpers.CONFIG_DIR)
+    current_file = (config_dir / f"{name}_config.yml").resolve()
+    if source_path != current_file:
+        helpers.save_to_named_config(yaml_text, name)
+    else:
+        kometa_config_dir = Path(app.config.get("KOMETA_ROOT", ".")) / "config"
+        try:
+            kometa_config_dir.mkdir(parents=True, exist_ok=True)
+            (kometa_config_dir / current_file.name).write_text(yaml_text, encoding="utf-8")
+        except OSError as exc:
+            helpers.ts_log(f"Failed to sync restored config to Kometa: {exc}", level="WARNING")
+
+    session["config_name"] = name
+    try:
+        menu_templates = helpers.get_menu_list()
+        workspace_status = _build_workspace_status_context(name, menu_templates, available_configs=database.get_unique_config_names() or [])
+    except Exception:
+        workspace_status = {}
+
+    return jsonify(
+        success=True,
+        config_name=name,
+        restored_path=str(source_path),
+        imported_sections=sorted(payload.keys()),
+        report_summary=report.summary(),
+        workspace_status=workspace_status,
+    )
+
+
+@app.route("/orphaned-config-artifacts/delete", methods=["POST"])
+def delete_orphaned_config_artifacts():
+    data = request.get_json(silent=True) or {}
+    names = data.get("names") or []
+    if not isinstance(names, list):
+        return jsonify(success=False, message="Invalid request payload."), 400
+
+    selected = [helpers.normalize_config_name_for_storage(name) for name in names if str(name or "").strip()]
+    if not selected:
+        return jsonify(success=False, message="No orphaned configs selected."), 400
+
+    inventory = helpers.list_orphaned_config_artifacts(kometa_root=app.config.get("KOMETA_ROOT", "."))
+    if inventory.get("errors"):
+        return jsonify(success=False, message="Unable to inspect config storage.", errors=inventory["errors"]), 500
+
+    orphan_bundles = {item.get("name"): item for item in inventory.get("orphans", []) if isinstance(item, dict) and item.get("name")}
+    orphan_names = set(orphan_bundles)
+    invalid = [name for name in selected if name not in orphan_names]
+    if invalid:
+        return jsonify(success=False, message="Only orphaned config bundles can be deleted here.", invalid=invalid), 400
+
+    deleted = []
+    errors = []
+    for name in selected:
+        result = helpers.delete_orphaned_artifact_bundle(orphan_bundles.get(name))
+        if result.get("errors"):
+            errors.extend(result["errors"])
+        else:
+            deleted.append(name)
+
+    if errors:
+        return jsonify(success=False, deleted=deleted, errors=errors, message="Some orphaned config bundles could not be deleted."), 500
+
+    return jsonify(success=True, deleted=deleted)
+
+
+def _build_logscan_resolution_context(log_dir=None, include_candidate_files=True):
+    cache_entries = []
+    ingest_cache = _load_logscan_ingest_cache()
+    cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
+    if isinstance(cache_logs, dict):
+        for raw_path, entry in cache_logs.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                path = Path(raw_path).resolve()
+            except Exception:
+                continue
+            if not path.exists() or not path.is_file():
+                continue
+            try:
+                stats = path.stat()
+            except Exception:
+                continue
+            cache_entries.append(
+                {
+                    "path": path,
+                    "mtime": float(stats.st_mtime),
+                    "size": int(stats.st_size),
+                    "run_key": entry.get("run_key"),
+                    "tool_name": _normalize_logscan_tool_name(entry.get("tool_name") or _detect_logscan_tool_from_path(path, log_dir=log_dir)),
+                }
+            )
+
+    candidate_files = []
+    if include_candidate_files:
+        for path in _iter_logscan_candidate_files(log_dir=log_dir, include_archive=True, include_compressed=True):
+            try:
+                stats = path.stat()
+            except Exception:
+                continue
+            candidate_files.append(
+                {
+                    "path": path,
+                    "mtime": float(stats.st_mtime),
+                    "size": int(stats.st_size),
+                    "location": _classify_logscan_file_location(path, log_dir=log_dir),
+                    "tool_name": _detect_logscan_tool_from_path(path, log_dir=log_dir),
+                }
+            )
+    return {"cache_entries": cache_entries, "candidate_files": candidate_files}
+
+
+def _find_logscan_cache_entry_for_run(run_key):
+    if not run_key:
+        return None
+    ingest_cache = _load_logscan_ingest_cache()
+    cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
+    if not isinstance(cache_logs, dict):
+        return None
+    for raw_path, entry in cache_logs.items():
+        if not isinstance(entry, dict) or entry.get("run_key") != run_key:
+            continue
+        try:
+            path = Path(raw_path).resolve()
+        except Exception:
+            continue
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            stats = path.stat()
+            mtime = float(stats.st_mtime)
+            size = int(stats.st_size)
+        except Exception:
+            mtime = float(entry.get("mtime", 0) or 0)
+            size = int(entry.get("size", 0) or 0)
+        return {
+            "path": path,
+            "mtime": mtime,
+            "size": size,
+            "run_key": entry.get("run_key"),
+            "tool_name": _normalize_logscan_tool_name(entry.get("tool_name") or _detect_logscan_tool_from_path(path)),
+        }
+    return None
+
+
+def _match_logscan_run_to_file(run_record, context=None, log_dir=None, allow_live_fallback=True):
+    if not isinstance(run_record, dict):
+        return None
+    context = context or _build_logscan_resolution_context(log_dir=log_dir)
+    run_key = run_record.get("run_key")
+    run_tool_name = _normalize_logscan_tool_name(run_record.get("tool_name"))
+    if run_key:
+        cache_matches = [
+            entry for entry in context.get("cache_entries", []) if entry.get("run_key") == run_key and _normalize_logscan_tool_name(entry.get("tool_name")) == run_tool_name
+        ]
+        if cache_matches:
+            cache_matches.sort(key=lambda entry: entry.get("mtime", 0), reverse=True)
+            match = cache_matches[0]
+            return {
+                "path": match["path"],
+                "location": _classify_logscan_file_location(match["path"], log_dir=log_dir),
+                "size": match.get("size"),
+                "mtime": match.get("mtime"),
+                "source": "cache",
+            }
+
+    target_mtime = run_record.get("log_mtime")
+    target_size = run_record.get("log_size")
+    candidates = []
+    for entry in context.get("candidate_files", []):
+        if _normalize_logscan_tool_name(entry.get("tool_name")) != run_tool_name:
+            continue
+        if not allow_live_fallback and entry.get("location") == "live":
+            continue
+        size_matches = target_size is not None and entry.get("size") == target_size
+        mtime_delta = None
+        mtime_matches = False
+        if target_mtime is not None:
+            try:
+                mtime_delta = abs(float(entry.get("mtime", 0)) - float(target_mtime))
+                mtime_matches = mtime_delta <= 1.0
+            except Exception:
+                mtime_delta = None
+        if not size_matches and not mtime_matches:
+            continue
+        rank = 0
+        if size_matches:
+            rank += 2
+        if mtime_matches:
+            rank += 2
+        candidates.append((rank, mtime_delta if mtime_delta is not None else 999999, -entry.get("mtime", 0), entry))
+    if not candidates:
+        return None
+    candidates.sort()
+    match = candidates[0][3]
+    return {
+        "path": match["path"],
+        "location": match.get("location") or _classify_logscan_file_location(match["path"], log_dir=log_dir),
+        "size": match.get("size"),
+        "mtime": match.get("mtime"),
+        "source": "fallback",
+    }
+
+
+def _resolve_logscan_run_log_info(run_key, run_record=None, context=None):
+    if not run_key:
+        return None
+    run_tool_name = _normalize_logscan_tool_name(run_record.get("tool_name")) if isinstance(run_record, dict) else None
+    cache_matches = []
+    if isinstance(context, dict):
+        cache_matches = [
+            entry
+            for entry in context.get("cache_entries", [])
+            if entry.get("run_key") == run_key and (not run_tool_name or _normalize_logscan_tool_name(entry.get("tool_name")) == run_tool_name)
+        ]
+    else:
+        direct_match = _find_logscan_cache_entry_for_run(run_key)
+        if direct_match and (not run_tool_name or _normalize_logscan_tool_name(direct_match.get("tool_name")) == run_tool_name):
+            cache_matches = [direct_match]
+    if cache_matches:
+        cache_matches.sort(key=lambda entry: entry.get("mtime", 0), reverse=True)
+        match = cache_matches[0]
+        location = _classify_logscan_file_location(match["path"])
+        if not (isinstance(run_record, dict) and location == "live"):
+            return {
+                "path": match["path"],
+                "location": location,
+                "size": match.get("size"),
+                "mtime": match.get("mtime"),
+                "source": "cache",
+            }
+    run_record = run_record if isinstance(run_record, dict) else database.get_log_run(run_key)
+    if not run_record:
+        if cache_matches:
+            match = cache_matches[0]
+            return {
+                "path": match["path"],
+                "location": _classify_logscan_file_location(match["path"]),
+                "size": match.get("size"),
+                "mtime": match.get("mtime"),
+                "source": "cache",
+            }
+        return None
+    full_context = context
+    if not isinstance(full_context, dict) or not isinstance(full_context.get("candidate_files"), list) or not full_context.get("candidate_files"):
+        full_context = _build_logscan_resolution_context(include_candidate_files=True)
+    info = _match_logscan_run_to_file(run_record, context=full_context, allow_live_fallback=False)
+    if info:
+        return info
+    if cache_matches:
+        match = cache_matches[0]
+        return {
+            "path": match["path"],
+            "location": _classify_logscan_file_location(match["path"]),
+            "size": match.get("size"),
+            "mtime": match.get("mtime"),
+            "source": "cache",
+        }
+    return None
+
+
+def _resolve_logscan_run_log_path(run_key):
+    info = _resolve_logscan_run_log_info(run_key)
+    return info.get("path") if isinstance(info, dict) else None
+
+
+def _resolve_logscan_run_archive_action_info(run_key, prefer_uncompressed=False):
+    run_key = str(run_key or "").strip()
+    if not run_key:
+        return None
+    run_record = database.get_log_run(run_key)
+    run_tool_name = _normalize_logscan_tool_name(run_record.get("tool_name")) if isinstance(run_record, dict) else None
+    ingest_cache = _load_logscan_ingest_cache()
+    cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
+    if isinstance(cache_logs, dict):
+        archive_matches = []
+        for raw_path, entry in cache_logs.items():
+            if not isinstance(entry, dict) or entry.get("run_key") != run_key:
+                continue
+            try:
+                path = Path(raw_path).resolve()
+            except Exception:
+                continue
+            if not path.exists() or not path.is_file():
+                continue
+            location = _classify_logscan_file_location(path)
+            if location != "archive":
+                continue
+            if run_tool_name and _normalize_logscan_tool_name(entry.get("tool_name") or _detect_logscan_tool_from_path(path)) != run_tool_name:
+                continue
+            try:
+                stats = path.stat()
+                size = int(stats.st_size)
+                mtime = float(stats.st_mtime)
+            except Exception:
+                size = int(entry.get("size", 0) or 0)
+                mtime = float(entry.get("mtime", 0) or 0)
+            archive_matches.append(
+                {
+                    "path": path,
+                    "location": location,
+                    "size": size,
+                    "mtime": mtime,
+                    "source": "cache",
+                    "is_compressed": _is_logscan_gzip_path(path),
+                }
+            )
+        if archive_matches:
+            if prefer_uncompressed:
+                plain_matches = [item for item in archive_matches if not item.get("is_compressed")]
+                if plain_matches:
+                    plain_matches.sort(key=lambda item: item.get("mtime", 0), reverse=True)
+                    return plain_matches[0]
+            archive_matches.sort(key=lambda item: item.get("mtime", 0), reverse=True)
+            return archive_matches[0]
+    return None
+
+
+def _delete_logscan_run_artifact(run_key):
+    run_key = str(run_key or "").strip()
+    if not run_key:
+        return False, {"error": "run_key required"}, 400
+    run_record = database.get_log_run(run_key)
+    incomplete_run = None if run_record else _get_logscan_incomplete_run(run_key)
+    if not run_record and not incomplete_run:
+        return False, {"error": "Run not found.", "run_key": run_key}, 404
+    target_run = run_record if run_record else incomplete_run
+    info = _resolve_logscan_run_log_info(run_key, run_record=target_run)
+    if not info or not info.get("path"):
+        return False, {"error": "Archived log file for this run could not be found.", "run_key": run_key}, 404
+    if info.get("location") != "archive":
+        return False, {"error": "Only archived logs can be deleted from Analytics.", "run_key": run_key}, 409
+    deleted_file = False
+    try:
+        Path(info["path"]).unlink()
+        deleted_file = True
+    except FileNotFoundError:
+        deleted_file = False
+    except Exception as exc:
+        return False, {"error": f"Failed to delete archived log: {exc}", "run_key": run_key}, 500
+
+    if run_record:
+        database.delete_log_run(run_key)
+    _remove_logscan_ingest_cache_entries(run_key=run_key, raw_path=str(Path(info["path"]).resolve()))
+    return (
+        True,
+        {
+            "success": True,
+            "run_key": run_key,
+            "deleted_file": deleted_file,
+            "deleted_run": bool(run_record),
+        },
+        200,
+    )
+
+
+def _compress_logscan_run_artifact(run_key):
+    run_key = str(run_key or "").strip()
+    if not run_key:
+        return False, {"error": "run_key required"}, 400
+    run_record = database.get_log_run(run_key)
+    incomplete_run = None if run_record else _get_logscan_incomplete_run(run_key)
+    if not run_record and not incomplete_run:
+        return False, {"error": "Run not found.", "run_key": run_key}, 404
+    target_run = run_record if run_record else incomplete_run
+    info = _resolve_logscan_run_archive_action_info(run_key, prefer_uncompressed=True) or _resolve_logscan_run_log_info(run_key, run_record=target_run)
+    if not info or not info.get("path"):
+        return False, {"error": "Archived log file for this run could not be found.", "run_key": run_key}, 404
+    source_path = Path(info["path"])
+    if info.get("location") != "archive":
+        return False, {"error": "Only archived logs can be compressed from Analytics.", "run_key": run_key}, 409
+    if _is_logscan_gzip_path(source_path):
+        return False, {"error": "Archived log is already compressed.", "run_key": run_key}, 409
+
+    tool_name = _normalize_logscan_tool_name((target_run or {}).get("tool_name") or _detect_logscan_tool_from_path(source_path))
+    archive_dir = _get_logscan_archive_dir(tool_name)
+    compressed_path = _archive_log_file(source_path, archive_dir)
+    if not compressed_path or not compressed_path.exists():
+        return False, {"error": "Failed to compress archived log.", "run_key": run_key}, 500
+
+    cache = _load_logscan_ingest_cache()
+    cache_logs = cache.get("logs", {}) if isinstance(cache, dict) else {}
+    if not isinstance(cache_logs, dict):
+        cache_logs = {}
+    source_key = str(source_path.resolve())
+    compressed_key = str(compressed_path.resolve())
+    cache_entry = cache_logs.pop(source_key, None)
+    if not isinstance(cache_entry, dict):
+        cache_entry = {
+            "run_key": run_key,
+            "run_complete": not bool(incomplete_run),
+        }
+    cache_entry["tool_name"] = tool_name
+    try:
+        compressed_stats = compressed_path.stat()
+        cache_entry["mtime"] = compressed_stats.st_mtime
+        cache_entry["size"] = compressed_stats.st_size
+    except Exception:
+        pass
+    cache_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+    cache_logs[compressed_key] = cache_entry
+    cache["logs"] = cache_logs
+    _save_logscan_ingest_cache(cache)
+
+    return (
+        True,
+        {
+            "success": True,
+            "run_key": run_key,
+            "compressed_file": True,
+            "compressed_path": compressed_key,
+        },
+        200,
+    )
+
+
+def _annotate_logscan_runs(runs, context=None):
+    if not isinstance(runs, list) or not runs:
+        return [] if isinstance(runs, list) else []
+    context = context or _build_logscan_resolution_context()
+    annotated = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        row = dict(run)
+        if str(row.get("tool_name") or "").strip().lower() == "imagemaid":
+            row["config_name"] = _resolve_imagemaid_run_config_name(row)
+        info = _resolve_logscan_run_log_info(row.get("run_key"), run_record=row, context=context)
+        row["log_available"] = bool(info and info.get("path"))
+        row["log_location"] = info.get("location") if info else "missing"
+        row["log_resolved_size"] = info.get("size") if info and isinstance(info.get("size"), int) else row.get("log_size")
+        row["log_is_compressed"] = bool(info and info.get("path") and _is_logscan_gzip_path(info["path"]))
+        row["log_can_delete"] = row["log_location"] == "archive" and row["log_available"]
+        row["log_can_compress"] = row["log_location"] == "archive" and row["log_available"] and not row["log_is_compressed"]
+        annotated.append(row)
+    return annotated
+
+
+@app.route("/logscan/trends/log", methods=["GET"])
+def logscan_trends_log_download():
+    run_key = request.args.get("run_key")
+    if not run_key:
+        return jsonify({"error": "run_key required"}), 400
+    log_path = _resolve_logscan_run_log_path(run_key)
+    if not log_path:
+        return jsonify({"error": "Log file for this run could not be found."}), 404
+    mimetype = "application/gzip" if _is_logscan_gzip_path(log_path) else "text/plain"
+    return send_file(
+        str(log_path),
+        as_attachment=True,
+        download_name=log_path.name,
+        mimetype=mimetype,
+    )
+
+
+@app.route("/logscan/trends/log/delete", methods=["POST"])
+def logscan_trends_log_delete():
+    payload = request.get_json(silent=True) or {}
+    raw_run_keys = payload.get("run_keys")
+    if isinstance(raw_run_keys, list):
+        run_keys = [str(value or "").strip() for value in raw_run_keys if str(value or "").strip()]
+    else:
+        run_key = str(payload.get("run_key", "")).strip()
+        run_keys = [run_key] if run_key else []
+    unique_run_keys = list(dict.fromkeys(run_keys))
+    if not unique_run_keys:
+        return jsonify({"error": "run_key required"}), 400
+
+    deleted = []
+    failures = []
+    for run_key in unique_run_keys:
+        success, result, status = _delete_logscan_run_artifact(run_key)
+        if success:
+            deleted.append(result)
+        else:
+            result["status"] = status
+            failures.append(result)
+
+    if not deleted and failures:
+        first = failures[0]
+        return jsonify({"success": False, "error": first.get("error"), "failures": failures}), int(first.get("status", 400))
+
+    response = {
+        "success": not failures,
+        "deleted": len(deleted),
+        "results": deleted,
+        "deleted_file_count": sum(1 for item in deleted if item.get("deleted_file")),
+        "deleted_run_count": sum(1 for item in deleted if item.get("deleted_run")),
+        "failures": failures,
+    }
+    if len(unique_run_keys) == 1 and deleted:
+        response["deleted_file"] = bool(deleted[0].get("deleted_file"))
+        response["deleted_run"] = bool(deleted[0].get("deleted_run"))
+    return jsonify(response)
+
+
+@app.route("/logscan/trends/log/compress", methods=["POST"])
+def logscan_trends_log_compress():
+    payload = request.get_json(silent=True) or {}
+    raw_run_keys = payload.get("run_keys")
+    if isinstance(raw_run_keys, list):
+        run_keys = [str(value or "").strip() for value in raw_run_keys if str(value or "").strip()]
+    else:
+        run_key = str(payload.get("run_key", "")).strip()
+        run_keys = [run_key] if run_key else []
+    unique_run_keys = list(dict.fromkeys(run_keys))
+    if not unique_run_keys:
+        return jsonify({"error": "run_key required"}), 400
+
+    compressed = []
+    failures = []
+    for run_key in unique_run_keys:
+        success, result, status = _compress_logscan_run_artifact(run_key)
+        if success:
+            compressed.append(result)
+        else:
+            result["status"] = status
+            failures.append(result)
+
+    if not compressed and failures:
+        first = failures[0]
+        return jsonify({"success": False, "error": first.get("error"), "failures": failures}), int(first.get("status", 400))
+
+    response = {
+        "success": not failures,
+        "compressed": len(compressed),
+        "results": compressed,
+        "failures": failures,
+    }
+    if len(unique_run_keys) == 1 and compressed:
+        response["compressed_file"] = bool(compressed[0].get("compressed_file"))
+        response["compressed_path"] = compressed[0].get("compressed_path")
+    return jsonify(response)
 
 
 @app.route("/rename-config", methods=["POST"])
@@ -2764,9 +5090,15 @@ def import_config_confirm():
             selected_sections = {section for section in merge_sections if section in importable_sections}
         else:
             selected_sections = set(importable_sections)
+        if "playlist_files" in selected_sections:
+            selected_sections.discard("playlist_files")
+            selected_sections.add("libraries")
         if not selected_sections:
             return jsonify(success=False, message="Select at least one section to merge."), 400
-        config_data = {key: value for key, value in config_data.items() if key in selected_sections}
+        selected_config_sections = set(selected_sections)
+        if "libraries" in selected_config_sections:
+            selected_config_sections.add("playlist_files")
+        config_data = {key: value for key, value in config_data.items() if key in selected_config_sections}
     if not config_name:
         return jsonify(success=False, message="Import payload is invalid."), 400
 
@@ -3038,11 +5370,22 @@ def import_config_confirm():
     session.pop("import_preview_plex_token", None)
     session.pop("import_preview_tmdb_apikey", None)
     session["config_name"] = config_name
+    importable_sections = sorted(str(section) for section in (cached.get("importable_sections") or payload.keys()))
+    skipped_sections = sorted(section for section in importable_sections if section not in set(imported_sections))
+    report_summary = report.summary() if "report" in locals() else (cached.get("report_summary") or {})
+    mapping_values = [str(value).strip() for value in library_mapping.values()] if isinstance(library_mapping, dict) else []
+    mapping_summary = {
+        "mapped": sum(1 for value in mapping_values if value and value != "__ignore__"),
+        "ignored": sum(1 for value in mapping_values if value == "__ignore__"),
+    }
 
     return jsonify(
         success=True,
         config_name=config_name,
         imported_sections=imported_sections,
+        skipped_sections=skipped_sections,
+        report_summary=report_summary,
+        mapping_summary=mapping_summary,
         fonts_copied=fonts_copied,
         fonts_skipped=fonts_skipped,
         fonts_skipped_existing=fonts_skipped_existing,
@@ -3053,9 +5396,27 @@ def import_config_confirm():
 @app.route("/step/<name>", methods=["GET", "POST"])
 def step(name):
     page_info = {}
-    header_style = "single_line"  # Default to 'single_line' font
+    header_style = "single line"
     save_error = None
+    if name == "900-final":
+        return redirect(url_for("step", name="900-kometa"), code=302)
     persistence.ensure_session_config_name()
+    requested_query_config = request.args.get("config_name")
+    if request.method == "GET" and requested_query_config:
+        normalized_query_config = helpers.normalize_config_name_for_storage(requested_query_config)
+        available_query_configs = database.get_unique_config_names() or []
+        if normalized_query_config in available_query_configs:
+            session["config_name"] = normalized_query_config
+    previous_config = session.get("config_name")
+
+    posted_config = request.form.get("configSelector")
+    posted_new_config_name = request.form.get("newConfigName")
+    if posted_config == "add_config" and posted_new_config_name:
+        posted_config = posted_new_config_name.strip()
+
+    # Ensure saves happen against the currently selected config.
+    if request.method == "POST" and posted_config:
+        session["config_name"] = posted_config
 
     if request.method == "POST":
         path_errors = path_validation.validate_payload(request.form)
@@ -3065,10 +5426,9 @@ def step(name):
             save_error = "Invalid values: " + " ".join(validation_errors)
         else:
             persistence.save_settings(request.referrer, request.form)
-            header_style = request.form.get("header_style", "single_line")
+            header_style = request.form.get("header_style", "single line")
 
     # --- Detect config change ---
-    previous_config = session.get("config_name")
     selected_config = request.form.get("configSelector") or previous_config
     new_config_name = request.form.get("newConfigName")
 
@@ -3088,16 +5448,23 @@ def step(name):
     # Retrieve stored settings from DB
     saved_settings = persistence.retrieve_settings(name)  # Retrieve from DB
 
-    # Ensure we correctly access header_style from "final"
-    if "final" in saved_settings and "header_style" in saved_settings["final"]:
-        header_style = saved_settings["final"]["header_style"]
+    saved_header_style = None
+    if "kometa" in saved_settings and "header_style" in saved_settings["kometa"]:
+        saved_header_style = saved_settings["kometa"]["header_style"]
+    elif "final" in saved_settings and "header_style" in saved_settings["final"]:
+        saved_header_style = saved_settings["final"]["header_style"]
+    if saved_header_style is not None:
+        header_style = saved_header_style
+
+    if header_style == "single_line":
+        header_style = "single line"
 
     if header_style is None:
-        header_style = "single_line" if "single_line" in available_fonts else "standard"
+        header_style = "single line" if "single line" in available_fonts else "standard"
 
     # Ensure the selected font is valid
     if header_style not in available_fonts:
-        header_style = "single_line" if "single_line" in available_fonts else "standard"
+        header_style = "single line" if "single line" in available_fonts else "standard"
 
     page_info["header_style"] = header_style  # Now properly restored
 
@@ -3122,6 +5489,7 @@ def step(name):
     page_info["qs_optimize_defaults"] = app.config.get("QS_OPTIMIZE_DEFAULTS", True)
     page_info["qs_config_history"] = app.config.get("QS_CONFIG_HISTORY", 0)
     page_info["qs_kometa_log_keep"] = app.config.get("QS_KOMETA_LOG_KEEP", 0)
+    page_info["qs_imagemaid_log_keep"] = app.config.get("QS_IMAGEMAID_LOG_KEEP", 0)
     page_info["qs_session_lifetime_days"] = app.config.get("QS_SESSION_LIFETIME_DAYS", 30)
     page_info["qs_flask_session_dir"] = app.config.get("QS_FLASK_SESSION_DIR", "")
     _, test_libs_path, test_libs_tmp, _, _ = _resolve_test_libraries_paths(helpers.get_app_root())
@@ -3207,26 +5575,51 @@ def step(name):
     if "kometa_root" not in session:
         session["kometa_root"] = app.config.get("KOMETA_ROOT", "")
 
-    # Fetch Plex settings
-    all_libraries = persistence.retrieve_settings("010-plex")
+    # Fetch Plex settings (reuse already loaded payload on Plex step)
+    all_libraries = data if name == "010-plex" else persistence.retrieve_settings("010-plex")
 
     # Ensure 'plex' key exists before accessing sub-keys
     plex_data = all_libraries.get("plex", {})
 
-    # --- Refresh Plex data if needed ---
-    if name in ["010-plex", "025-libraries", "900-final"] or config_changed:
-        if all_libraries.get("validated"):
-            refresh_plex_libraries()
-        telemetry = persistence.retrieve_settings("plex_telemetry")
+    cached_user_list = plex_data.get("tmp_user_list", "")
+    if isinstance(cached_user_list, str):
+        has_cached_user_list = any(user.strip() for user in cached_user_list.split(","))
+    elif isinstance(cached_user_list, list):
+        has_cached_user_list = any(str(user).strip() for user in cached_user_list)
     else:
-        telemetry = persistence.retrieve_settings("plex_telemetry")
+        has_cached_user_list = False
 
-    telemetry_data = telemetry.get("plex_telemetry")
+    plex_url = plex_data.get("url")
+    plex_token = plex_data.get("token")
+    dummy_plex = persistence.get_dummy_data("plex") or {}
+    has_plex_credentials = bool(
+        plex_url and plex_token and str(plex_url).strip() != str(dummy_plex.get("url", "")).strip() and str(plex_token).strip() != str(dummy_plex.get("token", "")).strip()
+    )
+    settings_needs_user_refresh = name == "150-settings" and not has_cached_user_list and has_plex_credentials
+
+    # --- Refresh Plex data if needed ---
+    should_refresh_plex = name in ["010-plex", "025-libraries", "900-kometa"] or config_changed or settings_needs_user_refresh
+    if should_refresh_plex:
+        if all_libraries.get("validated") or settings_needs_user_refresh:
+            if settings_needs_user_refresh and app.config["QS_DEBUG"]:
+                helpers.ts_log("Auto-refreshing Plex cache for settings page because tmp_user_list is empty.", level="DEBUG")
+            refresh_plex_libraries()
+            all_libraries = persistence.retrieve_settings("010-plex")
+            plex_data = all_libraries.get("plex", {})
+
+    telemetry_payload = {}
+    try:
+        telemetry_section = database.retrieve_section_data(name=selected_config, section="plex_telemetry")
+        if telemetry_section and isinstance(telemetry_section[2], dict):
+            telemetry_payload = telemetry_section[2].get("plex_telemetry", {}) or {}
+    except Exception:
+        telemetry_payload = {}
+    telemetry = {"plex_telemetry": telemetry_payload}
 
     # If telemetry is fresher in plex_data, use that
     telemetry_data = plex_data.get("telemetry")
     if not isinstance(telemetry_data, dict) or "plex_pass" not in telemetry_data:
-        telemetry_data = telemetry.get("plex_telemetry", {})
+        telemetry_data = telemetry_payload
 
         # Fallback if DB is also missing it
         if not isinstance(telemetry_data, dict) or "plex_pass" not in telemetry_data:
@@ -3329,21 +5722,22 @@ def step(name):
     plex_data["tmp_music_libraries"] = plex_data.get("tmp_music_libraries", "").split(",") if isinstance(plex_data.get("tmp_music_libraries"), str) else []
     plex_data["tmp_user_list"] = plex_data.get("tmp_user_list", "").split(",") if isinstance(plex_data.get("tmp_user_list"), str) else []
 
-    # Ensure correct rendering for the final validation page
+    # Ensure correct rendering for the Kometa page
     config_name = session.get("config_name") or page_info.get("config_name", "default")
     if app.config["QS_DEBUG"]:
         helpers.ts_log(f"Start render_template for {name}", level="DEBUG")
 
     start_time = time.perf_counter()
 
-    helpers.ts_log(f"Loading attribute_config...", level="TIMING")
-    attribute_config = helpers.load_quickstart_config("quickstart_attributes.json")
-    helpers.ts_log(f"Loading collection_config...", level="TIMING")
-    collection_config = helpers.load_quickstart_config("quickstart_collections.json")
-    helpers.ts_log(f"Loading overlay_config...", level="TIMING")
-    overlay_config = helpers.load_quickstart_config("quickstart_overlays.json")
+    needs_library_payload = name == "025-libraries"
+    attribute_config = {}
+    collection_config = []
+    overlay_config = []
+    service_validations = {}
+    overlay_fonts = []
+    image_data = {}
 
-    def add_offset_vars(config):
+    def add_offset_vars(config):  # noqa: ANN001
         """
         Ensure each overlay exposes positional offsets with sensible defaults.
         """
@@ -3383,114 +5777,151 @@ def step(name):
                     },
                 )
 
-    add_offset_vars(overlay_config)
+    if needs_library_payload:
+        helpers.ts_log(f"Loading attribute_config...", level="TIMING")
+        attribute_config = helpers.load_quickstart_config("quickstart_attributes.json")
+        helpers.ts_log(f"Loading collection_config...", level="TIMING")
+        collection_config = helpers.load_quickstart_config("quickstart_collections.json")
+        helpers.ts_log(f"Loading overlay_config...", level="TIMING")
+        overlay_config = helpers.load_quickstart_config("quickstart_overlays.json")
+        add_offset_vars(overlay_config)
+        helpers.ts_log(f"Loading preview image data...", level="TIMING")
+        image_data = _build_preview_image_data()
+        overlay_fonts = list_overlay_fonts()
 
-    service_validation_sources = [
-        ("010-plex", "plex"),
-        ("020-tmdb", "tmdb"),
-        ("050-omdb", "omdb"),
-        ("060-mdblist", "mdblist"),
-        ("100-anidb", "anidb"),
-        ("130-trakt", "trakt"),
-        ("140-mal", "mal"),
-    ]
-    validation_pages = {
-        "010-plex",
-        "020-tmdb",
-        "025-libraries",
-        "027-playlist_files",
-        "030-tautulli",
-        "040-github",
-        "050-omdb",
-        "060-mdblist",
-        "070-notifiarr",
-        "080-gotify",
-        "085-ntfy",
-        "090-webhooks",
-        "100-anidb",
-        "110-radarr",
-        "120-sonarr",
-        "130-trakt",
-        "140-mal",
-        "150-settings",
-    }
-    service_validations = {}
-    for section, key in service_validation_sources:
-        settings = persistence.retrieve_settings(section)
-        service_validations[key] = helpers.booler(settings.get("validated", False))
-    validation_sections = {key: key.split("-", 1)[1] for key in validation_pages}
-    validated_sections = database.retrieve_validated_map(config_name, list(validation_sections.values()))
-    jump_to_validations = {key: validated_sections.get(section, False) for key, section in validation_sections.items()}
+        service_validation_sources = [
+            ("010-plex", "plex"),
+            ("020-tmdb", "tmdb"),
+            ("050-omdb", "omdb"),
+            ("060-mdblist", "mdblist"),
+            ("100-anidb", "anidb"),
+            ("130-trakt", "trakt"),
+            ("140-mal", "mal"),
+        ]
+        for section, key in service_validation_sources:
+            settings = persistence.retrieve_settings(section)
+            service_validations[key] = helpers.booler(settings.get("validated", False))
+    workspace_status = _build_workspace_status_context(config_name, file_list, available_configs=available_configs)
+    jump_to_validations = workspace_status.get("jump_to_validations", {})
+    step_statuses = workspace_status.get("step_statuses", {})
+    section_statuses = workspace_status.get("section_statuses", {})
 
-    if name == "900-final":
+    if name == "915-imagemaid":
+        imagemaid_section = data.get("imagemaid", {}) if isinstance(data.get("imagemaid"), dict) else {}
+        imagemaid_state = _probe_imagemaid_root_state(helpers.get_imagemaid_root_path())
+        imagemaid_section_row = database.retrieve_section_data(config_name, "imagemaid")
+        imagemaid_section_validated = helpers.booler(imagemaid_section_row[0]) if imagemaid_section_row else False
+        page_info["imagemaid_root"] = str(helpers.get_imagemaid_root_path())
+        page_info["imagemaid_branch_override"] = helpers.normalize_imagemaid_branch_override(imagemaid_section.get("branch_override"))
+        page_info["imagemaid_mode"] = str(imagemaid_section.get("mode") or "report").strip().lower() or "report"
+        page_info["imagemaid_validated"] = imagemaid_section_validated
+        page_info["imagemaid_supports_no_verify_ssl"] = bool(imagemaid_state.get("supports_no_verify_ssl"))
+        page_info["imagemaid_supports_overlays_only"] = bool(imagemaid_state.get("supports_overlays_only"))
+
+    if name == "900-kometa":
         validation_meta = []
-        for file, display_name in file_list:
-            template_key = file.rsplit(".", 1)[0]
-            settings = persistence.retrieve_settings(template_key)
-            has_validation = template_key in validation_pages
-            validation_status = None
-            validation_reason = None
-            validation_details = None
-            if has_validation:
-                section_name = template_key.split("-", 1)[1]
-                stored_section = database.retrieve_section_data(config_name, section_name)
-                stored_payload = stored_section[2] if stored_section else None
-                if isinstance(stored_payload, dict):
-                    validation_status = stored_payload.get("validation_status")
-                    validation_reason = stored_payload.get("validation_reason")
-                    validation_details = stored_payload.get("validation_details")
-            if not validation_status and has_validation:
-                if helpers.booler(settings.get("validated", False)):
-                    validation_status = "validated"
-                elif settings.get("validated_at"):
-                    validation_status = "failed"
-
-            validation_result = ""
-            if validation_status:
-                label = validation_status.capitalize()
-                if validation_reason:
-                    pretty = VALIDATION_REASON_LABELS.get(validation_reason, validation_reason.replace("_", " "))
-                    detail_text = ""
-                    if isinstance(validation_details, (list, tuple)):
-                        detail_text = ", ".join(str(item) for item in validation_details if str(item))
-                    elif validation_details is not None:
-                        detail_text = str(validation_details)
-                    if detail_text:
-                        validation_result = f"{label}: {pretty}: {detail_text}"
-                    else:
-                        validation_result = f"{label}: {pretty}"
-                else:
-                    validation_result = label
-
-            validation_meta.append(
-                {
-                    "key": template_key,
-                    "label": display_name,
-                    "page": template_key,
-                    "has_validation": has_validation,
-                    "validated": helpers.booler(settings.get("validated", False)) if has_validation else None,
-                    "validated_at": settings.get("validated_at", "") if has_validation else "",
-                    "validation_result": validation_result,
-                }
-            )
-        validated, validation_error, config_data, yaml_content, validation_errors = output.build_config(header_style, config_name=config_name)
-        validation_summary = build_validation_summary(validation_errors)
-        validation_rollup = None
-        validation_rollup_at = None
+        validation_bulk_rollup = None
+        validation_bulk_rollup_at = None
         try:
             stored_validation = database.retrieve_section_data(config_name, "validation_summary")
             stored_payload = stored_validation[2] if stored_validation else None
             if isinstance(stored_payload, dict):
-                validation_rollup = stored_payload.get("summary_text")
-                validation_rollup_at = stored_payload.get("updated_at")
+                validation_bulk_rollup = stored_payload.get("summary_text")
+                validation_bulk_rollup_at = stored_payload.get("updated_at")
         except Exception:
-            validation_rollup = None
-            validation_rollup_at = None
-        used_fonts = helpers.collect_font_references(config_data)
-        saved_filename = helpers.save_to_named_config(yaml_content, config_name, used_fonts)
+            validation_bulk_rollup = None
+            validation_bulk_rollup_at = None
+
+        final_gate = _build_final_gate(workspace_status, file_list, validation_bulk_rollup_at)
+        template_keys_for_rollup = [file.rsplit(".", 1)[0] for file, _ in file_list]
+        validation_rollup = None
+        validation_rollup_summary = {}
+        validation_rollup_state = "unknown"
+        validation_rollup_at = None
+        if final_gate.get("stage") != "todo":
+            for file, display_name in file_list:
+                template_key = file.rsplit(".", 1)[0]
+                settings = persistence.retrieve_settings(template_key)
+                has_validation = template_key in QS_VALIDATION_STEP_KEYS
+                validation_status = None
+                validation_reason = None
+                validation_details = None
+                validation_updated_at = None
+                if has_validation:
+                    section_name = template_key.split("-", 1)[1]
+                    stored_section = database.retrieve_section_data(config_name, section_name)
+                    stored_payload = stored_section[2] if stored_section else None
+                    if isinstance(stored_payload, dict):
+                        validation_status = stored_payload.get("validation_status")
+                        validation_reason = stored_payload.get("validation_reason")
+                        validation_details = stored_payload.get("validation_details")
+                        validation_updated_at = stored_payload.get("validation_updated_at")
+                if not validation_status and has_validation:
+                    if helpers.booler(settings.get("validated", False)):
+                        validation_status = "validated"
+                    elif settings.get("validated_at"):
+                        validation_status = "failed"
+                if not validation_updated_at and has_validation:
+                    validation_updated_at = settings.get("validated_at")
+
+                validation_result = ""
+                if validation_status:
+                    label = validation_status.capitalize()
+                    if validation_reason:
+                        pretty = VALIDATION_REASON_LABELS.get(validation_reason, validation_reason.replace("_", " "))
+                        detail_text = ""
+                        if isinstance(validation_details, (list, tuple)):
+                            detail_text = ", ".join(str(item) for item in validation_details if str(item))
+                        elif validation_details is not None:
+                            detail_text = str(validation_details)
+                        if detail_text:
+                            validation_result = f"{label}: {pretty}: {detail_text}"
+                        else:
+                            validation_result = f"{label}: {pretty}"
+                    else:
+                        validation_result = label
+
+                validation_meta.append(
+                    {
+                        "key": template_key,
+                        "label": display_name,
+                        "page": template_key,
+                        "has_validation": has_validation,
+                        "validated": helpers.booler(settings.get("validated", False)) if has_validation else None,
+                        "validated_at": settings.get("validated_at", "") if has_validation else "",
+                        "validation_updated_at": validation_updated_at if has_validation else "",
+                        "validation_result": validation_result,
+                    }
+                )
+            live_rollup = _build_live_validation_rollup(step_statuses, template_keys_for_rollup)
+            validation_rollup = live_rollup.get("summary_text")
+            validation_rollup_summary = live_rollup.get("counts", {})
+            validation_rollup_state = live_rollup.get("state", "unknown")
+            validation_rollup_at = _latest_iso_timestamp([entry.get("validation_updated_at") for entry in validation_meta])
+        validated = False
+        validation_error = None
+        config_data = {}
+        yaml_content = ""
+        validation_errors = []
+        validation_summary = []
+        saved_filename = ""
+
+        if final_gate.get("can_build_config"):
+            validated, validation_error, config_data, yaml_content, validation_errors = output.build_config(header_style, config_name=config_name)
+            validation_summary = build_validation_summary(validation_errors)
+            used_fonts = helpers.collect_font_references(config_data)
+            saved_filename = helpers.save_to_named_config(yaml_content, config_name, used_fonts)
+            final_gate["config_valid"] = bool(validated)
+            final_gate["stage"] = "kometa" if validated else "config"
+        elif final_gate.get("stage") == "freshness":
+            validation_rollup_state = "warn"
+            if not validation_bulk_rollup:
+                validation_bulk_rollup = f"Validation is stale. Bulk validation has not run in the last {QS_FINAL_VALIDATION_TTL_HOURS} hours."
         page_info["saved_filename"] = saved_filename
         page_info["yaml_valid"] = validated
         page_info["quickstart_root"] = helpers.get_app_root()
+        kometa_is_running = helpers.is_kometa_running()
+        incomplete_resume_hint = None if kometa_is_running else _build_latest_incomplete_resume_hint()
         session["yaml_content"] = yaml_content
         library_settings = persistence.retrieve_settings("025-libraries").get("libraries", {})
         movie_libraries = []
@@ -3515,7 +5946,7 @@ def step(name):
             library_dropdown = movie_libraries + show_libraries
 
         html = render_template(
-            "900-final.html",
+            "900-kometa.html",
             page_info=page_info,
             data=data,
             yaml_content=yaml_content,
@@ -3523,21 +5954,41 @@ def step(name):
             validation_summary=validation_summary,
             validation_rollup=validation_rollup,
             validation_rollup_at=validation_rollup_at,
+            validation_rollup_summary=validation_rollup_summary,
+            validation_rollup_state=validation_rollup_state,
+            validation_bulk_rollup=validation_bulk_rollup,
+            validation_bulk_rollup_at=validation_bulk_rollup_at,
             template_list=file_list,
             available_configs=available_configs,
             movie_libraries=movie_libraries,
             show_libraries=show_libraries,
             library_dropdown=library_dropdown,
             config_dir=str(Path(helpers.CONFIG_DIR).resolve()),
-            overlay_fonts=list_overlay_fonts(),
+            overlay_fonts=overlay_fonts,
             service_validations=service_validations,
             validation_meta=validation_meta,
             jump_to_validations=jump_to_validations,
+            step_statuses=step_statuses,
+            section_statuses=section_statuses,
+            required_keys=workspace_status.get("required_keys", []),
+            optional_keys=workspace_status.get("optional_keys", []),
+            review_keys=workspace_status.get("review_keys", []),
+            tautulli_requirement_reasons=workspace_status.get("tautulli_requirement_reasons", []),
+            omdb_requirement_reasons=workspace_status.get("omdb_requirement_reasons", []),
+            mdblist_requirement_reasons=workspace_status.get("mdblist_requirement_reasons", []),
+            anidb_requirement_reasons=workspace_status.get("anidb_requirement_reasons", []),
+            radarr_requirement_reasons=workspace_status.get("radarr_requirement_reasons", []),
+            sonarr_requirement_reasons=workspace_status.get("sonarr_requirement_reasons", []),
+            trakt_requirement_reasons=workspace_status.get("trakt_requirement_reasons", []),
+            mal_requirement_reasons=workspace_status.get("mal_requirement_reasons", []),
+            workspace_readiness=workspace_status.get("readiness", {}),
+            final_gate=final_gate,
+            incomplete_resume_hint=incomplete_resume_hint,
         )
 
         end_time = time.perf_counter()
         if app.config["QS_DEBUG"]:
-            helpers.ts_log(f"Rendered 900-final.html in {end_time - start_time:.2f} seconds", level="PROFILE")
+            helpers.ts_log(f"Rendered 900-kometa.html in {end_time - start_time:.2f} seconds", level="PROFILE")
         return html
 
     else:
@@ -3563,15 +6014,24 @@ def step(name):
         overlay_config=overlay_config,
         template_list=file_list,
         available_configs=available_configs,
-        overlay_fonts=list_overlay_fonts(),
+        overlay_fonts=overlay_fonts,
         service_validations=service_validations,
         jump_to_validations=jump_to_validations,
-        image_data={
-            "movie": os.listdir(UPLOAD_FOLDERS["movie"]),
-            "show": os.listdir(UPLOAD_FOLDERS["show"]),
-            "season": os.listdir(UPLOAD_FOLDERS["season"]),
-            "episode": os.listdir(UPLOAD_FOLDERS["episode"]),
-        },
+        step_statuses=step_statuses,
+        section_statuses=section_statuses,
+        required_keys=workspace_status.get("required_keys", []),
+        optional_keys=workspace_status.get("optional_keys", []),
+        review_keys=workspace_status.get("review_keys", []),
+        tautulli_requirement_reasons=workspace_status.get("tautulli_requirement_reasons", []),
+        omdb_requirement_reasons=workspace_status.get("omdb_requirement_reasons", []),
+        mdblist_requirement_reasons=workspace_status.get("mdblist_requirement_reasons", []),
+        anidb_requirement_reasons=workspace_status.get("anidb_requirement_reasons", []),
+        radarr_requirement_reasons=workspace_status.get("radarr_requirement_reasons", []),
+        sonarr_requirement_reasons=workspace_status.get("sonarr_requirement_reasons", []),
+        trakt_requirement_reasons=workspace_status.get("trakt_requirement_reasons", []),
+        mal_requirement_reasons=workspace_status.get("mal_requirement_reasons", []),
+        workspace_readiness=workspace_status.get("readiness", {}),
+        image_data=image_data,
         config_dir=str(Path(helpers.CONFIG_DIR).resolve()),
         configured_ids=configured_ids,
         configured_counts=configured_counts,
@@ -3581,6 +6041,34 @@ def step(name):
     if app.config["QS_DEBUG"]:
         helpers.ts_log(f"Rendered {name}.html in {end_time - start_time:.2f} seconds", level="PROFILE")
     return html
+
+
+@app.route("/workspace_status", methods=["GET"])
+def workspace_status():
+    """Return live workspace step/group/readiness state for sidebar updates."""
+    persistence.ensure_session_config_name()
+    config_name = request.args.get("config_name") or session.get("config_name")
+    available_configs = database.get_unique_config_names() or []
+    menu_templates = helpers.get_menu_list()
+    status = _build_workspace_status_context(config_name, menu_templates, available_configs=available_configs)
+    return jsonify(
+        success=True,
+        config_name=config_name,
+        step_statuses=status.get("step_statuses", {}),
+        section_statuses=status.get("section_statuses", {}),
+        required_keys=status.get("required_keys", []),
+        optional_keys=status.get("optional_keys", []),
+        review_keys=status.get("review_keys", []),
+        tautulli_requirement_reasons=status.get("tautulli_requirement_reasons", []),
+        omdb_requirement_reasons=status.get("omdb_requirement_reasons", []),
+        mdblist_requirement_reasons=status.get("mdblist_requirement_reasons", []),
+        anidb_requirement_reasons=status.get("anidb_requirement_reasons", []),
+        radarr_requirement_reasons=status.get("radarr_requirement_reasons", []),
+        sonarr_requirement_reasons=status.get("sonarr_requirement_reasons", []),
+        trakt_requirement_reasons=status.get("trakt_requirement_reasons", []),
+        mal_requirement_reasons=status.get("mal_requirement_reasons", []),
+        readiness=status.get("readiness", {}),
+    )
 
 
 @app.route("/get_top_imdb_items/<library_name>")
@@ -3656,6 +6144,69 @@ def _build_library_lists():
     return movie_libraries, show_libraries, telemetry_data
 
 
+def _legacy_playlist_library_names():
+    settings = persistence.retrieve_settings("027-playlist_files") or {}
+    playlist_payload = settings.get("playlist_files", {}) if isinstance(settings, dict) else {}
+    if isinstance(playlist_payload, dict) and isinstance(playlist_payload.get("playlist_files"), dict):
+        playlist_payload = playlist_payload.get("playlist_files", {})
+    raw_libraries = playlist_payload.get("libraries", "") if isinstance(playlist_payload, dict) else ""
+    if isinstance(raw_libraries, list):
+        return {str(item).strip() for item in raw_libraries if str(item).strip()}
+    return {item.strip() for item in str(raw_libraries or "").split(",") if item.strip()}
+
+
+def _migrate_legacy_playlist_libraries_to_library_toggles(movie_libraries=None, show_libraries=None):
+    legacy_names = _legacy_playlist_library_names()
+    if not legacy_names:
+        return set()
+
+    settings = persistence.retrieve_settings("025-libraries") or {}
+    libraries_data = settings.get("libraries", {}) if isinstance(settings, dict) else {}
+    if not isinstance(libraries_data, dict):
+        return legacy_names
+
+    if any(isinstance(key, str) and key.endswith("-playlist") for key in libraries_data):
+        return set()
+
+    if movie_libraries is None or show_libraries is None:
+        movie_libraries, show_libraries, _telemetry = _build_library_lists()
+
+    migrated = {}
+    for library in list(movie_libraries or []) + list(show_libraries or []):
+        library_id = library.get("id")
+        library_name = library.get("name")
+        if not library_id or not library_name:
+            continue
+        if library_name not in legacy_names:
+            continue
+        if not _is_truthy_setting_value(libraries_data.get(f"{library_id}-library")):
+            continue
+        migrated[f"{library_id}-playlist"] = "true"
+
+    if not migrated:
+        return legacy_names
+
+    updated_libraries = libraries_data.copy()
+    updated_libraries.update(migrated)
+    settings["libraries"] = updated_libraries
+    config_name = session.get("config_name")
+    if not config_name:
+        return legacy_names
+    try:
+        database.save_section_data(
+            name=config_name,
+            section="libraries",
+            validated=helpers.booler(settings.get("validated", False)),
+            user_entered=True,
+            data=settings,
+        )
+    except Exception as e:
+        helpers.ts_log(f"Failed to migrate legacy playlist libraries: {e}", level="ERROR")
+        return legacy_names
+
+    return legacy_names
+
+
 @app.route("/library_fragment/<library_id>")
 def library_fragment(library_id):
     """Return a single library form fragment so we can lazy-load library settings on the page."""
@@ -3670,15 +6221,11 @@ def library_fragment(library_id):
     collection_config = helpers.load_quickstart_config("quickstart_collections.json")
     overlay_config = helpers.load_quickstart_config("quickstart_overlays.json")
 
+    legacy_playlist_libraries = _migrate_legacy_playlist_libraries_to_library_toggles(movie_libraries, show_libraries)
     data = persistence.retrieve_settings("025-libraries")
     configured_ids = _configured_library_ids(data.get("libraries", {}))
 
-    image_data = {
-        "movie": os.listdir(UPLOAD_FOLDERS["movie"]),
-        "show": os.listdir(UPLOAD_FOLDERS["show"]),
-        "season": os.listdir(UPLOAD_FOLDERS["season"]),
-        "episode": os.listdir(UPLOAD_FOLDERS["episode"]),
-    }
+    image_data = _build_preview_image_data()
 
     page_info = {"telemetry": telemetry_data}
 
@@ -3693,6 +6240,7 @@ def library_fragment(library_id):
         image_data=image_data,
         movie_images=image_data["movie"],
         configured_ids=configured_ids,
+        legacy_playlist_libraries=legacy_playlist_libraries,
     )
 
     return html
@@ -3711,6 +6259,139 @@ def autosave_library(library_id):
     except Exception as e:
         helpers.ts_log(f"Autosave failed for library {library_id}: {e}", level="ERROR")
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _build_merged_libraries_hint_payload(payload):
+    source_library_id = str(payload.get("source_library_id") or "").strip()
+    source_payload = payload.get("source_payload") if isinstance(payload.get("source_payload"), dict) else {}
+
+    settings = persistence.retrieve_settings("025-libraries")
+    libraries_data = settings.get("libraries", {}) if isinstance(settings, dict) else {}
+    merged = libraries_data.copy() if isinstance(libraries_data, dict) else {}
+
+    if not source_payload:
+        return merged
+
+    clean_payload = persistence.clean_form_data(MultiDict(source_payload))
+    incoming_dict = helpers.build_config_dict("libraries", clean_payload).get("libraries", {})
+    incoming_dict = incoming_dict if isinstance(incoming_dict, dict) else {}
+
+    prefixes = set()
+    if source_library_id:
+        source_prefix = source_library_id.split("-card-container")[0] if source_library_id.endswith("-card-container") else source_library_id
+        if source_prefix:
+            prefixes.add(source_prefix)
+
+    for key in incoming_dict:
+        prefix = _library_prefix_from_key(key)
+        if prefix:
+            prefixes.add(prefix)
+
+    for prefix in prefixes:
+        for existing_key in list(merged.keys()):
+            if existing_key == f"{prefix}-library" or existing_key.startswith(prefix + "-"):
+                merged.pop(existing_key, None)
+
+    for key, value in incoming_dict.items():
+        if (key.endswith("-library") or key.endswith("-playlist")) and not _is_truthy_setting_value(value):
+            continue
+        merged[key] = value
+
+    return merged
+
+
+def _libraries_dependency_hint_response(payload, resolver):
+    merged = _build_merged_libraries_hint_payload(payload)
+    reasons = resolver(merged)
+    return jsonify({"success": True, "required": bool(reasons), "reasons": reasons})
+
+
+@app.route("/libraries_tautulli_dependency_hint", methods=["POST"])
+def libraries_tautulli_dependency_hint():
+    """Preview Tautulli-required dependency reasons using current in-page library edits."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        return _libraries_dependency_hint_response(payload, _libraries_data_tautulli_dependency_reasons)
+    except Exception as e:
+        helpers.ts_log(f"Failed to build Tautulli dependency hint: {e}", level="ERROR")
+        return jsonify({"success": False, "required": False, "reasons": [], "error": str(e)}), 500
+
+
+@app.route("/libraries_omdb_dependency_hint", methods=["POST"])
+def libraries_omdb_dependency_hint():
+    """Preview OMDb-required dependency reasons using current in-page library edits."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        return _libraries_dependency_hint_response(payload, _libraries_data_omdb_dependency_reasons)
+    except Exception as e:
+        helpers.ts_log(f"Failed to build OMDb dependency hint: {e}", level="ERROR")
+        return jsonify({"success": False, "required": False, "reasons": [], "error": str(e)}), 500
+
+
+@app.route("/libraries_mdblist_dependency_hint", methods=["POST"])
+def libraries_mdblist_dependency_hint():
+    """Preview MDBList-required dependency reasons using current in-page library edits."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        return _libraries_dependency_hint_response(payload, _libraries_data_mdblist_dependency_reasons)
+    except Exception as e:
+        helpers.ts_log(f"Failed to build MDBList dependency hint: {e}", level="ERROR")
+        return jsonify({"success": False, "required": False, "reasons": [], "error": str(e)}), 500
+
+
+@app.route("/libraries_anidb_dependency_hint", methods=["POST"])
+def libraries_anidb_dependency_hint():
+    """Preview AniDB-required dependency reasons using current in-page library edits."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        return _libraries_dependency_hint_response(payload, _libraries_data_anidb_dependency_reasons)
+    except Exception as e:
+        helpers.ts_log(f"Failed to build AniDB dependency hint: {e}", level="ERROR")
+        return jsonify({"success": False, "required": False, "reasons": [], "error": str(e)}), 500
+
+
+@app.route("/libraries_radarr_dependency_hint", methods=["POST"])
+def libraries_radarr_dependency_hint():
+    """Preview Radarr-required dependency reasons using current in-page library edits."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        return _libraries_dependency_hint_response(payload, _libraries_data_radarr_dependency_reasons)
+    except Exception as e:
+        helpers.ts_log(f"Failed to build Radarr dependency hint: {e}", level="ERROR")
+        return jsonify({"success": False, "required": False, "reasons": [], "error": str(e)}), 500
+
+
+@app.route("/libraries_sonarr_dependency_hint", methods=["POST"])
+def libraries_sonarr_dependency_hint():
+    """Preview Sonarr-required dependency reasons using current in-page library edits."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        return _libraries_dependency_hint_response(payload, _libraries_data_sonarr_dependency_reasons)
+    except Exception as e:
+        helpers.ts_log(f"Failed to build Sonarr dependency hint: {e}", level="ERROR")
+        return jsonify({"success": False, "required": False, "reasons": [], "error": str(e)}), 500
+
+
+@app.route("/libraries_trakt_dependency_hint", methods=["POST"])
+def libraries_trakt_dependency_hint():
+    """Preview Trakt-required dependency reasons using current in-page library edits."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        return _libraries_dependency_hint_response(payload, _libraries_data_trakt_dependency_reasons)
+    except Exception as e:
+        helpers.ts_log(f"Failed to build Trakt dependency hint: {e}", level="ERROR")
+        return jsonify({"success": False, "required": False, "reasons": [], "error": str(e)}), 500
+
+
+@app.route("/libraries_mal_dependency_hint", methods=["POST"])
+def libraries_mal_dependency_hint():
+    """Preview MAL-required dependency reasons using current in-page library edits."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        return _libraries_dependency_hint_response(payload, _libraries_data_mal_dependency_reasons)
+    except Exception as e:
+        helpers.ts_log(f"Failed to build MAL dependency hint: {e}", level="ERROR")
+        return jsonify({"success": False, "required": False, "reasons": [], "error": str(e)}), 500
 
 
 @app.route("/copy_library_settings", methods=["POST"])
@@ -3994,7 +6675,7 @@ def download():
             download_name="config.yml",
         )
     flash("No configuration to download", "danger")
-    return redirect(url_for("step", page="900-final"))
+    return redirect(url_for("step", name="900-kometa"))
 
 
 @app.route("/download_redacted")
@@ -4030,7 +6711,7 @@ def download_redacted():
             download_name="config_redacted.yml",
         )
     flash("No configuration to download", "danger")
-    return redirect(url_for("step", page="900-final"))
+    return redirect(url_for("step", name="900-kometa"))
 
 
 @app.route("/validate_gotify", methods=["POST"])
@@ -4097,6 +6778,32 @@ def refresh_plex_libraries():
                 400,
             )
 
+        cached_refresh = helpers.get_cached_plex_refresh(plex_url, plex_token)
+        if cached_refresh:
+            helpers.ts_log("Using cached Plex library refresh payload.", level="DEBUG")
+            persistence.update_stored_plex_libraries(
+                "010-plex",
+                cached_refresh.get("movie_libraries", []),
+                cached_refresh.get("show_libraries", []),
+                cached_refresh.get("music_libraries", []),
+                cached_refresh.get("user_list", []),
+            )
+            cached_telemetry = {
+                key: value
+                for key, value in cached_refresh.items()
+                if key
+                not in {
+                    "validated",
+                    "user_list",
+                    "music_libraries",
+                    "movie_libraries",
+                    "show_libraries",
+                    "has_plex_pass",
+                }
+            }
+            persistence.save_settings("plex_telemetry", cached_telemetry)
+            return jsonify(cached_refresh)
+
         # Validate Plex server and get updated libraries
         plex_response = validations.validate_plex_server({"plex_url": plex_url, "plex_token": plex_token})
         plex_data = plex_response.get_json() if isinstance(plex_response, Flask.response_class) else plex_response
@@ -4110,14 +6817,16 @@ def refresh_plex_libraries():
             plex_data.get("movie_libraries", []),
             plex_data.get("show_libraries", []),
             plex_data.get("music_libraries", []),
+            plex_data.get("user_list", []),
         )
 
         # Get fresh telemetry using helpers and store it
-        telemetry = helpers.get_plex_metadata()
+        telemetry = helpers.get_plex_metadata(plex_url=plex_url, plex_token=plex_token)
         persistence.save_settings("plex_telemetry", telemetry)
 
         # Merge both plex_data and telemetry for response
         merged_response = {**plex_data, **telemetry}
+        helpers.set_cached_plex_refresh(plex_url, plex_token, merged_response)
 
         return jsonify(merged_response)
 
@@ -4661,7 +7370,6 @@ def validate_all_services():
     plex_is_valid = helpers.booler(plex_settings.get("validated", False)) if isinstance(plex_settings, dict) else False
     if not plex_is_valid:
         skip_section_validation("025-libraries", "libraries", reason="missing_plex_validation")
-        skip_section_validation("027-playlist_files", "playlist_files", reason="missing_plex_validation")
     else:
         libraries_settings = persistence.retrieve_settings("025-libraries") or {}
         libraries_data = libraries_settings.get("libraries", {}) if isinstance(libraries_settings, dict) else {}
@@ -4679,6 +7387,26 @@ def validate_all_services():
             if path_errors:
                 libraries_reason = "invalid_paths"
             else:
+
+                def has_minimal_library_yaml_selection(lib_id):
+                    allowed_markers = ("-collection_", "-overlay_", "-attribute_", "-top_level_")
+                    for key, value in libraries_data.items():
+                        if not isinstance(key, str) or not key.startswith(f"{lib_id}-"):
+                            continue
+                        if key in {f"{lib_id}-library", f"{lib_id}-playlist"}:
+                            continue
+                        if "-playlist" in key:
+                            continue
+                        if not any(marker in key for marker in allowed_markers):
+                            continue
+                        if not is_blank_value(value) and str(value).strip().lower() != "false":
+                            return True
+                    return False
+
+                missing_minimal_yaml = [lib_id for lib_id in selected_library_ids if not has_minimal_library_yaml_selection(lib_id)]
+                if missing_minimal_yaml:
+                    libraries_reason = "missing_library_defaults"
+
                 missing_placeholders = []
                 library_names = {}
                 for lib_id in selected_library_ids:
@@ -4697,14 +7425,15 @@ def validate_all_services():
                             return value
                     return None
 
-                for lib_id in selected_library_ids:
-                    use_separator = find_library_value(lib_id, ["template_variables[use_separator]", "attribute_use_separator"])
-                    if is_blank_value(use_separator) or str(use_separator).strip().lower() == "none":
-                        continue
-                    placeholder = find_library_value(lib_id, ["attribute_template_variables[placeholder_imdb_id]", "template_variables[placeholder_imdb_id]"])
-                    if is_blank_value(placeholder):
-                        missing_placeholders.append(library_names.get(lib_id, lib_id))
-                if missing_placeholders:
+                if libraries_reason is None:
+                    for lib_id in selected_library_ids:
+                        use_separator = find_library_value(lib_id, ["template_variables[use_separator]", "attribute_use_separator"])
+                        if is_blank_value(use_separator) or str(use_separator).strip().lower() == "none":
+                            continue
+                        placeholder = find_library_value(lib_id, ["attribute_template_variables[placeholder_imdb_id]", "template_variables[placeholder_imdb_id]"])
+                        if is_blank_value(placeholder):
+                            missing_placeholders.append(library_names.get(lib_id, lib_id))
+                if libraries_reason is None and missing_placeholders:
                     libraries_reason = "missing_placeholder_imdb"
 
             update_section_validation(
@@ -4715,19 +7444,6 @@ def validate_all_services():
                 details=missing_placeholders if libraries_reason == "missing_placeholder_imdb" else None,
             )
 
-        playlist_settings = persistence.retrieve_settings("027-playlist_files") or {}
-        playlist_payload = playlist_settings.get("playlist_files", {}) if isinstance(playlist_settings, dict) else {}
-        if isinstance(playlist_payload, dict) and isinstance(playlist_payload.get("playlist_files"), dict):
-            playlist_payload = playlist_payload.get("playlist_files", {})
-        libraries_value = ""
-        if isinstance(playlist_payload, dict):
-            libraries_value = playlist_payload.get("libraries") or ""
-        playlist_libraries = [lib.strip() for lib in str(libraries_value).split(",") if lib.strip()]
-        if playlist_libraries:
-            update_section_validation("027-playlist_files", "playlist_files", True)
-        else:
-            skip_section_validation("027-playlist_files", "playlist_files", reason="no_libraries")
-
     # Bulk validation for settings
     settings_settings = persistence.retrieve_settings("150-settings") or {}
     settings_section = settings_settings.get("settings", {}) if isinstance(settings_settings, dict) else {}
@@ -4736,13 +7452,15 @@ def validate_all_services():
     else:
         invalid_fields = []
 
-        def check_regex(key, pattern, flags=0):
+        def check_regex(key, pattern, flags=0, allow_blank=False):
             if key not in settings_section:
                 return
             value = settings_section.get(key)
             if value is None:
                 return
             if isinstance(value, str) and not value.strip():
+                if allow_blank:
+                    return
                 invalid_fields.append(key)
                 return
             value_text = str(value).strip()
@@ -4750,14 +7468,14 @@ def validate_all_services():
                 invalid_fields.append(key)
 
         check_regex("asset_depth", r"^(0|[1-9]\d*)$")
-        check_regex("overlay_artwork_quality", r"^(100|[1-9][0-9]?)$")
+        check_regex("overlay_artwork_quality", r"^(100|[1-9][0-9]?)$", allow_blank=True)
         check_regex("cache_expiration", r"^[1-9]\d*$")
         check_regex("item_refresh_delay", r"^(0|[1-9]\d*)$")
         check_regex("minimum_items", r"^[1-9]\d*$")
         check_regex("run_again_delay", r"^(0|[1-9]\d*)$")
-        check_regex("ignore_ids", r"^(None|\d{1,8}(,\d{1,8})*)$", flags=re.IGNORECASE)
-        check_regex("ignore_imdb_ids", r"^(None|tt\d{7,8}(,tt\d{7,8})*)$", flags=re.IGNORECASE)
-        check_regex("custom_repo", r"^(None|https?:\/\/[\da-z.-]+\.[a-z.]{2,6}([/\w.-]*)*\/?)$", flags=re.IGNORECASE)
+        check_regex("ignore_ids", r"^(None|\d{1,8}(,\d{1,8})*)$", flags=re.IGNORECASE, allow_blank=True)
+        check_regex("ignore_imdb_ids", r"^(None|tt\d{7,8}(,tt\d{7,8})*)$", flags=re.IGNORECASE, allow_blank=True)
+        check_regex("custom_repo", r"^(None|https?:\/\/[\da-z.-]+\.[a-z.]{2,6}([/\w.-]*)*\/?)$", flags=re.IGNORECASE, allow_blank=True)
 
         asset_dirs = settings_section.get("asset_directory") if isinstance(settings_section, dict) else None
         if isinstance(asset_dirs, str):
@@ -4863,6 +7581,7 @@ def validate_all_services():
         "missing_plex_validation": "Plex not validated",
         "no_libraries": "No libraries selected",
         "invalid_paths": "Invalid paths",
+        "missing_library_defaults": "Missing library defaults",
         "missing_placeholder_imdb": "Missing placeholder IMDb ID",
         "invalid_fields": "Invalid fields",
         "no_webhooks": "No webhooks configured",
@@ -4978,6 +7697,7 @@ def shutdown():
 def start_kometa():
     data = request.get_json() or {}
     command = data.get("command", "").strip()
+    start_mode = _normalize_kometa_start_mode(data.get("start_mode"))
     if not command:
         return jsonify({"error": "No command provided"}), 400
 
@@ -5003,18 +7723,33 @@ def start_kometa():
                 payload["started_at"] = started_at
             return jsonify(payload), 400
 
-    _update_run_context(command)
+    blocker = _get_active_work_blocker("kometa_run")
+    if blocker:
+        job = blocker.get("job") if isinstance(blocker.get("job"), dict) else {}
+        payload = {
+            "error": blocker.get("message") or "Cannot start Kometa right now.",
+            "status": "blocked",
+            "blocked_by": blocker.get("blocked_by"),
+            "target_page": blocker.get("target_page"),
+        }
+        if job.get("job_id"):
+            payload["job_id"] = job.get("job_id")
+        if job.get("phase"):
+            payload["phase"] = job.get("phase")
+        return jsonify(payload), 409
+
+    _update_run_context(command, start_mode=start_mode)
 
     start_min, end_min, window_str = _get_maintenance_window_live()
     if start_min is None or end_min is None:
         start_min, end_min, window_str = _get_maintenance_window_from_db()
     if _is_within_maintenance_window(datetime.now(), start_min, end_min):
-        _set_pending_kometa_start(command, session.get("config_name"))
-        return jsonify({"status": "queued", "maintenance_window": window_str}), 202
+        _set_pending_kometa_start(command, session.get("config_name"), start_mode=start_mode)
+        return jsonify({"status": "queued", "maintenance_window": window_str, "start_mode": start_mode}), 202
 
-    ok, result = _launch_kometa_command(command, session.get("config_name"))
+    ok, result = _launch_kometa_command(command, session.get("config_name"), start_mode=start_mode)
     if ok:
-        return jsonify({"status": "Kometa started", "pid": result})
+        return jsonify({"status": "Kometa started", "pid": result, "start_mode": start_mode})
     code = 500
     if isinstance(result, str) and result.lower().startswith("kometa.py not found"):
         code = 404
@@ -5041,6 +7776,7 @@ def stop_kometa():
 
         with RUN_CONTEXT_LOCK:
             RUN_CONTEXT["stop_requested_at"] = datetime.now(timezone.utc).isoformat()
+            run_config_name = RUN_CONTEXT.get("config_name")
 
         not_kometa = []
         alive_after = []
@@ -5058,6 +7794,10 @@ def stop_kometa():
         except Exception:
             pass
         KOMETA_CPU_CACHE.pop(pid, None)
+        try:
+            _write_quickstart_stop_marker(helpers.get_kometa_root_path(), config_name=run_config_name, reason="user_stop")
+        except Exception:
+            pass
 
         if alive_after:
             alive_pids = ", ".join(str(p.pid) for p in alive_after if p is not None)
@@ -5072,6 +7812,10 @@ def stop_kometa():
             os.remove(pid_file)
         except Exception:
             pass
+        try:
+            _write_quickstart_stop_marker(helpers.get_kometa_root_path(), config_name=session.get("config_name"), reason="process_missing")
+        except Exception:
+            pass
         return jsonify({"warning": "Process not found. Cleaned up PID file."}), 200
     except Exception as e:
         return jsonify({"error": f"Failed to stop Kometa: {str(e)}"}), 500
@@ -5082,6 +7826,9 @@ def kometa_status():
     pending = _peek_pending_kometa_start()
     pending_start = bool(pending)
     pending_requested_at = pending.get("requested_at") if pending else None
+    pending_start_mode = _normalize_kometa_start_mode(pending.get("start_mode")) if pending else "current"
+    pending_command = pending.get("command") if pending else None
+    ctx = _get_run_context()
     pid = helpers.get_kometa_pid()
     if not pid:
         proc = _find_running_kometa_process()
@@ -5093,6 +7840,10 @@ def kometa_status():
             except Exception:
                 pid = None
     if not pid:
+        try:
+            _ingest_completed_live_logs("kometa")
+        except Exception:
+            pass
         with MAINTENANCE_STATE_LOCK:
             maintenance_active = MAINTENANCE_STATE["active"]
             maintenance_paused = MAINTENANCE_STATE["paused"]
@@ -5112,6 +7863,8 @@ def kometa_status():
             window_unavailable_since=window_unavailable_since,
             pending_start=pending_start,
             pending_requested_at=pending_requested_at,
+            pending_start_mode=pending_start_mode,
+            pending_command=pending_command,
         )
 
     try:
@@ -5170,6 +7923,8 @@ def kometa_status():
                     window_unavailable_since=window_unavailable_since,
                     pending_start=pending_start,
                     pending_requested_at=pending_requested_at,
+                    start_mode=_normalize_kometa_start_mode(ctx.get("start_mode")),
+                    active_command=ctx.get("command"),
                 )
         # If we're here, it likely ended; try to get a return code
         try:
@@ -5182,6 +7937,10 @@ def kometa_status():
                 os.remove(helpers.get_kometa_pid_file())
             except Exception:
                 pass
+        try:
+            _ingest_completed_live_logs("kometa")
+        except Exception:
+            pass
         KOMETA_CPU_CACHE.pop(pid, None)
         with MAINTENANCE_STATE_LOCK:
             maintenance_active = MAINTENANCE_STATE["active"]
@@ -5203,6 +7962,8 @@ def kometa_status():
             window_unavailable_since=window_unavailable_since,
             pending_start=pending_start,
             pending_requested_at=pending_requested_at,
+            start_mode=_normalize_kometa_start_mode(ctx.get("start_mode")),
+            active_command=ctx.get("command"),
         )
     except psutil.NoSuchProcess:
         KOMETA_CPU_CACHE.pop(pid, None)
@@ -5229,6 +7990,8 @@ def kometa_status():
             window_unavailable_since=window_unavailable_since,
             pending_start=pending_start,
             pending_requested_at=pending_requested_at,
+            pending_start_mode=pending_start_mode,
+            pending_command=pending_command,
         )
 
 
@@ -5410,6 +8173,10 @@ def logscan_analyze():
             }
             _save_logscan_ingest_cache(ingest_cache)
             try:
+                _archive_finished_live_meta_log_if_idle(log_path.parent)
+            except Exception:
+                pass
+            try:
                 _archive_rotated_logs(log_path.parent)
             except Exception:
                 pass
@@ -5522,6 +8289,54 @@ def logscan_progress():
 
         cached = LOGSCAN_PROGRESS_CACHE
 
+        def _coerce_progress_datetime(value):
+            if not value:
+                return None
+            try:
+                ts = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                if ts.tzinfo is not None:
+                    ts = ts.astimezone().replace(tzinfo=None)
+                return ts
+            except Exception:
+                return None
+
+        def refresh_live_progress_elapsed(data, running, started_at):
+            if not isinstance(data, dict) or not running:
+                return data
+            data = deepcopy(data)
+            now_ts = datetime.now()
+
+            prep_locked = data.get("preparation_seconds")
+            if not isinstance(prep_locked, (int, float)):
+                prep_start = _coerce_progress_datetime(started_at)
+                if prep_start and now_ts > prep_start:
+                    data["preparation_elapsed_seconds"] = max(0, int((now_ts - prep_start).total_seconds()))
+
+            current_library = data.get("current_library")
+            phase_current = data.get("phase_current")
+            phase_starts = data.get("phase_starts") or {}
+            if current_library and phase_current and isinstance(phase_starts, dict):
+                phase_key = f"{current_library}||{phase_current}"
+                start_ts = _coerce_progress_datetime(phase_starts.get(phase_key))
+                if start_ts:
+                    base = 0
+                    for entry in data.get("libraries") or []:
+                        if entry.get("name") == current_library:
+                            durations = entry.get("durations") or {}
+                            if isinstance(durations.get(phase_current), (int, float)):
+                                base = int(durations.get(phase_current) or 0)
+                            break
+                    data["current_phase_elapsed_seconds"] = base + max(0, int((now_ts - start_ts).total_seconds()))
+
+            if data.get("playlist_running"):
+                playlist_started_at = _coerce_progress_datetime(data.get("playlist_started_at"))
+                if playlist_started_at:
+                    playlist_total = data.get("playlist_total_seconds")
+                    base = int(playlist_total or 0) if isinstance(playlist_total, (int, float)) else 0
+                    data["playlist_elapsed_seconds"] = base + max(0, int((now_ts - playlist_started_at).total_seconds()))
+
+            return data
+
         def normalize_progress_for_stopped(data, running, stopped_requested):
             if not isinstance(data, dict) or running:
                 return data
@@ -5559,6 +8374,7 @@ def logscan_progress():
 
         if log_stats and cached.get("mtime") == log_stats.st_mtime and cached.get("size") == log_stats.st_size:
             data = cached.get("data") or {}
+            data = refresh_live_progress_elapsed(data, running, started_at)
             data = normalize_progress_for_stopped(data, running, stopped_requested)
             return jsonify(data)
 
@@ -5577,6 +8393,8 @@ def logscan_progress():
             selected_libraries=selected,
             previous=LOGSCAN_PROGRESS_CACHE.get("data"),
             run_started_at=started_at,
+            now_ts=datetime.now(timezone.utc),
+            is_running=running,
         )
         phase_order = _get_progress_run_order(config_data=config_data)
         allowed_phases = phase_order or ["operations", "metadata", "collections", "overlays"]
@@ -5603,13 +8421,40 @@ def logscan_progress():
 @app.route("/logscan/trends", methods=["GET"])
 def logscan_trends():
     try:
-        limit = int(request.args.get("limit", "50"))
+        _ingest_completed_live_logs("imagemaid")
+        _archive_finished_live_meta_log_if_idle()
     except Exception:
-        limit = 50
-    limit = max(1, min(limit, 500))
+        pass
+    raw_limit = str(request.args.get("limit", "50")).strip().lower()
+    if raw_limit == "all":
+        limit = None
+    else:
+        try:
+            limit = int(raw_limit)
+        except Exception:
+            limit = 50
+        limit = max(1, min(limit, 500))
     total_runs = database.get_log_runs_count()
     ingest_health = _logscan_ingest_health()
-    return jsonify({"runs": database.get_log_runs(limit=limit), "total_runs": total_runs, "ingest_health": ingest_health})
+    resolution_context = _build_logscan_resolution_context()
+    runs = _annotate_logscan_runs(database.get_log_runs(limit=limit), context=resolution_context)
+    incomplete_runs = _annotate_logscan_runs(_get_logscan_incomplete_runs(limit=limit), context=resolution_context)
+    all_runs = database.get_log_runs(limit=None) if total_runs else []
+    all_incomplete_runs = _get_logscan_incomplete_runs(limit=None)
+    return jsonify(
+        {
+            "runs": runs,
+            "incomplete_runs": incomplete_runs,
+            "total_runs": total_runs,
+            "total_incomplete_runs": len(all_incomplete_runs),
+            "ingest_health": ingest_health,
+            "archive_storage": _get_logscan_archive_storage_summary(
+                all_runs=all_runs,
+                incomplete_runs=all_incomplete_runs,
+                context=resolution_context,
+            ),
+        }
+    )
 
 
 @app.route("/logscan/trends/recommendations", methods=["GET"])
@@ -5618,7 +8463,14 @@ def logscan_trends_recommendations():
     if not run_key:
         return jsonify({"error": "run_key required"}), 400
     recommendations = database.get_log_run_recommendations(run_key)
-    return jsonify({"run_key": run_key, "recommendations": recommendations})
+    run_record = database.get_log_run(run_key)
+    if not recommendations:
+        incomplete_run = _get_logscan_incomplete_run(run_key)
+        if incomplete_run:
+            recommendations = incomplete_run.get("recommendations") if isinstance(incomplete_run.get("recommendations"), list) else []
+            if not run_record:
+                run_record = incomplete_run
+    return jsonify({"run_key": run_key, "recommendations": recommendations, "run": run_record})
 
 
 @app.route("/logscan/trends/reset", methods=["POST"])
@@ -5636,21 +8488,53 @@ def logscan_trends_reset():
 
 def _logscan_reingest_snapshot():
     with logscan_reingest_lock:
+        active = _get_active_background_job("logscan_reingest")
+        if active:
+            return active
+        last_job_id = logscan_reingest_state.get("job_id")
+        if last_job_id:
+            payload = _get_background_job(last_job_id)
+            if payload:
+                return payload
         return dict(logscan_reingest_state)
 
 
 def _update_logscan_reingest_state(**updates):
     with logscan_reingest_lock:
+        job_id = str(updates.get("job_id") or logscan_reingest_state.get("job_id") or "").strip() or None
+        status = str(updates.get("status") or "").strip().lower()
+        create_if_missing = bool(job_id or status in {"queued", "running", "complete", "error"})
+        payload = _ensure_background_job(
+            "logscan_reingest",
+            job_id=job_id,
+            create_if_missing=create_if_missing,
+            trigger=str(updates.get("trigger") or "manual").strip() or "manual",
+            phase=str(updates.get("phase") or "queued").strip() or "queued",
+            status=status or "running",
+            target_page=JOB_TARGET_PAGES.get("logscan_reingest"),
+        )
+        if payload:
+            next_job_id = payload.get("job_id")
+            shared_updates = dict(updates)
+            shared_updates.pop("job_id", None)
+            payload = _update_background_job(next_job_id, **shared_updates) or payload
+            logscan_reingest_state.clear()
+            logscan_reingest_state.update(payload)
+            return
         logscan_reingest_state.update(updates)
 
 
 def _reset_logscan_reingest_state():
     with logscan_reingest_lock:
+        job_id = logscan_reingest_state.get("job_id")
+        _clear_active_background_job("logscan_reingest", job_id=job_id)
         logscan_reingest_state.clear()
         logscan_reingest_state.update(
             {
                 "status": "idle",
                 "job_id": None,
+                "trigger": None,
+                "migration_level": None,
             }
         )
 
@@ -5661,31 +8545,822 @@ def _get_logscan_cache_dir():
     return cache_dir
 
 
-def _get_logscan_archive_dir():
-    archive_dir = _get_logscan_cache_dir() / "archive"
+def _normalize_logscan_tool_name(tool_name):
+    normalized = str(tool_name or "kometa").strip().lower()
+    return "imagemaid" if normalized == "imagemaid" else "kometa"
+
+
+def _get_logscan_live_dir(tool_name="kometa", log_dir=None):
+    normalized = _normalize_logscan_tool_name(tool_name)
+    if normalized == "imagemaid":
+        return helpers.get_imagemaid_root_path() / "config" / "logs"
+    return Path(log_dir) if log_dir else helpers.get_kometa_root_path() / "config" / "logs"
+
+
+def _get_logscan_archive_root_dir():
+    archive_root = _get_logscan_cache_dir() / "archive"
+    archive_root.mkdir(parents=True, exist_ok=True)
+    return archive_root
+
+
+def _get_logscan_archive_dir(tool_name="kometa"):
+    normalized = _normalize_logscan_tool_name(tool_name)
+    base_archive_dir = _get_logscan_archive_root_dir()
+    archive_dir = base_archive_dir / normalized
     archive_dir.mkdir(parents=True, exist_ok=True)
     return archive_dir
 
 
-def _get_logscan_log_files(log_dir=None, include_archive=True):
-    log_dir = Path(log_dir) if log_dir else helpers.get_kometa_root_path() / "config" / "logs"
-    archive_dir = _get_logscan_archive_dir() if include_archive else None
-    log_files = []
-    dirs = [log_dir]
-    if include_archive and archive_dir:
-        dirs.append(archive_dir)
-    for base_dir in dirs:
-        if not base_dir.exists():
+def _detect_logscan_tool_from_path(path, log_dir=None):
+    if not path:
+        return "kometa"
+    try:
+        resolved = Path(path).resolve()
+    except Exception:
+        return "kometa"
+    if "imagemaid" in resolved.name.lower():
+        return "imagemaid"
+    imagemaid_live_dir = _get_logscan_live_dir("imagemaid").resolve()
+    imagemaid_archive_dir = _get_logscan_archive_dir("imagemaid").resolve()
+    kometa_live_dir = _get_logscan_live_dir("kometa", log_dir=log_dir).resolve()
+    kometa_archive_dir = _get_logscan_archive_dir("kometa").resolve()
+    legacy_archive_dir = _get_logscan_archive_root_dir().resolve()
+    for tool_name, base_dir in (
+        ("imagemaid", imagemaid_archive_dir),
+        ("imagemaid", imagemaid_live_dir),
+        ("kometa", kometa_archive_dir),
+        ("kometa", kometa_live_dir),
+    ):
+        try:
+            resolved.relative_to(base_dir)
+            return tool_name
+        except ValueError:
             continue
-        for path in base_dir.glob("*meta*.log*"):
-            if not path.is_file():
+    try:
+        resolved.relative_to(legacy_archive_dir)
+        return "imagemaid" if "imagemaid" in resolved.name.lower() else "kometa"
+    except ValueError:
+        pass
+    return "kometa"
+
+
+def _is_logscan_gzip_path(path):
+    try:
+        suffixes = [suffix.lower() for suffix in Path(path).suffixes]
+    except Exception:
+        return False
+    return bool(suffixes and suffixes[-1] == ".gz")
+
+
+def _read_logscan_text(path, encoding="utf-8", errors="replace"):
+    path = Path(path)
+    if _is_logscan_gzip_path(path):
+        with gzip.open(path, "rt", encoding=encoding, errors=errors) as handle:
+            return handle.read()
+    return path.read_text(encoding=encoding, errors=errors)
+
+
+def _iter_logscan_text_lines(path, encoding="utf-8", errors="replace"):
+    path = Path(path)
+    if _is_logscan_gzip_path(path):
+        with gzip.open(path, "rt", encoding=encoding, errors=errors) as handle:
+            for line in handle:
+                yield line
+        return
+    with path.open("r", encoding=encoding, errors=errors) as handle:
+        for line in handle:
+            yield line
+
+
+def _parse_imagemaid_runtime_seconds(runtime_text):
+    text = str(runtime_text or "").strip()
+    if not text:
+        return None
+    analyzer = logscan.LogscanAnalyzer()
+    try:
+        delta = analyzer._parse_run_time_from_line(f"Run Time: {text}")
+    except Exception:
+        delta = None
+    if delta is None:
+        return None
+    return int(delta.total_seconds())
+
+
+def _extract_imagemaid_error_lines(lines):
+    errors = []
+    in_error_report = False
+    for raw_line in lines:
+        line = str(raw_line or "")
+        if "Error Report" in line:
+            in_error_report = True
+            continue
+        if in_error_report and "ImageMaid Summary" in line:
+            break
+        if not in_error_report:
+            continue
+        stripped = line.strip().strip("|").strip()
+        if not stripped or stripped.startswith("="):
+            continue
+        if "Generic Errors:" in stripped:
+            continue
+        if "Error" not in stripped:
+            continue
+        errors.append(stripped)
+    return errors
+
+
+def _parse_imagemaid_bytes(text):
+    value = str(text or "").strip()
+    if not value:
+        return None
+    match = re.match(r"^([\d.]+)\s*([A-Za-z]+)$", value, re.IGNORECASE)
+    if match:
+        try:
+            number = float(match.group(1))
+        except (TypeError, ValueError):
+            return None
+        unit = str(match.group(2) or "").strip().lower().rstrip("s")
+        multipliers = {
+            "byte": 1,
+            "b": 1,
+            "kb": 1024,
+            "mb": 1024**2,
+            "gb": 1024**3,
+            "tb": 1024**4,
+        }
+        multiplier = multipliers.get(unit)
+        if multiplier is None:
+            return None
+        try:
+            return int(number * multiplier)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _normalize_imagemaid_snapshot_path(value):
+    text = str(value or "").strip().strip('"').strip("'")
+    if not text:
+        return ""
+    try:
+        return os.path.normcase(os.path.normpath(text))
+    except Exception:
+        return text.lower()
+
+
+def _parse_imagemaid_command_snapshot(run_command_text, fallback_mode=None):
+    snapshot = {}
+    mode = str(fallback_mode or "").strip().lower()
+    if mode:
+        snapshot["mode"] = mode
+
+    command = str(run_command_text or "").strip()
+    if not command:
+        return snapshot
+
+    try:
+        parts = shlex.split(command, posix=False)
+    except Exception:
+        parts = command.split()
+
+    flag_map = {
+        "--photo-transcoder": "photo_transcoder",
+        "--empty-trash": "empty_trash",
+        "--clean-bundles": "clean_bundles",
+        "--optimize-db": "optimize_db",
+        "--local": "local_db",
+        "--existing": "use_existing",
+        "--ignore-running": "ignore_running",
+        "--trace": "trace",
+        "--log-requests": "log_requests",
+        "--no-verify-ssl": "no_verify_ssl",
+        "--overlays-only": "overlays_only",
+    }
+    value_map = {
+        "--plex": "plex_path",
+        "--mode": "mode",
+        "--timeout": "timeout",
+        "--sleep": "sleep",
+    }
+
+    idx = 0
+    while idx < len(parts):
+        part = str(parts[idx] or "").strip()
+        if not part:
+            idx += 1
+            continue
+
+        matched = False
+        for flag, key in flag_map.items():
+            if part == flag:
+                snapshot[key] = True
+                matched = True
+                break
+        if matched:
+            idx += 1
+            continue
+
+        for flag, key in value_map.items():
+            if part == flag and idx + 1 < len(parts):
+                raw_value = str(parts[idx + 1] or "").strip()
+                if key == "plex_path":
+                    snapshot[key] = _normalize_imagemaid_snapshot_path(raw_value)
+                elif key in {"timeout", "sleep"}:
+                    snapshot[key] = str(raw_value).strip()
+                else:
+                    snapshot[key] = str(raw_value).strip().lower()
+                idx += 2
+                matched = True
+                break
+            if part.startswith(f"{flag}="):
+                raw_value = part.split("=", 1)[1].strip()
+                if key == "plex_path":
+                    snapshot[key] = _normalize_imagemaid_snapshot_path(raw_value)
+                elif key in {"timeout", "sleep"}:
+                    snapshot[key] = str(raw_value).strip()
+                else:
+                    snapshot[key] = str(raw_value).strip().lower()
+                idx += 1
+                matched = True
+                break
+        if matched:
+            continue
+
+        idx += 1
+
+    return snapshot
+
+
+def _build_imagemaid_section_snapshot(section_data):
+    section = section_data if isinstance(section_data, dict) else {}
+    snapshot = {}
+
+    mode = str(section.get("mode") or "").strip().lower()
+    if mode:
+        snapshot["mode"] = mode
+
+    plex_path = _normalize_imagemaid_snapshot_path(section.get("plex_path"))
+    if plex_path:
+        snapshot["plex_path"] = plex_path
+
+    for key in (
+        "photo_transcoder",
+        "empty_trash",
+        "clean_bundles",
+        "optimize_db",
+        "local_db",
+        "use_existing",
+        "ignore_running",
+        "trace",
+        "log_requests",
+        "no_verify_ssl",
+        "overlays_only",
+    ):
+        snapshot[key] = helpers.booler(section.get(key))
+
+    for key in ("timeout", "sleep"):
+        value = section.get(key)
+        if value not in [None, ""]:
+            snapshot[key] = str(value).strip()
+
+    return snapshot
+
+
+def _infer_imagemaid_config_name(mode=None, run_command_text=None):
+    command_snapshot = _parse_imagemaid_command_snapshot(run_command_text, fallback_mode=mode)
+    relevant_keys = [key for key, value in command_snapshot.items() if value not in [None, ""]]
+    discriminators = [key for key in relevant_keys if key != "mode"]
+    if not discriminators:
+        return None
+
+    matches = []
+    for config_name in database.get_unique_config_names() or []:
+        try:
+            _validated, _user_entered, stored = database.retrieve_section_data(config_name, "imagemaid")
+        except Exception:
+            continue
+        if not isinstance(stored, dict):
+            continue
+        section = stored.get("imagemaid") if isinstance(stored.get("imagemaid"), dict) else stored
+        if not isinstance(section, dict) or not section:
+            continue
+        section_snapshot = _build_imagemaid_section_snapshot(section)
+
+        score = 0
+        matched = True
+        for key in relevant_keys:
+            expected = command_snapshot.get(key)
+            actual = section_snapshot.get(key)
+            if actual != expected:
+                matched = False
+                break
+            score += 5 if key == "plex_path" else 1
+        if matched:
+            matches.append((score, str(config_name)))
+
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (-item[0], item[1]))
+    if len(matches) == 1:
+        return matches[0][1]
+    if matches[0][0] > matches[1][0]:
+        return matches[0][1]
+    return None
+
+
+def _resolve_imagemaid_run_config_name(run_record):
+    if not isinstance(run_record, dict):
+        return "unknown"
+    tool_name = str(run_record.get("tool_name") or "").strip().lower()
+    config_name = str(run_record.get("config_name") or "").strip()
+    if tool_name != "imagemaid":
+        return config_name
+    if config_name and config_name.lower() not in {"imagemaid", "unknown"}:
+        return config_name
+    inferred = _infer_imagemaid_config_name(
+        mode=run_record.get("imagemaid_mode"),
+        run_command_text=run_record.get("run_command"),
+    )
+    return inferred or "unknown"
+
+
+def _build_imagemaid_recommendations(summary, error_lines=None, completion_reason=None):
+    recommendations = []
+    completion_reason = str(completion_reason or "").strip().lower()
+    if completion_reason == "user_stop":
+        recommendations.append(
+            {
+                "first_line": "ImageMaid run stopped by user",
+                "message": "Quickstart recorded an explicit stop request for this ImageMaid run.",
+            }
+        )
+    elif completion_reason == "maintenance_blocked_start":
+        window = ""
+        maintenance_summary = summary.get("maintenance_summary") if isinstance(summary, dict) else {}
+        if isinstance(maintenance_summary, dict):
+            events = maintenance_summary.get("events")
+            if isinstance(events, list) and events:
+                window = str((events[0] or {}).get("window") or "").strip()
+        suffix = f" during the Plex maintenance window ({window})" if window else " during the Plex maintenance window"
+        recommendations.append(
+            {
+                "first_line": "ImageMaid start blocked by Plex maintenance",
+                "message": f"Quickstart did not start ImageMaid{suffix}.",
+            }
+        )
+    elif completion_reason and completion_reason != "completed":
+        recommendations.append(
+            {
+                "first_line": "ImageMaid run appears incomplete",
+                "message": f"Quickstart detected an incomplete ImageMaid run with reason: {completion_reason}.",
+            }
+        )
+    if error_lines:
+        recommendations.append(
+            {
+                "first_line": "ImageMaid reported errors",
+                "message": "\n".join(error_lines[:8]),
+            }
+        )
+    return recommendations
+
+
+def _analyze_imagemaid_log_content(content, log_path=None):
+    if not content:
+        return None
+    path = Path(log_path) if log_path else None
+    try:
+        stats = path.stat() if path and path.exists() else None
+    except Exception:
+        stats = None
+    lines = content.splitlines()
+    run_marker_pattern = re.compile(
+        r"\[Quickstart\]\s+Run marker:\s+started=([^\s]+)\s+config=([^\s]+).*?\btool=imagemaid\b(?:\s+mode=([^\s]+))?",
+        re.IGNORECASE,
+    )
+    stop_pattern = re.compile(
+        r"\[Quickstart\]\s+Run event:\s+event=stopped\s+at=([^\s]+)\s+config=([^\s]+).*?\btool=imagemaid\b(?:\s+mode=([^\s]+))?(?:\s+reason=([^\s]+))?",
+        re.IGNORECASE,
+    )
+    blocked_pattern = re.compile(
+        r"\[Quickstart\]\s+Maintenance marker:\s+event=blocked_start\s+at=([^\s]+)\s+local_at=[^\s]+\s+config=([^\s]+).*?\btool=imagemaid\b(?:\s+mode=([^\s]+))?.*?(?:\s+window=([^\s]+))?",
+        re.IGNORECASE,
+    )
+    timestamp_pattern = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),")
+    total_runtime_pattern = re.compile(r"\|\s*Total Runtime\s*\|\s*(.*?)\s*\|?$", re.IGNORECASE)
+
+    started_at = None
+    config_name = ""
+    mode = ""
+    stop_at = None
+    stop_reason = ""
+    blocked_at = None
+    blocked_window = ""
+    first_timestamp = None
+    finished_at = None
+    finished_seen = False
+    run_time_seconds = None
+    warning_count = 0
+    error_count = 0
+    trace_count = 0
+    quickstart_run_marker = False
+    local_version = ""
+    run_command_text = ""
+    photo_scan_runtime = None
+    photo_remove_runtime = None
+    photo_found_files = 0
+    photo_removed_files = 0
+    photo_recovered_bytes = 0
+    restore_scan_runtime = None
+    restore_action_runtime = None
+    restore_found_files = 0
+    restore_removed_files = 0
+    restore_recovered_bytes = 0
+    generic_error_lines = []
+    database_downloaded_new = False
+    database_download_failed = False
+    database_section_seen = False
+    photo_transcoder_enabled = False
+    empty_trash_enabled = False
+    clean_bundles_enabled = False
+    optimize_db_enabled = False
+    local_db_enabled = False
+    use_existing_enabled = False
+    no_verify_ssl_enabled = False
+    overlays_only_enabled = False
+    current_runtime_section = ""
+    operation_started = {
+        "empty_trash": False,
+        "clean_bundles": False,
+        "optimize_db": False,
+    }
+
+    for line in lines:
+        timestamp_match = timestamp_pattern.search(line)
+        if timestamp_match and not first_timestamp:
+            first_timestamp = timestamp_match.group(1)
+        if "[WARNING]" in line:
+            warning_count += 1
+        if "[ERROR]" in line:
+            error_count += 1
+        if "Traceback" in line:
+            trace_count += 1
+        stripped_line = line.strip().strip("|").strip()
+        if stripped_line and "Error:" in stripped_line and stripped_line not in generic_error_lines:
+            generic_error_lines.append(stripped_line)
+
+        if not quickstart_run_marker:
+            marker_match = run_marker_pattern.search(line)
+            if marker_match:
+                started_at = marker_match.group(1)
+                config_name = marker_match.group(2) or config_name
+                mode = marker_match.group(3) or mode
+                quickstart_run_marker = True
+
+        stop_match = stop_pattern.search(line)
+        if stop_match:
+            stop_at = stop_match.group(1)
+            config_name = stop_match.group(2) or config_name
+            mode = stop_match.group(3) or mode
+            stop_reason = stop_match.group(4) or stop_reason or "user_stop"
+
+        blocked_match = blocked_pattern.search(line)
+        if blocked_match:
+            blocked_at = blocked_match.group(1)
+            config_name = blocked_match.group(2) or config_name
+            mode = blocked_match.group(3) or mode
+            blocked_window = blocked_match.group(4) or blocked_window
+
+        if "ImageMaid Finished" in line:
+            finished_seen = True
+            if timestamp_match:
+                finished_at = timestamp_match.group(1)
+
+        runtime_match = total_runtime_pattern.search(line)
+        if runtime_match:
+            parsed_runtime = _parse_imagemaid_runtime_seconds(runtime_match.group(1))
+            if parsed_runtime is not None:
+                run_time_seconds = parsed_runtime
+
+        if not mode and "Running in " in line and " Mode" in line:
+            mode_match = re.search(r"Running in\s+([A-Za-z]+)\s+Mode", line, re.IGNORECASE)
+            if mode_match:
+                mode = (mode_match.group(1) or "").strip().lower()
+
+        version_match = re.search(r"\|\s*Version:\s*([^\s|]+)", line, re.IGNORECASE)
+        if version_match and not local_version:
+            local_version = str(version_match.group(1) or "").strip()
+
+        command_match = re.search(r"\|\s*Run Command:\s*(.*?)\s*\|?$", line, re.IGNORECASE)
+        if command_match and not run_command_text:
+            run_command_text = str(command_match.group(1) or "").strip()
+
+        if "Downloading Database via the Plex API" in line:
+            database_section_seen = True
+        if "Downloaded New Database" in line:
+            database_downloaded_new = True
+        if "Database File Could not Downloaded" in line:
+            database_download_failed = True
+
+        if "PhotoTranscoder set to True" in line:
+            photo_transcoder_enabled = True
+        if "--photo-transcoder" in line:
+            photo_transcoder_enabled = True
+        if "--empty-trash" in line:
+            empty_trash_enabled = True
+        if "--clean-bundles" in line:
+            clean_bundles_enabled = True
+        if "--optimize-db" in line:
+            optimize_db_enabled = True
+        if "--local" in line:
+            local_db_enabled = True
+        if "--existing" in line:
+            use_existing_enabled = True
+        if "--no-verify-ssl" in line:
+            no_verify_ssl_enabled = True
+        if "--overlays-only" in line:
+            overlays_only_enabled = True
+
+        if "Empty Trash Plex Operation Started" in line:
+            operation_started["empty_trash"] = True
+            empty_trash_enabled = True
+        if "Clean Bundles Plex Operation Started" in line:
+            operation_started["clean_bundles"] = True
+            clean_bundles_enabled = True
+        if "Optimize DB Plex Operation Started" in line:
+            operation_started["optimize_db"] = True
+            optimize_db_enabled = True
+
+        if "Scanning ImageMaid Restore for Bloat Images to Remove" in line:
+            current_runtime_section = "restore_scan"
+        elif "Removing ImageMaid Restore Bloat Images" in line or ("Removing Complete:" in line and "ImageMaid Restore Bloat Images" in line):
+            current_runtime_section = "restore_action"
+        elif "Scanning for PhotoTranscoder Images" in line or ("Scanning Complete:" in line and "PhotoTranscoder Images" in line):
+            current_runtime_section = "photo_scan"
+        elif "Removing PhotoTranscoder Images" in line or ("Remove Complete:" in line and "PhotoTranscoder Images" in line):
+            current_runtime_section = "photo_remove"
+
+        restore_found_match = re.search(
+            r"Found\s+(\d+)\s+Bloat Images in the ImageMaid Directory to Remove",
+            line,
+            re.IGNORECASE,
+        )
+        if restore_found_match:
+            try:
+                restore_found_files = int(restore_found_match.group(1))
+            except (TypeError, ValueError):
+                pass
+        restore_removed_match = re.search(
+            r"Removed\s+(\d+)\s+ImageMaid Restore Bloat Images",
+            line,
+            re.IGNORECASE,
+        )
+        if restore_removed_match:
+            try:
+                restore_removed_files = int(restore_removed_match.group(1))
+            except (TypeError, ValueError):
+                pass
+        found_match = re.search(r"Found\s+(\d+)\s+PhotoTranscoder Images to Remove", line, re.IGNORECASE)
+        if found_match:
+            try:
+                photo_found_files = int(found_match.group(1))
+            except (TypeError, ValueError):
+                pass
+        removed_match = re.search(r"Removed\s+(\d+)\s+PhotoTranscoder Images", line, re.IGNORECASE)
+        if removed_match:
+            try:
+                photo_removed_files = int(removed_match.group(1))
+            except (TypeError, ValueError):
+                pass
+        bytes_match = re.search(r"Space Recovered:\s*(.*?)\s*\|?$", line, re.IGNORECASE)
+        if bytes_match:
+            parsed_bytes = _parse_imagemaid_bytes(bytes_match.group(1))
+            if parsed_bytes is not None:
+                if current_runtime_section in {"restore_scan", "restore_action"}:
+                    restore_recovered_bytes = parsed_bytes
+                elif current_runtime_section in {"photo_scan", "photo_remove"}:
+                    photo_recovered_bytes = parsed_bytes
+        runtime_line_match = re.search(r"\|\s*Runtime:\s*(.*?)\s*\|?$", line, re.IGNORECASE)
+        if runtime_line_match:
+            parsed_runtime = _parse_imagemaid_runtime_seconds(runtime_line_match.group(1))
+            if parsed_runtime is not None:
+                if current_runtime_section == "restore_scan":
+                    restore_scan_runtime = parsed_runtime
+                elif current_runtime_section == "restore_action":
+                    restore_action_runtime = parsed_runtime
+                elif current_runtime_section == "photo_scan":
+                    photo_scan_runtime = parsed_runtime
+                elif current_runtime_section == "photo_remove":
+                    photo_remove_runtime = parsed_runtime
+
+    if finished_seen and not finished_at:
+        finished_at = _iso_from_mtime(stats.st_mtime if stats else None)
+
+    if not started_at and first_timestamp:
+        started_at = first_timestamp
+
+    if not config_name:
+        inferred_config_name = _infer_imagemaid_config_name(mode=mode, run_command_text=run_command_text)
+        if inferred_config_name:
+            config_name = inferred_config_name
+
+    completion_reason = "completed"
+    run_complete = bool(finished_at and run_time_seconds is not None)
+    if not run_complete:
+        if stop_at:
+            completion_reason = stop_reason or "user_stop"
+            finished_at = finished_at or stop_at
+        elif blocked_at:
+            completion_reason = "maintenance_blocked_start"
+            finished_at = finished_at or blocked_at
+        else:
+            completion_reason = "unknown_incomplete"
+
+    maintenance_events = []
+    if blocked_at:
+        maintenance_events.append(
+            {
+                "event": "blocked_start",
+                "at": blocked_at,
+                "local_at": "",
+                "window": blocked_window or "",
+                "paused_seconds": None,
+            }
+        )
+    maintenance_summary = {
+        "had_pause": False,
+        "pause_count": 0,
+        "pause_seconds": 0,
+        "open_pause": False,
+        "window": blocked_window or "",
+        "events": maintenance_events,
+    }
+    error_lines = _extract_imagemaid_error_lines(lines)
+    if generic_error_lines:
+        for item in generic_error_lines:
+            if item not in error_lines:
+                error_lines.append(item)
+    if error_lines and error_count == 0:
+        error_count = len(error_lines)
+    if run_complete and (error_count > 0 or error_lines):
+        completion_reason = "completed_with_errors"
+    mode = (mode or "report").strip().lower() or "report"
+    config_name = str(config_name or "").strip() or "unknown"
+    command_signature = f"--mode {mode}"
+    run_command = run_command_text or f"imagemaid {command_signature}"
+    timestamp_seed = started_at or finished_at or (stats.st_mtime if stats else 0)
+    run_key_seed = f"imagemaid|{timestamp_seed}|{mode}|{path.name if path else 'imagemaid.log'}"
+    created_at = finished_at or started_at or _iso_from_mtime(stats.st_mtime if stats else None)
+    section_runtimes = {}
+    if restore_scan_runtime is not None:
+        section_runtimes["restore_dir_scan"] = restore_scan_runtime
+    if restore_action_runtime is not None:
+        section_runtimes["restore_dir_action"] = restore_action_runtime
+    if photo_scan_runtime is not None:
+        section_runtimes["photo_transcoder_scan"] = photo_scan_runtime
+    if photo_remove_runtime is not None:
+        section_runtimes["photo_transcoder_remove"] = photo_remove_runtime
+    total_found_files = restore_found_files + photo_found_files
+    total_removed_files = restore_removed_files + photo_removed_files
+    total_recovered_bytes = restore_recovered_bytes + photo_recovered_bytes
+    analysis_counts = {
+        "imagemaid_error_lines": len(error_lines),
+        "imagemaid_database_seen": int(database_section_seen),
+        "imagemaid_database_downloaded_new": int(database_downloaded_new),
+        "imagemaid_database_download_failed": int(database_download_failed),
+        "imagemaid_restore_found_files": restore_found_files,
+        "imagemaid_restore_removed_files": restore_removed_files,
+        "imagemaid_restore_recovered_bytes": restore_recovered_bytes,
+        "imagemaid_photo_found_files": photo_found_files,
+        "imagemaid_photo_removed_files": photo_removed_files,
+        "imagemaid_photo_recovered_bytes": photo_recovered_bytes,
+        "imagemaid_total_found_files": total_found_files,
+        "imagemaid_total_removed_files": total_removed_files,
+        "imagemaid_total_recovered_bytes": total_recovered_bytes,
+        "imagemaid_empty_trash_enabled": int(empty_trash_enabled),
+        "imagemaid_clean_bundles_enabled": int(clean_bundles_enabled),
+        "imagemaid_optimize_db_enabled": int(optimize_db_enabled),
+        "imagemaid_photo_transcoder_enabled": int(photo_transcoder_enabled),
+        "imagemaid_local_db_enabled": int(local_db_enabled),
+        "imagemaid_use_existing_enabled": int(use_existing_enabled),
+        "imagemaid_no_verify_ssl_enabled": int(no_verify_ssl_enabled),
+        "imagemaid_overlays_only_enabled": int(overlays_only_enabled),
+        "imagemaid_empty_trash_started": int(operation_started["empty_trash"]),
+        "imagemaid_clean_bundles_started": int(operation_started["clean_bundles"]),
+        "imagemaid_optimize_db_started": int(operation_started["optimize_db"]),
+        "imagemaid_enabled_operation_count": int(database_section_seen)
+        + int(photo_transcoder_enabled)
+        + int(empty_trash_enabled)
+        + int(clean_bundles_enabled)
+        + int(optimize_db_enabled),
+        "imagemaid_completed_with_errors": int(completion_reason == "completed_with_errors"),
+    }
+    summary = {
+        "run_key": hashlib.sha256(run_key_seed.encode("utf-8")).hexdigest(),
+        "tool_name": "imagemaid",
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "run_time_seconds": run_time_seconds,
+        "kometa_version": local_version or helpers.get_imagemaid_local_version() or "",
+        "kometa_newest_version": "",
+        "config_name": config_name,
+        "config_hash": None,
+        "run_command": run_command,
+        "command_signature": command_signature,
+        "section_runtimes": section_runtimes,
+        "log_size": int(stats.st_size) if stats else None,
+        "log_counts": {
+            "debug": 0,
+            "info": 0,
+            "warning": warning_count,
+            "error": error_count,
+            "critical": 0,
+            "trace": trace_count,
+        },
+        "analysis_counts": analysis_counts,
+        "library_counts": {},
+        "maintenance_summary": maintenance_summary,
+        "maintenance_had_pause": False,
+        "quiet_period_summary": {},
+        "quickstart_run_marker": quickstart_run_marker,
+        "config_line_count": None,
+        "cache_line_count": None,
+        "created_at": created_at,
+        "run_complete": run_complete,
+        "completion_reason": completion_reason,
+        "imagemaid_mode": mode,
+    }
+    recommendations = _build_imagemaid_recommendations(summary, error_lines=error_lines, completion_reason=completion_reason)
+    return {"summary": summary, "recommendations": recommendations}
+
+
+def _build_logscan_archive_filename(path, stats=None, counter=None, preferred_suffix=None):
+    path = Path(path)
+    if stats is None:
+        stats = path.stat()
+    timestamp = datetime.fromtimestamp(float(stats.st_mtime), tz=timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    size = int(stats.st_size)
+    suffix = preferred_suffix or "".join(path.suffixes)
+    if not suffix:
+        suffix = ".log"
+    stem = path.name
+    for suffix_part in path.suffixes:
+        if stem.endswith(suffix_part):
+            stem = stem[: -len(suffix_part)]
+    tool_name = _detect_logscan_tool_from_path(path)
+    if tool_name == "kometa":
+        stem = "meta"
+    elif tool_name == "imagemaid":
+        stem = "imagemaid"
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "-", stem).strip("-").lower() or "log"
+    base_name = f"{stem}-{timestamp}-{size}"
+    if counter and counter > 1:
+        base_name = f"{base_name}-{counter}"
+    return f"{base_name}{suffix}"
+
+
+def _build_logscan_archive_destination(path, archive_dir, stats=None, preferred_suffix=None):
+    path = Path(path)
+    archive_dir = Path(archive_dir)
+    if stats is None:
+        stats = path.stat()
+    counter = 1
+    while True:
+        candidate = archive_dir / _build_logscan_archive_filename(path, stats=stats, counter=counter, preferred_suffix=preferred_suffix)
+        if candidate.resolve() == path.resolve():
+            return candidate
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def _iter_logscan_candidate_files(log_dir=None, include_archive=True, include_compressed=False, tool_name=None):
+    tool_names = [_normalize_logscan_tool_name(tool_name)] if tool_name else ["kometa", "imagemaid"]
+    log_files = []
+    for current_tool in tool_names:
+        live_dir = _get_logscan_live_dir(current_tool, log_dir=log_dir if current_tool == "kometa" else None)
+        archive_dir = _get_logscan_archive_dir(current_tool) if include_archive else None
+        dirs = [live_dir]
+        if include_archive and archive_dir:
+            dirs.append(archive_dir)
+        if include_archive and current_tool == "kometa":
+            dirs.append(_get_logscan_archive_root_dir())
+        patterns = ["*meta*.log*"] if current_tool == "kometa" else ["*.log*"]
+        for base_dir in dirs:
+            if not base_dir.exists():
                 continue
-            suffixes = [suffix.lower() for suffix in path.suffixes]
-            if suffixes and suffixes[-1] in (".gz", ".zip", ".7z"):
-                continue
-            if ".log" not in path.name.lower():
-                continue
-            log_files.append(path)
+            for pattern in patterns:
+                for path in base_dir.glob(pattern):
+                    if not path.is_file():
+                        continue
+                    suffixes = [suffix.lower() for suffix in path.suffixes]
+                    if suffixes and suffixes[-1] in (".zip", ".7z"):
+                        continue
+                    if not include_compressed and suffixes and suffixes[-1] == ".gz":
+                        continue
+                    if ".log" not in path.name.lower():
+                        continue
+                    log_files.append(path)
 
     def _mtime(value):
         try:
@@ -5694,6 +9369,150 @@ def _get_logscan_log_files(log_dir=None, include_archive=True):
             return 0
 
     return sorted({path.resolve() for path in log_files}, key=_mtime)
+
+
+def _get_logscan_log_files(log_dir=None, include_archive=True):
+    return _iter_logscan_candidate_files(log_dir=log_dir, include_archive=include_archive, include_compressed=True)
+
+
+def _logscan_cache_entry_matches(path, cache_entry=None, stats=None, require_complete=False):
+    if not isinstance(cache_entry, dict):
+        return False
+    if require_complete and cache_entry.get("run_complete") is not True:
+        return False
+    try:
+        stats = stats or Path(path).stat()
+    except Exception:
+        return False
+    cached_mtime = cache_entry.get("mtime")
+    cached_size = cache_entry.get("size")
+    try:
+        if cached_mtime is None or cached_size is None:
+            return False
+        return float(cached_mtime) == float(stats.st_mtime) and int(cached_size) == int(stats.st_size)
+    except Exception:
+        return False
+
+
+def _get_logscan_delta_files(log_dir=None, include_archive=True):
+    ingest_cache = _load_logscan_ingest_cache()
+    cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
+    candidates = []
+    for path in _get_logscan_log_files(log_dir=log_dir, include_archive=include_archive):
+        cache_entry = cache_logs.get(str(path.resolve()), {})
+        if not _logscan_cache_entry_matches(path, cache_entry=cache_entry):
+            candidates.append(path)
+
+    def _mtime_desc(value):
+        try:
+            return value.stat().st_mtime
+        except Exception:
+            return 0
+
+    return sorted(candidates, key=_mtime_desc, reverse=True)
+
+
+def _classify_logscan_file_location(path, log_dir=None):
+    if not path:
+        return "missing"
+    try:
+        resolved = Path(path).resolve()
+    except Exception:
+        return "missing"
+    legacy_archive_dir = _get_logscan_archive_root_dir().resolve()
+    for tool_name in ("kometa", "imagemaid"):
+        live_dir = _get_logscan_live_dir(tool_name, log_dir=log_dir if tool_name == "kometa" else None).resolve()
+        archive_dir = _get_logscan_archive_dir(tool_name).resolve()
+        try:
+            resolved.relative_to(archive_dir)
+            return "archive"
+        except ValueError:
+            pass
+        try:
+            resolved.relative_to(live_dir)
+            if tool_name == "kometa":
+                return "live" if resolved.name.lower() == "meta.log" else "archive"
+            return "live"
+        except ValueError:
+            pass
+    try:
+        resolved.relative_to(legacy_archive_dir)
+        return "archive"
+    except ValueError:
+        pass
+    return "other"
+
+
+def _format_archived_log_retention_label(keep_limit):
+    if keep_limit <= 0:
+        return "Keep all archived logs"
+    if keep_limit == 1:
+        return "Keep last 1 archived log"
+    return f"Keep last {keep_limit} archived logs"
+
+
+def _get_logscan_keep_limit(tool_name="kometa"):
+    normalized = _normalize_logscan_tool_name(tool_name)
+    config_key = "QS_IMAGEMAID_LOG_KEEP" if normalized == "imagemaid" else "QS_KOMETA_LOG_KEEP"
+    try:
+        return max(0, int(app.config.get(config_key, 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_logscan_archive_storage_summary(all_runs=None, incomplete_runs=None, context=None):
+    context = context or _build_logscan_resolution_context()
+    archive_paths = {}
+    for entry in context.get("candidate_files", []):
+        path = entry.get("path")
+        if not path or _classify_logscan_file_location(path) != "archive":
+            continue
+        archive_paths[str(path.resolve())] = entry
+
+    tracked_paths = set()
+    tracked_bytes = 0
+    for run in list(all_runs or []) + list(incomplete_runs or []):
+        if not isinstance(run, dict):
+            continue
+        info = _resolve_logscan_run_log_info(run.get("run_key"), run_record=run, context=context)
+        if not info or info.get("location") != "archive" or not info.get("path"):
+            continue
+        path_key = str(Path(info["path"]).resolve())
+        if path_key in tracked_paths:
+            continue
+        tracked_paths.add(path_key)
+        if isinstance(info.get("size"), int):
+            tracked_bytes += info["size"]
+        else:
+            entry = archive_paths.get(path_key)
+            tracked_bytes += int(entry.get("size", 0)) if isinstance(entry, dict) else 0
+
+    total_archived_bytes = 0
+    for entry in archive_paths.values():
+        if isinstance(entry.get("size"), int):
+            total_archived_bytes += entry["size"]
+
+    total_archived_files = len(archive_paths)
+    tracked_archived_files = len(tracked_paths)
+    extra_archived_files = max(0, total_archived_files - tracked_archived_files)
+    extra_archived_bytes = max(0, total_archived_bytes - tracked_bytes)
+    kometa_keep_limit = _get_logscan_keep_limit("kometa")
+    imagemaid_keep_limit = _get_logscan_keep_limit("imagemaid")
+    return {
+        "archived_bytes": tracked_bytes,
+        "archived_files": tracked_archived_files,
+        "disk_archived_bytes": total_archived_bytes,
+        "disk_archived_files": total_archived_files,
+        "extra_archived_files": extra_archived_files,
+        "extra_archived_bytes": extra_archived_bytes,
+        "keep_limit": kometa_keep_limit,
+        "retention_label": f"Kometa: {_format_archived_log_retention_label(kometa_keep_limit)} | ImageMaid: {_format_archived_log_retention_label(imagemaid_keep_limit)}",
+        "kometa_keep_limit": kometa_keep_limit,
+        "imagemaid_keep_limit": imagemaid_keep_limit,
+        "kometa_retention_label": _format_archived_log_retention_label(kometa_keep_limit),
+        "imagemaid_retention_label": _format_archived_log_retention_label(imagemaid_keep_limit),
+        "compression_ready": True,
+    }
 
 
 def _get_logscan_ingest_cache_path():
@@ -5741,19 +9560,979 @@ def _clear_logscan_ingest_cache():
         pass
 
 
+def _remove_logscan_ingest_cache_entries(run_key=None, raw_path=None):
+    cache = _load_logscan_ingest_cache()
+    logs = cache.get("logs", {}) if isinstance(cache, dict) else {}
+    if not isinstance(logs, dict):
+        return False
+    changed = False
+    for cache_key, entry in list(logs.items()):
+        matches_run = bool(run_key and isinstance(entry, dict) and entry.get("run_key") == run_key)
+        matches_path = bool(raw_path and cache_key == raw_path)
+        if not matches_run and not matches_path:
+            continue
+        logs.pop(cache_key, None)
+        changed = True
+    if changed:
+        cache["logs"] = logs
+        _save_logscan_ingest_cache(cache)
+    return changed
+
+
+def _normalize_logscan_archive_filenames(archive_dir=None):
+    ingest_cache = _load_logscan_ingest_cache()
+    cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
+    if not isinstance(cache_logs, dict):
+        cache_logs = {}
+    renamed = 0
+    skipped = 0
+    errors = []
+    cache_dirty = False
+
+    for path in sorted(_iter_logscan_candidate_files(include_archive=True, include_compressed=True), key=lambda item: item.name.lower()):
+        if _classify_logscan_file_location(path) != "archive":
+            continue
+        try:
+            stats = path.stat()
+            current_tool = _detect_logscan_tool_from_path(path)
+            target_archive_dir = Path(archive_dir) if archive_dir else _get_logscan_archive_dir(current_tool)
+            target_archive_dir.mkdir(parents=True, exist_ok=True)
+            target = _build_logscan_archive_destination(path, target_archive_dir, stats=stats)
+            if target.resolve() == path.resolve():
+                skipped += 1
+                continue
+            source_key = str(path.resolve())
+            target_key = str(target.resolve())
+            shutil.move(str(path), str(target))
+            if source_key in cache_logs:
+                cache_logs[target_key] = cache_logs.pop(source_key)
+                cache_dirty = True
+            renamed += 1
+        except Exception as exc:
+            errors.append(f"Failed to normalize archived log {path}: {exc}")
+    if cache_dirty:
+        ingest_cache["logs"] = cache_logs
+        _save_logscan_ingest_cache(ingest_cache)
+    return {"renamed": renamed, "skipped": skipped, "errors": errors}
+
+
+logscan_archive_result = _normalize_logscan_archive_filenames()
+if logscan_archive_result.get("renamed"):
+    helpers.ts_log(
+        f"Normalized {logscan_archive_result['renamed']} archived log file(s) to the canonical archive layout.",
+        level="INFO",
+    )
+if logscan_archive_result.get("errors"):
+    for msg in logscan_archive_result["errors"]:
+        helpers.ts_log(msg, level="WARNING")
+
+
+def _normalize_cli_whitespace(command):
+    return re.sub(r"\s+", " ", str(command or "")).strip()
+
+
+def _command_has_flag(command, flag):
+    if not command or not flag:
+        return False
+    pattern = re.compile(rf"(^|\s){re.escape(flag)}(?=\s|$)")
+    return bool(pattern.search(command))
+
+
+def _remove_cli_switch(command, flag):
+    if not command or not flag:
+        return command
+    pattern = re.compile(rf"(^|\s){re.escape(flag)}(?=\s|$)")
+    return pattern.sub(" ", command)
+
+
+def _remove_cli_option_with_value(command, flag):
+    if not command or not flag:
+        return command
+    pattern = re.compile(rf"(^|\s){re.escape(flag)}(?:=(?:\"[^\"]*\"|'[^']*'|[^\s]+)|\s+(?:\"[^\"]*\"|'[^']*'|[^\s]+))?")
+    return pattern.sub(" ", command)
+
+
+def _quote_cli_value(value):
+    text = str(value or "")
+    escaped = text.replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _normalize_library_scope_values(current_library=None, library_scope=None):
+    values = []
+    seen = set()
+
+    def add_value(raw):
+        candidate = str(raw or "").strip()
+        if not candidate:
+            return
+        normalized = candidate.casefold()
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        values.append(candidate)
+
+    if isinstance(library_scope, (list, tuple, set)):
+        for item in library_scope:
+            add_value(item)
+    elif library_scope:
+        if isinstance(library_scope, str) and "|" in library_scope:
+            for item in library_scope.split("|"):
+                add_value(item)
+        else:
+            add_value(library_scope)
+    elif current_library:
+        add_value(current_library)
+
+    return values
+
+
+def _build_resume_library_scope(original_command, progress_libraries=None, current_library=None, allow_current_fallback=False):
+    run_option, selected_libraries = _extract_selected_libraries(original_command)
+    progress_libraries = progress_libraries if isinstance(progress_libraries, list) else []
+
+    status_by_name = {}
+    ordered_library_names = []
+    for entry in progress_libraries:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        ordered_library_names.append(name)
+        status_by_name[name.casefold()] = str(entry.get("status") or "").strip()
+
+    base_scope = []
+    if isinstance(selected_libraries, list) and selected_libraries:
+        base_scope = [str(name).strip() for name in selected_libraries if str(name).strip()]
+    elif run_option != "--run-libraries":
+        base_scope = ordered_library_names[:]
+
+    remaining = []
+    seen = set()
+    for name in base_scope:
+        key = name.casefold()
+        status = status_by_name.get(key, "")
+        if status in ("Done", "Skipped"):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        remaining.append(name)
+
+    current_name = str(current_library or "").strip()
+    if current_name:
+        current_key = current_name.casefold()
+        if current_key not in seen:
+            current_status = status_by_name.get(current_key, "")
+            current_in_base_scope = (not base_scope) or any(str(name).strip().casefold() == current_key for name in base_scope)
+            if current_in_base_scope and current_status not in ("Done", "Skipped"):
+                if current_key in status_by_name or allow_current_fallback:
+                    remaining.insert(0, current_name)
+
+    return remaining
+
+
+def _should_suppress_recovery_for_completed_scope(original_command, progress_libraries=None, current_library=None):
+    progress_libraries = progress_libraries if isinstance(progress_libraries, list) else []
+    if not progress_libraries:
+        return False
+
+    run_option, selected_libraries = _extract_selected_libraries(original_command)
+    explicit_phase = _detect_explicit_phase_from_command(original_command)
+    if explicit_phase not in ("collections", "operations", "metadata", "overlays", "playlists") and run_option != "--run-libraries":
+        return False
+
+    remaining = _build_resume_library_scope(
+        original_command,
+        progress_libraries=progress_libraries,
+        current_library=current_library,
+        allow_current_fallback=False,
+    )
+    return len(remaining) == 0
+
+
+def _resolve_config_path_for_command(config_name=None):
+    normalized_name = str(config_name or "").strip().lower().replace(" ", "_")
+    if not normalized_name:
+        normalized_name = str(session.get("config_name") or "default").strip().lower().replace(" ", "_") or "default"
+    return str((helpers.get_kometa_root_path() / "config" / f"{normalized_name}_config.yml").resolve())
+
+
+def _inject_config_path_for_command(command, config_name=None):
+    cleaned = _normalize_cli_whitespace(command)
+    if not cleaned:
+        return ""
+    config_path = _resolve_config_path_for_command(config_name=config_name)
+    quoted = _quote_cli_value(config_path)
+    if "<config>" in cleaned:
+        return _normalize_cli_whitespace(cleaned.replace("<config>", quoted))
+    cleaned = _remove_cli_option_with_value(cleaned, "--config")
+    cleaned = _remove_cli_option_with_value(cleaned, "-c")
+    return _normalize_cli_whitespace(f"{cleaned} --config {quoted}")
+
+
+def _build_recovery_command(base_command, phase=None, current_library=None, library_scope=None):
+    command = _normalize_cli_whitespace(base_command)
+    if not command:
+        return ""
+
+    phase_modes = {
+        "operations": "--operations-only",
+        "metadata": "--metadata-only",
+        "collections": "--collections-only",
+        "overlays": "--overlays-only",
+        "playlists": "--playlists-only",
+    }
+    mode_flags = list(phase_modes.values())
+    scoped_flags = ["--run-libraries", "--run-collections", "--resume"]
+
+    for flag in mode_flags:
+        command = _remove_cli_switch(command, flag)
+    for flag in scoped_flags:
+        command = _remove_cli_option_with_value(command, flag)
+
+    phase_flag = phase_modes.get((phase or "").strip().lower())
+    if phase_flag:
+        command = f"{command} {phase_flag}"
+    library_values = _normalize_library_scope_values(current_library=current_library, library_scope=library_scope)
+    if library_scope is not None and not library_values:
+        return ""
+    if library_values:
+        command = f"{command} --run-libraries {_quote_cli_value('|'.join(library_values))}"
+    if not _command_has_flag(command, "--run") and not _command_has_flag(command, "--times"):
+        command = f"{command} --run"
+
+    return _normalize_cli_whitespace(command)
+
+
+def _build_collection_resume_command(base_command, current_collection=None, current_library=None):
+    command = _build_recovery_command(base_command, phase="collections", current_library=current_library)
+    if not command or not current_collection:
+        return ""
+    command = _remove_cli_option_with_value(command, "--resume")
+    command = f"{command} --resume {_quote_cli_value(current_collection)}"
+    return _normalize_cli_whitespace(command)
+
+
+def _build_resume_command_preserving_scope(base_command, current_collection=None, current_library=None, library_scope=None):
+    command = _normalize_cli_whitespace(base_command)
+    if not command or not current_collection:
+        return ""
+
+    explicit_phase = _detect_explicit_phase_from_command(command)
+    preserved_phase = explicit_phase if explicit_phase not in (None, "mixed") else None
+    command = _build_recovery_command(
+        command,
+        phase=preserved_phase,
+        current_library=current_library,
+        library_scope=library_scope,
+    )
+    if not command:
+        return ""
+    command = _remove_cli_option_with_value(command, "--resume")
+    command = f"{command} --resume {_quote_cli_value(current_collection)}"
+    return _normalize_cli_whitespace(command)
+
+
+def _iso_from_mtime(value):
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        except Exception:
+            return None
+    return None
+
+
+def _build_incomplete_resume_message(phase_current=None, current_library=None, finished_at=None):
+    if phase_current and current_library:
+        message = f"Run appears incomplete during {phase_current} in library '{current_library}'."
+    elif phase_current:
+        message = f"Run appears incomplete during {phase_current}."
+    elif current_library:
+        message = f"Run appears incomplete while processing library '{current_library}'."
+    else:
+        message = "Run appears incomplete."
+
+    if finished_at:
+        return f"{message} Last finished marker: {finished_at}."
+    return f"{message} No Finished Run marker was found."
+
+
+def _build_completed_scope_resume_message(phase_current=None, current_library=None, finished_at=None):
+    if current_library:
+        message = f"The original run scope appears fully completed through library '{current_library}'."
+    elif phase_current:
+        message = f"The original run scope appears fully completed through the {phase_current} phase."
+    else:
+        message = "The original run scope appears fully completed."
+
+    if finished_at:
+        return f"{message} Last finished marker: {finished_at}."
+    return message
+
+
+def _build_recovery_suggestions(original_command, phase_current=None, current_library=None, current_collection=None, progress_libraries=None):
+    suggestions = []
+    if not original_command:
+        return suggestions
+
+    if _should_suppress_recovery_for_completed_scope(
+        original_command,
+        progress_libraries=progress_libraries,
+        current_library=current_library,
+    ):
+        return []
+
+    phase_key = (phase_current or "").strip().lower()
+    explicit_phase = _detect_explicit_phase_from_command(original_command)
+    resume_library_scope = _build_resume_library_scope(
+        original_command,
+        progress_libraries=progress_libraries,
+        current_library=current_library,
+        allow_current_fallback=bool(phase_key == "collections" or explicit_phase == "collections"),
+    )
+    scoped_library_scope = resume_library_scope or None
+
+    if phase_key == "collections" and current_collection:
+        suggestions.append(
+            _build_resume_command_preserving_scope(
+                original_command,
+                current_collection=current_collection,
+                current_library=current_library,
+                library_scope=scoped_library_scope,
+            )
+        )
+        if scoped_library_scope is not None:
+            suggestions.append(
+                _build_resume_command_preserving_scope(
+                    original_command,
+                    current_collection=current_collection,
+                    current_library=None,
+                    library_scope=None,
+                )
+            )
+
+    phase_scope = explicit_phase if explicit_phase not in (None, "mixed") else None
+
+    if phase_scope:
+        suggestions.append(_build_recovery_command(original_command, phase=phase_scope, library_scope=scoped_library_scope))
+        if scoped_library_scope is not None:
+            suggestions.append(_build_recovery_command(original_command, phase=phase_scope, library_scope=None))
+    elif scoped_library_scope is not None:
+        suggestions.append(_build_recovery_command(original_command, phase=None, library_scope=scoped_library_scope))
+    suggestions.append(_normalize_cli_whitespace(original_command))
+
+    deduped = []
+    seen = set()
+    for item in suggestions:
+        normalized = _normalize_cli_whitespace(item)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped[:4]
+
+
+def _extract_cli_option_value(command, flag):
+    normalized = _normalize_cli_whitespace(command)
+    if not normalized or not flag:
+        return ""
+    pattern = re.compile(rf"(?:^|\s){re.escape(flag)}(?:=(\"[^\"]*\"|'[^']*'|[^\s]+)|\s+(\"[^\"]*\"|'[^']*'|[^\s]+))")
+    match = pattern.search(normalized)
+    if not match:
+        return ""
+    raw = match.group(1) or match.group(2) or ""
+    if len(raw) >= 2 and ((raw[0] == '"' and raw[-1] == '"') or (raw[0] == "'" and raw[-1] == "'")):
+        return raw[1:-1]
+    return raw
+
+
+def _detect_explicit_phase_from_command(command):
+    normalized = _normalize_cli_whitespace(command)
+    if not normalized:
+        return None
+    phase_modes = {
+        "operations": "--operations-only",
+        "metadata": "--metadata-only",
+        "collections": "--collections-only",
+        "overlays": "--overlays-only",
+        "playlists": "--playlists-only",
+    }
+    matches = [phase for phase, flag in phase_modes.items() if _command_has_flag(normalized, flag)]
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    return "mixed"
+
+
+def _build_resume_explanation(
+    original_command,
+    suggested_command,
+    phase_current=None,
+    current_library=None,
+    current_collection=None,
+    finished_at=None,
+):
+    lines = []
+    if finished_at:
+        lines.append(f"Last finished marker seen in the log: {finished_at}.")
+        lines.append("A final Finished Run block was not found after that point, so this run was treated as incomplete.")
+    else:
+        lines.append("No Finished Run marker was found in this log, so the run was treated as incomplete.")
+
+    phase_modes = {
+        "operations": "--operations-only",
+        "metadata": "--metadata-only",
+        "collections": "--collections-only",
+        "overlays": "--overlays-only",
+        "playlists": "--playlists-only",
+    }
+    phase_key = (phase_current or "").strip().lower()
+    phase_flag = phase_modes.get(phase_key)
+    explicit_phase = _detect_explicit_phase_from_command(original_command)
+    explicit_phase_flag = phase_modes.get(explicit_phase)
+    if phase_flag and explicit_phase == phase_key:
+        lines.append(f"Original logged command already targeted {phase_key} via {phase_flag}; recovery kept that same scope.")
+    elif phase_key == "collections":
+        if explicit_phase == "collections":
+            lines.append("Detected active phase 'collections', and the original logged command was already collections-only.")
+        else:
+            lines.append("Detected active phase 'collections', but the original logged command was not collections-only; recovery kept the original run scope.")
+    elif phase_flag:
+        if explicit_phase == phase_key:
+            lines.append(f"Detected active phase '{phase_key}', and the original logged command already used {phase_flag}.")
+        elif explicit_phase in (None, "mixed"):
+            lines.append(f"Detected active phase '{phase_key}', but the original logged command was not phase-only; recovery kept the original run scope.")
+        else:
+            lines.append(f"Detected active phase '{phase_key}', while the original logged command already targeted {explicit_phase}; recovery kept the original run scope.")
+    elif phase_current:
+        lines.append(f"Detected phase '{phase_current}', but no phase-only flag mapping was found.")
+    else:
+        if explicit_phase and explicit_phase != "mixed":
+            lines.append(f"Detected explicit phase mode in the logged command: {phase_modes.get(explicit_phase, explicit_phase)}.")
+        elif explicit_phase == "mixed":
+            lines.append("Detected multiple phase-only flags in the logged command; mode flags were normalized.")
+
+    effective_phase = phase_key or (explicit_phase if explicit_phase not in (None, "mixed") else "")
+    resume_value = _extract_cli_option_value(original_command, "--resume")
+    has_resume_flag = _command_has_flag(original_command, "--resume")
+    suggested_resume = _extract_cli_option_value(suggested_command, "--resume")
+    suggested_library = _extract_cli_option_value(suggested_command, "--run-libraries")
+
+    if effective_phase and effective_phase != "collections":
+        lines.append(f"Kometa --resume was not used because this run is {effective_phase}-phase; --resume only applies to collections.")
+    elif suggested_resume:
+        if suggested_resume:
+            if explicit_phase_flag == "--collections-only":
+                if current_collection and suggested_resume == current_collection:
+                    lines.append(f'Collections-only run preserved; using --resume "{suggested_resume}" from latest in-progress collection activity.')
+                else:
+                    lines.append(f'Collections-only run preserved; suggestion uses --resume "{suggested_resume}".')
+            else:
+                if current_collection and suggested_resume == current_collection:
+                    lines.append(f'Run was interrupted during collections, so recovery adds --resume "{suggested_resume}" while keeping the original run scope.')
+                else:
+                    lines.append(f'Recovery adds --resume "{suggested_resume}" while keeping the original run scope.')
+            if suggested_library:
+                lines.append(f'Used scoped resume (--run-libraries "{suggested_library}") instead of blind resume across all libraries.')
+    elif has_resume_flag and resume_value:
+        lines.append(f"Logged command already included --resume {resume_value}; it was not auto-carried forward to avoid stale checkpoints.")
+    elif effective_phase == "collections" or phase_key == "collections":
+        lines.append("Collections phase was detected. --resume can apply here, but no reliable resume checkpoint was found in this log.")
+    else:
+        lines.append("Kometa --resume was not used because phase could not be confirmed as collections.")
+
+    if current_library:
+        lines.append(f"Detected in-progress library '{current_library}', so the suggestion scopes with --run-libraries.")
+
+    config_path = _extract_cli_option_value(suggested_command, "--config")
+    if config_path:
+        lines.append(f"Config path in the suggested command is: {config_path}.")
+
+    normalized_original = _normalize_cli_whitespace(original_command)
+    normalized_suggested = _normalize_cli_whitespace(suggested_command)
+    if normalized_original and normalized_suggested and normalized_original != normalized_suggested:
+        lines.append("Conflicting mode/scope flags were normalized before applying the detected phase/library scope.")
+    return lines
+
+
+def _analyze_incomplete_log_for_resume(log_path, cache_entry=None, config_name=None):
+    try:
+        content = _read_logscan_text(log_path, encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    analyzer = logscan.LogscanAnalyzer()
+    try:
+        analysis = analyzer.analyze_content(
+            content,
+            log_path=log_path,
+            config_name=config_name,
+            include_people_scan=False,
+        )
+    except Exception:
+        return None
+
+    summary = analysis.get("summary") if isinstance(analysis, dict) else None
+    recommendations = analysis.get("recommendations") if isinstance(analysis, dict) else None
+    if not isinstance(recommendations, list):
+        recommendations = []
+    if not isinstance(summary, dict):
+        return None
+    if summary.get("run_complete"):
+        return None
+
+    try:
+        original_command = _inject_config_path_for_command(
+            summary.get("run_command") or "",
+            config_name=summary.get("config_name") or config_name,
+        )
+        config_path = _extract_cli_option_value(original_command, "--config")
+        config_data = _load_progress_config(config_path) if config_path else {}
+        selected_libraries = _extract_selected_libraries(original_command)[1]
+        progress = analyzer.extract_progress(
+            content,
+            library_list=_get_progress_library_list(
+                selected_libraries=selected_libraries,
+                config_path=config_path,
+                config_data=config_data,
+            ),
+            selected_libraries=selected_libraries,
+        )
+    except Exception:
+        progress = {}
+    if not isinstance(progress, dict):
+        progress = {}
+
+    phase_current = (progress.get("phase_current") or "").strip().lower() or None
+    current_library = (progress.get("current_library") or "").strip() or None
+    if not current_library:
+        for entry in progress.get("libraries", []) or []:
+            if entry.get("status") == "In progress" and entry.get("name"):
+                current_library = str(entry.get("name")).strip()
+                break
+
+    current_collection = None
+    collection_in_library_re = re.compile(r"^\s*(.+?)\s+Collection\s+in\s+.+$", re.IGNORECASE)
+    running_collection_re = re.compile(r"^\s*Running\s+(.+?)\s+Collection\b", re.IGNORECASE)
+    try:
+        for raw_line in content.splitlines():
+            if not raw_line:
+                continue
+            msg = raw_line.split("|", 1)[1].strip() if "|" in raw_line else raw_line.strip()
+            msg = analyzer._strip_divider_wrappers(msg)
+            match = running_collection_re.search(msg) or collection_in_library_re.search(msg)
+            if match:
+                candidate = str(match.group(1) or "").strip()
+                if candidate:
+                    current_collection = candidate
+    except Exception:
+        current_collection = None
+
+    suggestions = _build_recovery_suggestions(
+        original_command,
+        phase_current=phase_current,
+        current_library=current_library,
+        current_collection=current_collection,
+        progress_libraries=progress.get("libraries"),
+    )
+    primary = suggestions[0] if suggestions else ""
+    scope_completed = not primary and not suggestions
+    explanation = []
+    if primary:
+        explanation = _build_resume_explanation(
+            original_command,
+            primary,
+            phase_current=phase_current,
+            current_library=current_library,
+            current_collection=current_collection,
+            finished_at=summary.get("finished_at"),
+        )
+    reason = _build_incomplete_resume_message(
+        phase_current=phase_current,
+        current_library=current_library,
+        finished_at=summary.get("finished_at"),
+    )
+    if scope_completed:
+        reason = _build_completed_scope_resume_message(
+            phase_current=phase_current,
+            current_library=current_library,
+            finished_at=summary.get("finished_at"),
+        )
+    counts = summary.get("log_counts") if isinstance(summary.get("log_counts"), dict) else {}
+    mtime = summary.get("log_mtime")
+    if not isinstance(mtime, (int, float)) and isinstance(cache_entry, dict):
+        mtime = cache_entry.get("mtime")
+    created_at = summary.get("created_at")
+    if not created_at and isinstance(cache_entry, dict):
+        created_at = cache_entry.get("updated_at") or _iso_from_mtime(cache_entry.get("mtime"))
+    if not created_at:
+        created_at = _iso_from_mtime(mtime)
+    run_key = summary.get("run_key")
+    if not run_key:
+        run_key_seed = f"incomplete|{log_path}|{mtime or 0}"
+        run_key = hashlib.sha256(run_key_seed.encode("utf-8")).hexdigest()
+
+    return {
+        "run_key": run_key,
+        "started_at": summary.get("started_at"),
+        "finished_at": summary.get("finished_at"),
+        "run_time_seconds": summary.get("run_time_seconds"),
+        "kometa_version": summary.get("kometa_version"),
+        "kometa_newest_version": summary.get("kometa_newest_version"),
+        "config_name": summary.get("config_name") or config_name or "",
+        "config_hash": summary.get("config_hash"),
+        "run_command": original_command,
+        "command_signature": summary.get("command_signature"),
+        "section_runtimes": summary.get("section_runtimes") or {},
+        "recommendations_count": len(recommendations),
+        "recommendations": recommendations,
+        "log_mtime": mtime,
+        "log_size": summary.get("log_size"),
+        "debug_count": counts.get("debug", 0),
+        "info_count": counts.get("info", 0),
+        "warning_count": counts.get("warning", 0),
+        "error_count": counts.get("error", 0),
+        "critical_count": counts.get("critical", 0),
+        "trace_count": counts.get("trace", 0),
+        "analysis_counts": summary.get("analysis_counts") if isinstance(summary.get("analysis_counts"), dict) else {},
+        "library_counts": summary.get("library_counts") if isinstance(summary.get("library_counts"), dict) else {},
+        "maintenance_summary": summary.get("maintenance_summary") if isinstance(summary.get("maintenance_summary"), dict) else {},
+        "maintenance_had_pause": bool((summary.get("maintenance_summary") or {}).get("had_pause")),
+        "quiet_period_summary": summary.get("quiet_period_summary") if isinstance(summary.get("quiet_period_summary"), dict) else {},
+        "quickstart_run_marker": bool(summary.get("quickstart_run_marker")),
+        "start_mode": summary.get("start_mode"),
+        "config_line_count": summary.get("config_line_count"),
+        "cache_line_count": summary.get("cache_line_count"),
+        "created_at": created_at,
+        "run_complete": False,
+        "is_incomplete": True,
+        "incomplete_log_name": Path(log_path).name,
+        "incomplete_log_path": str(Path(log_path)),
+        "phase_current": phase_current,
+        "current_library": current_library,
+        "current_collection": current_collection,
+        "resume_reason": reason,
+        "resume_primary": primary,
+        "resume_recommendations": suggestions,
+        "resume_explanation": explanation,
+        "resume_scope_completed": scope_completed,
+    }
+
+
+def _build_incomplete_run_from_cache_entry(log_path, cache_entry=None, config_name=None):
+    path = Path(log_path)
+    cache_entry = cache_entry if isinstance(cache_entry, dict) else {}
+    summary = cache_entry.get("summary") if isinstance(cache_entry.get("summary"), dict) else {}
+    tool_name = _normalize_logscan_tool_name(summary.get("tool_name") or cache_entry.get("tool_name"))
+    recommendations = cache_entry.get("recommendations")
+    if not isinstance(recommendations, list):
+        recommendations = []
+    try:
+        stats = path.stat()
+        mtime = stats.st_mtime
+        size = stats.st_size
+    except Exception:
+        mtime = cache_entry.get("mtime") if isinstance(cache_entry.get("mtime"), (int, float)) else None
+        size = cache_entry.get("size") if isinstance(cache_entry.get("size"), int) else None
+    counts = summary.get("log_counts") if isinstance(summary.get("log_counts"), dict) else {}
+    run_key = summary.get("run_key") or cache_entry.get("run_key")
+    if not run_key:
+        run_key_seed = f"incomplete|cached|{path}|{mtime or 0}|{size or 0}"
+        run_key = hashlib.sha256(run_key_seed.encode("utf-8")).hexdigest()
+    created_at = summary.get("created_at")
+    if not created_at:
+        created_at = cache_entry.get("updated_at") or _iso_from_mtime(mtime)
+    original_command = summary.get("run_command") or ""
+    if tool_name == "kometa":
+        original_command = _inject_config_path_for_command(
+            original_command,
+            config_name=summary.get("config_name") or config_name,
+        )
+    return {
+        "run_key": run_key,
+        "tool_name": tool_name,
+        "started_at": summary.get("started_at"),
+        "finished_at": summary.get("finished_at"),
+        "run_time_seconds": summary.get("run_time_seconds"),
+        "kometa_version": summary.get("kometa_version"),
+        "kometa_newest_version": summary.get("kometa_newest_version"),
+        "config_name": summary.get("config_name") or config_name or "",
+        "config_hash": summary.get("config_hash"),
+        "run_command": original_command,
+        "command_signature": summary.get("command_signature"),
+        "section_runtimes": summary.get("section_runtimes") or {},
+        "recommendations_count": len(recommendations),
+        "recommendations": recommendations,
+        "log_mtime": mtime,
+        "log_size": summary.get("log_size") if isinstance(summary.get("log_size"), int) else size,
+        "debug_count": counts.get("debug", 0),
+        "info_count": counts.get("info", 0),
+        "warning_count": counts.get("warning", 0),
+        "error_count": counts.get("error", 0),
+        "critical_count": counts.get("critical", 0),
+        "trace_count": counts.get("trace", 0),
+        "analysis_counts": summary.get("analysis_counts") if isinstance(summary.get("analysis_counts"), dict) else {},
+        "library_counts": summary.get("library_counts") if isinstance(summary.get("library_counts"), dict) else {},
+        "maintenance_summary": summary.get("maintenance_summary") if isinstance(summary.get("maintenance_summary"), dict) else {},
+        "maintenance_had_pause": bool((summary.get("maintenance_summary") or {}).get("had_pause")),
+        "quiet_period_summary": summary.get("quiet_period_summary") if isinstance(summary.get("quiet_period_summary"), dict) else {},
+        "quickstart_run_marker": bool(summary.get("quickstart_run_marker")),
+        "start_mode": summary.get("start_mode") or cache_entry.get("start_mode"),
+        "config_line_count": summary.get("config_line_count"),
+        "cache_line_count": summary.get("cache_line_count"),
+        "created_at": created_at,
+        "run_complete": False,
+        "is_incomplete": True,
+        "incomplete_log_name": path.name,
+        "incomplete_log_path": str(path),
+        "phase_current": cache_entry.get("phase_current"),
+        "current_library": cache_entry.get("current_library"),
+        "current_collection": cache_entry.get("current_collection"),
+        "resume_reason": cache_entry.get("resume_reason") or "Run appears incomplete. Open the report for more detail or download the log for investigation.",
+        "resume_primary": cache_entry.get("resume_primary") or "",
+        "resume_recommendations": cache_entry.get("resume_recommendations") if isinstance(cache_entry.get("resume_recommendations"), list) else [],
+        "resume_explanation": cache_entry.get("resume_explanation") if isinstance(cache_entry.get("resume_explanation"), list) else [],
+    }
+
+
+def _build_incomplete_log_fallback(log_path, cache_entry=None, config_name=None):
+    path = Path(log_path)
+    cache_entry = cache_entry if isinstance(cache_entry, dict) else {}
+    tool_name = _normalize_logscan_tool_name(cache_entry.get("tool_name"))
+    try:
+        stats = path.stat()
+        mtime = stats.st_mtime
+        size = stats.st_size
+    except Exception:
+        mtime = cache_entry.get("mtime") if isinstance(cache_entry.get("mtime"), (int, float)) else None
+        size = cache_entry.get("size") if isinstance(cache_entry.get("size"), int) else None
+    run_key = cache_entry.get("run_key")
+    if not run_key:
+        run_key_seed = f"incomplete|fallback|{path}|{mtime or 0}|{size or 0}"
+        run_key = hashlib.sha256(run_key_seed.encode("utf-8")).hexdigest()
+    created_at = cache_entry.get("updated_at") or _iso_from_mtime(mtime)
+    return {
+        "run_key": run_key,
+        "tool_name": tool_name,
+        "started_at": None,
+        "finished_at": None,
+        "run_time_seconds": None,
+        "kometa_version": "",
+        "kometa_newest_version": "",
+        "config_name": config_name or "",
+        "config_hash": None,
+        "run_command": "",
+        "command_signature": "",
+        "section_runtimes": {},
+        "recommendations_count": 0,
+        "recommendations": [],
+        "log_mtime": mtime,
+        "log_size": size,
+        "debug_count": 0,
+        "info_count": 0,
+        "warning_count": 0,
+        "error_count": 0,
+        "critical_count": 0,
+        "trace_count": 0,
+        "analysis_counts": {},
+        "library_counts": {},
+        "maintenance_summary": {},
+        "maintenance_had_pause": False,
+        "quiet_period_summary": {},
+        "quickstart_run_marker": False,
+        "start_mode": cache_entry.get("start_mode"),
+        "config_line_count": None,
+        "cache_line_count": None,
+        "created_at": created_at,
+        "run_complete": False,
+        "is_incomplete": True,
+        "incomplete_log_name": path.name,
+        "incomplete_log_path": str(path),
+        "phase_current": None,
+        "current_library": None,
+        "current_collection": None,
+        "resume_reason": "Run appears incomplete. Detailed parse data is not available, but the log is preserved for investigation.",
+        "resume_primary": "",
+        "resume_recommendations": [],
+        "resume_explanation": ["Quickstart preserved this incomplete log file even though detailed parsing was unavailable."],
+    }
+
+
+def _get_logscan_incomplete_runs(limit=100, config_name=None):
+    if limit is None:
+        safe_limit = None
+    else:
+        safe_limit = max(0, min(int(limit or 0), 1000000))
+    if safe_limit == 0:
+        return []
+    ingest_cache = _load_logscan_ingest_cache()
+    cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
+    if not isinstance(cache_logs, dict):
+        return []
+
+    candidates = []
+    for path_key, entry in cache_logs.items():
+        if not isinstance(entry, dict) or entry.get("run_complete") is True:
+            continue
+        try:
+            path = Path(path_key).resolve()
+        except Exception:
+            continue
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except Exception:
+            mtime = entry.get("mtime") if isinstance(entry.get("mtime"), (int, float)) else 0
+        candidates.append((float(mtime or 0), path, entry))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    parsed_runs = []
+    selected_candidates = candidates if safe_limit is None else candidates[:safe_limit]
+    for _, path, entry in selected_candidates:
+        if isinstance(entry.get("summary"), dict):
+            parsed = _build_incomplete_run_from_cache_entry(path, cache_entry=entry, config_name=config_name)
+        else:
+            parsed = _build_incomplete_log_fallback(path, cache_entry=entry, config_name=config_name)
+        if parsed:
+            parsed_runs.append(parsed)
+    return parsed_runs
+
+
+def _get_logscan_incomplete_run(run_key, config_name=None):
+    if not run_key:
+        return None
+    ingest_cache = _load_logscan_ingest_cache()
+    cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
+    if not isinstance(cache_logs, dict):
+        return None
+    for path_key, entry in cache_logs.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("run_complete") is True:
+            continue
+        if entry.get("run_key") != run_key:
+            continue
+        path = Path(path_key)
+        if not path.exists() or not path.is_file():
+            return None
+        if isinstance(entry.get("summary"), dict):
+            return _build_incomplete_run_from_cache_entry(path, cache_entry=entry, config_name=config_name)
+        if _normalize_logscan_tool_name(entry.get("tool_name")) != "kometa":
+            return _build_incomplete_log_fallback(path, cache_entry=entry, config_name=config_name)
+        parsed = _analyze_incomplete_log_for_resume(path, cache_entry=entry, config_name=config_name)
+        if parsed:
+            return parsed
+        return _build_incomplete_log_fallback(path, cache_entry=entry, config_name=config_name)
+    return None
+
+
+def _get_incomplete_resume_runs(limit=25, config_name=None):
+    safe_limit = max(0, min(int(limit or 0), 100))
+    if safe_limit == 0:
+        return []
+    ingest_cache = _load_logscan_ingest_cache()
+    cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
+    if not isinstance(cache_logs, dict):
+        return []
+
+    is_running = helpers.is_kometa_running()
+    candidates = []
+    for path_key, entry in cache_logs.items():
+        if not isinstance(entry, dict):
+            continue
+        if _normalize_logscan_tool_name(entry.get("tool_name")) != "kometa":
+            continue
+        try:
+            path = Path(path_key).resolve()
+        except Exception:
+            continue
+        if not path.exists() or not path.is_file():
+            continue
+        if is_running and path.name.lower() == "meta.log":
+            continue
+        # Prefer ingest-cache mtime to preserve analyzed-run ordering; live
+        # meta.log is refreshed separately below when Kometa is not running.
+        mtime = entry.get("mtime")
+        if not isinstance(mtime, (int, float)):
+            try:
+                mtime = path.stat().st_mtime
+            except Exception:
+                mtime = 0
+        candidates.append((float(mtime), path, entry))
+
+    try:
+        live_meta = (helpers.get_kometa_root_path() / "config" / "logs" / "meta.log").resolve()
+    except Exception:
+        live_meta = None
+    if live_meta and live_meta.exists() and live_meta.is_file():
+        if not is_running:
+            try:
+                live_mtime = live_meta.stat().st_mtime
+            except Exception:
+                live_mtime = 0
+            # Replace any cached candidate for live meta with a fresh mtime candidate.
+            candidates = [item for item in candidates if item[1] != live_meta]
+            live_entry = cache_logs.get(str(live_meta), {}) if isinstance(cache_logs, dict) else {}
+            if not isinstance(live_entry, dict):
+                live_entry = {}
+            if not isinstance(live_entry.get("mtime"), (int, float)):
+                live_entry["mtime"] = live_mtime
+            live_entry.setdefault("run_complete", False)
+            candidates.append((float(live_mtime), live_meta, live_entry))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    if not candidates:
+        return []
+
+    # Only evaluate the latest run candidate. Older incomplete logs may no longer
+    # be actionable once a newer run has completed.
+    _, path, entry = candidates[0]
+    parsed = _analyze_incomplete_log_for_resume(path, cache_entry=entry, config_name=config_name)
+    if not parsed:
+        return []
+    return [parsed]
+
+
+def _build_latest_incomplete_resume_hint():
+    incomplete_runs = _get_incomplete_resume_runs(limit=1, config_name=session.get("config_name"))
+    if not incomplete_runs:
+        return None
+    latest = incomplete_runs[0]
+
+    session_config = (session.get("config_name") or "default").strip()
+    summary_config = (latest.get("config_name") or "").strip()
+    context_mismatch = bool(summary_config and session_config and summary_config != session_config)
+
+    return {
+        "message": latest.get("resume_reason") or "Last run appears incomplete.",
+        "phase_current": latest.get("phase_current"),
+        "current_library": latest.get("current_library"),
+        "current_collection": latest.get("current_collection"),
+        "original_command": latest.get("run_command") or "",
+        "suggested_command": latest.get("resume_primary") or "",
+        "log_name": latest.get("incomplete_log_name") or "",
+        "log_path": latest.get("incomplete_log_path") or "",
+        "config_name": summary_config,
+        "context_mismatch": context_mismatch,
+        "explanation": latest.get("resume_explanation") if isinstance(latest.get("resume_explanation"), list) else [],
+        "scope_completed": bool(latest.get("resume_scope_completed")),
+    }
+
+
 def _logscan_needs_reingest(cache_logs, log_dir):
-    log_files = _get_logscan_log_files(log_dir=log_dir, include_archive=True)
-    for path in log_files:
-        entry = cache_logs.get(str(path.resolve()), {})
-        if not entry or not entry.get("run_complete"):
-            return True
-    return False
+    return bool(_get_logscan_delta_files(log_dir=log_dir, include_archive=True))
 
 
 def _logscan_ingest_health(log_dir=None):
     log_dir = Path(log_dir) if log_dir else helpers.get_kometa_root_path() / "config" / "logs"
     log_dir_exists = log_dir.exists()
-    log_files = _get_logscan_log_files(log_dir=log_dir, include_archive=True) if log_dir_exists else []
+    imagemaid_log_dir = _get_logscan_live_dir("imagemaid")
+    imagemaid_dir_exists = imagemaid_log_dir.exists()
+    log_files = _get_logscan_log_files(log_dir=log_dir, include_archive=True) if (log_dir_exists or imagemaid_dir_exists) else []
     ingest_cache = _load_logscan_ingest_cache()
     cache_logs = ingest_cache["logs"]
     missing = []
@@ -5762,10 +10541,15 @@ def _logscan_ingest_health(log_dir=None):
     complete = 0
     pending_active = False
     latest_updated = None
-    is_running = helpers.is_kometa_running()
+    kometa_running = helpers.is_kometa_running()
+    imagemaid_running = helpers.is_imagemaid_running()
 
     for path in log_files:
-        if is_running and path.name.lower() == "meta.log":
+        tool_name = _detect_logscan_tool_from_path(path, log_dir=log_dir)
+        if tool_name == "kometa" and kometa_running and path.name.lower() == "meta.log":
+            pending_active = True
+            continue
+        if tool_name == "imagemaid" and imagemaid_running and _classify_logscan_file_location(path, log_dir=log_dir) == "live":
             pending_active = True
             continue
         entry = cache_logs.get(str(path.resolve()))
@@ -5788,7 +10572,7 @@ def _logscan_ingest_health(log_dir=None):
 
     return {
         "source": "health",
-        "log_dir_missing": not log_dir_exists,
+        "log_dir_missing": not log_dir_exists and not imagemaid_dir_exists,
         "total": total,
         "tracked": tracked,
         "complete": complete,
@@ -5805,48 +10589,227 @@ def _logscan_ingest_health(log_dir=None):
 def _start_logscan_auto_reingest(log_dir):
     if logscan_ingest_lock.locked():
         return False
-
-    def _runner():
-        _perform_logscan_reingest(reset=False, job_id=None, update_state=False)
-
-    thread = threading.Thread(target=_runner, daemon=True)
+    snapshot = _logscan_reingest_snapshot()
+    if snapshot.get("status") == "running":
+        return False
+    job_id = secrets.token_urlsafe(8)
+    _update_logscan_reingest_state(
+        status="running",
+        job_id=job_id,
+        trigger="auto",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        finished_at=None,
+        total=0,
+        scanned=0,
+        ingested=0,
+        duplicates=0,
+        skipped_incomplete=0,
+        skipped_invalid=0,
+        errors=0,
+        current_file=None,
+        missing_people_unique=0,
+        missing_people_logs=0,
+        missing_people_log_ready=False,
+        missing_people_log_lines=0,
+        sample_incomplete=[],
+        sample_errors=[],
+    )
+    thread = threading.Thread(target=_run_logscan_reingest_job, args=(job_id, False), daemon=True, name="logscan-auto-reingest")
     thread.start()
     return True
 
 
-def _archive_log_file(path, archive_dir, log_dir=None):
+def _ingest_completed_live_logs(tool_name="kometa", log_dir=None):
+    tool_name = _normalize_logscan_tool_name(tool_name)
+    if tool_name == "kometa" and helpers.is_kometa_running():
+        return {"ingested": 0, "archived": 0}
+    if tool_name == "imagemaid" and helpers.is_imagemaid_running():
+        return {"ingested": 0, "archived": 0}
+
+    live_dir = _get_logscan_live_dir(tool_name, log_dir=log_dir if tool_name == "kometa" else None)
+    if not live_dir.exists():
+        return {"ingested": 0, "archived": 0}
+
+    if tool_name == "kometa":
+        candidates = [live_dir / "meta.log"]
+    else:
+        candidates = [
+            path for path in sorted(live_dir.glob("*.log*"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True) if path.is_file() and ".log" in path.name.lower()
+        ]
+
+    ingest_cache = _load_logscan_ingest_cache()
+    cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
+    if not isinstance(cache_logs, dict):
+        cache_logs = {}
+    cache_dirty = False
+    ingested = 0
+    archived = 0
+
+    analyzer = logscan.LogscanAnalyzer()
+    archive_dir = _get_logscan_archive_dir(tool_name)
+
+    for path in candidates:
+        try:
+            path = Path(path)
+            if not path.exists() or not path.is_file():
+                continue
+            stats = path.stat()
+            cache_key = str(path.resolve())
+            cached_entry = cache_logs.get(cache_key, {})
+            if _logscan_cache_entry_matches(path, cache_entry=cached_entry, stats=stats):
+                continue
+
+            content = _read_logscan_text(path, encoding="utf-8", errors="replace")
+            if tool_name == "imagemaid":
+                result = _analyze_imagemaid_log_content(content, log_path=path)
+            else:
+                result = analyzer.analyze_content(content, log_path=path, include_people_scan=False)
+            summary = result.get("summary") if isinstance(result, dict) else None
+            recommendations = result.get("recommendations") if isinstance(result, dict) else None
+            if not isinstance(recommendations, list):
+                recommendations = []
+            if not isinstance(summary, dict):
+                continue
+            if not summary.get("run_complete"):
+                cache_logs[cache_key] = {
+                    "mtime": stats.st_mtime,
+                    "size": stats.st_size,
+                    "run_key": summary.get("run_key"),
+                    "tool_name": tool_name,
+                    "run_complete": False,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "summary": summary,
+                    "recommendations": recommendations,
+                }
+                cache_dirty = True
+                continue
+
+            cached_run_key = cached_entry.get("run_key")
+            if not (cached_entry.get("run_complete") is True and cached_run_key == summary.get("run_key")):
+                if database.save_log_run(summary, recommendations=recommendations):
+                    ingested += 1
+
+            cache_logs[cache_key] = {
+                "mtime": stats.st_mtime,
+                "size": stats.st_size,
+                "run_key": summary.get("run_key"),
+                "tool_name": tool_name,
+                "run_complete": True,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            cache_dirty = True
+
+            if tool_name == "kometa":
+                archived_path = _archive_log_file(path, archive_dir, log_dir=live_dir, allow_live_meta=True)
+            else:
+                archived_path = _archive_log_file(path, archive_dir, log_dir=live_dir)
+            if archived_path:
+                try:
+                    archived_stats = archived_path.stat()
+                    cache_logs.pop(cache_key, None)
+                    cache_logs[str(archived_path.resolve())] = {
+                        "mtime": archived_stats.st_mtime,
+                        "size": archived_stats.st_size,
+                        "run_key": summary.get("run_key"),
+                        "tool_name": tool_name,
+                        "run_complete": True,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    cache_dirty = True
+                    archived += 1
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+    if cache_dirty:
+        ingest_cache["logs"] = cache_logs
+        _save_logscan_ingest_cache(ingest_cache)
+        _prune_logscan_archive(archive_dir)
+    return {"ingested": ingested, "archived": archived}
+
+
+def _archive_log_file(path, archive_dir, log_dir=None, allow_live_meta=False):
     try:
         path = Path(path)
         if not path.exists() or not path.is_file():
             return None
-        if path.name.lower() == "meta.log":
+        if path.name.lower() == "meta.log" and not allow_live_meta:
             return None
         if log_dir and path.resolve().parent != Path(log_dir).resolve():
             return None
         archive_dir = Path(archive_dir)
         archive_dir.mkdir(parents=True, exist_ok=True)
         src_stats = path.stat()
-        dest = archive_dir / path.name
+        should_compress = not _is_logscan_gzip_path(path)
+        preferred_suffix = ".log.gz" if should_compress else None
+        dest = _build_logscan_archive_destination(path, archive_dir, stats=src_stats, preferred_suffix=preferred_suffix)
         if dest.exists():
+            path.unlink()
+            return dest
+        if should_compress:
             try:
-                dst_stats = dest.stat()
-                if dst_stats.st_size == src_stats.st_size and dst_stats.st_mtime == src_stats.st_mtime:
-                    path.unlink()
-                    return dest
+                with path.open("rb") as source, gzip.open(dest, "wb") as target:
+                    shutil.copyfileobj(source, target)
+                os.utime(dest, (src_stats.st_atime, src_stats.st_mtime))
+                path.unlink()
             except Exception:
-                pass
-            suffix = "".join(path.suffixes)
-            base = path.name[: -len(suffix)] if suffix else path.stem
-            candidate = archive_dir / f"{base}-{int(src_stats.st_mtime)}-{src_stats.st_size}{suffix}"
-            counter = 1
-            while candidate.exists():
-                candidate = archive_dir / f"{base}-{int(src_stats.st_mtime)}-{src_stats.st_size}-{counter}{suffix}"
-                counter += 1
-            dest = candidate
-        shutil.move(str(path), str(dest))
+                try:
+                    if dest.exists():
+                        dest.unlink()
+                except Exception:
+                    pass
+                raise
+        else:
+            shutil.move(str(path), str(dest))
         return dest
     except Exception:
         return None
+
+
+def _archive_finished_live_meta_log_if_idle(log_dir=None):
+    log_dir = Path(log_dir) if log_dir else helpers.get_kometa_root_path() / "config" / "logs"
+    live_path = (log_dir / "meta.log").resolve()
+    if helpers.is_kometa_running():
+        return None
+    if not live_path.exists() or not live_path.is_file():
+        return None
+
+    ingest_cache = _load_logscan_ingest_cache()
+    cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
+    if not isinstance(cache_logs, dict):
+        return None
+
+    live_key = str(live_path)
+    live_entry = cache_logs.get(live_key)
+    if not isinstance(live_entry, dict):
+        return None
+    if live_entry.get("run_complete") is not True:
+        return None
+    if not live_entry.get("run_key"):
+        return None
+
+    archive_dir = _get_logscan_archive_dir()
+    archived_path = _archive_log_file(live_path, archive_dir, log_dir=log_dir, allow_live_meta=True)
+    if not archived_path:
+        return None
+
+    try:
+        archived_stats = archived_path.stat()
+        archived_key = str(archived_path.resolve())
+    except Exception:
+        return None
+
+    updated_entry = dict(live_entry)
+    updated_entry["mtime"] = archived_stats.st_mtime
+    updated_entry["size"] = archived_stats.st_size
+    updated_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+    cache_logs.pop(live_key, None)
+    cache_logs[archived_key] = updated_entry
+    ingest_cache["logs"] = cache_logs
+    _save_logscan_ingest_cache(ingest_cache)
+    _prune_logscan_archive(archive_dir)
+    return archived_path
 
 
 def _archive_rotated_logs(log_dir):
@@ -5868,19 +10831,53 @@ def _archive_rotated_logs(log_dir):
     return archived
 
 
+def _archive_rotated_log_and_update_cache(path, cache_logs, archive_dir, run_key=None, run_complete=False):
+    try:
+        source_path = Path(path).resolve()
+    except Exception:
+        return None
+    if source_path.name.lower() == "meta.log":
+        return None
+    archived_path = _archive_log_file(source_path, archive_dir, log_dir=source_path.parent)
+    if not archived_path:
+        return None
+    try:
+        archived_stats = archived_path.stat()
+        archived_key = str(archived_path.resolve())
+    except Exception:
+        return None
+    source_key = str(source_path)
+    existing_entry = cache_logs.get(source_key, {}) if isinstance(cache_logs, dict) else {}
+    if not isinstance(existing_entry, dict):
+        existing_entry = {}
+    updated_entry = dict(existing_entry)
+    updated_entry["mtime"] = archived_stats.st_mtime
+    updated_entry["size"] = archived_stats.st_size
+    updated_entry["run_complete"] = bool(run_complete)
+    updated_entry["tool_name"] = _detect_logscan_tool_from_path(source_path)
+    updated_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if run_key:
+        updated_entry["run_key"] = run_key
+    if isinstance(cache_logs, dict):
+        cache_logs.pop(source_key, None)
+        cache_logs[archived_key] = updated_entry
+    return archived_path
+
+
 def _prune_logscan_archive(archive_dir):
-    keep_limit = app.config.get("QS_KOMETA_LOG_KEEP", 0)
+    tool_name = _detect_logscan_tool_from_path(Path(archive_dir))
+    keep_limit = _get_logscan_keep_limit(tool_name)
     if keep_limit <= 0:
         return 0
     archive_dir = Path(archive_dir)
     if not archive_dir.exists():
         return 0
     candidates = []
-    for path in archive_dir.glob("*meta*.log*"):
+    for path in archive_dir.glob("*.log*"):
         if not path.is_file():
             continue
         suffixes = [suffix.lower() for suffix in path.suffixes]
-        if suffixes and suffixes[-1] in (".gz", ".zip", ".7z"):
+        if suffixes and suffixes[-1] in (".zip", ".7z"):
             continue
         if ".log" not in path.name.lower():
             continue
@@ -5961,21 +10958,23 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
         cache_logs = ingest_cache["logs"]
 
         kometa_root = helpers.get_kometa_root_path()
-        log_dir = kometa_root / "config" / "logs"
-        if not log_dir.exists():
-            message = f"Log folder not found at: {log_dir}"
+        kometa_log_dir = kometa_root / "config" / "logs"
+        imagemaid_log_dir = _get_logscan_live_dir("imagemaid")
+        if not kometa_log_dir.exists() and not imagemaid_log_dir.exists():
+            message = f"Log folders not found at: {kometa_log_dir} or {imagemaid_log_dir}"
             if update_state:
                 _update_logscan_reingest_state(status="error", error=message, finished_at=datetime.now(timezone.utc).isoformat())
             return {"success": False, "error": message}
 
-        log_files = _get_logscan_log_files(log_dir=log_dir, include_archive=True)
+        log_files = _get_logscan_log_files(log_dir=kometa_log_dir, include_archive=True) if reset else _get_logscan_delta_files(log_dir=kometa_log_dir, include_archive=True)
         total_files = len(log_files)
         if update_state:
             _update_logscan_reingest_state(total=total_files)
 
         analyzer = logscan.LogscanAnalyzer()
-        if log_files:
-            analyzer.preload_people_index(log_files[0])
+        preload_path = next((path for path in log_files if _detect_logscan_tool_from_path(path, log_dir=kometa_log_dir) == "kometa"), None)
+        if preload_path:
+            analyzer.preload_people_index(preload_path)
         ingested = 0
         duplicates = 0
         skipped_incomplete = 0
@@ -5990,7 +10989,6 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
         sample_incomplete = []
         sample_errors = []
 
-        archive_dir = _get_logscan_archive_dir()
         for idx, path in enumerate(log_files, start=1):
             if update_state:
                 _update_logscan_reingest_state(current_file=path.name, scanned=max(0, idx - 1))
@@ -6000,31 +10998,88 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                 cached_entry = cache_logs.get(cache_key, {})
                 cached_run_key = cached_entry.get("run_key")
                 skip_save_if_cached = cached_entry.get("run_complete") is True and cached_run_key
+                tool_name = _detect_logscan_tool_from_path(path, log_dir=kometa_log_dir)
+                live_dir = _get_logscan_live_dir(tool_name, log_dir=kometa_log_dir if tool_name == "kometa" else None)
+                archive_dir = _get_logscan_archive_dir(tool_name)
 
-                content = path.read_text(encoding="utf-8", errors="replace")
-                result = analyzer.analyze_content(
-                    content,
-                    log_path=path,
-                    include_people_scan=True,
-                )
+                content = _read_logscan_text(path, encoding="utf-8", errors="replace")
+                if tool_name == "imagemaid":
+                    result = _analyze_imagemaid_log_content(content, log_path=path)
+                else:
+                    result = analyzer.analyze_content(
+                        content,
+                        log_path=path,
+                        include_people_scan=True,
+                    )
                 summary = result.get("summary") if isinstance(result, dict) else None
                 if not summary:
                     skipped_invalid += 1
+                    if path.parent.resolve() == live_dir.resolve() and path.name.lower() != "meta.log":
+                        archived_path = _archive_rotated_log_and_update_cache(
+                            path,
+                            cache_logs,
+                            archive_dir,
+                            run_key=cached_run_key,
+                            run_complete=False,
+                        )
+                        if archived_path:
+                            cache_dirty = True
                     continue
                 if not summary.get("run_complete"):
                     skipped_incomplete += 1
                     if len(sample_incomplete) < 5:
                         sample_incomplete.append(path.name)
+                    incomplete_recommendations = result.get("recommendations") if isinstance(result, dict) else None
+                    if not isinstance(incomplete_recommendations, list):
+                        incomplete_recommendations = []
                     cache_logs[cache_key] = {
                         "mtime": stats.st_mtime,
                         "size": stats.st_size,
                         "run_key": summary.get("run_key"),
+                        "tool_name": tool_name,
                         "run_complete": False,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "summary": {
+                            "run_key": summary.get("run_key"),
+                            "tool_name": tool_name,
+                            "started_at": summary.get("started_at"),
+                            "finished_at": summary.get("finished_at"),
+                            "run_time_seconds": summary.get("run_time_seconds"),
+                            "kometa_version": summary.get("kometa_version"),
+                            "kometa_newest_version": summary.get("kometa_newest_version"),
+                            "config_name": summary.get("config_name"),
+                            "config_hash": summary.get("config_hash"),
+                            "run_command": summary.get("run_command"),
+                            "command_signature": summary.get("command_signature"),
+                            "section_runtimes": summary.get("section_runtimes") if isinstance(summary.get("section_runtimes"), dict) else {},
+                            "log_size": summary.get("log_size"),
+                            "log_counts": summary.get("log_counts") if isinstance(summary.get("log_counts"), dict) else {},
+                            "analysis_counts": summary.get("analysis_counts") if isinstance(summary.get("analysis_counts"), dict) else {},
+                            "library_counts": summary.get("library_counts") if isinstance(summary.get("library_counts"), dict) else {},
+                            "maintenance_summary": summary.get("maintenance_summary") if isinstance(summary.get("maintenance_summary"), dict) else {},
+                            "quiet_period_summary": summary.get("quiet_period_summary") if isinstance(summary.get("quiet_period_summary"), dict) else {},
+                            "quickstart_run_marker": bool(summary.get("quickstart_run_marker")),
+                            "start_mode": summary.get("start_mode"),
+                            "config_line_count": summary.get("config_line_count"),
+                            "cache_line_count": summary.get("cache_line_count"),
+                            "created_at": summary.get("created_at"),
+                        },
+                        "start_mode": summary.get("start_mode"),
+                        "recommendations": incomplete_recommendations,
                     }
                     cache_dirty = True
+                    if path.parent.resolve() == live_dir.resolve() and path.name.lower() != "meta.log":
+                        archived_path = _archive_rotated_log_and_update_cache(
+                            path,
+                            cache_logs,
+                            archive_dir,
+                            run_key=summary.get("run_key"),
+                            run_complete=False,
+                        )
+                        if archived_path:
+                            cache_dirty = True
                     continue
-                missing_people = result.get("missing_people") if isinstance(result, dict) else None
+                missing_people = result.get("missing_people") if tool_name == "kometa" and isinstance(result, dict) else None
                 if missing_people:
                     missing_people_logs += 1
                     missing_people_unique.update({name.lower() for name in missing_people})
@@ -6054,12 +11109,17 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                     "mtime": stats.st_mtime,
                     "size": stats.st_size,
                     "run_key": summary.get("run_key"),
+                    "tool_name": tool_name,
                     "run_complete": True,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
                 cache_dirty = True
-                if path.parent.resolve() == log_dir.resolve():
-                    archived_path = _archive_log_file(path, archive_dir, log_dir=log_dir)
+                is_live_source = path.parent.resolve() == live_dir.resolve()
+                should_archive_live = (
+                    is_live_source and not (tool_name == "kometa" and path.name.lower() == "meta.log") and not (tool_name == "imagemaid" and helpers.is_imagemaid_running())
+                )
+                if should_archive_live:
+                    archived_path = _archive_log_file(path, archive_dir, log_dir=live_dir)
                     if archived_path:
                         try:
                             archived_stats = archived_path.stat()
@@ -6067,6 +11127,7 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                                 "mtime": archived_stats.st_mtime,
                                 "size": archived_stats.st_size,
                                 "run_key": summary.get("run_key"),
+                                "tool_name": tool_name,
                                 "run_complete": True,
                                 "updated_at": datetime.now(timezone.utc).isoformat(),
                             }
@@ -6164,6 +11225,153 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
         logscan_ingest_lock.release()
 
 
+def _logscan_startup_migrations_enabled():
+    raw = str(os.getenv(LOGSCAN_STARTUP_MIGRATIONS_ENV, "1") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _get_logscan_migration_level_done():
+    raw = str(os.getenv(LOGSCAN_MIGRATION_LEVEL_DONE_ENV, "0") or "").strip()
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _set_logscan_migration_level_done(level):
+    normalized = str(max(0, int(level)))
+    helpers.update_env_variable(LOGSCAN_MIGRATION_LEVEL_DONE_ENV, normalized)
+    os.environ[LOGSCAN_MIGRATION_LEVEL_DONE_ENV] = normalized
+
+
+def _get_pending_logscan_startup_migration():
+    enabled = _logscan_startup_migrations_enabled()
+    completed_level = _get_logscan_migration_level_done()
+    required_level = max(0, int(REQUIRED_LOGSCAN_MIGRATION_LEVEL or 0))
+    state = {
+        "enabled": enabled,
+        "completed_level": completed_level,
+        "required_level": required_level,
+        "should_run": False,
+        "reason": "up_to_date",
+    }
+    if not enabled:
+        state["reason"] = "disabled"
+        return state
+    if required_level <= 0:
+        state["reason"] = "not_configured"
+        return state
+    if completed_level >= required_level:
+        state["reason"] = "up_to_date"
+        return state
+    kometa_root = helpers.get_kometa_root_path()
+    log_dir = kometa_root / "config" / "logs"
+    if not log_dir.exists():
+        state["reason"] = "waiting_for_logs"
+        return state
+    candidate_files = _get_logscan_log_files(log_dir=log_dir, include_archive=True)
+    if not candidate_files:
+        state["reason"] = "waiting_for_logs"
+        return state
+    state["should_run"] = True
+    state["reason"] = "pending"
+    state["candidate_files"] = len(candidate_files)
+    return state
+
+
+def _run_logscan_startup_migration(app_in, required_level, completed_level):
+    helpers.ts_log(
+        (
+            f"Starting one-time Analytics migration level {required_level} "
+            f"(completed level: {completed_level}). Quickstart will reset stored "
+            "trend data and reingest Kometa logs in the background."
+        ),
+        level="INFO",
+    )
+    try:
+        with app_in.app_context():
+            result = _perform_logscan_reingest(
+                reset=True,
+                job_id=LOGSCAN_STARTUP_MIGRATION_JOB_ID,
+                update_state=True,
+            )
+        if result.get("success"):
+            _set_logscan_migration_level_done(required_level)
+            helpers.ts_log(
+                (f"Completed Analytics migration level {required_level}. " f"Persisted {LOGSCAN_MIGRATION_LEVEL_DONE_ENV}={required_level}."),
+                level="INFO",
+            )
+        else:
+            helpers.ts_log(
+                (f"Analytics migration level {required_level} did not complete: " f"{result.get('error', 'Unknown error')}."),
+                level="WARNING",
+            )
+        return result
+    except Exception as exc:
+        _update_logscan_reingest_state(
+            status="error",
+            error=f"Startup Analytics migration failed: {exc}",
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+        helpers.ts_log(f"Startup Analytics migration failed: {exc}", level="ERROR")
+        return {"success": False, "error": str(exc)}
+
+
+def _start_pending_logscan_startup_migration(app_in):
+    state = _get_pending_logscan_startup_migration()
+    if not state.get("should_run"):
+        reason = state.get("reason")
+        required_level = state.get("required_level", 0)
+        completed_level = state.get("completed_level", 0)
+        if reason == "disabled":
+            helpers.ts_log(
+                (f"Skipping startup Analytics migration because " f"{LOGSCAN_STARTUP_MIGRATIONS_ENV}=0."),
+                level="INFO",
+            )
+        elif reason == "waiting_for_logs":
+            helpers.ts_log(
+                (f"Deferring Analytics migration level {required_level} until Kometa " "log files exist. This is expected on a first-time Quickstart setup."),
+                level="INFO",
+            )
+        elif required_level > 0 and completed_level >= required_level:
+            helpers.ts_log(f"Analytics migration level {required_level} already applied.", level="DEBUG")
+        return state
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    _update_logscan_reingest_state(
+        status="running",
+        job_id=LOGSCAN_STARTUP_MIGRATION_JOB_ID,
+        trigger="startup_migration",
+        migration_level=state["required_level"],
+        started_at=started_at,
+        finished_at=None,
+        total=0,
+        scanned=0,
+        ingested=0,
+        duplicates=0,
+        skipped_incomplete=0,
+        skipped_invalid=0,
+        errors=0,
+        current_file=None,
+        missing_people_unique=0,
+        missing_people_logs=0,
+        missing_people_log_ready=False,
+        missing_people_log_lines=0,
+        sample_incomplete=[],
+        sample_errors=[],
+    )
+    thread = threading.Thread(
+        target=_run_logscan_startup_migration,
+        args=(app_in, state["required_level"], state["completed_level"]),
+        daemon=True,
+        name="logscan-startup-migration",
+    )
+    thread.start()
+    state["started"] = True
+    state["job_id"] = LOGSCAN_STARTUP_MIGRATION_JOB_ID
+    return state
+
+
 def _run_logscan_reingest_job(job_id, reset):
     try:
         with app.app_context():
@@ -6188,13 +11396,59 @@ def logscan_trends_reingest_status():
     return jsonify(snapshot)
 
 
+@app.route("/background-jobs/active", methods=["GET"])
+def background_jobs_active():
+    job_type = str(request.args.get("job_type", "") or request.args.get("type", "")).strip()
+    if job_type:
+        active = _get_active_background_job(job_type)
+        return jsonify(success=True, active=bool(active), job=active)
+    jobs = sorted(
+        _get_active_background_jobs(),
+        key=lambda job: str(job.get("started_at") or ""),
+        reverse=True,
+    )
+    return jsonify(success=True, jobs=jobs)
+
+
+@app.route("/background-jobs/<job_id>", methods=["GET"])
+def background_job_status(job_id):
+    job = _get_background_job(job_id)
+    if not job:
+        return jsonify(success=False, error="Unknown job_id."), 404
+    since = request.args.get("since", "0").strip()
+    try:
+        start_idx = max(int(since or "0"), 0)
+    except ValueError:
+        start_idx = 0
+    logs = list(job.get("logs") or [])
+    return jsonify(
+        success=True,
+        job=job,
+        lines=logs[start_idx:],
+        next_index=len(logs),
+        done=job.get("status") in {"complete", "error"},
+    )
+
+
 @app.route("/logscan/trends/reingest", methods=["POST"])
 def logscan_trends_reingest():
     data = request.get_json(silent=True) or {}
     reset = data.get("reset") is True
     background = data.get("background") is True
     if logscan_ingest_lock.locked():
-        return jsonify({"error": "Reingest already running."}), 409
+        snapshot = _logscan_reingest_snapshot()
+        return (
+            jsonify(
+                {
+                    "error": "Reingest already running.",
+                    "job_id": snapshot.get("job_id"),
+                    "status": snapshot.get("status") or "running",
+                    "trigger": snapshot.get("trigger"),
+                    "migration_level": snapshot.get("migration_level"),
+                }
+            ),
+            409,
+        )
     if background:
         snapshot = _logscan_reingest_snapshot()
         if snapshot.get("status") == "running":
@@ -6204,6 +11458,8 @@ def logscan_trends_reingest():
                         "error": "Reingest already running.",
                         "job_id": snapshot.get("job_id"),
                         "status": snapshot.get("status"),
+                        "trigger": snapshot.get("trigger"),
+                        "migration_level": snapshot.get("migration_level"),
                     }
                 ),
                 409,
@@ -6254,6 +11510,7 @@ def logscan_trends_page():
         "qs_optimize_defaults": app.config.get("QS_OPTIMIZE_DEFAULTS", True),
         "qs_config_history": app.config.get("QS_CONFIG_HISTORY", 0),
         "qs_kometa_log_keep": app.config.get("QS_KOMETA_LOG_KEEP", 0),
+        "qs_imagemaid_log_keep": app.config.get("QS_IMAGEMAID_LOG_KEEP", 0),
         "qs_session_lifetime_days": app.config.get("QS_SESSION_LIFETIME_DAYS", 30),
         "qs_flask_session_dir": app.config.get("QS_FLASK_SESSION_DIR", ""),
         "shutdown_nonce": session["shutdown_nonce"],
@@ -6288,11 +11545,27 @@ def logscan_trends_page():
         progress_index = max(total_steps - 1, 0)
     page_info["progress"] = round(((progress_index + 1) / total_steps) * 100) if total_steps else 0
     available_configs = database.get_unique_config_names() or []
+    workspace_status = _build_workspace_status_context(page_info.get("config_name"), template_list, available_configs=available_configs)
     return render_template(
         "905-analytics.html",
         page_info=page_info,
         template_list=template_list,
         available_configs=available_configs,
+        jump_to_validations=workspace_status.get("jump_to_validations", {}),
+        step_statuses=workspace_status.get("step_statuses", {}),
+        section_statuses=workspace_status.get("section_statuses", {}),
+        required_keys=workspace_status.get("required_keys", []),
+        optional_keys=workspace_status.get("optional_keys", []),
+        review_keys=workspace_status.get("review_keys", []),
+        tautulli_requirement_reasons=workspace_status.get("tautulli_requirement_reasons", []),
+        omdb_requirement_reasons=workspace_status.get("omdb_requirement_reasons", []),
+        mdblist_requirement_reasons=workspace_status.get("mdblist_requirement_reasons", []),
+        anidb_requirement_reasons=workspace_status.get("anidb_requirement_reasons", []),
+        radarr_requirement_reasons=workspace_status.get("radarr_requirement_reasons", []),
+        sonarr_requirement_reasons=workspace_status.get("sonarr_requirement_reasons", []),
+        trakt_requirement_reasons=workspace_status.get("trakt_requirement_reasons", []),
+        mal_requirement_reasons=workspace_status.get("mal_requirement_reasons", []),
+        workspace_readiness=workspace_status.get("readiness", {}),
     )
 
 
@@ -6428,6 +11701,8 @@ def support_info():
         elif key.startswith("sho-library_"):
             show_libraries.append(str(value))
 
+    movie_libraries = sorted((name.strip() for name in movie_libraries if str(name).strip()), key=lambda value: value.casefold())
+    show_libraries = sorted((name.strip() for name in show_libraries if str(name).strip()), key=lambda value: value.casefold())
     library_names = movie_libraries + show_libraries
     if library_names:
         library_details = helpers.get_library_summaries(library_names)
@@ -6548,6 +11823,17 @@ def update_quickstart_settings():
         if log_keep_value is not None and log_keep_value < 0:
             errors.append("Kometa log retention must be a non-negative number.")
 
+    imagemaid_log_keep_raw = data.get("imagemaid_log_keep")
+    imagemaid_log_keep_value = None
+    if imagemaid_log_keep_raw is not None:
+        try:
+            imagemaid_log_keep_value = int(str(imagemaid_log_keep_raw).strip())
+        except (TypeError, ValueError):
+            errors.append("ImageMaid log retention must be a non-negative number.")
+            imagemaid_log_keep_value = None
+        if imagemaid_log_keep_value is not None and imagemaid_log_keep_value < 0:
+            errors.append("ImageMaid log retention must be a non-negative number.")
+
     session_lifetime_raw = data.get("session_lifetime_days")
     session_lifetime_value = None
     if session_lifetime_raw is not None:
@@ -6617,6 +11903,11 @@ def update_quickstart_settings():
         app.config["QS_KOMETA_LOG_KEEP"] = log_keep_value
         changes_applied = True
 
+    if imagemaid_log_keep_value is not None and imagemaid_log_keep_value != app.config.get("QS_IMAGEMAID_LOG_KEEP", 0):
+        helpers.update_env_variable("QS_IMAGEMAID_LOG_KEEP", str(imagemaid_log_keep_value))
+        app.config["QS_IMAGEMAID_LOG_KEEP"] = imagemaid_log_keep_value
+        changes_applied = True
+
     if session_lifetime_value is not None and session_lifetime_value != app.config.get("QS_SESSION_LIFETIME_DAYS", 30):
         helpers.update_env_variable("QS_SESSION_LIFETIME_DAYS", str(session_lifetime_value))
         app.config["QS_SESSION_LIFETIME_DAYS"] = session_lifetime_value
@@ -6668,6 +11959,7 @@ def update_quickstart_settings():
             optimize_defaults=app.config.get("QS_OPTIMIZE_DEFAULTS", True),
             config_history=app.config.get("QS_CONFIG_HISTORY", 0),
             kometa_log_keep=app.config.get("QS_KOMETA_LOG_KEEP", 0),
+            imagemaid_log_keep=app.config.get("QS_IMAGEMAID_LOG_KEEP", 0),
             session_lifetime_days=app.config.get("QS_SESSION_LIFETIME_DAYS", 30),
             session_dir=app.config.get("QS_FLASK_SESSION_DIR", ""),
         )
@@ -6683,6 +11975,7 @@ def update_quickstart_settings():
             optimize_defaults=app.config.get("QS_OPTIMIZE_DEFAULTS", True),
             config_history=app.config.get("QS_CONFIG_HISTORY", 0),
             kometa_log_keep=app.config.get("QS_KOMETA_LOG_KEEP", 0),
+            imagemaid_log_keep=app.config.get("QS_IMAGEMAID_LOG_KEEP", 0),
             session_lifetime_days=app.config.get("QS_SESSION_LIFETIME_DAYS", 30),
             session_dir=app.config.get("QS_FLASK_SESSION_DIR", ""),
         )
@@ -6696,6 +11989,7 @@ def update_quickstart_settings():
         optimize_defaults=app.config.get("QS_OPTIMIZE_DEFAULTS", True),
         config_history=app.config.get("QS_CONFIG_HISTORY", 0),
         kometa_log_keep=app.config.get("QS_KOMETA_LOG_KEEP", 0),
+        imagemaid_log_keep=app.config.get("QS_IMAGEMAID_LOG_KEEP", 0),
         session_lifetime_days=app.config.get("QS_SESSION_LIFETIME_DAYS", 30),
         session_dir=app.config.get("QS_FLASK_SESSION_DIR", ""),
     )
@@ -6706,7 +12000,9 @@ def header_style_preview():
     font = str(request.args.get("font", "") or "").strip()
     available_fonts = helpers.get_pyfiglet_fonts()
     if not font:
-        font = "standard"
+        font = "single line"
+    if font == "single_line":
+        font = "single line"
     if font not in available_fonts:
         return jsonify(success=False, message="Unknown header style."), 404
 
@@ -6914,12 +12210,6 @@ def validate_kometa_root():
 
     log("✅ Kometa root is valid and ready.")
 
-    kometa_update_info = helpers.check_kometa_update(p)
-    if kometa_update_info["update_available"]:
-        log(f"⬆️ Update available: {kometa_update_info['local_version']} → {kometa_update_info['remote_version']}")
-    else:
-        log(f"✅ Kometa is up to date: {kometa_update_info['local_version']}")
-
     return (
         jsonify(
             success=True,
@@ -6930,10 +12220,196 @@ def validate_kometa_root():
             kometa_root_display=kometa_root_display,
             venv_python_display=str(python_bin),
             kometa_version=kometa_version,
-            local_version=kometa_update_info["local_version"],
-            remote_version=kometa_update_info["remote_version"],
-            kometa_update_available=kometa_update_info["update_available"],
             log=logs,
+        ),
+        200,
+    )
+
+
+def _probe_kometa_root_state(path_obj):
+    p = Path(path_obj)
+    kometa_root_posix = p.as_posix()
+    kometa_root_display = str(p)
+    is_windows = sys.platform.startswith("win")
+    venv_dir = p / "kometa-venv"
+    bin_dir = venv_dir / ("Scripts" if is_windows else "bin")
+    python_bin = bin_dir / ("python.exe" if is_windows else "python")
+    version_path = p / "VERSION"
+    kometa_py = p / "kometa.py"
+    requirements = p / "requirements.txt"
+    config_dir = p / "config"
+    version_value = "Unknown"
+    if version_path.exists():
+        try:
+            version_value = version_path.read_text(encoding="utf-8").strip() or "Unknown"
+        except Exception:
+            version_value = "Unknown"
+
+    return {
+        "kometa_root": kometa_root_posix,
+        "kometa_root_display": kometa_root_display,
+        "venv_python": python_bin.as_posix(),
+        "venv_python_display": str(python_bin),
+        "kometa_version": version_value,
+        "root_exists": p.exists(),
+        "config_dir_exists": config_dir.exists(),
+        "kometa_installed": kometa_py.exists() and requirements.exists(),
+        "venv_exists": venv_dir.exists(),
+        "venv_python_exists": python_bin.exists(),
+        "kometa_running": helpers.is_kometa_running(),
+    }
+
+
+@app.route("/probe-kometa-root", methods=["POST"])
+def probe_kometa_root():
+    payload = request.get_json(silent=True) or {}
+    root_path = str(payload.get("path", "")).strip()
+    logs = []
+
+    def log(msg):
+        print(msg, file=sys.stderr)
+        logs.append(msg)
+
+    if not root_path:
+        log("❌ No path provided.")
+        return jsonify(success=False, error="No path provided.", log=logs), 400
+
+    p = _resolve_user_dir(root_path)
+    if not p:
+        log("❌ Invalid path provided.")
+        return jsonify(success=False, error="Invalid path provided.", log=logs), 400
+
+    session["kometa_root"] = p.as_posix()
+    app.config["KOMETA_ROOT"] = str(p)
+
+    state = _probe_kometa_root_state(p)
+    log(f"🔍 Probing Kometa path: {state['kometa_root_display']}")
+    if not state["root_exists"]:
+        log("ℹ️ Kometa root does not exist yet. Install required.")
+    elif not state["kometa_installed"]:
+        log("ℹ️ Kometa files not found yet. Install required.")
+    else:
+        log("✅ Kometa files detected locally.")
+        if state["kometa_version"]:
+            log(f"📦 Local Kometa version: {state['kometa_version']}")
+        if state["venv_python_exists"]:
+            log(f"🐍 Kometa venv python detected at: {state['venv_python_display']}")
+        else:
+            log("ℹ️ Kometa venv python not present yet. Prepare step still needed.")
+    if state["kometa_running"]:
+        log("ℹ️ Kometa is currently running.")
+
+    return jsonify(success=True, log=logs, **state), 200
+
+
+@app.route("/check-kometa-update", methods=["POST"])
+def check_kometa_update():
+    payload = request.get_json(silent=True) or {}
+    root_path = str(payload.get("path", "")).strip()
+    branch_override_raw = payload.get("branch_override")
+    branch_override = helpers.normalize_kometa_branch_override(branch_override_raw)
+    logs = []
+
+    def log(msg):
+        print(msg, file=sys.stderr)
+        logs.append(msg)
+
+    if not root_path:
+        log("❌ No path provided.")
+        return jsonify(success=False, error="No path provided.", log=logs), 400
+
+    if branch_override_raw and not branch_override:
+        log(f"❌ Invalid Kometa branch override: {branch_override_raw}")
+        return jsonify(success=False, error="Invalid Kometa branch override.", log=logs), 400
+
+    p = _resolve_user_dir(root_path)
+    if not p:
+        log("❌ Invalid path provided.")
+        return jsonify(success=False, error="Invalid path provided.", log=logs), 400
+
+    session["kometa_root"] = p.as_posix()
+    app.config["KOMETA_ROOT"] = str(p)
+
+    state = _probe_kometa_root_state(p)
+    if not state["kometa_installed"]:
+        log("ℹ️ Kometa is not installed yet; update check skipped.")
+        return (
+            jsonify(
+                success=True,
+                log=logs,
+                update_check_completed=False,
+                kometa_update_check_skipped=False,
+                local_version=state["kometa_version"],
+                remote_version="",
+                kometa_update_available=False,
+                cached=False,
+                **state,
+            ),
+            200,
+        )
+
+    if state["kometa_running"]:
+        log("ℹ️ Kometa is currently running; update check skipped.")
+        return (
+            jsonify(
+                success=True,
+                log=logs,
+                update_check_completed=True,
+                kometa_update_check_skipped=True,
+                local_version=state["kometa_version"],
+                remote_version="",
+                kometa_update_available=False,
+                cached=False,
+                **state,
+            ),
+            200,
+        )
+
+    if branch_override:
+        log(f"⚠️ Kometa branch override selected: {branch_override}")
+    else:
+        log("ℹ️ Kometa branch selection: auto")
+
+    update_info = helpers.get_cached_kometa_update(
+        p,
+        force_refresh=helpers.booler(payload.get("force", False)),
+        branch_override=branch_override,
+    )
+    local_version = update_info.get("local_version") or state["kometa_version"]
+    remote_version = update_info.get("remote_version") or ""
+    remote_branch = update_info.get("branch") or "nightly"
+    local_branch = update_info.get("local_branch") or "unknown"
+    local_sha = update_info.get("local_sha") or ""
+    remote_sha = update_info.get("remote_sha") or ""
+    comparison_basis = update_info.get("comparison_basis") or "version"
+    remote_version_url = helpers.GITHUB_BASE_URL + f"/{remote_branch}/VERSION"
+    log(f"🌐 Remote VERSION source: {remote_version_url}")
+    log(f"ℹ️ Installed Kometa branch metadata: {local_branch}")
+    if local_sha:
+        log(f"🔎 Local Kometa SHA: {local_sha[:12]}")
+    if remote_sha:
+        log(f"🔎 Remote Kometa SHA: {remote_sha[:12]}")
+    log(f"ℹ️ Update comparison basis: {comparison_basis}")
+    if update_info.get("cached"):
+        log("ℹ️ Using cached Kometa update lookup.")
+    if update_info.get("update_available"):
+        if update_info.get("branch_mismatch"):
+            log(f"⚠️ Installed branch '{local_branch}' differs from selected branch '{remote_branch}'.")
+        log(f"⬆️ Update available: {local_version} → {remote_version}")
+    else:
+        log(f"✅ Kometa is up to date: {local_version}")
+
+    return (
+        jsonify(
+            success=True,
+            log=logs,
+            update_check_completed=True,
+            kometa_update_check_skipped=False,
+            local_version=local_version,
+            remote_version=remote_version,
+            kometa_update_available=bool(update_info.get("update_available")),
+            cached=bool(update_info.get("cached")),
+            **state,
         ),
         200,
     )
@@ -6941,34 +12417,141 @@ def validate_kometa_root():
 
 @app.route("/update-kometa", methods=["POST"])
 def update_kometa():
-    # hard-stop if Kometa is currently running
-    if helpers.is_kometa_running():
-        pid = helpers.get_kometa_pid()
-        return jsonify({"success": False, "error": f"Kometa is currently running (PID {pid}). Stop it before updating."}), 409
-    logs = []
+    blocker = _get_active_work_blocker("kometa_update")
+    if blocker:
+        pid = blocker.get("pid")
+        target_page = blocker.get("target_page")
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": f"Kometa is currently running (PID {pid}). Stop it before updating.",
+                    "blocked_by": blocker.get("blocked_by"),
+                    "pid": pid,
+                    "target_page": target_page,
+                }
+            ),
+            409,
+        )
     try:
         cfg_dir = helpers.CONFIG_DIR
 
         # (optional) allow the caller to pass qs branch; otherwise detect from repo
         data = request.get_json(silent=True) or {}
+        branch_override_raw = data.get("branch_override")
+        branch_override = helpers.normalize_kometa_branch_override(branch_override_raw)
+        if branch_override_raw and not branch_override:
+            return jsonify({"success": False, "error": "Invalid Kometa branch override.", "log": ["❌ Invalid Kometa branch override."]}), 400
         qs_branch = data.get("branch") or helpers.detect_git_branch(app.root_path)
-        kometa_branch = "master" if qs_branch == "master" else "nightly"
+        kometa_branch = branch_override or ("master" if qs_branch == "master" else "nightly")
         force_update = helpers.booler(data.get("force", False))
+        background = data.get("background") is True
 
+        if background:
+            active = _get_active_background_job("kometa_update")
+            if active:
+                phase = active.get("phase")
+                if phase and phase not in ["done", "error"]:
+                    return (
+                        jsonify(success=True, active=True, existing_job=True, job_id=active.get("job_id"), phase=phase),
+                        200,
+                    )
+                _clear_active_background_job("kometa_update", job_id=active.get("job_id"))
+
+            job = _create_background_job(
+                "kometa_update",
+                trigger="manual",
+                phase="queued",
+                status="running",
+                target_page=JOB_TARGET_PAGES.get("kometa_update"),
+                logs=[],
+                done=False,
+                success=False,
+                up_to_date=False,
+                skipped=False,
+                force=force_update,
+                qs_branch=qs_branch,
+                kometa_branch=kometa_branch,
+                started_epoch=time.time(),
+            )
+            job_id = job["job_id"]
+
+            def worker():
+                class _ProgressLog(list):
+                    def append(self_inner, item):
+                        super().append(item)
+                        current = _get_background_job(job_id) or {}
+                        lines = list(current.get("logs") or [])
+                        lines.append(item)
+                        _update_background_job(job_id, logs=lines)
+
+                logs = _ProgressLog()
+                _update_background_job(job_id, phase="running", status="running")
+                logs.append(f"🔎 Quickstart branch: {qs_branch}")
+                if branch_override:
+                    logs.append(f"⚠️ Kometa branch override selected: {branch_override}")
+                else:
+                    logs.append("ℹ️ Kometa branch selection: auto")
+                logs.append(f"⚙️ Kometa branch selected: {kometa_branch} (ZIP mode)")
+                if force_update:
+                    logs.append("Force update enabled.")
+
+                try:
+                    result = helpers.perform_kometa_update_zip_only(cfg_dir, branch=kometa_branch, force=force_update, logs=logs)
+                    try:
+                        helpers.invalidate_cached_kometa_update(cfg_dir)
+                    except Exception:
+                        pass
+                    if result.get("success", False):
+                        _complete_background_job(
+                            job_id,
+                            phase="done",
+                            success=True,
+                            done=True,
+                            up_to_date=bool(result.get("up_to_date", False)),
+                            skipped=bool(result.get("skipped", False)),
+                        )
+                    else:
+                        _fail_background_job(
+                            job_id,
+                            "Kometa update failed.",
+                            done=True,
+                            success=False,
+                            up_to_date=bool(result.get("up_to_date", False)),
+                            skipped=bool(result.get("skipped", False)),
+                        )
+                except Exception as e:
+                    logs.append("Exception during Kometa update.")
+                    helpers.ts_log(f"Kometa update failed: {e}", level="ERROR")
+                    _fail_background_job(job_id, e, done=True, success=False)
+                finally:
+                    _clear_active_background_job("kometa_update", job_id=job_id)
+
+            threading.Thread(target=worker, daemon=True).start()
+            return jsonify(success=True, active=True, job_id=job_id, phase="queued"), 200
+
+        logs = []
         logs.append(f"🔎 Quickstart branch: {qs_branch}")
+        if branch_override:
+            logs.append(f"⚠️ Kometa branch override selected: {branch_override}")
+        else:
+            logs.append("ℹ️ Kometa branch selection: auto")
         logs.append(f"⚙️ Kometa branch selected: {kometa_branch} (ZIP mode)")
         if force_update:
             logs.append("Force update enabled.")
 
-        result = helpers.perform_kometa_update_zip_only(cfg_dir, branch=kometa_branch, force=force_update)
-        logs.extend(result.get("log", []))
+        result = helpers.perform_kometa_update_zip_only(cfg_dir, branch=kometa_branch, force=force_update, logs=logs)
+        try:
+            helpers.invalidate_cached_kometa_update(cfg_dir)
+        except Exception:
+            pass
         status = 200 if result.get("success") else 500
 
         return (
             jsonify(
                 {
                     "success": result.get("success", False),
-                    "log": logs,
+                    "log": list(logs),
                     "qs_branch": qs_branch,
                     "kometa_branch": kometa_branch,
                     "up_to_date": result.get("up_to_date", False),
@@ -6981,8 +12564,969 @@ def update_kometa():
 
     except Exception as e:
         helpers.ts_log(f"Kometa update failed: {e}", level="ERROR")
-        logs.append("Exception during Kometa update.")
-        return jsonify({"success": False, "log": logs}), 500
+        return jsonify({"success": False, "log": ["Exception during Kometa update."]}), 500
+
+
+@app.route("/update-kometa-progress", methods=["GET"])
+def update_kometa_progress():
+    job_id = request.args.get("job_id", "").strip()
+    since = request.args.get("since", "0").strip()
+    if not job_id:
+        return jsonify(success=False, error="Missing job_id."), 400
+    info = _get_background_job(job_id)
+    if not info:
+        return jsonify(success=False, error="Unknown job_id."), 404
+    try:
+        start_idx = max(int(since or "0"), 0)
+    except ValueError:
+        start_idx = 0
+    lines = list(info.get("logs") or [])
+    return jsonify(
+        success=True,
+        job_id=job_id,
+        phase=info.get("phase"),
+        done=bool(info.get("done")) or info.get("status") in {"complete", "error"},
+        update_success=bool(info.get("success")),
+        up_to_date=bool(info.get("up_to_date")),
+        skipped=bool(info.get("skipped")),
+        force=bool(info.get("force")),
+        qs_branch=info.get("qs_branch"),
+        kometa_branch=info.get("kometa_branch"),
+        lines=lines[start_idx:],
+        next_index=len(lines),
+    )
+
+
+def _probe_imagemaid_root_state(path_obj):
+    p = Path(path_obj)
+    imagemaid_root_posix = p.as_posix()
+    imagemaid_root_display = str(p)
+    is_windows = sys.platform.startswith("win")
+    venv_dir = p / "imagemaid-venv"
+    bin_dir = venv_dir / ("Scripts" if is_windows else "bin")
+    python_bin = bin_dir / ("python.exe" if is_windows else "python3")
+    if not python_bin.exists():
+        python_bin = bin_dir / ("python.exe" if is_windows else "python")
+    imagemaid_py = p / "imagemaid.py"
+    requirements = p / "requirements.txt"
+    config_dir = p / "config"
+    capabilities = _get_imagemaid_supported_options(p)
+
+    return {
+        "imagemaid_root": imagemaid_root_posix,
+        "imagemaid_root_display": imagemaid_root_display,
+        "venv_python": python_bin.as_posix(),
+        "venv_python_display": str(python_bin),
+        "root_exists": p.exists(),
+        "config_dir_exists": config_dir.exists(),
+        "imagemaid_installed": imagemaid_py.exists() and requirements.exists(),
+        "venv_exists": venv_dir.exists(),
+        "venv_python_exists": python_bin.exists(),
+        "imagemaid_running": helpers.is_imagemaid_running(),
+        "local_version": helpers.get_imagemaid_local_version(p) or "",
+        "local_sha": helpers.get_imagemaid_local_sha(p) or "",
+        "local_branch": helpers.get_imagemaid_local_branch(p) or "",
+        "supports_no_verify_ssl": bool(capabilities.get("no_verify_ssl")),
+        "supports_overlays_only": bool(capabilities.get("overlays_only")),
+    }
+
+
+def _imagemaid_settings_to_form_payload(payload):
+    if not isinstance(payload, dict):
+        return {}
+    keys = [
+        "branch_override",
+        "plex_path",
+        "mode",
+        "timeout",
+        "sleep",
+        "photo_transcoder",
+        "empty_trash",
+        "clean_bundles",
+        "optimize_db",
+        "local_db",
+        "use_existing",
+        "ignore_running",
+        "trace",
+        "log_requests",
+        "no_verify_ssl",
+        "overlays_only",
+    ]
+    form_payload = {}
+    for key in keys:
+        if key in payload:
+            form_payload[f"imagemaid_{key}"] = payload.get(key)
+    return form_payload
+
+
+def _get_imagemaid_settings_section():
+    settings = persistence.retrieve_settings("915-imagemaid") or {}
+    section = settings.get("imagemaid", {}) if isinstance(settings, dict) else {}
+    if not isinstance(section, dict):
+        section = {}
+    return settings, section
+
+
+def _persist_imagemaid_validation(section_data, is_valid, reason=None, details=None):
+    config_name = persistence.ensure_session_config_name()
+    stored_validated, user_entered, stored_payload = database.retrieve_section_data(config_name, "imagemaid")
+    payload = stored_payload if isinstance(stored_payload, dict) else {}
+    payload["imagemaid"] = section_data if isinstance(section_data, dict) else {}
+    if is_valid:
+        payload["validated_at"] = utc_now_iso()
+        payload["validation_status"] = "validated"
+        payload.pop("validation_reason", None)
+        payload.pop("validation_details", None)
+        payload["validation_updated_at"] = utc_now_iso()
+        database.save_section_data(
+            name=config_name,
+            section="imagemaid",
+            validated=True,
+            user_entered=True,
+            data=payload,
+        )
+        return payload
+
+    existing_validated_at = payload.get("validated_at")
+    if existing_validated_at:
+        payload["validated_at"] = existing_validated_at
+    payload["validation_status"] = "failed"
+    payload["validation_reason"] = reason
+    payload["validation_details"] = details
+    payload["validation_updated_at"] = utc_now_iso()
+    database.save_section_data(
+        name=config_name,
+        section="imagemaid",
+        validated=False,
+        user_entered=True,
+        data=payload,
+    )
+    return payload
+
+
+def _get_imagemaid_supported_options(imagemaid_root=None):
+    root = Path(imagemaid_root or helpers.get_imagemaid_root_path())
+    script_path = root / "imagemaid.py"
+    try:
+        text = script_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {"no_verify_ssl": False, "overlays_only": False}
+
+    lowered = text.lower()
+    return {
+        "no_verify_ssl": ('"env": "no_verify_ssl"' in lowered) or ('"key": "no-verify-ssl"' in lowered) or ("--no-verify-ssl" in lowered),
+        "overlays_only": ('"env": "overlays_only"' in lowered) or ('"key": "overlays-only"' in lowered) or ("--overlays-only" in lowered),
+    }
+
+
+def _validate_imagemaid_plex_path(path_value, require_transcoder=False):
+    resolved = _resolve_user_dir(path_value)
+    required_label = "Plex path must point to the Plex config directory containing Cache, Metadata, and Plug-in Support."
+    if not resolved:
+        return False, "invalid_paths", f"{required_label} Use an absolute path."
+    if not resolved.exists() or not resolved.is_dir():
+        return False, "invalid_paths", f"{required_label} The selected path does not exist or is not a directory."
+
+    required_dirs = ["Metadata", "Plug-in Support"]
+    missing = [name for name in required_dirs if not (resolved / name).exists()]
+    if missing:
+        return False, "invalid_paths", f"{required_label} The selected folder is missing: {', '.join(missing)}."
+
+    if require_transcoder and not (resolved / "Cache" / "PhotoTranscoder").exists():
+        return False, "invalid_paths", f"{required_label} PhotoTranscoder cleanup also requires Cache\\PhotoTranscoder."
+
+    return True, None, None
+
+
+def _quote_cli_value(value):
+    text = str(value or "")
+    escaped = text.replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _build_imagemaid_command_parts(section_data, plex_url, plex_token, imagemaid_root=None, redact=False):
+    imagemaid_root = Path(imagemaid_root or helpers.get_imagemaid_root_path())
+    capabilities = _get_imagemaid_supported_options(imagemaid_root)
+    is_win = sys.platform.startswith("win")
+    python_bin = imagemaid_root / "imagemaid-venv" / ("Scripts" if is_win else "bin") / ("python.exe" if is_win else "python3")
+    if not python_bin.exists():
+        python_bin = imagemaid_root / "imagemaid-venv" / ("Scripts" if is_win else "bin") / ("python.exe" if is_win else "python")
+    script_path = imagemaid_root / "imagemaid.py"
+
+    parts = [str(python_bin), str(script_path)]
+    parts.extend(["--url", "(saved Plex URL)" if redact else str(plex_url or "")])
+    parts.extend(["--token", "(saved Plex token)" if redact else str(plex_token or "")])
+
+    plex_path = str(section_data.get("plex_path") or "").strip()
+    if plex_path:
+        parts.extend(["--plex", plex_path])
+
+    mode = str(section_data.get("mode") or "report").strip().lower() or "report"
+    parts.extend(["--mode", mode])
+
+    bool_flags = {
+        "photo_transcoder": "--photo-transcoder",
+        "empty_trash": "--empty-trash",
+        "clean_bundles": "--clean-bundles",
+        "optimize_db": "--optimize-db",
+        "local_db": "--local",
+        "use_existing": "--existing",
+        "ignore_running": "--ignore",
+        "trace": "--trace",
+        "log_requests": "--log-requests",
+    }
+    if capabilities.get("no_verify_ssl"):
+        bool_flags["no_verify_ssl"] = "--no-verify-ssl"
+    if capabilities.get("overlays_only"):
+        bool_flags["overlays_only"] = "--overlays-only"
+    for key, flag in bool_flags.items():
+        if helpers.booler(section_data.get(key)):
+            parts.append(flag)
+
+    timeout_value = str(section_data.get("timeout") or "").strip()
+    if timeout_value:
+        parts.extend(["--timeout", timeout_value])
+    sleep_value = str(section_data.get("sleep") or "").strip()
+    if sleep_value:
+        parts.extend(["--sleep", sleep_value])
+
+    return parts
+
+
+def _build_imagemaid_command(section_data, plex_url, plex_token, imagemaid_root=None, redact=False):
+    parts = _build_imagemaid_command_parts(
+        section_data,
+        plex_url,
+        plex_token,
+        imagemaid_root=imagemaid_root,
+        redact=redact,
+    )
+    return subprocess.list2cmdline(parts)
+
+
+def _validate_imagemaid_settings(section_data):
+    mode = str(section_data.get("mode") or "report").strip().lower() or "report"
+    valid_modes = {"report", "move", "restore", "clear", "remove", "nothing"}
+    if mode not in valid_modes:
+        return False, "invalid_mode", f"ImageMaid mode must be one of: {', '.join(sorted(valid_modes))}."
+
+    plex_settings = persistence.retrieve_settings("010-plex") or {}
+    if not helpers.booler(plex_settings.get("validated", False)):
+        return False, "missing_plex_validation", "Validate the Plex page before running ImageMaid."
+    plex_url, plex_token = persistence.get_stored_plex_credentials("010-plex")
+    if not plex_url or not plex_token:
+        return False, "missing_credentials", "Saved Plex URL/token are required."
+    valid_path, reason, details = _validate_imagemaid_plex_path(
+        section_data.get("plex_path"),
+        require_transcoder=helpers.booler(section_data.get("photo_transcoder")),
+    )
+    if not valid_path:
+        return False, reason, details
+
+    resolved_plex_path = _resolve_user_dir(section_data.get("plex_path"))
+    restore_dir = resolved_plex_path / "ImageMaid Restore" if resolved_plex_path else None
+    if mode in {"report", "move", "remove"} and restore_dir and restore_dir.exists():
+        return (
+            False,
+            "restore_dir_blocks_mode",
+            f"{mode.capitalize()} mode is not allowed while the ImageMaid Restore folder exists: {restore_dir}. " "Use nothing, restore, or clear while that folder is present.",
+        )
+    if mode in {"restore", "clear"} and restore_dir and not restore_dir.exists():
+        return False, "missing_restore_dir", f"{mode.capitalize()} mode expects the ImageMaid Restore folder at: {restore_dir}"
+
+    return True, None, None
+
+
+def _get_latest_imagemaid_log_path():
+    log_dir = helpers.get_imagemaid_root_path() / "config" / "logs"
+    if not log_dir.exists():
+        return None
+    candidates = sorted(log_dir.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
+def _read_text_tail(path, max_lines=200):
+    with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
+        return "".join(deque(handle, maxlen=max_lines))
+
+
+def _sanitize_imagemaid_log_tail(text):
+    content = str(text or "")
+    if not content:
+        return content
+    lines = content.splitlines()
+    filtered = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if (
+            line.startswith("Exception ignored in: <function _ExecutorManagerThread.__init__.<locals>.weakref_cb")
+            and i + 3 < len(lines)
+            and lines[i + 1] == "Traceback (most recent call last):"
+            and "concurrent" in lines[i + 2]
+            and "process.py" in lines[i + 2]
+            and "AttributeError: 'NoneType' object has no attribute 'debug'" in lines[i + 3]
+        ):
+            i += 4
+            continue
+        filtered.append(line)
+        i += 1
+    return "\n".join(filtered).strip("\n")
+
+
+@app.route("/probe-imagemaid-root", methods=["POST"])
+def probe_imagemaid_root():
+    payload = request.get_json(silent=True) or {}
+    root_path = str(payload.get("path", "")).strip()
+    branch_override = helpers.normalize_imagemaid_branch_override(payload.get("branch_override"))
+    logs = []
+
+    def log(msg):
+        print(msg, file=sys.stderr)
+        logs.append(msg)
+
+    if not root_path:
+        root_path = str(helpers.get_imagemaid_root_path())
+
+    p = _resolve_user_dir(root_path)
+    if not p:
+        log("❌ Invalid path provided.")
+        return jsonify(success=False, error="Invalid path provided.", log=logs), 400
+
+    session["imagemaid_root"] = p.as_posix()
+    app.config["IMAGEMAID_ROOT"] = str(p)
+
+    state = _probe_imagemaid_root_state(p)
+    effective_branch = helpers.resolve_imagemaid_update_branch(branch_override)
+    log(f"🔍 Probing ImageMaid path: {state['imagemaid_root_display']}")
+    if not state["root_exists"]:
+        log("ℹ️ ImageMaid root does not exist yet. Install required.")
+    elif not state["imagemaid_installed"]:
+        log("ℹ️ ImageMaid files not found yet. Install required.")
+    else:
+        log("✅ ImageMaid files detected locally.")
+        if state["local_branch"]:
+            log(f"🌿 Local ImageMaid branch metadata: {state['local_branch']}")
+        if state["local_sha"]:
+            log(f"🔎 Local ImageMaid SHA: {state['local_sha'][:12]}")
+        if state["venv_python_exists"]:
+            log(f"🐍 ImageMaid venv python detected at: {state['venv_python_display']}")
+        else:
+            log("ℹ️ ImageMaid venv python not present yet. Prepare step still needed.")
+    if state["imagemaid_running"]:
+        log("ℹ️ ImageMaid is currently running.")
+
+    return (
+        jsonify(
+            success=True,
+            log=logs,
+            effective_branch=effective_branch,
+            branch_source_url=f"{helpers.IMAGEMAID_GITHUB_BASE_URL}/{effective_branch}",
+            zip_source_url=helpers.IMAGEMAID_GITHUB_ZIP_URL.format(branch=effective_branch),
+            **state,
+        ),
+        200,
+    )
+
+
+@app.route("/check-imagemaid-update", methods=["POST"])
+def check_imagemaid_update():
+    payload = request.get_json(silent=True) or {}
+    root_path = str(payload.get("path", "")).strip()
+    branch_override_raw = payload.get("branch_override")
+    branch_override = helpers.normalize_imagemaid_branch_override(branch_override_raw)
+    branch = helpers.resolve_imagemaid_update_branch(branch_override)
+    logs = []
+
+    def log(msg):
+        print(msg, file=sys.stderr)
+        logs.append(msg)
+
+    if not root_path:
+        root_path = str(helpers.get_imagemaid_root_path())
+
+    if branch_override_raw and not branch_override:
+        log(f"❌ Invalid ImageMaid branch override: {branch_override_raw}")
+        return jsonify(success=False, error="Invalid ImageMaid branch override.", log=logs), 400
+
+    p = _resolve_user_dir(root_path)
+    if not p:
+        log("❌ Invalid path provided.")
+        return jsonify(success=False, error="Invalid path provided.", log=logs), 400
+
+    session["imagemaid_root"] = p.as_posix()
+    app.config["IMAGEMAID_ROOT"] = str(p)
+
+    state = _probe_imagemaid_root_state(p)
+    if not state["imagemaid_installed"]:
+        log("ℹ️ ImageMaid is not installed yet; update check skipped.")
+        response = dict(state)
+        response.update(
+            success=True,
+            log=logs,
+            update_check_completed=False,
+            imagemaid_update_available=False,
+            imagemaid_update_check_skipped=False,
+            cached=False,
+            effective_branch=branch,
+            remote_version="",
+            remote_sha="",
+            branch_mismatch=False,
+            branch_source_url=f"{helpers.IMAGEMAID_GITHUB_BASE_URL}/{branch}",
+            zip_source_url=helpers.IMAGEMAID_GITHUB_ZIP_URL.format(branch=branch),
+        )
+        return jsonify(response), 200
+
+    if state["imagemaid_running"]:
+        log("ℹ️ ImageMaid is currently running; update check skipped.")
+        response = dict(state)
+        response.update(
+            success=True,
+            log=logs,
+            update_check_completed=True,
+            imagemaid_update_check_skipped=True,
+            imagemaid_update_available=False,
+            cached=False,
+            effective_branch=branch,
+            remote_version="",
+            remote_sha="",
+            branch_mismatch=False,
+            branch_source_url=f"{helpers.IMAGEMAID_GITHUB_BASE_URL}/{branch}",
+            zip_source_url=helpers.IMAGEMAID_GITHUB_ZIP_URL.format(branch=branch),
+        )
+        return jsonify(response), 200
+
+    if branch_override:
+        log(f"⚠️ ImageMaid branch override selected: {branch_override}")
+    else:
+        log("ℹ️ ImageMaid branch selection: auto")
+
+    update_info = helpers.get_cached_imagemaid_update(
+        p,
+        force_refresh=helpers.booler(payload.get("force", False)),
+        branch_override=branch_override,
+    )
+    remote_branch = update_info.get("branch") or "develop"
+    local_version = update_info.get("local_version") or state.get("local_version") or "unknown"
+    local_branch = update_info.get("local_branch") or "unknown"
+    local_sha = update_info.get("local_sha") or ""
+    remote_version = update_info.get("remote_version") or ""
+    remote_sha = update_info.get("remote_sha") or ""
+    log(f"🌐 Remote ImageMaid branch source: {helpers.IMAGEMAID_GITHUB_BASE_URL}/{remote_branch}")
+    if local_version:
+        log(f"ℹ️ Installed ImageMaid version: {local_version}")
+    if remote_version:
+        log(f"🌐 Remote ImageMaid version: {remote_version}")
+    log(f"ℹ️ Installed ImageMaid branch metadata: {local_branch}")
+    if local_sha:
+        log(f"🔎 Local ImageMaid SHA: {local_sha[:12]}")
+    if remote_sha:
+        log(f"🔎 Remote ImageMaid SHA: {remote_sha[:12]}")
+    if update_info.get("cached"):
+        log("ℹ️ Using cached ImageMaid update lookup.")
+    if update_info.get("update_available"):
+        if update_info.get("branch_mismatch"):
+            log(f"⚠️ Installed branch '{local_branch}' differs from selected branch '{remote_branch}'.")
+        log("⬆️ ImageMaid update available.")
+    else:
+        log("✅ ImageMaid is up to date.")
+
+    response = dict(state)
+    response.update(
+        success=True,
+        log=logs,
+        update_check_completed=True,
+        imagemaid_update_check_skipped=False,
+        imagemaid_update_available=bool(update_info.get("update_available")),
+        cached=bool(update_info.get("cached")),
+        effective_branch=remote_branch,
+        local_version=local_version,
+        local_branch=local_branch,
+        local_sha=local_sha,
+        remote_version=remote_version,
+        remote_sha=remote_sha,
+        branch_mismatch=bool(update_info.get("branch_mismatch")),
+        branch_source_url=f"{helpers.IMAGEMAID_GITHUB_BASE_URL}/{remote_branch}",
+        zip_source_url=helpers.IMAGEMAID_GITHUB_ZIP_URL.format(branch=remote_branch),
+    )
+    return jsonify(response), 200
+
+
+@app.route("/update-imagemaid", methods=["POST"])
+def update_imagemaid():
+    blocker = _get_active_work_blocker("imagemaid_update")
+    if blocker:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": blocker.get("message") or "ImageMaid is currently running.",
+                    "blocked_by": blocker.get("blocked_by"),
+                    "pid": blocker.get("pid"),
+                    "target_page": blocker.get("target_page"),
+                }
+            ),
+            409,
+        )
+
+    try:
+        cfg_dir = helpers.CONFIG_DIR
+        data = request.get_json(silent=True) or {}
+        branch_override_raw = data.get("branch_override")
+        branch_override = helpers.normalize_imagemaid_branch_override(branch_override_raw)
+        if branch_override_raw and not branch_override:
+            return jsonify({"success": False, "error": "Invalid ImageMaid branch override.", "log": ["❌ Invalid ImageMaid branch override."]}), 400
+
+        imagemaid_branch = branch_override or helpers.resolve_imagemaid_update_branch()
+        force_update = helpers.booler(data.get("force", False))
+        background = data.get("background") is True
+
+        if background:
+            active = _get_active_background_job("imagemaid_update")
+            if active:
+                phase = active.get("phase")
+                if phase and phase not in ["done", "error"]:
+                    return jsonify(success=True, active=True, existing_job=True, job_id=active.get("job_id"), phase=phase), 200
+                _clear_active_background_job("imagemaid_update", job_id=active.get("job_id"))
+
+            job = _create_background_job(
+                "imagemaid_update",
+                trigger="manual",
+                phase="queued",
+                status="running",
+                target_page=JOB_TARGET_PAGES.get("imagemaid_update"),
+                logs=[],
+                done=False,
+                success=False,
+                up_to_date=False,
+                skipped=False,
+                force=force_update,
+                imagemaid_branch=imagemaid_branch,
+                started_epoch=time.time(),
+            )
+            job_id = job["job_id"]
+
+            def worker():
+                class _ProgressLog(list):
+                    def append(self_inner, item):
+                        super().append(item)
+                        current = _get_background_job(job_id) or {}
+                        lines = list(current.get("logs") or [])
+                        lines.append(item)
+                        _update_background_job(job_id, logs=lines)
+
+                logs = _ProgressLog()
+                _update_background_job(job_id, phase="running", status="running")
+                if branch_override:
+                    logs.append(f"⚠️ ImageMaid branch override selected: {branch_override}")
+                else:
+                    logs.append("ℹ️ ImageMaid branch selection: auto")
+                logs.append(f"⚙️ ImageMaid branch selected: {imagemaid_branch} (ZIP mode)")
+                if force_update:
+                    logs.append("Force update enabled.")
+
+                try:
+                    result = helpers.perform_imagemaid_update_zip_only(cfg_dir, branch=imagemaid_branch, force=force_update, logs=logs)
+                    try:
+                        helpers.invalidate_cached_imagemaid_update(Path(cfg_dir) / "imagemaid")
+                    except Exception:
+                        pass
+                    if result.get("success", False):
+                        _complete_background_job(
+                            job_id, phase="done", success=True, done=True, up_to_date=bool(result.get("up_to_date", False)), skipped=bool(result.get("skipped", False))
+                        )
+                    else:
+                        _fail_background_job(
+                            job_id,
+                            "ImageMaid update failed.",
+                            done=True,
+                            success=False,
+                            up_to_date=bool(result.get("up_to_date", False)),
+                            skipped=bool(result.get("skipped", False)),
+                        )
+                except Exception as e:
+                    logs.append("Exception during ImageMaid update.")
+                    helpers.ts_log(f"ImageMaid update failed: {e}", level="ERROR")
+                    _fail_background_job(job_id, e, done=True, success=False)
+                finally:
+                    _clear_active_background_job("imagemaid_update", job_id=job_id)
+
+            threading.Thread(target=worker, daemon=True).start()
+            return jsonify(success=True, active=True, job_id=job_id, phase="queued"), 200
+
+        logs = []
+        if branch_override:
+            logs.append(f"⚠️ ImageMaid branch override selected: {branch_override}")
+        else:
+            logs.append("ℹ️ ImageMaid branch selection: auto")
+        logs.append(f"⚙️ ImageMaid branch selected: {imagemaid_branch} (ZIP mode)")
+        if force_update:
+            logs.append("Force update enabled.")
+
+        result = helpers.perform_imagemaid_update_zip_only(cfg_dir, branch=imagemaid_branch, force=force_update, logs=logs)
+        try:
+            helpers.invalidate_cached_imagemaid_update(Path(cfg_dir) / "imagemaid")
+        except Exception:
+            pass
+        status = 200 if result.get("success") else 500
+
+        return (
+            jsonify(
+                {
+                    "success": result.get("success", False),
+                    "log": list(logs),
+                    "imagemaid_branch": imagemaid_branch,
+                    "up_to_date": result.get("up_to_date", False),
+                    "skipped": result.get("skipped", False),
+                    "force": force_update,
+                }
+            ),
+            status,
+        )
+    except Exception as e:
+        helpers.ts_log(f"ImageMaid update failed: {e}", level="ERROR")
+        return jsonify({"success": False, "log": ["Exception during ImageMaid update."]}), 500
+
+
+@app.route("/update-imagemaid-progress", methods=["GET"])
+def update_imagemaid_progress():
+    job_id = request.args.get("job_id", "").strip()
+    since = request.args.get("since", "0").strip()
+    if not job_id:
+        return jsonify(success=False, error="Missing job_id."), 400
+    info = _get_background_job(job_id)
+    if not info:
+        return jsonify(success=False, error="Unknown job_id."), 404
+    try:
+        start_idx = max(int(since or "0"), 0)
+    except ValueError:
+        start_idx = 0
+    lines = list(info.get("logs") or [])
+    return jsonify(
+        success=True,
+        job_id=job_id,
+        phase=info.get("phase"),
+        done=bool(info.get("done")) or info.get("status") in {"complete", "error"},
+        update_success=bool(info.get("success")),
+        up_to_date=bool(info.get("up_to_date")),
+        skipped=bool(info.get("skipped")),
+        force=bool(info.get("force")),
+        imagemaid_branch=info.get("imagemaid_branch"),
+        lines=lines[start_idx:],
+        next_index=len(lines),
+    )
+
+
+@app.route("/validate-imagemaid", methods=["POST"])
+def validate_imagemaid():
+    payload = request.get_json(silent=True) or {}
+    form_payload = _imagemaid_settings_to_form_payload(payload)
+    if form_payload:
+        persistence.save_settings("915-imagemaid", form_payload)
+
+    settings, section_data = _get_imagemaid_settings_section()
+    is_valid, reason, details = _validate_imagemaid_settings(section_data)
+    _persist_imagemaid_validation(section_data, is_valid, reason=reason, details=details)
+
+    plex_url, plex_token = persistence.get_stored_plex_credentials("010-plex")
+    preview_command = _build_imagemaid_command(section_data, plex_url or "", plex_token or "", redact=True)
+    return jsonify(success=is_valid, validated=is_valid, reason=reason, details=details, command_preview=preview_command), (200 if is_valid else 400)
+
+
+@app.route("/autosave-imagemaid", methods=["POST"])
+def autosave_imagemaid():
+    payload = request.get_json(silent=True) or {}
+    form_payload = _imagemaid_settings_to_form_payload(payload)
+    if form_payload:
+        persistence.save_settings("915-imagemaid", form_payload)
+
+    settings, section_data = _get_imagemaid_settings_section()
+    if helpers.booler(settings.get("validated", False)):
+        _persist_imagemaid_validation(
+            section_data,
+            False,
+            reason="config_changed",
+            details="Configuration changed. Validate ImageMaid again.",
+        )
+
+    return jsonify(success=True, validated=False)
+
+
+@app.route("/start-imagemaid", methods=["POST"])
+def start_imagemaid():
+    config_name = session.get("config_name") or persistence.ensure_session_config_name()
+    payload = request.get_json(silent=True) or {}
+    form_payload = _imagemaid_settings_to_form_payload(payload)
+    if form_payload:
+        persistence.save_settings("915-imagemaid", form_payload)
+
+    if helpers.is_imagemaid_running():
+        pid = helpers.get_imagemaid_pid()
+        try:
+            proc = psutil.Process(pid)
+            started_at = datetime.fromtimestamp(proc.create_time()).isoformat()
+            return jsonify({"error": f"ImageMaid is already running (PID: {pid}) since {started_at}.", "status": "running", "pid": pid, "started_at": started_at}), 400
+        except Exception:
+            return jsonify({"error": f"ImageMaid is already running (PID: {pid}).", "status": "running", "pid": pid}), 400
+    else:
+        proc = _find_running_imagemaid_process()
+        if proc:
+            try:
+                with open(helpers.get_imagemaid_pid_file(), "w", encoding="utf-8") as f:
+                    f.write(str(proc.pid))
+                started_at = datetime.fromtimestamp(proc.create_time()).isoformat()
+            except Exception:
+                started_at = None
+            payload = {"error": f"ImageMaid is already running (PID: {proc.pid}).", "status": "running", "pid": proc.pid}
+            if started_at:
+                payload["started_at"] = started_at
+            return jsonify(payload), 400
+
+    blocker = _get_active_work_blocker("imagemaid_run")
+    if blocker:
+        job = blocker.get("job") if isinstance(blocker.get("job"), dict) else {}
+        response = {
+            "error": blocker.get("message") or "Cannot start ImageMaid right now.",
+            "status": "blocked",
+            "blocked_by": blocker.get("blocked_by"),
+            "target_page": blocker.get("target_page"),
+        }
+        if blocker.get("pid"):
+            response["pid"] = blocker.get("pid")
+        if job.get("job_id"):
+            response["job_id"] = job.get("job_id")
+        if job.get("phase"):
+            response["phase"] = job.get("phase")
+        return jsonify(response), 409
+
+    settings, section_data = _get_imagemaid_settings_section()
+    is_valid, reason, details = _validate_imagemaid_settings(section_data)
+    _persist_imagemaid_validation(section_data, is_valid, reason=reason, details=details)
+    if not is_valid:
+        return jsonify({"error": details or "ImageMaid settings are not valid.", "status": "invalid", "reason": reason}), 400
+
+    start_min, end_min, window_str = _get_maintenance_window_live()
+    if start_min is None or end_min is None:
+        start_min, end_min, window_str = _get_maintenance_window_from_db()
+    if _is_within_maintenance_window(datetime.now(), start_min, end_min):
+        try:
+            _write_quickstart_imagemaid_maintenance_marker(
+                helpers.get_imagemaid_root_path(),
+                "blocked_start",
+                mode=section_data.get("mode"),
+                config_name=config_name,
+                window=window_str,
+                log_path=_get_latest_imagemaid_log_path(),
+            )
+        except Exception:
+            pass
+        window_label = f" ({window_str})" if window_str else ""
+        return (
+            jsonify(
+                {
+                    "error": f"ImageMaid cannot start during the Plex maintenance window{window_label}.",
+                    "status": "maintenance_blocked",
+                    "maintenance_window": window_str,
+                }
+            ),
+            409,
+        )
+
+    plex_url, plex_token = persistence.get_stored_plex_credentials("010-plex")
+    command = _build_imagemaid_command_parts(section_data, plex_url, plex_token, redact=False)
+    ok, result = _launch_imagemaid_command(command, mode=section_data.get("mode"), config_name=config_name)
+    if ok:
+        return jsonify({"status": "ImageMaid started", "pid": result, "command_preview": _build_imagemaid_command(section_data, plex_url, plex_token, redact=True)})
+    code = 500
+    if isinstance(result, str):
+        lowered = result.lower()
+        if lowered.startswith("imagemaid.py not found"):
+            code = 404
+        elif "exited immediately" in lowered or "finished immediately" in lowered:
+            code = 400
+    return jsonify({"error": result}), code
+
+
+@app.route("/stop-imagemaid", methods=["POST"])
+def stop_imagemaid():
+    config_name = session.get("config_name") or persistence.ensure_session_config_name()
+    pid = helpers.get_imagemaid_pid()
+    pid_file = helpers.get_imagemaid_pid_file()
+
+    if not pid:
+        procs = _find_running_imagemaid_processes()
+        if not procs:
+            return jsonify({"warning": "No active ImageMaid PID"}), 200
+    else:
+        proc = _find_running_imagemaid_process()
+        procs = [proc] if proc is not None else []
+
+    try:
+        if not procs:
+            return jsonify({"warning": "No active ImageMaid process found."}), 200
+
+        _settings, section_data = _get_imagemaid_settings_section()
+        imagemaid_mode = section_data.get("mode") if isinstance(section_data, dict) else None
+        not_imagemaid = []
+        alive_after = []
+        for proc in procs:
+            cmdline = " ".join(proc.cmdline() or [])
+            if "imagemaid.py" not in cmdline:
+                not_imagemaid.append(proc.pid)
+                continue
+            alive_after.extend(_stop_process_tree(proc))
+
+        try:
+            os.remove(pid_file)
+        except Exception:
+            pass
+        try:
+            _write_quickstart_imagemaid_stop_marker(
+                helpers.get_imagemaid_root_path(),
+                mode=imagemaid_mode,
+                config_name=config_name,
+                log_path=_get_latest_imagemaid_log_path(),
+                reason="user_stop",
+            )
+        except Exception:
+            pass
+
+        if alive_after:
+            alive_pids = ", ".join(str(p.pid) for p in alive_after if p is not None)
+            return jsonify({"warning": f"ImageMaid stop requested, but some processes are still running: {alive_pids}"}), 200
+        if not_imagemaid:
+            return jsonify({"warning": f"Cleaned PID file. Non-ImageMaid PIDs detected: {', '.join(map(str, not_imagemaid))}"}), 200
+        return jsonify({"success": True, "message": "ImageMaid stopped and cleaned up."}), 200
+    except psutil.NoSuchProcess:
+        try:
+            os.remove(pid_file)
+        except Exception:
+            pass
+        try:
+            _settings, section_data = _get_imagemaid_settings_section()
+            imagemaid_mode = section_data.get("mode") if isinstance(section_data, dict) else None
+            _write_quickstart_imagemaid_stop_marker(
+                helpers.get_imagemaid_root_path(),
+                mode=imagemaid_mode,
+                config_name=config_name,
+                log_path=_get_latest_imagemaid_log_path(),
+                reason="process_missing",
+            )
+        except Exception:
+            pass
+        return jsonify({"warning": "Process not found. Cleaned up PID file."}), 200
+    except Exception as e:
+        return jsonify({"error": f"Failed to stop ImageMaid: {str(e)}"}), 500
+
+
+@app.route("/imagemaid-status", methods=["GET"])
+def imagemaid_status():
+    pid = helpers.get_imagemaid_pid()
+    pid_file = Path(helpers.get_imagemaid_pid_file())
+
+    def pid_file_age_seconds():
+        try:
+            if pid_file.exists():
+                return max(0.0, time.time() - pid_file.stat().st_mtime)
+        except Exception:
+            return None
+        return None
+
+    if not pid:
+        proc = _find_running_imagemaid_process()
+        if proc:
+            try:
+                with open(pid_file, "w", encoding="utf-8") as f:
+                    f.write(str(proc.pid))
+                pid = proc.pid
+            except Exception:
+                pid = None
+    if not pid:
+        try:
+            _ingest_completed_live_logs("imagemaid")
+        except Exception:
+            pass
+        return jsonify(status="not started")
+
+    try:
+        proc = psutil.Process(pid)
+        started_at_ts = None
+        elapsed_seconds = None
+        within_grace = False
+        try:
+            started_at_ts = proc.create_time()
+            elapsed_seconds = max(0, int(time.time() - started_at_ts))
+            within_grace = elapsed_seconds < IMAGEMAID_STARTUP_GRACE_SECONDS
+        except Exception:
+            age = pid_file_age_seconds()
+            if age is not None:
+                elapsed_seconds = max(0, int(age))
+                within_grace = age < IMAGEMAID_STARTUP_GRACE_SECONDS
+        if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+            try:
+                cmdline = " ".join(proc.cmdline() or [])
+            except Exception:
+                cmdline = ""
+            if "imagemaid.py" in cmdline:
+                started_at = datetime.fromtimestamp(started_at_ts).isoformat()
+                return jsonify(status="running", pid=pid, started_at=started_at, started_at_ts=started_at_ts, elapsed_seconds=elapsed_seconds)
+            if within_grace:
+                payload = {"status": "starting", "pid": pid, "elapsed_seconds": elapsed_seconds}
+                if started_at_ts is not None:
+                    payload["started_at"] = datetime.fromtimestamp(started_at_ts).isoformat()
+                    payload["started_at_ts"] = started_at_ts
+                return jsonify(payload)
+        try:
+            rc = proc.wait(timeout=0.1)
+        except psutil.TimeoutExpired:
+            if within_grace:
+                payload = {"status": "starting", "pid": pid, "elapsed_seconds": elapsed_seconds}
+                if started_at_ts is not None:
+                    payload["started_at"] = datetime.fromtimestamp(started_at_ts).isoformat()
+                    payload["started_at_ts"] = started_at_ts
+                return jsonify(payload)
+            rc = None
+        finally:
+            if not within_grace:
+                try:
+                    os.remove(pid_file)
+                except Exception:
+                    pass
+        if not within_grace:
+            try:
+                _ingest_completed_live_logs("imagemaid")
+            except Exception:
+                pass
+        return jsonify(status="done", return_code=rc if rc is not None else -1)
+    except psutil.NoSuchProcess:
+        age = pid_file_age_seconds()
+        if age is not None and age < IMAGEMAID_STARTUP_GRACE_SECONDS:
+            return jsonify(status="starting", pid=pid, elapsed_seconds=max(0, int(age)))
+        try:
+            os.remove(pid_file)
+        except Exception:
+            pass
+        return jsonify(status="not started")
+
+
+@app.route("/tail-imagemaid-log", methods=["GET"])
+def tail_imagemaid_log():
+    latest_log = _get_latest_imagemaid_log_path()
+    path = latest_log if latest_log and Path(latest_log).exists() else None
+
+    if not path or not Path(path).exists():
+        return jsonify({"error": "No ImageMaid log found."}), 404
+    try:
+        text = _sanitize_imagemaid_log_tail(_read_text_tail(path))
+        return jsonify(
+            {
+                "success": True,
+                "path": str(path),
+                "text": text,
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": f"Failed to read ImageMaid log: {e}"}), 500
 
 
 def _normalize_test_libraries_path(raw_path, base_dir):
@@ -7196,8 +13740,7 @@ def update_test_libraries_settings():
 @app.route("/clone-test-libraries-start", methods=["POST"])
 def clone_test_libraries_start():
     """
-    Starts a background job to download and install plex_test_libraries,
-    reporting rich progress via CLONE_PROGRESS[job_id].
+    Starts a background job to download and install plex_test_libraries.
 
     Progress payload shapes by phase:
       download: {"phase":"download","pct":<int|None>,"text":str,"downloaded":int,"total":int}
@@ -7222,24 +13765,23 @@ def clone_test_libraries_start():
             message="Target path exists but does not look like test libraries. Choose an empty folder or one containing test libraries.",
         )
 
-    # Ensure CLONE_PROGRESS dict exists
-    try:
-        _ = CLONE_PROGRESS
-    except NameError:
-        # Create if missing (keeps function drop-in friendly)
-        globals()["CLONE_PROGRESS"] = {}
-    # If a job is already running, return it so other clients can follow along
-    active_job_id = ACTIVE_TEST_LIB_JOB.get("job_id")
-    if active_job_id:
-        info = CLONE_PROGRESS.get(active_job_id) or {}
-        phase = info.get("phase")
+    active = _get_active_background_job("test_library_install")
+    if active:
+        phase = active.get("phase")
         if phase and phase not in ["done", "error"]:
-            return jsonify(success=True, job_id=active_job_id, existing_job=True, started_at=ACTIVE_TEST_LIB_JOB.get("started_at"))
-        ACTIVE_TEST_LIB_JOB.clear()
-    job_id = str(uuid.uuid4())
-    CLONE_PROGRESS[job_id] = {"phase": "queued", "pct": 0, "text": "Queued..."}
-    ACTIVE_TEST_LIB_JOB["job_id"] = job_id
-    ACTIVE_TEST_LIB_JOB["started_at"] = time.time()
+            return jsonify(success=True, job_id=active.get("job_id"), existing_job=True, started_at=active.get("started_epoch"))
+        _clear_active_background_job("test_library_install", job_id=active.get("job_id"))
+    job = _create_background_job(
+        "test_library_install",
+        trigger="manual",
+        phase="queued",
+        status="running",
+        target_page=JOB_TARGET_PAGES.get("test_library_install"),
+        pct=0,
+        text="Queued...",
+        started_epoch=time.time(),
+    )
+    job_id = job["job_id"]
 
     def worker():
         zip_url = "https://github.com/chazlarson/plex-test-libraries/archive/refs/heads/main.zip"
@@ -7248,6 +13790,9 @@ def clone_test_libraries_start():
         estimated = False
         estimated_note = ""
         fallback_total = 5 * 1024 * 1024 * 1024  # 5 GiB
+
+        def set_job_progress(**state):
+            _update_background_job(job_id, status="running", **state)
 
         try:
             # Best-effort SHA for UI banner
@@ -7306,15 +13851,15 @@ def clone_test_libraries_start():
                 estimated = True
                 estimated_note = "fallback"
 
-            CLONE_PROGRESS[job_id] = {
-                "phase": "download",
-                "pct": 0 if total_size else None,  # None => indeterminate until we know size
-                "text": "Downloading zip…",
-                "downloaded": 0,
-                "total": total_size,
-                "estimated": estimated,
-                "estimated_note": estimated_note,
-            }
+            set_job_progress(
+                phase="download",
+                pct=0 if total_size else None,  # None => indeterminate until we know size
+                text="Downloading zip…",
+                downloaded=0,
+                total=total_size,
+                estimated=estimated,
+                estimated_note=estimated_note,
+            )
 
             ok, msg = _ensure_rw_dir(tmp_root)
             if not ok:
@@ -7340,11 +13885,10 @@ def clone_test_libraries_start():
                     if not total_size:
                         try:
                             total_size = int(r.headers.get("Content-Length", "0") or 0)
-                            CLONE_PROGRESS[job_id]["total"] = total_size
                             if total_size:
                                 estimated = False
-                                CLONE_PROGRESS[job_id]["estimated"] = False
-                                CLONE_PROGRESS[job_id]["estimated_note"] = ""
+                                estimated_note = ""
+                            set_job_progress(total=total_size, estimated=estimated, estimated_note=estimated_note)
                         except Exception:
                             total_size = 0
 
@@ -7361,19 +13905,25 @@ def clone_test_libraries_start():
                                 pct = None
                                 if total_size:
                                     pct = int(downloaded * 100 / total_size)
-                                CLONE_PROGRESS[job_id] = {
-                                    "phase": "download",
-                                    "pct": pct,
-                                    "text": "Downloading zip…",
-                                    "downloaded": downloaded,
-                                    "total": total_size,
-                                    "estimated": estimated,
-                                    "estimated_note": estimated_note,
-                                }
+                                set_job_progress(
+                                    phase="download",
+                                    pct=pct,
+                                    text="Downloading zip…",
+                                    downloaded=downloaded,
+                                    total=total_size,
+                                    estimated=estimated,
+                                    estimated_note=estimated_note,
+                                )
                                 last_push = now
 
                 # Extract with per-file progress
-                CLONE_PROGRESS[job_id] = {"phase": "extract", "pct": 0, "text": "Extracting…", "files_done": 0, "files_total": 0}
+                set_job_progress(
+                    phase="extract",
+                    pct=0,
+                    text="Extracting…",
+                    files_done=0,
+                    files_total=0,
+                )
                 with zipfile.ZipFile(zip_path, "r") as zip_ref:
                     members = zip_ref.infolist()
                     total_files = len(members) or 1
@@ -7387,19 +13937,19 @@ def clone_test_libraries_start():
                         now = time.time()
                         if (now - last_push) > 0.2 or files_done == total_files:
                             pct = int(files_done * 100 / total_files)
-                            CLONE_PROGRESS[job_id] = {
-                                "phase": "extract",
-                                "pct": pct,
-                                "text": f"Extracting… {files_done}/{total_files} files",
-                                "files_done": files_done,
-                                "files_total": total_files,
-                            }
+                            set_job_progress(
+                                phase="extract",
+                                pct=pct,
+                                text=f"Extracting… {files_done}/{total_files} files",
+                                files_done=files_done,
+                                files_total=total_files,
+                            )
                             last_push = now
 
                 extracted_dir = os.path.join(tmpdir, "plex-test-libraries-main")
 
                 # Finalize (replace folder)
-                CLONE_PROGRESS[job_id] = {"phase": "finalize", "pct": 95, "text": "Finalizing…"}
+                set_job_progress(phase="finalize", pct=95, text="Finalizing…")
                 if os.path.exists(target_path):
                     if not _safe_to_replace_test_libraries(target_path):
                         raise RuntimeError("Target path exists but does not look like test libraries. Choose an empty folder or one containing test libraries.")
@@ -7418,32 +13968,72 @@ def clone_test_libraries_start():
                 if platform.system() in ["Linux", "Darwin"]:
                     subprocess.run(["chmod", "-R", "777", target_path], check=False)
 
-                CLONE_PROGRESS[job_id] = {
-                    "phase": "done",
-                    "pct": 100,
-                    "text": "Installed/updated successfully.",
-                    "target_path": resolved_path,
-                }
-                if ACTIVE_TEST_LIB_JOB.get("job_id") == job_id:
-                    ACTIVE_TEST_LIB_JOB.clear()
+                _complete_background_job(
+                    job_id,
+                    phase="done",
+                    success=True,
+                    pct=100,
+                    text="Installed/updated successfully.",
+                    target_path=resolved_path,
+                )
 
         except Exception as e:
-            CLONE_PROGRESS[job_id] = {
-                "phase": "error",
-                "pct": 0,
-                "text": f"Error: {str(e)}",
-            }
-            if ACTIVE_TEST_LIB_JOB.get("job_id") == job_id:
-                ACTIVE_TEST_LIB_JOB.clear()
+            _fail_background_job(
+                job_id,
+                e,
+                phase="error",
+                success=False,
+                pct=0,
+                text=f"Error: {str(e)}",
+            )
 
     threading.Thread(target=worker, daemon=True).start()
-    return jsonify(success=True, job_id=job_id, started_at=ACTIVE_TEST_LIB_JOB.get("started_at"))
+    return jsonify(success=True, job_id=job_id, started_at=job.get("started_epoch"))
+
+
+def _schedule_quickstart_imagemaid_run_marker(imagemaid_root, mode=None, config_name=None, timeout_seconds=20):
+    root = Path(imagemaid_root)
+    log_dir = root / "config" / "logs"
+    initial = {}
+    if log_dir.exists():
+        for path in log_dir.glob("*.log"):
+            try:
+                stat = path.stat()
+                initial[str(path)] = (stat.st_mtime, stat.st_size)
+            except OSError:
+                continue
+
+    def worker():
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            try:
+                if log_dir.exists():
+                    candidates = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+                    for path in candidates:
+                        try:
+                            stat = path.stat()
+                        except OSError:
+                            continue
+                        prev = initial.get(str(path))
+                        if prev is None:
+                            if stat.st_size > 0:
+                                _write_quickstart_imagemaid_run_marker(root, mode=mode, config_name=config_name, log_path=path)
+                                return
+                        elif (stat.st_mtime, stat.st_size) != prev and stat.st_size > 0:
+                            _write_quickstart_imagemaid_run_marker(root, mode=mode, config_name=config_name, log_path=path)
+                            return
+            except Exception:
+                pass
+            time.sleep(0.5)
+        _write_quickstart_imagemaid_run_marker(root, mode=mode, config_name=config_name)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 @app.route("/clone-test-libraries-progress", methods=["GET"])
 def clone_test_libraries_progress():
     job_id = request.args.get("job_id", "")
-    info = CLONE_PROGRESS.get(job_id)
+    info = _get_background_job(job_id)
     if not info:
         return jsonify(success=False, message="Unknown job_id"), 404
 
@@ -7456,21 +14046,22 @@ def clone_test_libraries_progress():
 
 @app.route("/clone-test-libraries-active", methods=["GET"])
 def clone_test_libraries_active():
-    job_id = ACTIVE_TEST_LIB_JOB.get("job_id")
-    if not job_id:
+    active = _get_active_background_job("test_library_install")
+    if not active:
         return jsonify(success=True, active=False)
 
-    info = CLONE_PROGRESS.get(job_id) or {}
+    job_id = active.get("job_id")
+    info = _get_background_job(job_id) or {}
     phase = info.get("phase")
     if phase in ["done", "error"]:
-        ACTIVE_TEST_LIB_JOB.clear()
+        _clear_active_background_job("test_library_install", job_id=job_id)
         return jsonify(success=True, active=False)
 
     return jsonify(
         success=True,
         active=True,
         job_id=job_id,
-        started_at=ACTIVE_TEST_LIB_JOB.get("started_at"),
+        started_at=info.get("started_epoch"),
         progress=info,
     )
 
@@ -7626,6 +14217,8 @@ if __name__ == "__main__":
 
     maintenance_thread = threading.Thread(target=_maintenance_guard_loop, args=(app,), daemon=True)
     maintenance_thread.start()
+
+    _start_pending_logscan_startup_migration(app)
 
     def get_lan_ip():
         try:
