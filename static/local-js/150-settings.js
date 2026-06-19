@@ -1,4 +1,4 @@
-/* global $, PathValidation */
+/* global PathValidation, bootstrap */
 
 document.addEventListener('DOMContentLoaded', function () {
   const validatedAtInput = document.getElementById('settings_validated_at')
@@ -7,8 +7,86 @@ document.addEventListener('DOMContentLoaded', function () {
   const saveExcludeChangesButton = document.getElementById('saveExcludeChangesButton')
   const configForm = document.getElementById('configForm')
   const validationMessages = document.getElementById('validation-messages')
-  const syncUsersModal = document.getElementById('syncUsersModal')
-  const excludeUsersModal = document.getElementById('excludeUsersModal')
+  let syncUsersModal = document.getElementById('syncUsersModal')
+  let excludeUsersModal = document.getElementById('excludeUsersModal')
+
+  if (window.QSTemplateStringLists && typeof window.QSTemplateStringLists.setup === 'function') {
+    window.QSTemplateStringLists.setup(document)
+  }
+
+  function ensureSettingsModalRoot (modalEl) {
+    if (!modalEl || !document.body) return modalEl
+    const modalId = modalEl.id
+    modalEl.dataset.settingsModal = 'true'
+    if (modalId) {
+      const bodyModal = Array.from(document.body.querySelectorAll('[data-settings-modal]'))
+        .find(el => el.id === modalId && el !== modalEl)
+      if (bodyModal) {
+        if (modalEl.parentElement) modalEl.remove()
+        return bodyModal
+      }
+    }
+    if (modalEl.parentElement !== document.body) {
+      document.body.appendChild(modalEl)
+    }
+    return modalEl
+  }
+
+  function syncSettingsModalBackdrop (modalEl) {
+    if (!modalEl) return
+    modalEl.style.zIndex = '2000'
+    modalEl.style.pointerEvents = 'auto'
+    modalEl.removeAttribute('inert')
+
+    const dialog = modalEl.querySelector('.modal-dialog')
+    if (dialog) dialog.style.pointerEvents = 'auto'
+
+    const content = modalEl.querySelector('.modal-content')
+    if (content) content.style.pointerEvents = 'auto'
+
+    const latestBackdrop = Array.from(document.querySelectorAll('.modal-backdrop')).at(-1)
+    if (latestBackdrop) latestBackdrop.style.zIndex = '1990'
+  }
+
+  function cleanupSettingsModalBackdrops () {
+    if (document.querySelector('.modal.show')) return
+    document.querySelectorAll('.modal-backdrop').forEach(backdrop => backdrop.remove())
+  }
+
+  function queueSettingsModalBackdropSync (modalEl) {
+    if (window && typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(() => syncSettingsModalBackdrop(modalEl))
+      return
+    }
+    syncSettingsModalBackdrop(modalEl)
+  }
+
+  function prepareSettingsModal (modalEl) {
+    if (!modalEl) return modalEl
+    modalEl = ensureSettingsModalRoot(modalEl)
+    if (modalEl.dataset.settingsModalPrepared === 'true') return modalEl
+    modalEl.dataset.settingsModalPrepared = 'true'
+    modalEl.addEventListener('show.bs.modal', function () {
+      syncSettingsModalBackdrop(modalEl)
+      queueSettingsModalBackdropSync(modalEl)
+    })
+    modalEl.addEventListener('shown.bs.modal', function () {
+      syncSettingsModalBackdrop(modalEl)
+    })
+    modalEl.addEventListener('hidden.bs.modal', function () {
+      cleanupSettingsModalBackdrops()
+    })
+    return modalEl
+  }
+
+  function hideSettingsModal (modalEl) {
+    if (!modalEl || typeof bootstrap === 'undefined' || !bootstrap.Modal) return
+    const modal = bootstrap.Modal.getInstance(modalEl)
+    if (modal) modal.hide()
+  }
+
+  syncUsersModal = prepareSettingsModal(syncUsersModal)
+  excludeUsersModal = prepareSettingsModal(excludeUsersModal)
 
   function populateModalToggles (inputId, modalSelector, toggleClass) {
     const selectedUsers = document.getElementById(inputId).value.split(', ').map(u => u.trim())
@@ -25,53 +103,59 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   // Populate Sync Users modal when opened
-  syncUsersModal.addEventListener('show.bs.modal', function () {
-    populateModalToggles('playlist_sync_to_users', '#syncUsersModal', 'sync-user-toggle')
-  })
+  if (syncUsersModal) {
+    syncUsersModal.addEventListener('show.bs.modal', function () {
+      populateModalToggles('playlist_sync_to_users', '#syncUsersModal', 'sync-user-toggle')
+    })
+  }
 
   // Populate Exclude Users modal when opened
-  excludeUsersModal.addEventListener('show.bs.modal', function () {
-    populateModalToggles('playlist_exclude_users', '#excludeUsersModal', 'exclude-user-toggle')
-  })
-
-  saveSyncChangesButton.addEventListener('click', function () {
-    const selectedUsers = []
-    const checkboxes = document.querySelectorAll('#syncUserListForm input[type="checkbox"]:checked')
-    const allSelected = document.getElementById('sync_all_users').checked
-
-    if (allSelected) {
-      selectedUsers.push('all')
-    } else {
-      checkboxes.forEach((checkbox) => {
-        if (checkbox.value !== 'all') {
-          selectedUsers.push(checkbox.value)
-        }
-      })
-    }
-
-    const csvUsers = selectedUsers.join(', ')
-    document.getElementById('playlist_sync_to_users').value = csvUsers
-
-    // Close the modal using Bootstrap 4 jQuery method
-    console.log($('#syncUsersModal').data('bs.modal'))
-    $('#syncUsersModal').modal('hide')
-
-    // Mark settings as invalid until re-validated
-    setSettingsValidated(false)
-  })
-  saveExcludeChangesButton.addEventListener('click', function () {
-    const selectedUsers = []
-    const checkboxes = document.querySelectorAll('#excludeUserListForm input[type="checkbox"]:checked')
-
-    checkboxes.forEach((checkbox) => {
-      selectedUsers.push(checkbox.value)
+  if (excludeUsersModal) {
+    excludeUsersModal.addEventListener('show.bs.modal', function () {
+      populateModalToggles('playlist_exclude_users', '#excludeUsersModal', 'exclude-user-toggle')
     })
+  }
 
-    const csvUsers = selectedUsers.join(', ')
-    document.getElementById('playlist_exclude_users').value = csvUsers
-    $('#excludeUsersModal').modal('hide')
-    setSettingsValidated(false)
-  })
+  if (saveSyncChangesButton) {
+    saveSyncChangesButton.addEventListener('click', function () {
+      const selectedUsers = []
+      const checkboxes = document.querySelectorAll('#syncUserListForm input[type="checkbox"]:checked')
+      const allSelected = document.getElementById('sync_all_users').checked
+
+      if (allSelected) {
+        selectedUsers.push('all')
+      } else {
+        checkboxes.forEach((checkbox) => {
+          if (checkbox.value !== 'all') {
+            selectedUsers.push(checkbox.value)
+          }
+        })
+      }
+
+      const csvUsers = selectedUsers.join(', ')
+      document.getElementById('playlist_sync_to_users').value = csvUsers
+
+      hideSettingsModal(syncUsersModal)
+
+      // Mark settings as invalid until re-validated
+      setSettingsValidated(false)
+    })
+  }
+  if (saveExcludeChangesButton) {
+    saveExcludeChangesButton.addEventListener('click', function () {
+      const selectedUsers = []
+      const checkboxes = document.querySelectorAll('#excludeUserListForm input[type="checkbox"]:checked')
+
+      checkboxes.forEach((checkbox) => {
+        selectedUsers.push(checkbox.value)
+      })
+
+      const csvUsers = selectedUsers.join(', ')
+      document.getElementById('playlist_exclude_users').value = csvUsers
+      hideSettingsModal(excludeUsersModal)
+      setSettingsValidated(false)
+    })
+  }
 
   function setSettingsValidated (isValid) {
     const settingsValidatedInput = document.getElementById('settings_validated')
@@ -98,6 +182,21 @@ document.addEventListener('DOMContentLoaded', function () {
         accordionHeader.click() // Simulate a click to open the accordion
       }
     }
+  }
+
+  function focusFieldFromHash () {
+    const hash = String(window.location.hash || '').trim()
+    if (!hash || hash.length < 2) return
+    const field = document.getElementById(hash.slice(1))
+    if (!field) return
+
+    showAccordionForField(field)
+    window.setTimeout(() => {
+      field.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      if (typeof field.focus === 'function') {
+        field.focus({ preventScroll: true })
+      }
+    }, 200)
   }
 
   function validateField (field, regex, errorMessage) {
@@ -162,16 +261,6 @@ document.addEventListener('DOMContentLoaded', function () {
       errorMessage: 'Please enter a valid integer (0 or greater).'
     },
     {
-      id: 'ignore_ids',
-      regex: /^(|None|\d{1,8}(,\d{1,8})*)$/i,
-      errorMessage: 'Please enter a valid CSV list of numeric IDs (1-8 digits), "None", or leave blank.'
-    },
-    {
-      id: 'ignore_imdb_ids',
-      regex: /^(|None|tt\d{7,8}(,tt\d{7,8})*)$/i,
-      errorMessage: 'Please enter a valid CSV list of IMDb IDs (e.g., tt1234567), "None", or leave blank.'
-    },
-    {
       id: 'custom_repo',
       regex: /^(|None|https?:\/\/[\da-z.-]+\.[a-z.]{2,6}([/\w.-]*)*\/?)$/i,
       errorMessage: 'Please enter a valid URL, "None", or leave blank.'
@@ -212,6 +301,13 @@ document.addEventListener('DOMContentLoaded', function () {
       }
     }
 
+    if (window.QSTemplateStringLists && typeof window.QSTemplateStringLists.validateAll === 'function') {
+      const templateListsValid = window.QSTemplateStringLists.validateAll(configForm || document)
+      if (!templateListsValid) {
+        isFormValid = false
+      }
+    }
+
     updateValidationMessages(isFormValid)
     return isFormValid
   }
@@ -232,6 +328,12 @@ document.addEventListener('DOMContentLoaded', function () {
       })
     }
   })
+
+  if (configForm) {
+    configForm.addEventListener('qs:template-string-list-change', function () {
+      settingsTouched = true
+    })
+  }
 
   const assetDirectoryContainer = document.getElementById('asset_directory_container')
   const addAssetDirectoryButton = document.getElementById('add-asset-directory')
@@ -317,4 +419,7 @@ document.addEventListener('DOMContentLoaded', function () {
       setSettingsValidated(true)
     }
   })
+
+  focusFieldFromHash()
+  window.addEventListener('hashchange', focusFieldFromHash)
 })

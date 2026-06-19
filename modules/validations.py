@@ -1,13 +1,16 @@
+import os
 import re
 import urllib.parse
 from json import JSONDecodeError
+from pathlib import Path
 
 import requests
+from ruamel.yaml import YAML
 from flask import current_app as app
 from flask import jsonify, flash
 from plexapi.server import PlexServer
 
-from modules import iso, helpers, url_validation
+from modules import iso, helpers, path_validation, persistence, url_validation
 
 
 def validate_iso3166_1(code):
@@ -31,6 +34,618 @@ def _validate_service_url(raw_url, label, allow_local=True):
     if not valid:
         return False, f"{label} URL: {message}"
     return True, None
+
+
+def _validate_yaml_text(raw_text, label):
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return False, f"{label} must not be empty."
+    parser = YAML(typ="safe", pure=True)
+    try:
+        parsed = parser.load(raw_text)
+    except Exception as exc:
+        return False, f"{label} must contain valid YAML. {exc}"
+    return True, None, parsed
+
+
+def _display_yaml_source_name(source_name, label):
+    source = str(source_name or "").strip()
+    if source:
+        return f"`{source}`"
+    return label
+
+
+def _validate_required_top_level_mapping(raw_text, label, source_name, mapping_name):
+    subject = _display_yaml_source_name(source_name, label)
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return False, f"{subject} must not be empty."
+
+    parser = YAML(typ="safe", pure=True)
+    try:
+        parsed = parser.load(raw_text)
+    except Exception as exc:
+        return False, f"Invalid YAML in {subject}. {exc}"
+
+    if not isinstance(parsed, dict):
+        return False, f"Top-level `{mapping_name}:` was not found in {subject}."
+
+    if mapping_name not in parsed:
+        return False, f"Top-level `{mapping_name}:` was not found in {subject}."
+
+    mapping = parsed.get(mapping_name)
+    if not isinstance(mapping, dict) or not mapping:
+        return False, f"Top-level `{mapping_name}:` in {subject} must be a non-empty mapping."
+
+    return True, None
+
+
+def _validate_metadata_yaml_text(raw_text, label, source_name=None):
+    return _validate_required_top_level_mapping(raw_text, label, source_name, "metadata")
+
+
+def _validate_collection_yaml_text(raw_text, label, source_name=None):
+    return _validate_required_top_level_mapping(raw_text, label, source_name, "collections")
+
+
+def _validate_overlay_yaml_text(raw_text, label, source_name=None):
+    return _validate_required_top_level_mapping(raw_text, label, source_name, "overlays")
+
+
+def _validate_yaml_location_suffix(location, label):
+    lowered = str(location or "").strip().lower()
+    if not lowered.endswith((".yml", ".yaml")):
+        return False, f"{label} must end with .yml or .yaml."
+    return True, None
+
+
+def _resolve_managed_library_path(location):
+    raw = str(location or "").strip()
+    if not raw:
+        return raw
+    expanded = Path(os.path.expandvars(os.path.expanduser(raw)))
+    if expanded.is_absolute():
+        return str(expanded)
+    normalized_parts = [part for part in str(expanded).replace("\\", "/").split("/") if part]
+    if len(normalized_parts) >= 3 and normalized_parts[1] in helpers.MANAGED_LIBRARY_FILE_DIRS:
+        return str(Path(helpers.CONFIG_DIR) / Path(*normalized_parts))
+    if normalized_parts and normalized_parts[0] in helpers.MANAGED_LIBRARY_FILE_DIRS:
+        return str(Path(helpers.CONFIG_DIR) / expanded)
+    return raw
+
+
+def _validate_yaml_location(location, label):
+    resolved_location = _resolve_managed_library_path(location)
+    valid, message = _validate_yaml_location_suffix(location, label)
+    if not valid:
+        return False, message
+
+    if str(location).strip().lower().startswith(("http://", "https://")):
+        valid, message = url_validation.validate_url(location, allow_local=True)
+        if not valid:
+            return False, f"{label}: {message}"
+
+        try:
+            response = requests.get(location, timeout=10)
+        except requests.RequestException as exc:
+            return False, f"Connection error: {str(exc)}"
+
+        if response.status_code >= 400:
+            return False, f"Failed to fetch {label} ({response.status_code} [{response.reason}])."
+
+        result = _validate_yaml_text(response.text, label)
+        if len(result) == 2:
+            return result
+        valid, message, _parsed = result
+        return valid, message
+
+    valid, message = path_validation.validate_path(
+        resolved_location,
+        {"allow_relative": True, "must_exist": True, "mode": "input_file"},
+    )
+    if not valid:
+        return False, f"{label}: {message}"
+
+    try:
+        with open(resolved_location, "r", encoding="utf-8") as handle:
+            yaml_text = handle.read()
+    except OSError as exc:
+        return False, f"{label}: Unable to read file. {exc}"
+
+    result = _validate_yaml_text(yaml_text, label)
+    if len(result) == 2:
+        return result
+    valid, message, _parsed = result
+    return valid, message
+
+
+def _validate_metadata_yaml_location(location, label):
+    resolved_location = _resolve_managed_library_path(location)
+    valid, message = _validate_yaml_location_suffix(location, label)
+    if not valid:
+        return False, message
+
+    source_name = os.path.basename(urllib.parse.urlparse(str(location)).path) or os.path.basename(str(location)) or label
+
+    if str(location).strip().lower().startswith(("http://", "https://")):
+        valid, message = url_validation.validate_url(location, allow_local=True)
+        if not valid:
+            return False, f"{label}: {message}"
+
+        try:
+            response = requests.get(location, timeout=10)
+        except requests.RequestException as exc:
+            return False, f"Connection error: {str(exc)}"
+
+        if response.status_code >= 400:
+            return False, f"Failed to fetch {label} ({response.status_code} [{response.reason}])."
+
+        return _validate_metadata_yaml_text(response.text, label, source_name)
+
+    valid, message = path_validation.validate_path(
+        resolved_location,
+        {"allow_relative": True, "must_exist": True, "mode": "input_file"},
+    )
+    if not valid:
+        return False, f"{label}: {message}"
+
+    try:
+        with open(resolved_location, "r", encoding="utf-8") as handle:
+            yaml_text = handle.read()
+    except OSError as exc:
+        return False, f"{label}: Unable to read file. {exc}"
+
+    return _validate_metadata_yaml_text(yaml_text, label, source_name)
+
+
+def _validate_collection_yaml_location(location, label):
+    resolved_location = _resolve_managed_library_path(location)
+    valid, message = _validate_yaml_location_suffix(location, label)
+    if not valid:
+        return False, message
+
+    source_name = os.path.basename(urllib.parse.urlparse(str(location)).path) or os.path.basename(str(location)) or label
+
+    if str(location).strip().lower().startswith(("http://", "https://")):
+        valid, message = url_validation.validate_url(location, allow_local=True)
+        if not valid:
+            return False, f"{label}: {message}"
+
+        try:
+            response = requests.get(location, timeout=10)
+        except requests.RequestException as exc:
+            return False, f"Connection error: {str(exc)}"
+
+        if response.status_code >= 400:
+            return False, f"Failed to fetch {label} ({response.status_code} [{response.reason}])."
+
+        return _validate_collection_yaml_text(response.text, label, source_name)
+
+    valid, message = path_validation.validate_path(
+        resolved_location,
+        {"allow_relative": True, "must_exist": True, "mode": "input_file"},
+    )
+    if not valid:
+        return False, f"{label}: {message}"
+
+    try:
+        with open(resolved_location, "r", encoding="utf-8") as handle:
+            yaml_text = handle.read()
+    except OSError as exc:
+        return False, f"{label}: Unable to read file. {exc}"
+
+    return _validate_collection_yaml_text(yaml_text, label, source_name)
+
+
+def _validate_overlay_yaml_location(location, label):
+    resolved_location = _resolve_managed_library_path(location)
+    valid, message = _validate_yaml_location_suffix(location, label)
+    if not valid:
+        return False, message
+
+    source_name = os.path.basename(urllib.parse.urlparse(str(location)).path) or os.path.basename(str(location)) or label
+
+    if str(location).strip().lower().startswith(("http://", "https://")):
+        valid, message = url_validation.validate_url(location, allow_local=True)
+        if not valid:
+            return False, f"{label}: {message}"
+
+        try:
+            response = requests.get(location, timeout=15)
+        except requests.RequestException as exc:
+            return False, f"{label}: Unable to fetch URL. {exc}"
+        if response.status_code >= 400:
+            return False, f"{label}: URL returned HTTP {response.status_code} {response.reason}."
+        yaml_text = response.text
+    else:
+        valid, message = path_validation.validate_path(
+            resolved_location,
+            {"allow_relative": True, "must_exist": True, "mode": "input_file"},
+        )
+        if not valid:
+            return False, f"{label}: {message}"
+
+        try:
+            with open(resolved_location, "r", encoding="utf-8") as handle:
+                yaml_text = handle.read()
+        except OSError as exc:
+            return False, f"{label}: Unable to read file. {exc}"
+
+    return _validate_overlay_yaml_text(yaml_text, label, source_name)
+
+
+def _summarize_folder_validation_failures(label, yaml_files, failures):
+    scanned_files = len(yaml_files)
+    invalid_files = len(failures)
+    suffix = "" if scanned_files == 1 else "s"
+    invalid_suffix = "" if invalid_files == 1 else "s"
+    summary = f"{label}: Scanned {scanned_files} top-level YAML file{suffix} and found {invalid_files} invalid file{invalid_suffix}."
+    return False, summary, {"message": summary, "files": failures}
+
+
+def _validate_yaml_folder(location, label):
+    resolved_location = _resolve_managed_library_path(location)
+    valid, message = path_validation.validate_path(
+        resolved_location,
+        {"allow_relative": True, "must_exist": True, "mode": "input_dir"},
+    )
+    if not valid:
+        return False, f"{label}: {message}"
+
+    try:
+        entries = sorted(os.listdir(resolved_location), key=str.casefold)
+    except OSError as exc:
+        return False, f"{label}: Unable to read folder. {exc}"
+
+    yaml_files = [
+        os.path.join(resolved_location, entry) for entry in entries if os.path.isfile(os.path.join(resolved_location, entry)) and entry.lower().endswith((".yml", ".yaml"))
+    ]
+    if not yaml_files:
+        return False, f"{label}: Folder must contain at least one top-level .yml or .yaml file."
+
+    failures = []
+    for yaml_file in yaml_files:
+        try:
+            with open(yaml_file, "r", encoding="utf-8") as handle:
+                yaml_text = handle.read()
+        except OSError as exc:
+            failures.append(f"Unable to read `{os.path.basename(yaml_file)}`. {exc}")
+            continue
+
+        valid, message = _validate_metadata_yaml_text(yaml_text, label, os.path.basename(yaml_file))
+        if not valid:
+            failures.append(message)
+
+    if failures:
+        return _summarize_folder_validation_failures(label, yaml_files, failures)
+
+    validated_files = len(yaml_files)
+    file_names = [os.path.basename(yaml_file) for yaml_file in yaml_files]
+    suffix = "" if validated_files == 1 else "s"
+    return True, None, {"validated_files": validated_files, "files": file_names, "message": f"Validated {validated_files} YAML file{suffix} in folder."}
+
+
+def _validate_collection_yaml_folder(location, label):
+    resolved_location = _resolve_managed_library_path(location)
+    valid, message = path_validation.validate_path(
+        resolved_location,
+        {"allow_relative": True, "must_exist": True, "mode": "input_dir"},
+    )
+    if not valid:
+        return False, f"{label}: {message}"
+
+    try:
+        entries = sorted(os.listdir(resolved_location), key=str.casefold)
+    except OSError as exc:
+        return False, f"{label}: Unable to read folder. {exc}"
+
+    yaml_files = [
+        os.path.join(resolved_location, entry) for entry in entries if os.path.isfile(os.path.join(resolved_location, entry)) and entry.lower().endswith((".yml", ".yaml"))
+    ]
+    if not yaml_files:
+        return False, f"{label}: Folder must contain at least one top-level .yml or .yaml file."
+
+    failures = []
+    for yaml_file in yaml_files:
+        try:
+            with open(yaml_file, "r", encoding="utf-8") as handle:
+                yaml_text = handle.read()
+        except OSError as exc:
+            failures.append(f"Unable to read `{os.path.basename(yaml_file)}`. {exc}")
+            continue
+
+        valid, message = _validate_collection_yaml_text(yaml_text, label, os.path.basename(yaml_file))
+        if not valid:
+            failures.append(message)
+
+    if failures:
+        return _summarize_folder_validation_failures(label, yaml_files, failures)
+
+    validated_files = len(yaml_files)
+    file_names = [os.path.basename(yaml_file) for yaml_file in yaml_files]
+    suffix = "" if validated_files == 1 else "s"
+    return True, None, {"validated_files": validated_files, "files": file_names, "message": f"Validated {validated_files} YAML file{suffix} in folder."}
+
+
+def _validate_overlay_yaml_folder(location, label):
+    resolved_location = _resolve_managed_library_path(location)
+    valid, message = path_validation.validate_path(
+        resolved_location,
+        {"allow_relative": True, "must_exist": True, "mode": "input_dir"},
+    )
+    if not valid:
+        return False, f"{label}: {message}"
+
+    try:
+        entries = sorted(os.listdir(resolved_location), key=str.casefold)
+    except OSError as exc:
+        return False, f"{label}: Unable to read folder. {exc}"
+
+    yaml_files = [
+        os.path.join(resolved_location, entry) for entry in entries if os.path.isfile(os.path.join(resolved_location, entry)) and entry.lower().endswith((".yml", ".yaml"))
+    ]
+    if not yaml_files:
+        return False, f"{label}: Folder must contain at least one top-level .yml or .yaml file."
+
+    failures = []
+    for yaml_file in yaml_files:
+        try:
+            with open(yaml_file, "r", encoding="utf-8") as handle:
+                yaml_text = handle.read()
+        except OSError as exc:
+            failures.append(f"Unable to read `{os.path.basename(yaml_file)}`. {exc}")
+            continue
+
+        valid, message = _validate_overlay_yaml_text(yaml_text, label, os.path.basename(yaml_file))
+        if not valid:
+            failures.append(message)
+
+    if failures:
+        return _summarize_folder_validation_failures(label, yaml_files, failures)
+
+    validated_files = len(yaml_files)
+    file_names = [os.path.basename(yaml_file) for yaml_file in yaml_files]
+    suffix = "" if validated_files == 1 else "s"
+    return True, None, {"validated_files": validated_files, "files": file_names, "message": f"Validated {validated_files} YAML file{suffix} in folder."}
+
+
+def _normalize_custom_repo_base(custom_repo):
+    repo = str(custom_repo or "").strip()
+    if not repo or repo.lower() == "none":
+        return None
+    if "https://github.com/" in repo:
+        repo = repo.replace("https://github.com/", "https://raw.githubusercontent.com/").replace("/tree/", "/")
+        if not repo.endswith("/"):
+            repo += "/"
+    return repo
+
+
+def _saved_custom_repo_base():
+    settings_data = persistence.retrieve_settings("150-settings") or {}
+    settings_section = settings_data.get("settings", {}) if isinstance(settings_data, dict) else {}
+    return _normalize_custom_repo_base(settings_section.get("custom_repo"))
+
+
+def _normalize_metadata_validation_result(result):
+    if isinstance(result, tuple):
+        if len(result) == 3:
+            valid, message, details = result
+            return bool(valid), message, details or {}
+        if len(result) == 2:
+            valid, message = result
+            return bool(valid), message, {}
+    return False, "Validation failed.", {}
+
+
+def validate_metadata_file_payload(data):
+    metadata_file_type = str(data.get("metadata_file_type") or "").strip().lower()
+    metadata_file_location = str(data.get("metadata_file_location") or "").strip()
+
+    if metadata_file_type not in {"file", "folder", "url", "git", "repo"}:
+        return False, "Metadata file type must be file, folder, url, git, or repo.", {}
+
+    if not metadata_file_location:
+        return False, "Metadata file location is required.", {}
+
+    if metadata_file_type == "url":
+        if not metadata_file_location.lower().startswith(("http://", "https://")):
+            return False, "Metadata file URL must start with http:// or https://.", {}
+        label = "Metadata file URL"
+        return _normalize_metadata_validation_result(_validate_metadata_yaml_location(metadata_file_location, label))
+
+    if metadata_file_type == "folder":
+        if metadata_file_location.lower().startswith(("http://", "https://")):
+            return False, "Metadata folder path must be a local folder path.", {}
+        label = "Metadata folder path"
+        return _normalize_metadata_validation_result(_validate_yaml_folder(metadata_file_location, label))
+
+    if metadata_file_type == "file":
+        if metadata_file_location.lower().startswith(("http://", "https://")):
+            return False, "Metadata file path must be a local file path.", {}
+        label = "Metadata file path"
+        return _normalize_metadata_validation_result(_validate_metadata_yaml_location(metadata_file_location, label))
+
+    if metadata_file_location.lower().startswith(("http://", "https://")):
+        return False, f"Metadata file {metadata_file_type} value must not be a full URL.", {}
+
+    if metadata_file_type == "git":
+        valid, message = _validate_yaml_location_suffix(metadata_file_location, "Metadata file git path")
+        if not valid:
+            return False, message, {}
+        return _normalize_metadata_validation_result(
+            _validate_metadata_yaml_location(
+                f"https://raw.githubusercontent.com/Kometa-Team/Community-Configs/master/{metadata_file_location}",
+                "Metadata file git path",
+            )
+        )
+
+    custom_repo_base = _saved_custom_repo_base()
+    if not custom_repo_base:
+        return False, "Metadata file repo entries require Custom Repo to be configured and saved first within the Settings page.", {}
+    valid, message = _validate_yaml_location_suffix(metadata_file_location, "Metadata file repo path")
+    if not valid:
+        return False, message, {}
+    resolved_repo_location = f"{custom_repo_base}{metadata_file_location}"
+    return _normalize_metadata_validation_result(_validate_metadata_yaml_location(resolved_repo_location, "Metadata file repo path"))
+
+
+def validate_collection_file_payload(data):
+    collection_file_type = str(data.get("collection_file_type") or "").strip().lower()
+    collection_file_location = str(data.get("collection_file_location") or "").strip()
+
+    if collection_file_type not in {"file", "folder", "url", "git", "repo"}:
+        return False, "Collection file type must be file, folder, url, git, or repo.", {}
+
+    if not collection_file_location:
+        return False, "Collection file location is required.", {}
+
+    if collection_file_type == "url":
+        if not collection_file_location.lower().startswith(("http://", "https://")):
+            return False, "Collection file URL must start with http:// or https://.", {}
+        label = "Collection file URL"
+        return _normalize_metadata_validation_result(_validate_collection_yaml_location(collection_file_location, label))
+
+    if collection_file_type == "folder":
+        if collection_file_location.lower().startswith(("http://", "https://")):
+            return False, "Collection folder path must be a local folder path.", {}
+        label = "Collection folder path"
+        return _normalize_metadata_validation_result(_validate_collection_yaml_folder(collection_file_location, label))
+
+    if collection_file_type == "file":
+        if collection_file_location.lower().startswith(("http://", "https://")):
+            return False, "Collection file path must be a local file path.", {}
+        label = "Collection file path"
+        return _normalize_metadata_validation_result(_validate_collection_yaml_location(collection_file_location, label))
+
+    if collection_file_location.lower().startswith(("http://", "https://")):
+        return False, f"Collection file {collection_file_type} value must not be a full URL.", {}
+
+    if collection_file_type == "git":
+        valid, message = _validate_yaml_location_suffix(collection_file_location, "Collection file git path")
+        if not valid:
+            return False, message, {}
+        return _normalize_metadata_validation_result(
+            _validate_collection_yaml_location(
+                f"https://raw.githubusercontent.com/Kometa-Team/Community-Configs/master/{collection_file_location}",
+                "Collection file git path",
+            )
+        )
+
+    custom_repo_base = _saved_custom_repo_base()
+    if not custom_repo_base:
+        return False, "Collection file repo entries require Custom Repo to be configured and saved first within the Settings page.", {}
+    valid, message = _validate_yaml_location_suffix(collection_file_location, "Collection file repo path")
+    if not valid:
+        return False, message, {}
+    resolved_repo_location = f"{custom_repo_base}{collection_file_location}"
+    return _normalize_metadata_validation_result(_validate_collection_yaml_location(resolved_repo_location, "Collection file repo path"))
+
+
+def validate_overlay_file_payload(data):
+    overlay_file_type = str(data.get("overlay_file_type") or "").strip().lower()
+    overlay_file_location = str(data.get("overlay_file_location") or "").strip()
+
+    if overlay_file_type not in {"file", "folder", "url", "git", "repo"}:
+        return False, "Overlay file type must be file, folder, url, git, or repo.", {}
+
+    if not overlay_file_location:
+        return False, "Overlay file location is required.", {}
+
+    if overlay_file_type == "url":
+        if not overlay_file_location.lower().startswith(("http://", "https://")):
+            return False, "Overlay file URL must start with http:// or https://.", {}
+        label = "Overlay file URL"
+        return _normalize_metadata_validation_result(_validate_overlay_yaml_location(overlay_file_location, label))
+
+    if overlay_file_type == "folder":
+        if overlay_file_location.lower().startswith(("http://", "https://")):
+            return False, "Overlay folder path must be a local folder path.", {}
+        label = "Overlay folder path"
+        return _normalize_metadata_validation_result(_validate_overlay_yaml_folder(overlay_file_location, label))
+
+    if overlay_file_type == "file":
+        if overlay_file_location.lower().startswith(("http://", "https://")):
+            return False, "Overlay file path must be a local file path.", {}
+        label = "Overlay file path"
+        return _normalize_metadata_validation_result(_validate_overlay_yaml_location(overlay_file_location, label))
+
+    if overlay_file_location.lower().startswith(("http://", "https://")):
+        return False, f"Overlay file {overlay_file_type} value must not be a full URL.", {}
+
+    if overlay_file_type == "git":
+        valid, message = _validate_yaml_location_suffix(overlay_file_location, "Overlay file git path")
+        if not valid:
+            return False, message, {}
+        return _normalize_metadata_validation_result(
+            _validate_overlay_yaml_location(
+                f"https://raw.githubusercontent.com/Kometa-Team/Community-Configs/master/{overlay_file_location}",
+                "Overlay file git path",
+            )
+        )
+
+    custom_repo_base = _saved_custom_repo_base()
+    if not custom_repo_base:
+        return False, "Overlay file repo entries require Custom Repo to be configured and saved first within the Settings page.", {}
+    valid, message = _validate_yaml_location_suffix(overlay_file_location, "Overlay file repo path")
+    if not valid:
+        return False, message, {}
+    resolved_repo_location = f"{custom_repo_base}{overlay_file_location}"
+    return _normalize_metadata_validation_result(_validate_overlay_yaml_location(resolved_repo_location, "Overlay file repo path"))
+
+
+def validate_metadata_file_server(data):
+    valid, message, details = validate_metadata_file_payload(data)
+    if not valid:
+        payload = {"valid": False, "error": message}
+        if details.get("message") or isinstance(details.get("files"), list):
+            payload["error_details"] = {"text": details.get("message") or message, "files": details.get("files") if isinstance(details.get("files"), list) else []}
+        if isinstance(details.get("files"), list):
+            payload["files"] = details["files"]
+        return jsonify(payload), 400
+    payload = {"valid": True}
+    if details.get("message"):
+        payload["message"] = details["message"]
+    if "validated_files" in details:
+        payload["validated_files"] = details["validated_files"]
+    if isinstance(details.get("files"), list):
+        payload["files"] = details["files"]
+    return jsonify(payload)
+
+
+def validate_collection_file_server(data):
+    valid, message, details = validate_collection_file_payload(data)
+    if not valid:
+        payload = {"valid": False, "error": message}
+        if details.get("message") or isinstance(details.get("files"), list):
+            payload["error_details"] = {"text": details.get("message") or message, "files": details.get("files") if isinstance(details.get("files"), list) else []}
+        if isinstance(details.get("files"), list):
+            payload["files"] = details["files"]
+        return jsonify(payload), 400
+    payload = {"valid": True}
+    if details.get("message"):
+        payload["message"] = details["message"]
+    if "validated_files" in details:
+        payload["validated_files"] = details["validated_files"]
+    if isinstance(details.get("files"), list):
+        payload["files"] = details["files"]
+    return jsonify(payload)
+
+
+def validate_overlay_file_server(data):
+    valid, message, details = validate_overlay_file_payload(data)
+    if not valid:
+        payload = {"valid": False, "error": message}
+        if details.get("message") or isinstance(details.get("files"), list):
+            payload["error_details"] = {"text": details.get("message") or message, "files": details.get("files") if isinstance(details.get("files"), list) else []}
+        if isinstance(details.get("files"), list):
+            payload["files"] = details["files"]
+        return jsonify(payload), 400
+    payload = {"valid": True}
+    if details.get("message"):
+        payload["message"] = details["message"]
+    if "validated_files" in details:
+        payload["validated_files"] = details["validated_files"]
+    if isinstance(details.get("files"), list):
+        payload["files"] = details["files"]
+    return jsonify(payload)
 
 
 def validate_plex_server(data):
@@ -275,6 +890,18 @@ def validate_ntfy_server(data):
         return jsonify({"valid": False, "error": f"Connection error: {str(e)}"})
 
 
+def validate_apprise_server(data):
+    apprise_location = str(data.get("apprise_location") or "").strip()
+    if not apprise_location:
+        return jsonify({"valid": False, "error": "Apprise YAML path or URL is required."}), 400
+
+    valid, message = _validate_yaml_location(apprise_location, "Apprise location")
+    if not valid:
+        return jsonify({"valid": False, "error": message}), 400
+
+    return jsonify({"valid": True})
+
+
 def validate_mal_server(data):
     mal_client_id = data.get("mal_client_id")
     mal_client_secret = data.get("mal_client_secret")
@@ -335,60 +962,70 @@ def validate_webhook_server(data):
 
 
 def validate_radarr_server(data):
-    radarr_url = data.get("radarr_url")
-    radarr_apikey = data.get("radarr_token")
+    result, status_code = validate_radarr_payload(data)
+    if not result.get("valid"):
+        error = result.get("error")
+        if error:
+            flash(f"Invalid Radarr URL or API Key: {error}", "error")
+    return (jsonify(result), status_code) if status_code != 200 else jsonify(result)
+
+
+def validate_sonarr_server(data):
+    result, status_code = validate_sonarr_payload(data)
+    if not result.get("valid"):
+        error = result.get("error")
+        if error:
+            flash(f"Invalid Sonarr URL or API Key: {error}", "error")
+    return (jsonify(result), status_code) if status_code != 200 else jsonify(result)
+
+
+def validate_radarr_payload(data):
+    radarr_url = data.get("radarr_url") or data.get("url")
+    radarr_apikey = data.get("radarr_token") or data.get("token")
 
     ok, msg = _validate_service_url(radarr_url, "Radarr", allow_local=True)
     if not ok:
-        return jsonify({"valid": False, "error": msg}), 400
+        return {"valid": False, "error": msg}, 400
 
     status_api_url = f"{radarr_url}/api/v3/system/status?apikey={radarr_apikey}"
     root_folder_api_url = f"{radarr_url}/api/v3/rootfolder?apikey={radarr_apikey}"
     quality_profile_api_url = f"{radarr_url}/api/v3/qualityprofile?apikey={radarr_apikey}"
 
     try:
-        # Validate API key by checking system status
         response = requests.get(status_api_url, timeout=10)
         response.raise_for_status()
         status_data = response.json()
 
         if "version" not in status_data:
             helpers.ts_log("Radarr connection failed. Invalid response data.")
-            return jsonify({"valid": False, "error": "Invalid Radarr URL or Apikey"})
+            return {"valid": False, "error": "Invalid Radarr URL or Apikey"}, 200
 
-        # Fetch root folders
         response = requests.get(root_folder_api_url, timeout=10)
         response.raise_for_status()
         root_folders = response.json()
 
-        # Fetch quality profiles
         response = requests.get(quality_profile_api_url, timeout=10)
         response.raise_for_status()
         quality_profiles = response.json()
 
         helpers.ts_log("Radarr connection successful.")
-
-        return jsonify(
-            {
-                "valid": True,
-                "root_folders": root_folders,
-                "quality_profiles": quality_profiles,
-            }
-        )
-
+        return {
+            "valid": True,
+            "root_folders": root_folders,
+            "quality_profiles": quality_profiles,
+        }, 200
     except requests.exceptions.RequestException as e:
-        helpers.ts_log("Error validating Radarr connection: {e}", level="ERROR")
-        flash(f"Invalid Radarr URL or API Key: {str(e)}", "error")
-        return jsonify({"valid": False, "error": f"Invalid Radarr URL or Apikey: {str(e)}"})
+        helpers.ts_log(f"Error validating Radarr connection: {e}", level="ERROR")
+        return {"valid": False, "error": f"Invalid Radarr URL or Apikey: {str(e)}"}, 200
 
 
-def validate_sonarr_server(data):
-    sonarr_url = data.get("sonarr_url")
-    sonarr_apikey = data.get("sonarr_token")
+def validate_sonarr_payload(data):
+    sonarr_url = data.get("sonarr_url") or data.get("url")
+    sonarr_apikey = data.get("sonarr_token") or data.get("token")
 
     ok, msg = _validate_service_url(sonarr_url, "Sonarr", allow_local=True)
     if not ok:
-        return jsonify({"valid": False, "error": msg}), 400
+        return {"valid": False, "error": msg}, 400
 
     status_api_url = f"{sonarr_url}/api/v3/system/status?apikey={sonarr_apikey}"
     root_folder_api_url = f"{sonarr_url}/api/v3/rootfolder?apikey={sonarr_apikey}"
@@ -396,45 +1033,36 @@ def validate_sonarr_server(data):
     language_profile_api_url = f"{sonarr_url}/api/v3/language?apikey={sonarr_apikey}"
 
     try:
-        # Validate API key by checking system status
         response = requests.get(status_api_url, timeout=10)
         response.raise_for_status()
         status_data = response.json()
 
         if "version" not in status_data:
             helpers.ts_log("Sonarr connection failed. Invalid response data.")
-            return jsonify({"valid": False, "error": "Invalid Sonarr URL or Apikey"})
+            return {"valid": False, "error": "Invalid Sonarr URL or Apikey"}, 200
 
-        # Fetch root folders
         response = requests.get(root_folder_api_url, timeout=10)
         response.raise_for_status()
         root_folders = response.json()
 
-        # Fetch quality profiles
         response = requests.get(quality_profile_api_url, timeout=10)
         response.raise_for_status()
         quality_profiles = response.json()
 
-        # Fetch quality profiles
         response = requests.get(language_profile_api_url, timeout=10)
         response.raise_for_status()
         language_profiles = response.json()
 
         helpers.ts_log("Sonarr connection successful.")
-
-        return jsonify(
-            {
-                "valid": True,
-                "root_folders": root_folders,
-                "quality_profiles": quality_profiles,
-                "language_profiles": language_profiles,
-            }
-        )
-
+        return {
+            "valid": True,
+            "root_folders": root_folders,
+            "quality_profiles": quality_profiles,
+            "language_profiles": language_profiles,
+        }, 200
     except requests.exceptions.RequestException as e:
         helpers.ts_log(f"Error validating Sonarr connection: {e}", level="ERROR")
-        flash(f"Invalid Sonarr URL or API Key: {str(e)}", "error")
-        return jsonify({"valid": False, "error": f"Invalid Sonarr URL or Apikey: {str(e)}"})
+        return {"valid": False, "error": f"Invalid Sonarr URL or Apikey: {str(e)}"}, 200
 
 
 def validate_omdb_server(data):

@@ -92,6 +92,13 @@ def clean_form_data(form_data):
                 value_list = form_data.getlist(key)
             clean_data[key] = [v.strip() for v in value_list if v.strip()]
 
+        elif key.endswith("template_overlay_languages[languages]") or key.endswith("template_overlay_languages_subtitles[languages]"):
+            if isinstance(value, list):
+                value_list = value
+            else:
+                value_list = form_data.getlist(key)
+            clean_data[key] = [v.strip() for v in value_list if isinstance(v, str) and v.strip()]
+
         elif key.endswith("use_separator"):
             prefix = "mov" if key.startswith("mov") else "sho"
             clean_data.setdefault(f"{prefix}-template_variables", {})["use_separator"] = value if value != "none" else None
@@ -495,5 +502,6 @@ def notification_systems_available():
     notifiarr_available, notifiarr_user_entered = retrieve_status("notifiarr")
     gotify_available, gotify_user_entered = retrieve_status("gotify")
     ntfy_available, ntfy_user_entered = retrieve_status("ntfy")
+    apprise_available, apprise_user_entered = retrieve_status("apprise")
 
-    return notifiarr_available, gotify_available, ntfy_available
+    return notifiarr_available, gotify_available, ntfy_available, apprise_available

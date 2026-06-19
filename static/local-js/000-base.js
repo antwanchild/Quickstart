@@ -70,94 +70,94 @@ function getWorkspaceLoadingHost () {
 }
 
 const QS_NAV_LOADING_QUOTES = [
-  'Downloading more RAM…',
-  'Downloading more RAM.',
-  'Now in technicolor.',
-  'Previously on Quickstart...',
-  'Previously on Kometa...',
-  'Previously on Plex Meta Manager...',
-  'Bleep Bloop.',
-  'Locating the required gigapixels to render...',
-  'Spinning up the hamster wheel...',
-  'At least you\'re not on hold.',
-  'Hum something loud while others stare.',
-  'Scanning the high seas... please hold while we avoid suspicious parrots.',
-  'Loading... or maybe just staring dramatically into the middle distance.',
-  'Optimizing your patience... progress bar sold separately.',
-  'Negotiating with your hard drive. It\'s asking for a coffee break.',
-  'Buffering... because time travel is still in beta.',
-  'We\'re not stuck. We\'re just... thinking about our life choices.',
-  'This would be faster in Python… probably.',
-  'Polishing pixels for maximum shininess…',
-  'Untangling cable spaghetti…',
-  'Reticulating splines…',
-  'Calibrating the matrix…',
-  'Negotiating with APIs…',
-  'Aligning bits and vibes…',
-  'Warming up the hamsters…',
-  'Summoning config gremlins…',
-  'Congratulations! You are the 1000th visitor.',
-  'HELP! I\'m being held hostage and forced to write these stupid lines!',
-  'RE-calibrating the internet...',
-  'I\'ll be here all week',
-  'Don\'t forget to tip your waitress',
+  'Adjusting the dilithium crystal converter assembly, please wait...',
+  'Aligning bits and vibes...',
+  'Allocating some humor memory... nearly full.',
+  'Almost finished, but now I’m thinking about snacks.',
   'Apply directly to the forehead',
-  'Loading Battlestation',
-  'It\'s not you. It\'s me.',
-  'Do not run! We are your friends!',
-  'What do you call 8 Hobbits? A Hobbyte.',
-  'Putting the icing on the cake. The cake is not a lie...',
-  'There is no spoon. Because we are not done loading it',
+  'Asking Yoda: \'Patience, you must have...\'',
+  'At least you\'re not on hold.',
+  'Bleep Bloop.',
+  'Buffering... because time travel is still in beta.',
+  'Bypassing control of the matter-antimatter integrator, please wait...',
+  'Calculating the odds like C-3PO...',
+  'Calibrating the matrix...',
+  'Calibrating toaster for maximum browning... do not touch.',
+  'Chuck Norris doesn\'t wear a watch. HE decides what time it is.',
   'Chuck Norris never git push. The repo pulls before.',
-  'Java developers never RIP. They just get Garbage Collected.',
-  'Proving P=NP...',
-  'Please wait... Consulting the manual...',
+  'Compiling infinite wisdom... almost done.',
+  'Congratulations, you discovered a loading joke!',
+  'Congratulations! You are the 1000th visitor.',
+  'Converging tachyon pulses, please wait...',
+  'Counting invisible unicorns... half done.',
+  'Creating an anti-time reaction, please wait...',
+  'Decrypting the Matrix... red pill or blue pill...?',
+  'Defragging your patience... please hold.',
+  'Disrupting warp fields with an inverse graviton burst, please wait...',
+  'Do not run! We are your friends!',
+  'Don\'t forget to tip your waitress',
+  'Downloading more RAM...',
+  'Executing sudo patience command... don\'t panic.',
+  'Fetching more coffee for the CPU.',
+  'HELP! I\'m being held hostage and forced to write these stupid lines!',
+  'Hum something loud while others stare.',
+  'I\'ll be here all week',
+  'If you are reading this, you are officially patient.',
+  'Inflating your patience balloon... watch out for pop!',
+  'Installing the update that fixes the update...',
   'It is dark. You\'re likely to be eaten by a grue.',
   'It\'s 10:00pm somewhere. Do you know where your children are?',
-  'Please wait, while we purge the Decepticons for you. Yes, You can thank us later!',
-  'Chuck Norris doesn\'t wear a watch. HE decides what time it is.',
-  'Creating an anti-time reaction, please wait...',
-  'Rupturing the subspace barrier, please wait...',
-  'Converging tachyon pulses, please wait...',
-  'Bypassing control of the matter-antimatter integrator, please wait...',
-  'Adjusting the dilithium crystal converter assembly, please wait...',
-  'Reversing the shield polarity, please wait...',
-  'Disrupting warp fields with an inverse graviton burst, please wait...',
-  'Compiling infinite wisdom… almost done.',
-  'Reversing the bits… because why not?',
-  'Fetching more coffee for the CPU.',
-  'Allocating some humor memory… nearly full.',
-  'Defragging your patience… please hold.',
-  'Overclocking the hamsters… success imminent.',
-  'Optimizing quantum entanglement for page load…',
-  'Executing sudo patience command… don\'t panic.',
-  'Patching reality… ETA unknown.',
-  'Waiting for the flux capacitor to stabilize…',
-  'Summoning Gandalf for assistance…',
-  'We\'re engaging cloaking device, please stand by.',
-  'Trying to remember the words to the Cantina song…',
-  'Calculating the odds like C-3PO…',
-  'Asking Yoda: \'Patience, you must have…\'',
-  'Decrypting the Matrix… red pill or blue pill…?',
-  'Teleporting the data from a parallel dimension…',
-  'Counting invisible unicorns… half done.',
-  'Waiting for the penguins to align…',
-  'Negotiating with the Wi-Fi spirits…',
-  'Polishing pixels… carefully…',
-  'Training squirrels to deliver your data…',
-  'Washing imaginary dishes… almost there.',
-  'Inflating your patience balloon… watch out for pop!',
-  'Calibrating toaster for maximum browning… do not touch.',
-  'This message will self-destruct in 3… 2… 1…',
-  'Congratulations, you discovered a loading joke!',
-  'If you are reading this, you are officially patient.',
-  'Almost finished, but now I’m thinking about snacks.',
-  'Loading… your expectations may vary.',
-  'Please wait… our developers are dancing while waiting too.',
-  'You’re not stuck, the page is just contemplating existence.',
-  'This text is taking longer to write than the page.',
+  'It\'s not you. It\'s me.',
   'It\'s only typing...',
-  'That\'s a fixable problem...'
+  'Java developers never RIP. They just get Garbage Collected.',
+  'Loading... or maybe just staring dramatically into the middle distance.',
+  'Loading... your expectations may vary.',
+  'Loading Battlestation',
+  'Locating the required gigapixels to render...',
+  'Negotiating with APIs...',
+  'Negotiating with the Wi-Fi spirits...',
+  'Negotiating with your hard drive. It\'s asking for a coffee break.',
+  'Now in technicolor.',
+  'Optimizing quantum entanglement for page load...',
+  'Optimizing your patience... progress bar sold separately.',
+  'Overclocking the hamsters... success imminent.',
+  'Patching reality... ETA unknown.',
+  'Please wait, while we purge the Decepticons for you. Yes, You can thank us later!',
+  'Please wait... Consulting the manual...',
+  'Please wait... our developers are dancing while waiting too.',
+  'Polishing pixels for maximum shininess...',
+  'Polishing pixels... carefully...',
+  'Previously on Kometa...',
+  'Previously on Plex Meta Manager...',
+  'Previously on Quickstart...',
+  'Proving P=NP...',
+  'Putting the icing on the cake. The cake is not a lie...',
+  'RE-calibrating the internet...',
+  'Reticulating splines...',
+  'Reversing the bits... because why not?',
+  'Reversing the shield polarity, please wait...',
+  'Rupturing the subspace barrier, please wait...',
+  'Scanning the high seas... please hold while we avoid suspicious parrots.',
+  'Spinning up the hamster wheel...',
+  'Summoning config gremlins...',
+  'Summoning Gandalf for assistance...',
+  'Teleporting the data from a parallel dimension...',
+  'That\'s a fixable problem...',
+  'There is no spoon. Because we are not done loading it',
+  'This message will self-destruct in 3... 2... 1...',
+  'This text is taking longer to write than the page.',
+  'This would be faster in Python... probably.',
+  'Training squirrels to deliver your data...',
+  'Trying to remember the words to the Cantina song...',
+  'Untangling cable spaghetti...',
+  'Waiting for the flux capacitor to stabilize...',
+  'Waiting for the penguins to align...',
+  'Warming up the hamsters...',
+  'Washing imaginary dishes... almost there.',
+  'We\'re engaging cloaking device, please stand by.',
+  'We\'re not stuck. We\'re just... thinking about our life choices.',
+  'What do you call 8 Hobbits? A Hobbyte.',
+  'You’re not stuck, the page is just contemplating existence.'
 ]
 
 let qsNavLoadingQuoteTimer = null
@@ -187,7 +187,7 @@ function refillNavLoadingQuotePool () {
 }
 
 function nextNavLoadingQuote () {
-  if (!QS_NAV_LOADING_QUOTES.length) return 'Loading…'
+  if (!QS_NAV_LOADING_QUOTES.length) return 'Loading...'
   if (QS_NAV_LOADING_QUOTES.length === 1) return QS_NAV_LOADING_QUOTES[0]
   if (!qsNavLoadingQuotePool.length) {
     refillNavLoadingQuotePool()
@@ -219,8 +219,8 @@ function startNavLoadingQuoteLoop (overlay) {
     setNavLoadingQuote(overlay)
     qsNavLoadingQuoteTimer = setInterval(() => {
       setNavLoadingQuote(overlay)
-    }, 2800)
-  }, 1400)
+    }, 4200)
+  }, 2200)
 }
 
 function stopNavLoadingQuoteLoop () {
@@ -260,8 +260,8 @@ function ensureNavigationLoadingOverlay () {
     <div class="qs-nav-loading-card" role="status" aria-live="polite">
       <div class="qs-nav-loading-spinner" aria-hidden="true"></div>
       <div class="qs-nav-loading-text">
-        <div class="qs-nav-loading-label">Opening step…</div>
-        <div class="qs-nav-loading-quote">Downloading more RAM…</div>
+        <div class="qs-nav-loading-label">Opening step...</div>
+        <div class="qs-nav-loading-quote">Downloading more RAM...</div>
       </div>
     </div>
   `
@@ -275,21 +275,21 @@ function showNavigationLoadingOverlay (action, targetLabel) {
 
   const label = overlay.querySelector('.qs-nav-loading-label')
   const actionText = {
-    prev: 'Opening previous step…',
-    next: 'Opening next step…',
-    jump: 'Opening selected step…',
-    'library-initial': 'Loading first library…',
-    'library-switch': 'Switching library…',
-    'kometa-check': 'Validating Kometa…',
-    'header-style': 'Regenerating section style…',
-    'config-switch': 'Saving current page…'
+    prev: 'Opening previous step...',
+    next: 'Opening next step...',
+    jump: 'Opening selected step...',
+    'library-initial': 'Loading first library...',
+    'library-switch': 'Switching library...',
+    'kometa-check': 'Validating Kometa...',
+    'header-style': 'Regenerating section style...',
+    'config-switch': 'Saving current page...'
   }
   const normalizedTarget = String(targetLabel || '').trim()
   if (label) {
     if (normalizedTarget) {
-      label.textContent = `Opening ${normalizedTarget}…`
+      label.textContent = `Opening ${normalizedTarget}...`
     } else {
-      label.textContent = actionText[action] || 'Loading…'
+      label.textContent = actionText[action] || 'Loading...'
     }
   }
 
@@ -555,13 +555,16 @@ const qsCurrentTemplate = String(window.QS_CURRENT_TEMPLATE || document.document
 const qsSkipMaintenancePoll = qsCurrentTemplate === '900-kometa'
 const qsSkipImageMaidPoll = qsCurrentTemplate === '915-imagemaid'
 const qsSkipLogscanReingestPoll = qsCurrentTemplate === '905-analytics'
+const QS_APP_READINESS_POLL_INTERVAL_MS = 12000
 let qsLatestKometaStatus = null
 let qsLatestImageMaidStatus = null
+let qsLatestAppReadiness = null
 let qsActiveBackgroundJobs = []
 let qsMaintenancePollInFlight = false
 let qsLogscanReingestPollInFlight = false
 let qsImageMaidPollInFlight = false
 let qsBackgroundJobsPollInFlight = false
+let qsAppReadinessPollInFlight = false
 
 function qsShouldPollBackgroundState () {
   return !document.hidden
@@ -610,20 +613,20 @@ function qsBuildKometaActiveWorkEntry () {
   const href = '/step/900-kometa'
   const status = String(data.status || '').trim().toLowerCase()
   const running = status === 'running'
-  const unavailableBlocksWork = Boolean(data.window_unavailable) && (Boolean(data.pending_start) || Boolean(data.maintenance_paused) || !running)
+  const unavailableBlocksWork = Boolean(data.window_unavailable) && (Boolean(data.pending_start) || Boolean(data.maintenance_paused) || running)
 
   if (unavailableBlocksWork) {
-    const since = data.window_unavailable_since ? `Since ${qsFormatTimestamp(data.window_unavailable_since)}` : 'Maintenance window unavailable'
+    const since = data.window_unavailable_since ? `Since ${qsFormatTimestamp(data.window_unavailable_since)}` : 'Maintenance window data unavailable'
     return {
       key: 'kometa-window-unavailable',
-      title: 'Kometa start blocked',
+      title: 'Maintenance window data unavailable',
       chip: 'Waiting',
       state: 'warn',
       meta: windowLabel ? `${since} • Window ${windowLabel}` : since,
       href,
       titleAttr: windowLabel
-        ? `Kometa start is blocked because the configured Plex maintenance window ${windowLabel} is unavailable.`
-        : 'Kometa start is blocked because the configured Plex maintenance window is unavailable.'
+        ? `Quickstart cannot read the configured Plex maintenance window ${windowLabel} while work is active.`
+        : 'Quickstart cannot read the configured Plex maintenance window while work is active.'
     }
   }
 
@@ -963,7 +966,7 @@ function qsHandleMaintenanceStatus (data) {
       const label = unavailableBadge.querySelector('span')
       unavailableBadge.classList.remove('d-none')
       if (label) {
-        label.innerHTML = `<i class="bi bi-exclamation-triangle me-1"></i> Plex maintenance window unavailable${sinceLabel}`
+        label.innerHTML = `<i class="bi bi-exclamation-triangle me-1"></i> Plex maintenance window data unavailable${sinceLabel}`
       }
     } else {
       unavailableBadge.classList.add('d-none')
@@ -982,6 +985,7 @@ function qsHandleMaintenanceStatus (data) {
 
   qsLastMaintenancePaused = paused
   qsRenderActiveWorkCard()
+  qsRenderAppReadiness()
   document.dispatchEvent(new CustomEvent('qs:maintenance-status', { detail: data }))
 }
 
@@ -1004,6 +1008,7 @@ function qsHandleImageMaidStatus (data) {
     }
   }
   qsRenderActiveWorkCard()
+  qsRenderAppReadiness()
 }
 
 window.QS_handleImageMaidStatus = qsHandleImageMaidStatus
@@ -1017,6 +1022,202 @@ function qsHandleLogscanReingestStatus (data) {
 }
 
 window.QS_handleLogscanReingestStatus = qsHandleLogscanReingestStatus
+
+function qsGetAppReadinessState (entry) {
+  return String((entry && entry.state) || '').trim().toLowerCase()
+}
+
+function qsIsAppReadinessAvailable (entry) {
+  return ['ready', 'review', 'running', 'queued'].includes(qsGetAppReadinessState(entry))
+}
+
+function qsHydrateKometaReadiness (entry) {
+  const hydrated = { ...(entry || {}) }
+  const data = qsLatestKometaStatus
+  if (!data || typeof data !== 'object') return hydrated
+
+  const status = String(data.status || '').trim().toLowerCase()
+  const elapsed = typeof data.elapsed_seconds === 'number' ? qsFormatElapsedLabel(data.elapsed_seconds) : ''
+  const windowLabel = String(data.maintenance_window || '').trim()
+  const windowSuffix = windowLabel ? ` (${windowLabel})` : ''
+  const unavailableBlocksWork = Boolean(data.window_unavailable) && (Boolean(data.pending_start) || Boolean(data.maintenance_paused) || status !== 'running')
+
+  if (status === 'running') {
+    hydrated.state = 'running'
+    hydrated.summary = 'Running now'
+    hydrated.detail = `Kometa is currently running${elapsed ? ` (${elapsed})` : ''}.`
+    return hydrated
+  }
+  if (data.pending_start) {
+    hydrated.state = 'queued'
+    hydrated.summary = 'Start queued'
+    hydrated.detail = `Kometa will start when the Plex maintenance window allows it${windowSuffix}.`
+    return hydrated
+  }
+  if (data.maintenance_paused) {
+    hydrated.state = 'blocked'
+    hydrated.summary = 'Paused for maintenance'
+    hydrated.detail = `Kometa is paused for Plex maintenance${windowSuffix}.`
+    return hydrated
+  }
+  if (unavailableBlocksWork) {
+    hydrated.state = 'blocked'
+    hydrated.summary = 'Window data unavailable'
+    hydrated.detail = 'Quickstart cannot confirm the Plex maintenance window right now.'
+  }
+  return hydrated
+}
+
+function qsHydrateImageMaidReadiness (entry) {
+  const hydrated = { ...(entry || {}) }
+  const data = qsLatestImageMaidStatus
+  if (!data || typeof data !== 'object') return hydrated
+
+  if (String(data.status || '').trim().toLowerCase() === 'running') {
+    const elapsed = typeof data.elapsed_seconds === 'number' ? qsFormatElapsedLabel(data.elapsed_seconds) : ''
+    hydrated.state = 'running'
+    hydrated.summary = 'Running now'
+    hydrated.detail = `ImageMaid is currently running${elapsed ? ` (${elapsed})` : ''}.`
+  }
+  return hydrated
+}
+
+function qsFormatAppReadinessSnippet (entry) {
+  const state = qsGetAppReadinessState(entry)
+  const name = String((entry && entry.name) || 'App').trim()
+  switch (state) {
+    case 'ready':
+    case 'review':
+      return `${name} ready`
+    case 'running':
+      return `${name} running`
+    case 'queued':
+      return `${name} queued`
+    case 'needs_validation':
+      return `${name} needs validation`
+    case 'needs_prepare':
+      return `${name} needs preparation`
+    case 'blocked':
+    case 'needs_setup':
+    case 'error':
+      return `${name}: ${String((entry && entry.summary) || 'needs attention').trim()}`
+    default:
+      return `${name}: ${String((entry && entry.summary) || 'checking status').trim()}`
+  }
+}
+
+function qsSetStepGroupIndicatorState (group, state) {
+  if (!group) return
+  const normalized = ['ok', 'warn', 'error', 'unknown'].includes(String(state || '').trim().toLowerCase())
+    ? String(state || '').trim().toLowerCase()
+    : 'unknown'
+  const indicator = group.querySelector('.qs-step-group-state')
+  if (!indicator) return
+  indicator.classList.remove('qs-step-group-state--ok', 'qs-step-group-state--warn', 'qs-step-group-state--error', 'qs-step-group-state--unknown')
+  indicator.classList.add(`qs-step-group-state--${normalized}`)
+}
+
+function qsRenderAppReadiness () {
+  const appsLineEl = document.querySelector('[data-qs-readiness-apps]')
+  const appsGroup = document.querySelector('[data-step-group="apps"]')
+  const appsGroupSummaryEl = appsGroup ? appsGroup.querySelector('[data-qs-app-group-summary]') : null
+  const payload = qsLatestAppReadiness && typeof qsLatestAppReadiness === 'object'
+    ? (qsLatestAppReadiness.apps || qsLatestAppReadiness)
+    : null
+
+  if (!appsLineEl && !appsGroupSummaryEl) return
+
+  if (!payload || typeof payload !== 'object') {
+    if (appsLineEl) {
+      appsLineEl.textContent = 'Apps: checking status...'
+      appsLineEl.classList.remove('qs-readiness-apps-line--ok', 'qs-readiness-apps-line--warn', 'qs-readiness-apps-line--error', 'qs-readiness-apps-line--unknown')
+      appsLineEl.classList.add('qs-readiness-apps-line--unknown')
+    }
+    if (appsGroupSummaryEl) {
+      appsGroupSummaryEl.classList.add('d-none')
+      appsGroupSummaryEl.textContent = ''
+      appsGroupSummaryEl.removeAttribute('title')
+    }
+    qsSetStepGroupIndicatorState(appsGroup, 'unknown')
+    return
+  }
+
+  const entries = []
+  if (payload.kometa) entries.push(qsHydrateKometaReadiness(payload.kometa))
+  if (payload.imagemaid) entries.push(qsHydrateImageMaidReadiness(payload.imagemaid))
+
+  if (!entries.length) {
+    if (appsLineEl) {
+      appsLineEl.textContent = 'Apps: status unavailable.'
+      appsLineEl.classList.remove('qs-readiness-apps-line--ok', 'qs-readiness-apps-line--warn', 'qs-readiness-apps-line--error', 'qs-readiness-apps-line--unknown')
+      appsLineEl.classList.add('qs-readiness-apps-line--unknown')
+    }
+    if (appsGroupSummaryEl) {
+      appsGroupSummaryEl.classList.add('d-none')
+      appsGroupSummaryEl.textContent = ''
+      appsGroupSummaryEl.removeAttribute('title')
+    }
+    qsSetStepGroupIndicatorState(appsGroup, 'unknown')
+    return
+  }
+
+  const availableEntries = entries.filter(entry => qsIsAppReadinessAvailable(entry))
+  const runningEntries = entries.filter(entry => qsGetAppReadinessState(entry) === 'running')
+  const validationEntries = entries.filter(entry => qsGetAppReadinessState(entry) === 'needs_validation')
+  const setupEntries = entries.filter((entry) => ['needs_setup', 'needs_prepare', 'blocked', 'error'].includes(qsGetAppReadinessState(entry)))
+
+  let lineState = 'unknown'
+  let lineText = 'Apps: checking status...'
+  let groupMetaText = ''
+
+  if (availableEntries.length === entries.length) {
+    lineState = 'ok'
+    if (entries.length === 1) {
+      lineText = `Apps: ${entries[0].name} is ready.`
+    } else {
+      lineText = `Apps: ${entries.map(entry => entry.name).join(' and ')} are ready.`
+    }
+    groupMetaText = runningEntries.length > 0 ? `${runningEntries.length} Running` : `${availableEntries.length} Ready`
+  } else if (availableEntries.length > 0) {
+    lineState = 'warn'
+    lineText = `Apps: ${entries.map(qsFormatAppReadinessSnippet).join('; ')}.`
+    groupMetaText = `${availableEntries.length} Ready`
+  } else if (validationEntries.length > 0) {
+    lineState = 'warn'
+    lineText = `Apps: ${entries.map(qsFormatAppReadinessSnippet).join('; ')}.`
+    groupMetaText = 'Validate'
+  } else if (setupEntries.length > 0) {
+    lineState = 'error'
+    lineText = `Apps: ${entries.map(qsFormatAppReadinessSnippet).join('; ')}.`
+    groupMetaText = 'Needs Setup'
+  } else {
+    lineState = 'unknown'
+    lineText = `Apps: ${entries.map(qsFormatAppReadinessSnippet).join('; ')}.`
+    groupMetaText = 'Checking'
+  }
+
+  if (appsLineEl) {
+    appsLineEl.textContent = lineText
+    appsLineEl.classList.remove('qs-readiness-apps-line--ok', 'qs-readiness-apps-line--warn', 'qs-readiness-apps-line--error', 'qs-readiness-apps-line--unknown')
+    appsLineEl.classList.add(`qs-readiness-apps-line--${lineState}`)
+    appsLineEl.title = entries.map((entry) => `${entry.name}: ${entry.summary}`).join(' | ')
+  }
+
+  if (appsGroupSummaryEl) {
+    appsGroupSummaryEl.classList.remove('d-none', 'qs-step-group-summary-meta--ok', 'qs-step-group-summary-meta--warn', 'qs-step-group-summary-meta--error', 'qs-step-group-summary-meta--unknown')
+    appsGroupSummaryEl.classList.add(`qs-step-group-summary-meta--${lineState}`)
+    appsGroupSummaryEl.textContent = groupMetaText
+    appsGroupSummaryEl.title = entries.map((entry) => `${entry.name}: ${entry.summary}`).join(' | ')
+  }
+
+  qsSetStepGroupIndicatorState(appsGroup, lineState)
+}
+
+function qsRefreshAppReadiness () {
+  qsRenderAppReadiness()
+}
+
+window.QS_refreshAppReadiness = qsRefreshAppReadiness
 
 ;(function qsMaintenancePoll () {
   if (qsSkipMaintenancePoll) return
@@ -1068,6 +1269,25 @@ window.QS_handleLogscanReingestStatus = qsHandleLogscanReingestStatus
   }
   setTimeout(poll, 1600)
   setInterval(poll, QS_MAINTENANCE_TOAST_INTERVAL_MS)
+})()
+
+;(function qsAppReadinessPoll () {
+  const poll = () => {
+    if (!qsShouldPollBackgroundState() || qsAppReadinessPollInFlight) return
+    qsAppReadinessPollInFlight = true
+    fetch('/workspace_app_readiness')
+      .then(res => res.json())
+      .then((data) => {
+        qsLatestAppReadiness = data
+        qsRenderAppReadiness()
+      })
+      .catch(() => {})
+      .finally(() => {
+        qsAppReadinessPollInFlight = false
+      })
+  }
+  setTimeout(poll, 900)
+  setInterval(poll, QS_APP_READINESS_POLL_INTERVAL_MS)
 })()
 
 ;(function qsBackgroundJobsPoll () {
@@ -1184,6 +1404,7 @@ function qsCurrentStepHasMeaningfulInput () {
     '070-notifiarr': ['notifiarr_apikey'],
     '080-gotify': ['gotify_url', 'gotify_token'],
     '085-ntfy': ['ntfy_url', 'ntfy_token', 'ntfy_topic'],
+    '087-apprise': ['apprise_location'],
     '110-radarr': ['radarr_url', 'radarr_token'],
     '120-sonarr': ['sonarr_url', 'sonarr_token'],
     '130-trakt': ['trakt_client_id', 'trakt_client_secret', 'trakt_pin', 'trakt_access_token', 'trakt_refresh_token'],
@@ -1840,6 +2061,36 @@ function qsRefreshWorkspaceStatus (options = {}) {
   return Promise.resolve(null)
 }
 
+function qsApplyActiveConfigUi (name, options = {}) {
+  const nextName = String(name || '').trim()
+  if (!nextName) return
+
+  document.querySelectorAll('.qs-config-switch-trigger[data-current]').forEach((trigger) => {
+    trigger.dataset.current = nextName
+  })
+  document.querySelectorAll('.qs-main-page-meta-value').forEach((label) => {
+    label.textContent = nextName
+  })
+
+  const activeConfigInput = document.getElementById('qs-active-config-input')
+  if (activeConfigInput) activeConfigInput.value = nextName
+
+  const configSelector = document.getElementById('configSelector')
+  if (configSelector) configSelector.value = nextName
+
+  const configSwitchSelect = document.getElementById('configSwitchSelect')
+  if (configSwitchSelect) configSwitchSelect.value = nextName
+
+  if (window.pageInfo) window.pageInfo.config_name = nextName
+
+  const workspaceStatus = options && typeof options === 'object' ? options.workspaceStatus : null
+  if (workspaceStatus && typeof qsApplyWorkspaceStatus === 'function') {
+    qsApplyWorkspaceStatus(Object.assign({ success: true, config_name: nextName }, workspaceStatus))
+  } else {
+    qsRefreshWorkspaceStatus({ immediate: true, configName: nextName })
+  }
+}
+
 let qsBulkValidationRequest = null
 
 function qsGetBulkSummaryCounts (summary) {
@@ -2355,6 +2606,7 @@ window.QSWorkspaceStatus = {
   apply: qsApplyWorkspaceStatus,
   recalculateFromSidebar: qsRecalculateReadinessFromSidebar
 }
+window.qsApplyActiveConfigUi = qsApplyActiveConfigUi
 
 document.addEventListener('qs:workspace-data-changed', (event) => {
   const detail = (event && event.detail) || {}
@@ -2393,11 +2645,12 @@ function trackModifiedSelects () {
 }
 
 function restartQuickstart (reason) {
-  const payload = (typeof reason === 'string' && reason.trim()) ? { reason: reason.trim() } : null
-  const options = { method: 'POST' }
-  if (payload) {
-    options.headers = { 'Content-Type': 'application/json' }
-    options.body = JSON.stringify(payload)
+  const payload = { nonce: window.pageInfo?.restart_nonce }
+  if (typeof reason === 'string' && reason.trim()) payload.reason = reason.trim()
+  const options = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
   }
   fetch('/restart', options)
     .then(res => res.json())
@@ -2700,25 +2953,46 @@ document.addEventListener('DOMContentLoaded', () => {
       body: formData,
       cache: 'no-store',
       credentials: 'same-origin',
-      headers: { Accept: 'text/html' }
+      headers: {
+        Accept: 'application/json',
+        'X-QS-Autosave-Only': '1'
+      }
     })
-    const text = await response.text()
-    if (!response.ok || text.includes('Invalid values:')) {
+    const payload = await response.json().catch(() => null)
+    if (!response.ok || !payload || payload.success !== true) {
       throw new Error('Current page could not be saved. Fix validation errors before switching configs.')
     }
     return { saved: true, skipped: false }
   }
 
   if (select) {
-    modalEl.addEventListener('show.bs.modal', () => {
+    select.dataset.qsPendingTarget = select.value || ''
+    select.addEventListener('change', () => {
+      select.dataset.qsPendingTarget = select.value || ''
+    })
+    configTriggers.forEach((trigger) => {
+      if (!trigger || trigger.dataset.qsConfigSwitchBound === 'true') return
+      trigger.dataset.qsConfigSwitchBound = 'true'
+      trigger.addEventListener('click', () => {
+        const current = getCurrentConfig()
+        if (current) {
+          select.value = current
+          select.dataset.qsPendingTarget = current
+        }
+      })
+    })
+    modalEl.addEventListener('hidden.bs.modal', () => {
       const current = getCurrentConfig()
-      if (current) select.value = current
+      if (current) {
+        select.value = current
+        select.dataset.qsPendingTarget = current
+      }
     })
   }
 
   if (confirmBtn && select) {
     confirmBtn.addEventListener('click', async () => {
-      const target = select.value
+      const target = String(select.dataset.qsPendingTarget || select.value || '').trim()
       const current = getCurrentConfig()
       if (!target || target === current) {
         const modal = bootstrap.Modal.getInstance(modalEl)
@@ -2746,30 +3020,25 @@ document.addEventListener('DOMContentLoaded', () => {
           throw new Error(data.message || 'Failed to switch configs.')
         }
         const nextName = data.name || target
-        configTriggers.forEach((trigger) => {
-          if (trigger && trigger.dataset) {
-            trigger.dataset.current = nextName
-          }
-        })
-        document.querySelectorAll('.qs-main-page-meta-value').forEach((node) => {
-          node.textContent = nextName
-        })
-        const activeConfigInput = document.getElementById('qs-active-config-input')
-        if (activeConfigInput) {
-          activeConfigInput.value = nextName
+        qsApplyActiveConfigUi(nextName, { workspaceStatus: data.workspace_status })
+        const modal = bootstrap.Modal.getInstance(modalEl)
+        if (modal) modal.hide()
+        try {
+          showToast('success', `Switched to config "${nextName}".`)
+        } catch (toastErr) {
+          // Navigation should not depend on toast rendering.
         }
-        if (window.pageInfo) {
-          window.pageInfo.config_name = nextName
-        }
-        if (data.workspace_status && typeof qsApplyWorkspaceStatus === 'function') {
-          qsApplyWorkspaceStatus(Object.assign({ success: true, config_name: nextName }, data.workspace_status))
-        } else {
-          qsRefreshWorkspaceStatus({ immediate: true, configName: nextName })
-        }
-        showToast('success', `Switched to config "${nextName}".`)
         const nextConfig = encodeURIComponent(nextName)
         const nextUrl = `${window.location.pathname}?config_name=${nextConfig}`
-        setTimeout(() => window.location.assign(nextUrl), 150)
+        if (window.history && typeof window.history.replaceState === 'function') {
+          window.history.replaceState(null, '', nextUrl)
+        }
+        const navigate = () => window.location.replace(nextUrl)
+        if (typeof window.requestAnimationFrame === 'function') {
+          window.requestAnimationFrame(navigate)
+        } else {
+          navigate()
+        }
       } catch (err) {
         window.QS_SWITCHING_CONFIG = false
         confirmBtn.disabled = false
@@ -3212,7 +3481,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
         setStatus('Restarting Quickstart...', false)
         showToast('info', 'Restarting Quickstart...')
-        await fetch('/restart', { method: 'POST' })
+        await fetch('/restart', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nonce: window.pageInfo?.restart_nonce })
+        })
 
         if (data.theme) {
           document.documentElement.setAttribute('data-theme', data.theme)
@@ -3618,6 +3891,90 @@ document.addEventListener('DOMContentLoaded', () => {
 
   if (refreshBtn) refreshBtn.addEventListener('click', loadSupportInfo)
   if (copyBtn) copyBtn.addEventListener('click', copySupportInfo)
+})
+
+document.addEventListener('DOMContentLoaded', () => {
+  if (typeof bootstrap === 'undefined' || !bootstrap.Modal || !document.body) return
+
+  function ensureModalRoot (modalEl) {
+    if (!modalEl) return modalEl
+    const modalId = modalEl.id
+    modalEl.dataset.qsModalRoot = 'true'
+    if (modalId) {
+      const bodyModal = Array.from(document.body.querySelectorAll('[data-qs-modal-root]'))
+        .find(el => el.id === modalId && el !== modalEl)
+      if (bodyModal) {
+        if (modalEl.parentElement) modalEl.remove()
+        return bodyModal
+      }
+    }
+    if (modalEl.parentElement !== document.body) {
+      document.body.appendChild(modalEl)
+    }
+    return modalEl
+  }
+
+  function syncModalBackdrop (modalEl) {
+    if (!modalEl) return
+    modalEl.style.zIndex = '2000'
+    modalEl.style.pointerEvents = 'auto'
+    modalEl.removeAttribute('inert')
+
+    const dialog = modalEl.querySelector('.modal-dialog')
+    if (dialog) dialog.style.pointerEvents = 'auto'
+
+    const content = modalEl.querySelector('.modal-content')
+    if (content) content.style.pointerEvents = 'auto'
+
+    const latestBackdrop = Array.from(document.querySelectorAll('.modal-backdrop')).at(-1)
+    if (latestBackdrop) latestBackdrop.style.zIndex = '1990'
+  }
+
+  function cleanupModalBackdrops () {
+    if (document.querySelector('.modal.show')) return
+    document.querySelectorAll('.modal-backdrop').forEach(backdrop => backdrop.remove())
+  }
+
+  function prepareModal (modalEl) {
+    if (!modalEl) return modalEl
+    modalEl = ensureModalRoot(modalEl)
+    if (modalEl.dataset.qsModalPrepared === 'true') return modalEl
+    modalEl.dataset.qsModalPrepared = 'true'
+    modalEl.addEventListener('show.bs.modal', () => {
+      syncModalBackdrop(modalEl)
+      requestAnimationFrame(() => syncModalBackdrop(modalEl))
+    })
+    modalEl.addEventListener('shown.bs.modal', () => {
+      syncModalBackdrop(modalEl)
+    })
+    modalEl.addEventListener('hidden.bs.modal', () => {
+      cleanupModalBackdrops()
+    })
+    return modalEl
+  }
+
+  function resolveModalFromTrigger (trigger) {
+    if (!trigger) return null
+    const selector = trigger.getAttribute('data-bs-target') || trigger.getAttribute('href')
+    if (!selector || !selector.startsWith('#')) return null
+    return document.querySelector(selector)
+  }
+
+  document.querySelectorAll('.modal').forEach(prepareModal)
+
+  document.addEventListener('click', event => {
+    const trigger = event.target.closest('[data-bs-toggle="modal"]')
+    if (!trigger) return
+    prepareModal(resolveModalFromTrigger(trigger))
+  })
+
+  document.addEventListener('show.bs.modal', event => {
+    const modalEl = event.target instanceof window.Element && event.target.classList.contains('modal')
+      ? event.target
+      : null
+    if (!modalEl) return
+    prepareModal(modalEl)
+  })
 })
 
 document.addEventListener('DOMContentLoaded', () => {

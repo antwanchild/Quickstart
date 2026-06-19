@@ -15,6 +15,7 @@ SIMPLE_SECTIONS = {
     "notifiarr",
     "gotify",
     "ntfy",
+    "apprise",
     "github",
     "radarr",
     "sonarr",
@@ -24,6 +25,44 @@ SIMPLE_SECTIONS = {
     "webhooks",
     "settings",
     "playlist_files",
+}
+
+LIBRARY_RADARR_IMPORT_FIELDS = {
+    "url": "string",
+    "token": "string",
+    "root_folder_path": "string",
+    "quality_profile": "string",
+    "availability": "string",
+    "tag": "string",
+    "monitor": "bool",
+    "search": "bool",
+    "add_missing": "bool",
+    "add_existing": "bool",
+    "upgrade_existing": "bool",
+    "monitor_existing": "bool",
+    "ignore_cache": "bool",
+    "radarr_path": "string",
+    "plex_path": "string",
+}
+LIBRARY_SONARR_IMPORT_FIELDS = {
+    "url": "string",
+    "token": "string",
+    "root_folder_path": "string",
+    "quality_profile": "string",
+    "language_profile": "string",
+    "series_type": "string",
+    "season_folder": "bool",
+    "monitor": "string",
+    "tag": "string",
+    "search": "bool",
+    "cutoff_search": "bool",
+    "add_missing": "bool",
+    "add_existing": "bool",
+    "upgrade_existing": "bool",
+    "monitor_existing": "bool",
+    "ignore_cache": "bool",
+    "sonarr_path": "string",
+    "plex_path": "string",
 }
 
 
@@ -324,6 +363,25 @@ def _collect_template_keys(template_vars: Any) -> set[str]:
     return keys
 
 
+def _has_template_string_list_values(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, list):
+        return any(str(item).strip() for item in value if item is not None)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return False
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            return any(str(item).strip() for item in parsed if item is not None)
+        return True
+    return bool(value)
+
+
 def _build_collection_index(collection_config: list[dict]) -> tuple[dict[str, dict], dict[str, str]]:
     by_id: dict[str, dict] = {}
     by_alias: dict[str, str] = {}
@@ -380,10 +438,15 @@ def _build_overlay_index(overlay_config: list[dict]) -> tuple[dict[str, dict], d
             alias = oid.replace("overlay_", "", 1)
             by_alias[alias] = oid
             if input_type == "radio" and radio_group and "value" in overlay:
+                radio_value = overlay.get("value")
                 radio_map[oid] = {
                     "group_name": str(radio_group),
-                    "value": overlay.get("value"),
+                    "value": radio_value,
                 }
+                if isinstance(radio_value, str):
+                    radio_alias = radio_value.strip()
+                    if radio_alias:
+                        by_alias[radio_alias] = oid
     return by_id, by_alias, radio_map
 
 
@@ -661,6 +724,18 @@ def _flatten_dict(base: str, payload: Any, report: ImportReport, max_depth: int 
         report.add("imported", base)
 
 
+def _coerce_import_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1", "on"}:
+            return True
+        if lowered in {"false", "no", "0", "off"}:
+            return False
+    return None
+
+
 def prepare_import_payload(
     config_data: dict,
     plex_movie_names: set[str],
@@ -677,6 +752,92 @@ def prepare_import_payload(
 
     collection_by_id, collection_by_alias = _build_collection_index(collection_config)
     overlay_by_id, overlay_by_alias, overlay_radio = _build_overlay_index(overlay_config)
+    language_weight_template_keys = {
+        f"weight_{key}"
+        for key in {
+            "en",
+            "de",
+            "fr",
+            "es",
+            "pt",
+            "ja",
+            "ko",
+            "zh",
+            "da",
+            "ru",
+            "it",
+            "hi",
+            "te",
+            "fa",
+            "th",
+            "nl",
+            "no",
+            "is",
+            "sv",
+            "tr",
+            "pl",
+            "cs",
+            "uk",
+            "hu",
+            "ar",
+            "bg",
+            "bn",
+            "bs",
+            "ca",
+            "cy",
+            "el",
+            "et",
+            "eu",
+            "fi",
+            "tl",
+            "fil",
+            "gl",
+            "he",
+            "hr",
+            "id",
+            "ka",
+            "kk",
+            "kn",
+            "la",
+            "lt",
+            "lv",
+            "mk",
+            "ml",
+            "mr",
+            "ms",
+            "nb",
+            "nn",
+            "pa",
+            "ro",
+            "sk",
+            "sl",
+            "sq",
+            "sr",
+            "so",
+            "sw",
+            "ta",
+            "ur",
+            "ay",
+            "ga",
+            "li",
+            "kh",
+            "vi",
+            "mn",
+            "af",
+            "bm",
+            "ln",
+            "wo",
+            "lo",
+            "myn",
+            "iu",
+            "rom",
+            "am",
+            "su",
+            "zu",
+            "lb",
+            "mos",
+        }
+    }
     (
         template_vars,
         simple_attrs,
@@ -981,6 +1142,31 @@ def prepare_import_payload(
         if section == "playlist_files":
             continue
 
+        if section == "apprise":
+            apprise_location = None
+            if isinstance(section_payload, dict):
+                if "config" in section_payload:
+                    apprise_location = section_payload.get("config")
+                elif "location" in section_payload:
+                    apprise_location = section_payload.get("location")
+                elif "apprise" in section_payload:
+                    nested_apprise = section_payload.get("apprise")
+                    if isinstance(nested_apprise, dict):
+                        apprise_location = nested_apprise.get("config") or nested_apprise.get("location")
+                    else:
+                        apprise_location = nested_apprise
+            elif isinstance(section_payload, str):
+                apprise_location = section_payload
+
+            apprise_location = str(apprise_location).strip() if apprise_location is not None else ""
+            if apprise_location:
+                normalized_apprise = {"location": apprise_location}
+                payload[section] = {section: normalized_apprise}
+                _flatten_dict(section, normalized_apprise, report)
+            else:
+                report.add("unmapped", section, "Unsupported section format.")
+            continue
+
         if isinstance(section_payload, dict):
             if section == "settings":
                 asset_directory = section_payload.get("asset_directory")
@@ -1085,14 +1271,27 @@ def prepare_import_payload(
             # Collections
             collection_files = lib_cfg.get("collection_files")
             if isinstance(collection_files, list):
+                imported_collection_files = []
                 for idx, entry in enumerate(collection_files):
                     default_value = None
                     template_values = None
+                    raw_entry_type = None
+                    raw_entry_location = None
                     if isinstance(entry, dict):
                         default_value = entry.get("default")
                         template_values = entry.get("template_variables")
+                        for candidate in ("file", "folder", "url", "git", "repo"):
+                            location = entry.get(candidate)
+                            if location:
+                                raw_entry_type = candidate
+                                raw_entry_location = str(location)
+                                break
                     elif isinstance(entry, str):
                         default_value = entry
+                    if raw_entry_type and raw_entry_location:
+                        imported_collection_files.append({"type": raw_entry_type, "location": raw_entry_location})
+                        report.add("imported", f"libraries.{lib_name}.collection_files[{idx}].{raw_entry_type}")
+                        continue
                     if not default_value:
                         report.add("unmapped", f"libraries.{lib_name}.collection_files[{idx}]", "Missing default.")
                         continue
@@ -1134,6 +1333,12 @@ def prepare_import_payload(
                                     "imported",
                                     f"libraries.{lib_name}.collection_files[{idx}].template_variables.data",
                                 )
+                        if _has_template_string_list_values(expanded_template_values.get("include")) and _has_template_string_list_values(expanded_template_values.get("exclude")):
+                            report.add(
+                                "skipped",
+                                f"libraries.{lib_name}.collection_files[{idx}].template_variables.include_exclude_warning",
+                                "Warning - include and exclude were both imported. Kometa code allows this, but the wiki says not to combine them.",
+                            )
                         for key, value in expanded_template_values.items():
                             if key in allowed:
                                 child_name = f"{lib_id}-template_collection_{clean_id}_{key}"
@@ -1152,25 +1357,43 @@ def prepare_import_payload(
                                     "Template variable not available in Quickstart.",
                                 )
 
+                if imported_collection_files:
+                    libraries_data[f"{lib_id}-collection_files"] = json.dumps(imported_collection_files, ensure_ascii=True)
+                    report.add("imported", f"libraries.{lib_name}.collection_files")
+
             elif collection_files is not None:
                 report.add("unmapped", f"libraries.{lib_name}.collection_files", "Unsupported collection_files format.")
 
             # Overlays
             overlay_files = lib_cfg.get("overlay_files")
             if isinstance(overlay_files, list):
+                imported_overlay_files = []
                 for idx, entry in enumerate(overlay_files):
                     default_value = None
                     template_values = None
                     builder_level = builder_default
+                    raw_entry_type = None
+                    raw_entry_location = None
                     if isinstance(entry, dict):
                         default_value = entry.get("default")
                         template_values = entry.get("template_variables")
+                        for candidate in ("file", "folder", "url", "git", "repo"):
+                            location = entry.get(candidate)
+                            if location:
+                                raw_entry_type = candidate
+                                raw_entry_location = str(location)
+                                break
                         if isinstance(template_values, dict) and "builder_level" in template_values:
                             level = template_values.get("builder_level")
                             if level in {"show", "season", "episode"}:
                                 builder_level = level
                     elif isinstance(entry, str):
                         default_value = entry
+
+                    if raw_entry_type and raw_entry_location:
+                        imported_overlay_files.append({"type": raw_entry_type, "location": raw_entry_location})
+                        report.add("imported", f"libraries.{lib_name}.overlay_files[{idx}].{raw_entry_type}")
+                        continue
 
                     if not default_value:
                         report.add("unmapped", f"libraries.{lib_name}.overlay_files[{idx}]", "Missing default.")
@@ -1222,6 +1445,9 @@ def prepare_import_payload(
 
                     if isinstance(template_values, dict):
                         allowed = _collect_template_keys(overlay_meta.get("template_variables"))
+                        if overlay_id in {"overlay_languages", "overlay_languages_subtitles"}:
+                            allowed = set(allowed)
+                            allowed.update(language_weight_template_keys)
                         for key, value in template_values.items():
                             if key not in allowed:
                                 if key == "builder_level":
@@ -1239,8 +1465,58 @@ def prepare_import_payload(
                                 f"libraries.{lib_name}.overlay_files[{idx}].template_variables.{key}",
                             )
 
+                if imported_overlay_files:
+                    libraries_data[f"{lib_id}-overlay_files"] = json.dumps(imported_overlay_files, ensure_ascii=True)
+                    report.add("imported", f"libraries.{lib_name}.overlay_files")
+
             elif overlay_files is not None:
                 report.add("unmapped", f"libraries.{lib_name}.overlay_files", "Unsupported overlay_files format.")
+
+            metadata_files = lib_cfg.get("metadata_files")
+            if isinstance(metadata_files, list):
+                imported_metadata_files = []
+                for idx, entry in enumerate(metadata_files):
+                    entry_type = None
+                    location = None
+                    if isinstance(entry, dict):
+                        if "file" in entry:
+                            entry_type = "file"
+                            location = entry.get("file")
+                        elif "folder" in entry:
+                            entry_type = "folder"
+                            location = entry.get("folder")
+                        elif "git" in entry:
+                            entry_type = "git"
+                            location = entry.get("git")
+                        elif "repo" in entry:
+                            entry_type = "repo"
+                            location = entry.get("repo")
+                        elif "url" in entry:
+                            entry_type = "url"
+                            location = entry.get("url")
+                    if entry_type not in {"file", "folder", "url", "git", "repo"}:
+                        report.add(
+                            "unmapped",
+                            f"libraries.{lib_name}.metadata_files[{idx}]",
+                            "Only file, folder, url, git, and repo metadata files are supported.",
+                        )
+                        continue
+                    location = str(location or "").strip()
+                    if not location:
+                        report.add(
+                            "unmapped",
+                            f"libraries.{lib_name}.metadata_files[{idx}]",
+                            "Metadata file location is required.",
+                        )
+                        continue
+                    imported_metadata_files.append({"type": entry_type, "location": location})
+                    report.add("imported", f"libraries.{lib_name}.metadata_files[{idx}].{entry_type}")
+
+                if imported_metadata_files:
+                    libraries_data[f"{lib_id}-metadata_files"] = json.dumps(imported_metadata_files, ensure_ascii=True)
+                    report.add("imported", f"libraries.{lib_name}.metadata_files")
+            elif metadata_files is not None:
+                report.add("unmapped", f"libraries.{lib_name}.metadata_files", "Unsupported metadata_files format.")
 
             # Library settings
             settings_section = lib_cfg.get("settings")
@@ -1301,6 +1577,53 @@ def prepare_import_payload(
             elif settings_section is not None:
                 report.add("unmapped", f"libraries.{lib_name}.settings", "Unsupported settings format.")
 
+            for service_name, field_map in (
+                ("radarr", LIBRARY_RADARR_IMPORT_FIELDS),
+                ("sonarr", LIBRARY_SONARR_IMPORT_FIELDS),
+            ):
+                service_section = lib_cfg.get(service_name)
+                if not isinstance(service_section, dict):
+                    if service_section is not None:
+                        report.add("unmapped", f"libraries.{lib_name}.{service_name}", "Unsupported service override format.")
+                    continue
+
+                imported_service = False
+                if service_name == "radarr" and not str(lib_id).startswith("mov-library_"):
+                    report.add("unmapped", f"libraries.{lib_name}.radarr", "Radarr overrides are only supported on movie libraries.")
+                    continue
+                if service_name == "sonarr" and not str(lib_id).startswith("sho-library_"):
+                    report.add("unmapped", f"libraries.{lib_name}.sonarr", "Sonarr overrides are only supported on show libraries.")
+                    continue
+
+                for key, value in service_section.items():
+                    field_type = field_map.get(str(key))
+                    if not field_type:
+                        report.add("unmapped", f"libraries.{lib_name}.{service_name}.{key}", "Library service override not supported for import.")
+                        continue
+
+                    target_key = f"{lib_id}-attribute_{service_name}_{key}"
+                    if field_type == "bool":
+                        bool_value = _coerce_import_bool(value)
+                        if bool_value is None:
+                            report.add("unmapped", f"libraries.{lib_name}.{service_name}.{key}", "Invalid boolean value.")
+                            continue
+                        libraries_data[target_key] = "true" if bool_value else "false"
+                    else:
+                        if isinstance(value, (dict, list)):
+                            report.add("unmapped", f"libraries.{lib_name}.{service_name}.{key}", "Unsupported override value format.")
+                            continue
+                        text_value = str(value).strip()
+                        if not text_value:
+                            report.add("unmapped", f"libraries.{lib_name}.{service_name}.{key}", "Override value is empty.")
+                            continue
+                        libraries_data[target_key] = text_value
+
+                    report.add("imported", f"libraries.{lib_name}.{service_name}.{key}")
+                    imported_service = True
+
+                if imported_service:
+                    report.add("imported", f"libraries.{lib_name}.{service_name}")
+
             # Operations
             operations = lib_cfg.get("operations")
             if isinstance(operations, dict):
@@ -1336,7 +1659,7 @@ def prepare_import_payload(
             elif operations is not None:
                 report.add("unmapped", f"libraries.{lib_name}.operations", "Unsupported operations format.")
 
-            handled_keys = {"collection_files", "overlay_files", "template_variables", "settings", "operations"}
+            handled_keys = {"collection_files", "overlay_files", "metadata_files", "template_variables", "settings", "operations", "radarr", "sonarr"}
             handled_keys.update(top_level_map.keys())
             for key in lib_cfg.keys():
                 if key in handled_keys:

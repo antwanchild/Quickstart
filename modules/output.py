@@ -17,7 +17,47 @@ from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import PlainScalarString
 from ruamel.yaml.comments import CommentedSeq
 
+_EMPTY_OUTPUT = object()
+
 from modules import helpers, persistence, database
+
+LIBRARY_RADARR_FIELDS = {
+    "url": "string",
+    "token": "string",
+    "root_folder_path": "string",
+    "quality_profile": "string",
+    "availability": "string",
+    "tag": "string",
+    "monitor": "bool",
+    "search": "bool",
+    "add_missing": "bool",
+    "add_existing": "bool",
+    "upgrade_existing": "bool",
+    "monitor_existing": "bool",
+    "ignore_cache": "bool",
+    "radarr_path": "string",
+    "plex_path": "string",
+}
+LIBRARY_SONARR_FIELDS = {
+    "url": "string",
+    "token": "string",
+    "root_folder_path": "string",
+    "quality_profile": "string",
+    "language_profile": "string",
+    "series_type": "string",
+    "season_folder": "bool",
+    "monitor": "string",
+    "tag": "string",
+    "search": "bool",
+    "cutoff_search": "bool",
+    "add_missing": "bool",
+    "add_existing": "bool",
+    "upgrade_existing": "bool",
+    "monitor_existing": "bool",
+    "ignore_cache": "bool",
+    "sonarr_path": "string",
+    "plex_path": "string",
+}
 
 
 def add_border_to_ascii_art(art):
@@ -257,6 +297,87 @@ def _parse_string_list(value):
                 return _coerce_string_list(parsed)
         return _coerce_string_list([stripped])
     return _coerce_string_list([value])
+
+
+def _parse_comma_string_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return _coerce_string_list(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = json.loads(stripped)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                return _coerce_string_list(parsed)
+            try:
+                parsed = ast.literal_eval(stripped)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                return _coerce_string_list(parsed)
+        return _coerce_string_list(part.strip() for part in stripped.split(","))
+    return _coerce_string_list([value])
+
+
+def _parse_string_list_mapping(value):
+    if value is None:
+        return {}
+    parsed = value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return {}
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(stripped)
+            except Exception:
+                parsed = None
+    if not isinstance(parsed, dict):
+        return {}
+
+    normalized = {}
+    for raw_key, raw_values in parsed.items():
+        key_text = str(raw_key or "").strip()
+        if not key_text:
+            continue
+        values = _parse_comma_string_list(raw_values)
+        if values:
+            normalized[key_text] = values
+    return normalized
+
+
+def _normalize_collection_template_var_value(key, value):
+    if key in {"ignore_ids", "ignore_imdb_ids"}:
+        list_values = _parse_string_list(value)
+        return ",".join(list_values) if list_values else None
+    if key in {"append_include"}:
+        list_values = _parse_string_list(value)
+        return list_values if list_values else None
+    if key in {"addons", "append_addons"}:
+        mapping_values = _parse_string_list_mapping(value)
+        return mapping_values if mapping_values else None
+    if key == "remove_suffix":
+        list_values = _parse_comma_string_list(value)
+        return ",".join(list_values) if list_values else None
+    if key in {"radarr_tag", "sonarr_tag", "item_radarr_tag", "item_sonarr_tag"}:
+        list_values = _parse_string_list(value)
+        return list_values if list_values else None
+    return value
+
+
+def _normalize_settings_section_value(key, value):
+    if key in {"ignore_ids", "ignore_imdb_ids"}:
+        list_values = _parse_string_list(value)
+        return ",".join(list_values) if list_values else None
+    return value
 
 
 def _normalize_asset_directory_entry(value):
@@ -796,7 +917,12 @@ def optimize_template_variables(config_data, library_types=None):
         entry["template_variables"] = ordered
 
     libraries_section = config_data.get("libraries", {})
-    libraries = libraries_section.get("libraries")
+    if isinstance(libraries_section, dict) and isinstance(libraries_section.get("libraries"), dict):
+        libraries = libraries_section.get("libraries")
+    elif isinstance(libraries_section, dict):
+        libraries = libraries_section
+    else:
+        libraries = None
     if not isinstance(libraries, dict):
         return config_data
 
@@ -909,7 +1035,13 @@ def _collapse_collection_data_template_vars(config_data):
     if not isinstance(config_data, dict):
         return config_data
     libraries_section = config_data.get("libraries", {})
-    libraries = libraries_section.get("libraries")
+    libraries = None
+    if isinstance(libraries_section, dict):
+        nested = libraries_section.get("libraries")
+        if isinstance(nested, dict):
+            libraries = nested
+        else:
+            libraries = libraries_section
     if not isinstance(libraries, dict):
         return config_data
     for library_data in libraries.values():
@@ -952,15 +1084,154 @@ def _collapse_collection_data_template_vars(config_data):
     return config_data
 
 
+def _normalize_legacy_collection_template_vars(config_data):
+    if not isinstance(config_data, dict):
+        return config_data
+    libraries_section = config_data.get("libraries", {})
+    libraries = None
+    if isinstance(libraries_section, dict):
+        nested = libraries_section.get("libraries")
+        if isinstance(nested, dict):
+            libraries = nested
+        else:
+            libraries = libraries_section
+    if not isinstance(libraries, dict):
+        return config_data
+
+    letterboxd_key_map = {
+        "use_top_250": "use_top_500",
+        "radarr_add_missing_top_250": "radarr_add_missing_top_500",
+        "visible_home_top_250": "visible_home_top_500",
+        "visible_library_top_250": "visible_library_top_500",
+        "visible_shared_top_250": "visible_shared_top_500",
+        "limit_top_250": "limit_top_500",
+    }
+
+    for library_data in libraries.values():
+        if not isinstance(library_data, dict):
+            continue
+        collection_files = library_data.get("collection_files")
+        if not isinstance(collection_files, list):
+            continue
+        for entry in collection_files:
+            if not isinstance(entry, dict) or entry.get("default") != "letterboxd":
+                continue
+            template_vars = entry.get("template_variables")
+            if not isinstance(template_vars, dict):
+                continue
+            for old_key, new_key in letterboxd_key_map.items():
+                if old_key not in template_vars or new_key in template_vars:
+                    continue
+                template_vars[new_key] = template_vars.pop(old_key)
+    return config_data
+
+
+def _parse_metadata_file_entries(raw_value):
+    if isinstance(raw_value, list):
+        entries = raw_value
+    elif isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return []
+        try:
+            entries = json.loads(text)
+        except Exception:
+            return []
+    else:
+        return []
+
+    if not isinstance(entries, list):
+        return []
+
+    normalized = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = str(entry.get("type") or "").strip().lower()
+        location = str(entry.get("location") or "").strip()
+        if entry_type not in {"file", "folder", "url", "git", "repo"} or not location:
+            continue
+        normalized.append({entry_type: location})
+
+    normalized.sort(key=lambda item: (next(iter(item.keys())), next(iter(item.values())).casefold()))
+    return normalized
+
+
+def _parse_collection_file_block_entries(raw_value):
+    if isinstance(raw_value, list):
+        entries = raw_value
+    elif isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return []
+        try:
+            entries = json.loads(text)
+        except Exception:
+            return []
+    else:
+        return []
+
+    if not isinstance(entries, list):
+        return []
+
+    normalized = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = str(entry.get("type") or "").strip().lower()
+        location = str(entry.get("location") or "").strip()
+        if entry_type not in {"file", "folder", "url", "git", "repo"} or not location:
+            continue
+        normalized.append({entry_type: location})
+
+    normalized.sort(key=lambda item: (next(iter(item.keys())), next(iter(item.values())).casefold()))
+    return normalized
+
+
+def _parse_overlay_file_block_entries(raw_value):
+    if isinstance(raw_value, list):
+        entries = raw_value
+    elif isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return []
+        try:
+            entries = json.loads(text)
+        except Exception:
+            return []
+    else:
+        return []
+
+    if not isinstance(entries, list):
+        return []
+
+    normalized = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = str(entry.get("type") or "").strip().lower()
+        location = str(entry.get("location") or "").strip()
+        if entry_type not in {"file", "folder", "url", "git", "repo"} or not location:
+            continue
+        normalized.append({entry_type: location})
+
+    normalized.sort(key=lambda item: (next(iter(item.keys())), next(iter(item.values())).casefold()))
+    return normalized
+
+
 def build_libraries_section(
     movie_libraries,
     show_libraries,
     movie_collections,
     show_collections,
+    movie_collection_files,
+    show_collection_files,
     movie_overlays,
     show_overlays,
     movie_attributes,
     show_attributes,
+    movie_metadata_files,
+    show_metadata_files,
     movie_templates,
     show_templates,
     movie_top_level,
@@ -1012,6 +1283,7 @@ def build_libraries_section(
             "sonarr_add_all",
         ]
         library_settings = {}
+        service_overrides = {}
         operations = {}
         attr_group = attributes.get(lib_id, {})
         # Begin: Mass Genre Update Section
@@ -1200,6 +1472,19 @@ def build_libraries_section(
             if value not in [None, "", False]:
                 operations[field] = value
 
+        service_field_map = LIBRARY_RADARR_FIELDS if library_type == "mov" else LIBRARY_SONARR_FIELDS
+        service_name = "radarr" if library_type == "mov" else "sonarr"
+        for field, field_type in service_field_map.items():
+            attr_key = f"{library_type}-library_{lib_id}-attribute_{service_name}_{field}"
+            value = attr_group.get(attr_key, None)
+            if field_type == "bool":
+                bool_value = _coerce_bool(value)
+                if bool_value is not None:
+                    service_overrides[field] = bool_value
+                continue
+            if value not in [None, "", False]:
+                service_overrides[field] = value
+
         # Handle nested delete_collections block
         delete_collections = {}
         configured_key = f"{library_type}-library_{lib_id}-attribute_delete_collections_configured"
@@ -1241,6 +1526,9 @@ def build_libraries_section(
         if library_settings:
             entry["settings"] = library_settings
 
+        if service_overrides:
+            entry[service_name] = service_overrides
+
         if operations:
             entry["operations"] = operations
 
@@ -1251,10 +1539,10 @@ def build_libraries_section(
             helpers.ts_log(f"collections keys for {collection_key}: {list(collections.get(collection_key, {}).keys())}", level="DEBUG")
             helpers.ts_log(f"templates keys for {collection_key}: {list(templates.get(collection_key, {}).keys())}", level="DEBUG")
 
-        if collection_key and collection_key in collections:
+        if collection_key:
             collection_files = []
 
-            for key, selected in collections[collection_key].items():
+            for key, selected in collections.get(collection_key, {}).items():
                 if "template_collection_" in key:
                     if app.config["QS_DEBUG"]:
                         helpers.ts_log(f"Skipping invalid collection key (template child): {key}", level="DEBUG")
@@ -1306,15 +1594,28 @@ def build_libraries_section(
                         if new_key not in template_vars:
                             template_vars[new_key] = template_vars[old_key]
                         template_vars.pop(old_key, None)
-                    if "exclude" in template_vars:
-                        exclude_values = _parse_string_list(template_vars.get("exclude"))
-                        if exclude_values:
-                            template_vars["exclude"] = exclude_values
+                    for list_key in ("include", "exclude", "exclude_prefix"):
+                        if list_key not in template_vars:
+                            continue
+                        list_values = _parse_string_list(template_vars.get(list_key))
+                        if list_values:
+                            template_vars[list_key] = list_values
                         else:
-                            template_vars.pop("exclude", None)
-                    file_entry["template_variables"] = template_vars
+                            template_vars.pop(list_key, None)
+                    for template_key in list(template_vars.keys()):
+                        normalized_value = _normalize_collection_template_var_value(template_key, template_vars.get(template_key))
+                        if normalized_value is None:
+                            template_vars.pop(template_key, None)
+                        else:
+                            template_vars[template_key] = normalized_value
+                    if template_vars:
+                        file_entry["template_variables"] = template_vars
 
                 collection_files.append(file_entry)
+
+            raw_collection_group = movie_collection_files.get(collection_key, {}) if library_type == "mov" else show_collection_files.get(collection_key, {})
+            library_prefix = library_key[: -len("-library")] if isinstance(library_key, str) and library_key.endswith("-library") else library_key
+            raw_collection_entries = _parse_collection_file_block_entries(raw_collection_group.get(f"{library_prefix}-collection_files"))
 
             if collection_files:
 
@@ -1323,6 +1624,11 @@ def build_libraries_section(
                     return default_name in {"collectionless", "collection_collectionless"} or default_name.endswith("collectionless")
 
                 collection_files.sort(key=lambda item: (is_collectionless(item)))
+
+            if raw_collection_entries:
+                collection_files.extend(raw_collection_entries)
+
+            if collection_files:
                 entry["collection_files"] = collection_files
 
             # Process Overlays
@@ -1584,6 +1890,91 @@ def build_libraries_section(
                         ordered[key] = tv[key]
                 overlay_entry["template_variables"] = ordered
 
+            default_language_flag_codes = ["en", "de", "fr", "es", "pt", "ja"]
+            default_language_flag_weights = {
+                "en": 610,
+                "de": 600,
+                "fr": 590,
+                "es": 580,
+                "pt": 570,
+                "ja": 560,
+                "ko": 550,
+                "zh": 540,
+                "da": 530,
+                "ru": 520,
+                "it": 510,
+                "hi": 500,
+                "te": 490,
+                "fa": 480,
+                "th": 470,
+                "nl": 460,
+                "no": 450,
+                "is": 440,
+                "sv": 430,
+                "tr": 420,
+                "pl": 410,
+                "cs": 400,
+                "uk": 390,
+                "hu": 380,
+                "ar": 370,
+                "bg": 360,
+                "bn": 350,
+                "bs": 340,
+                "ca": 330,
+                "cy": 320,
+                "el": 310,
+                "et": 300,
+                "eu": 290,
+                "fi": 280,
+                "tl": 270,
+                "fil": 265,
+                "gl": 260,
+                "he": 250,
+                "hr": 240,
+                "id": 230,
+                "ka": 220,
+                "kk": 210,
+                "kn": 200,
+                "la": 190,
+                "lt": 180,
+                "lv": 170,
+                "mk": 160,
+                "ml": 150,
+                "mr": 140,
+                "ms": 130,
+                "nb": 120,
+                "nn": 110,
+                "pa": 100,
+                "ro": 90,
+                "sk": 80,
+                "sl": 70,
+                "sq": 60,
+                "sr": 50,
+                "so": 45,
+                "sw": 40,
+                "ta": 30,
+                "ur": 20,
+                "ay": 19,
+                "ga": 18,
+                "li": 17,
+                "kh": 16,
+                "vi": 15,
+                "mn": 14,
+                "af": 13,
+                "bm": 12,
+                "ln": 11,
+                "wo": 10,
+                "lo": 9,
+                "myn": 8,
+                "iu": 7,
+                "rom": 6,
+                "am": 5,
+                "su": 4,
+                "zu": 3,
+                "lb": 2,
+                "mos": 1,
+            }
+
             if overlay_key and overlay_key in overlays:
                 raw_overlay_entries = overlays[overlay_key]
 
@@ -1630,7 +2021,14 @@ def build_libraries_section(
                             if not raw_key.startswith(full_key_prefix + "["):
                                 continue
                             var_name = raw_key[len(full_key_prefix) + 1 : -1]
-                            if isinstance(raw_value, str):
+                            if var_name == "languages":
+                                raw_value = _parse_string_list(raw_value)
+                            elif isinstance(var_name, str) and var_name.startswith("weight_"):
+                                try:
+                                    raw_value = int(str(raw_value).strip())
+                                except (TypeError, ValueError):
+                                    pass
+                            elif isinstance(raw_value, str):
                                 raw_value = True if raw_value.lower() == "true" else False if raw_value.lower() == "false" else raw_value
                             overlay_entry.setdefault("template_variables", {})[var_name] = raw_value
 
@@ -1700,7 +2098,14 @@ def build_libraries_section(
                             if not raw_key.startswith(full_key_prefix + "["):
                                 continue
                             var_name = raw_key[len(full_key_prefix) + 1 : -1]
-                            if isinstance(raw_value, str):
+                            if var_name == "languages":
+                                raw_value = _parse_string_list(raw_value)
+                            elif isinstance(var_name, str) and var_name.startswith("weight_"):
+                                try:
+                                    raw_value = int(str(raw_value).strip())
+                                except (TypeError, ValueError):
+                                    pass
+                            elif isinstance(raw_value, str):
                                 raw_value = True if raw_value.lower() == "true" else False if raw_value.lower() == "false" else raw_value
                             overlay_entry.setdefault("template_variables", {})[var_name] = raw_value
 
@@ -1727,16 +2132,72 @@ def build_libraries_section(
                             continue
                     if isinstance(default_name, str) and default_name in {"resolution", "overlay_resolution"}:
                         use_edition_val = tv.get("use_edition")
+                        use_resolution_val = tv.get("use_resolution")
                         if isinstance(use_edition_val, str):
                             use_edition_val = use_edition_val.lower() == "true"
+                        if isinstance(use_resolution_val, str):
+                            use_resolution_val = use_resolution_val.lower() == "true"
                         if use_edition_val is None:
                             tv["use_edition"] = True
                             use_edition_val = True
                         elif use_edition_val is False:
                             tv["use_edition"] = False
                             use_edition_val = False
+                        if use_resolution_val is None:
+                            tv["use_resolution"] = True
+                            use_resolution_val = True
+                        elif use_resolution_val is False:
+                            tv["use_resolution"] = False
+                            use_resolution_val = False
                         if use_edition_val is True:
-                            keep_keys = {"builder_level", "use_edition", "horizontal_offset", "vertical_offset"}
+                            resolution_levels = ["4k", "1080p", "720p", "576p", "480p"]
+                            resolution_variants = ["dvhdrplus", "dvhdr", "plus", "dv", "hlg", "hdr"]
+                            keep_keys = {
+                                "builder_level",
+                                "use_edition",
+                                "use_resolution",
+                                "use_4k",
+                                "use_1080p",
+                                "use_720p",
+                                "use_576p",
+                                "use_480p",
+                                "use_dv",
+                                "use_hlg",
+                                "use_hdr",
+                                "use_plus",
+                                "use_dvhdr",
+                                "use_dvhdrplus",
+                                "use_extended",
+                                "use_uncut",
+                                "use_unrated",
+                                "use_special",
+                                "use_anniversary",
+                                "use_collector",
+                                "use_diamond",
+                                "use_platinum",
+                                "use_directors",
+                                "use_final",
+                                "use_international",
+                                "use_theatrical",
+                                "use_ultimate",
+                                "use_alternate",
+                                "use_coda",
+                                "use_enhanced",
+                                "use_imax",
+                                "use_remastered",
+                                "use_criterion",
+                                "use_richarddonner",
+                                "use_blackchrome",
+                                "use_definitive",
+                                "use_openmatte",
+                                "use_ulysses",
+                                "use_producers",
+                                "horizontal_offset",
+                                "vertical_offset",
+                            }
+                            keep_keys.update(
+                                {f"use_{resolution_level}_{resolution_variant}" for resolution_level in resolution_levels for resolution_variant in resolution_variants}
+                            )
                             for key in list(tv.keys()):
                                 if key not in keep_keys:
                                     tv.pop(key, None)
@@ -1754,6 +2215,29 @@ def build_libraries_section(
                         if not tv:
                             ov.pop("template_variables", None)
                         continue
+                    if isinstance(default_name, str) and default_name in {"languages", "overlay_languages"}:
+                        languages_value = tv.get("languages")
+                        if languages_value is not None:
+                            normalized_languages = _parse_string_list(languages_value)
+                            if normalized_languages == default_language_flag_codes or not normalized_languages:
+                                tv.pop("languages", None)
+                            else:
+                                tv["languages"] = normalized_languages
+                        for key in list(tv.keys()):
+                            if not (isinstance(key, str) and key.startswith("weight_")):
+                                continue
+                            language_key = key[len("weight_") :]
+                            default_weight = default_language_flag_weights.get(language_key)
+                            try:
+                                numeric_value = int(str(tv.get(key)).strip())
+                            except (TypeError, ValueError):
+                                continue
+                            tv[key] = numeric_value
+                            if default_weight is not None and numeric_value == default_weight:
+                                tv.pop(key, None)
+                        if not tv:
+                            ov.pop("template_variables", None)
+                            continue
                     if isinstance(default_name, str) and default_name in {"aspect", "video_format", "overlay_aspect", "overlay_video_format"}:
                         tv.pop("text", None)
                         if not tv:
@@ -1815,7 +2299,23 @@ def build_libraries_section(
 
                         overlay_entries.sort(key=overlay_sort_key)
 
+                overlay_library_prefix = library_key[: -len("-library")] if isinstance(library_key, str) and library_key.endswith("-library") else library_key
+                raw_overlay_file_entries = _parse_overlay_file_block_entries(overlays.get(overlay_key, {}).get(f"{overlay_library_prefix}-overlay_files"))
+                if raw_overlay_file_entries:
+                    overlay_entries.extend(raw_overlay_file_entries)
+
+                if overlay_entries:
                     entry["overlay_files"] = overlay_entries
+
+        metadata_group = (
+            movie_metadata_files.get(helpers.extract_library_name(library_key), {})
+            if library_type == "mov"
+            else show_metadata_files.get(helpers.extract_library_name(library_key), {})
+        )
+        library_prefix = library_key[: -len("-library")] if isinstance(library_key, str) and library_key.endswith("-library") else library_key
+        metadata_entries = _parse_metadata_file_entries(metadata_group.get(f"{library_prefix}-metadata_files"))
+        if metadata_entries:
+            entry["metadata_files"] = metadata_entries
 
         # Template Variables
         template_key = helpers.extract_library_name(library_key)
@@ -2017,24 +2517,34 @@ def build_libraries_section(
 
         remove_key = f"{library_type}-library_{lib_id}-top_level_remove_overlays"
         reset_key = f"{library_type}-library_{lib_id}-top_level_reset_overlays"
+        schedule_key = f"{library_type}-library_{lib_id}-top_level_schedule"
+        schedule_overlays_key = f"{library_type}-library_{lib_id}-top_level_schedule_overlays"
         report_path_key = f"{library_type}-library_{lib_id}-top_level_report_path"
 
         remove_overlays = top_group.get(remove_key)
         reset_overlays = top_group.get(reset_key)
+        schedule = top_group.get(schedule_key)
+        schedule_overlays = top_group.get(schedule_overlays_key)
         report_path = top_group.get(report_path_key)
 
         if report_path not in [None, ""]:
             entry["report_path"] = report_path
+        if schedule not in [None, ""]:
+            entry["schedule"] = schedule
         if remove_overlays:
             entry["remove_overlays"] = True
         if reset_overlays not in [None, "None", ""]:
             entry["reset_overlays"] = reset_overlays
+        if schedule_overlays not in [None, ""]:
+            entry["schedule_overlays"] = schedule_overlays
 
         if app.config["QS_DEBUG"]:
             helpers.ts_log(f"Top Level for {lib_id}: {top_group}", level="DEBUG")
             helpers.ts_log(f"{report_path_key} = {report_path}", level="DEBUG")
+            helpers.ts_log(f"{schedule_key} = {schedule}", level="DEBUG")
             helpers.ts_log(f"{remove_key} = {remove_overlays}", level="DEBUG")
             helpers.ts_log(f"{reset_key} = {reset_overlays}", level="DEBUG")
+            helpers.ts_log(f"{schedule_overlays_key} = {schedule_overlays}", level="DEBUG")
 
         if operations:
             entry["operations"] = operations
@@ -2085,9 +2595,13 @@ def reorder_library_section(library_data):
     """
     Reorders library data so that:
     - `report_path` appears first.
-    - `remove_overlays` and `reset_overlays` come next.
+    - `schedule` comes next.
+    - `remove_overlays`, `reset_overlays`, and `schedule_overlays` come after that.
     - `template_variables` next.
-    - `settings` appears before `operations`.
+    - `settings` appears before `radarr` / `sonarr` / `operations`.
+    - `metadata_files` appears after library settings and operations.
+    - `metadata_files` appears before `collection_files`.
+    - `collection_files` appears before `overlay_files`.
     - Keys inside `operations` are ordered as per Kometa Wiki.
     - Other keys retain their natural order.
     """
@@ -2097,21 +2611,33 @@ def reorder_library_section(library_data):
     if "report_path" in library_data:
         reordered_data["report_path"] = library_data["report_path"]
 
-    # 2. Then remove/reset overlays
+    # 2. Then library schedule
+    if "schedule" in library_data:
+        reordered_data["schedule"] = library_data["schedule"]
+
+    # 3. Then remove/reset overlays
     if "remove_overlays" in library_data:
         reordered_data["remove_overlays"] = library_data["remove_overlays"]
     if "reset_overlays" in library_data:
         reordered_data["reset_overlays"] = library_data["reset_overlays"]
+    if "schedule_overlays" in library_data:
+        reordered_data["schedule_overlays"] = library_data["schedule_overlays"]
 
-    # 3. Then template_variables
+    # 4. Then template_variables
     if "template_variables" in library_data:
         reordered_data["template_variables"] = library_data["template_variables"]
 
-    # 4. Then library settings
+    # 5. Then library settings
     if "settings" in library_data:
         reordered_data["settings"] = library_data["settings"]
 
-    # 5. Reorder operations
+    # 6. Then per-library Arr overrides
+    if "radarr" in library_data:
+        reordered_data["radarr"] = library_data["radarr"]
+    if "sonarr" in library_data:
+        reordered_data["sonarr"] = library_data["sonarr"]
+
+    # 7. Reorder operations
     operations_order = [
         "assets_for_all",
         "assets_for_all_collections",
@@ -2156,7 +2682,15 @@ def reorder_library_section(library_data):
                 ordered_ops[k] = v
         reordered_data["operations"] = ordered_ops
 
-    # 6. Finally add any other keys that weren't handled
+    # 8. Then library-level metadata/collections/overlays in explicit YAML order
+    if "metadata_files" in library_data:
+        reordered_data["metadata_files"] = library_data["metadata_files"]
+    if "collection_files" in library_data:
+        reordered_data["collection_files"] = library_data["collection_files"]
+    if "overlay_files" in library_data:
+        reordered_data["overlay_files"] = library_data["overlay_files"]
+
+    # 9. Finally add any other keys that weren't handled
     for key, value in library_data.items():
         if key not in reordered_data:
             reordered_data[key] = value
@@ -2270,6 +2804,28 @@ def build_config(header_style="standard", config_name=None):
             if "webhooks" not in config_data:
                 helpers.ts_log(f"Webhooks section completely removed.", level="DEBUG")
 
+    if "apprise" in config_data:
+        apprise_data = config_data["apprise"]
+        apprise_location = None
+
+        if isinstance(apprise_data, dict):
+            if "apprise" in apprise_data:
+                nested_apprise = apprise_data["apprise"]
+                if isinstance(nested_apprise, dict):
+                    apprise_location = nested_apprise.get("location")
+                else:
+                    apprise_location = nested_apprise
+            elif "location" in apprise_data:
+                apprise_location = apprise_data.get("location")
+        elif isinstance(apprise_data, str):
+            apprise_location = apprise_data
+
+        apprise_location = str(apprise_location).strip() if apprise_location is not None else ""
+        if apprise_location:
+            config_data["apprise"] = {"apprise": {"config": apprise_location}}
+        else:
+            config_data.pop("apprise", None)
+
     # Initialize movie and show libraries
     movie_libraries = {}
     show_libraries = {}
@@ -2314,8 +2870,28 @@ def build_config(header_style="standard", config_name=None):
             """
             grouped = {}
 
+            def matches_group_prefix(key):
+                if not isinstance(key, str):
+                    return False
+                # Keep library-level *_files blocks isolated from the default
+                # collection/overlay groups so they do not suppress built-in
+                # defaults during YAML emission.
+                if prefix == "collection_":
+                    return "-collection_" in key or "-template_collection_" in key
+                if prefix == "overlay_":
+                    return "-overlay_" in key or "-template_overlay_" in key
+                if prefix == "attribute_":
+                    return "-attribute_" in key
+                if prefix == "template_variables":
+                    return "-template_variables" in key or "-attribute_template_variables" in key
+                if prefix == "top_level_":
+                    return "-top_level_" in key
+                if prefix in {"collection_files", "overlay_files", "metadata_files"}:
+                    return key.endswith(f"-{prefix}")
+                return prefix in key
+
             for key, value in nested_libraries_data.items():
-                if prefix not in key:
+                if not matches_group_prefix(key):
                     continue
 
                 lib_name_raw = helpers.extract_library_name(key)
@@ -2337,12 +2913,22 @@ def build_config(header_style="standard", config_name=None):
         # Group collections, overlays, attributes, and templates only for selected libraries
         movie_collections = group_by_library("collection_", movie_library_names)
         show_collections = group_by_library("collection_", show_library_names)
+        movie_collection_files = group_by_library("collection_files", movie_library_names)
+        show_collection_files = group_by_library("collection_files", show_library_names)
+        movie_overlay_file_blocks = group_by_library("overlay_files", movie_library_names)
+        show_overlay_file_blocks = group_by_library("overlay_files", show_library_names)
         # movie_overlays = group_by_library("overlay_", movie_library_names)
         # show_overlays = group_by_library("overlay_", show_library_names)
         movie_overlays = group_by_library("overlay_", movie_library_names, normalize_overlays=True)
         show_overlays = group_by_library("overlay_", show_library_names, normalize_overlays=True)
+        for lib_name, payload in movie_overlay_file_blocks.items():
+            movie_overlays.setdefault(lib_name, {}).update(payload)
+        for lib_name, payload in show_overlay_file_blocks.items():
+            show_overlays.setdefault(lib_name, {}).update(payload)
         movie_attributes = group_by_library("attribute_", movie_library_names)
         show_attributes = group_by_library("attribute_", show_library_names)
+        movie_metadata_files = group_by_library("metadata_files", movie_library_names)
+        show_metadata_files = group_by_library("metadata_files", show_library_names)
         movie_templates = group_by_library("template_variables", movie_library_names)
         show_templates = group_by_library("template_variables", show_library_names)
         movie_top_level = group_by_library("top_level_", movie_library_names)
@@ -2354,10 +2940,16 @@ def build_config(header_style="standard", config_name=None):
             helpers.ts_log(f"Extracted Show Libraries: {show_libraries}", level="DEBUG")
             helpers.ts_log(f"Extracted Movie Collections: {movie_collections}", level="DEBUG")
             helpers.ts_log(f"Extracted Show Collections: {show_collections}", level="DEBUG")
+            helpers.ts_log(f"Extracted Movie Collection Files: {movie_collection_files}", level="DEBUG")
+            helpers.ts_log(f"Extracted Show Collection Files: {show_collection_files}", level="DEBUG")
+            helpers.ts_log(f"Extracted Movie Overlay File Blocks: {movie_overlay_file_blocks}", level="DEBUG")
+            helpers.ts_log(f"Extracted Show Overlay File Blocks: {show_overlay_file_blocks}", level="DEBUG")
             helpers.ts_log(f"Extracted Movie Overlays: {movie_overlays}", level="DEBUG")
             helpers.ts_log(f"Extracted Show Overlays: {show_overlays}", level="DEBUG")
             helpers.ts_log(f"Extracted Movie Attributes: {movie_attributes}", level="DEBUG")
             helpers.ts_log(f"Extracted Show Attributes: {show_attributes}", level="DEBUG")
+            helpers.ts_log(f"Extracted Movie Metadata Files: {movie_metadata_files}", level="DEBUG")
+            helpers.ts_log(f"Extracted Show Metadata Files: {show_metadata_files}", level="DEBUG")
             helpers.ts_log(f"Extracted Movie Templates: {movie_templates}", level="DEBUG")
             helpers.ts_log(f"Extracted Show Templates: {show_templates}", level="DEBUG")
             helpers.ts_log(f"Extracted Movie Top Level: {movie_top_level}", level="DEBUG")
@@ -2369,16 +2961,20 @@ def build_config(header_style="standard", config_name=None):
             show_libraries,
             movie_collections,
             show_collections,
+            movie_collection_files,
+            show_collection_files,
             movie_overlays,
             show_overlays,
             movie_attributes,
             show_attributes,
+            movie_metadata_files,
+            show_metadata_files,
             movie_templates,
             show_templates,
             movie_top_level,
             show_top_level,
         )
-        config_data["libraries"] = libraries_section
+        config_data["libraries"] = libraries_section.get("libraries", {}) if isinstance(libraries_section, dict) else {}
         ordered_library_names = _library_names_in_output_order(libraries_section)
         has_playlist_toggle, playlist_libraries = _playlist_libraries_from_library_toggles(
             nested_libraries_data,
@@ -2415,8 +3011,8 @@ def build_config(header_style="standard", config_name=None):
     with open(os.path.join(helpers.JSON_SCHEMA_DIR, "config-schema.json"), "r") as file:
         schema = yaml.load(file)
 
-    # Fetch kometa_branch dynamically
-    version_info = helpers.check_for_update()
+    # Reuse the shared update snapshot instead of re-checking on every final-page render.
+    version_info = app.config.get("VERSION_CHECK") or helpers.check_for_update()
     kometa_branch = version_info.get("kometa_branch", "nightly")  # Default to nightly if not found
 
     # Fetch other Quickstart details
@@ -2482,9 +3078,10 @@ def build_config(header_style="standard", config_name=None):
     )
     library_names = movie_summary_names + show_summary_names
     library_details = helpers.get_library_summaries(library_names)
+    schema_header = f"# yaml-language-server: $schema=https://raw.githubusercontent.com/Kometa-Team/Kometa/{kometa_branch}/json-schema/config-schema.json"
 
     yaml_content = (
-        f"# yaml-language-server: $schema=https://raw.githubusercontent.com/Kometa-Team/Kometa/{kometa_branch}/json-schema/config-schema.json\n\n"
+        f"{schema_header}\n\n"
         f"{add_border_to_ascii_art(section_heading('KOMETA', font=header_style)) if header_style not in ['none', 'single line'] else section_heading('KOMETA', font=header_style)}\n\n"
         f"#==================== {config_name} ====================#\n"
         f"# {config_name} config created by Quickstart on {timestamp}\n"
@@ -2541,6 +3138,8 @@ def build_config(header_style="standard", config_name=None):
 
             elif stripped.startswith("collection_files:"):
                 output.append(art("Collections"))
+            elif stripped.startswith("metadata_files:"):
+                output.append(art("Metadata Files"))
             elif stripped.startswith("overlay_files:"):
                 output.append(art("Overlays"))
 
@@ -2562,6 +3161,31 @@ def build_config(header_style="standard", config_name=None):
             lambda self, _: self.represent_scalar("tag:yaml.org,2002:null", ""),
         )
 
+        def _prune_empty_output_values(obj):
+            if isinstance(obj, dict):
+                pruned = {}
+                for key, value in obj.items():
+                    if key == "valid":
+                        continue
+                    cleaned_value = _prune_empty_output_values(value)
+                    if cleaned_value is _EMPTY_OUTPUT:
+                        continue
+                    pruned[key] = cleaned_value
+                return pruned if pruned else _EMPTY_OUTPUT
+            if isinstance(obj, list):
+                cleaned_items = []
+                for value in obj:
+                    cleaned_value = _prune_empty_output_values(value)
+                    if cleaned_value is _EMPTY_OUTPUT:
+                        continue
+                    cleaned_items.append(cleaned_value)
+                return cleaned_items if cleaned_items else _EMPTY_OUTPUT
+            if obj is None:
+                return _EMPTY_OUTPUT
+            if isinstance(obj, str) and obj.strip() == "":
+                return _EMPTY_OUTPUT
+            return obj
+
         def clean_data(obj):
             if isinstance(obj, dict):
                 # Sort specific sections alphabetically
@@ -2577,6 +3201,7 @@ def build_config(header_style="standard", config_name=None):
                     "notifiarr",
                     "gotify",
                     "ntfy",
+                    "apprise",
                     "anidb",
                     "radarr",
                     "sonarr",
@@ -2584,14 +3209,32 @@ def build_config(header_style="standard", config_name=None):
                     "mal",
                 ]:
                     obj = dict(sorted(obj.items()))  # Alphabetically sort keys in the section
-                return {k: clean_data(v) for k, v in obj.items() if k != "valid"}
+                cleaned_dict = {}
+                for k, v in obj.items():
+                    if k == "valid":
+                        continue
+                    cleaned_value = clean_data(v)
+                    if cleaned_value is _EMPTY_OUTPUT:
+                        continue
+                    cleaned_dict[k] = cleaned_value
+                return cleaned_dict if cleaned_dict else _EMPTY_OUTPUT
             elif isinstance(obj, list):
-                return [clean_data(v) for v in obj]
+                cleaned_list = []
+                for v in obj:
+                    cleaned_value = clean_data(v)
+                    if cleaned_value is _EMPTY_OUTPUT:
+                        continue
+                    cleaned_list.append(cleaned_value)
+                return cleaned_list if cleaned_list else _EMPTY_OUTPUT
             else:
-                return obj
+                return _prune_empty_output_values(obj)
 
         # Clean the data
         cleaned_data = clean_data(data)
+        if cleaned_data is _EMPTY_OUTPUT:
+            cleaned_data = {}
+        if dump_name == "libraries" and isinstance(cleaned_data, dict) and "libraries" not in cleaned_data:
+            cleaned_data = {"libraries": cleaned_data}
         if dump_name == "anidb":
             section = cleaned_data.get("anidb")
             if isinstance(section, dict):
@@ -2608,6 +3251,7 @@ def build_config(header_style="standard", config_name=None):
             "notifiarr",
             "gotify",
             "ntfy",
+            "apprise",
             "anidb",
             "radarr",
             "sonarr",
@@ -2661,14 +3305,23 @@ def build_config(header_style="standard", config_name=None):
                         ordered_section[key] = value
                 cleaned_data["trakt"] = ordered_section
 
-        # Ensure `asset_directory` is serialized as a proper YAML list
-        if dump_name == "settings" and "asset_directory" in cleaned_data.get("settings", {}):
-            if isinstance(cleaned_data["settings"]["asset_directory"], str):
-                # Convert multi-line string into a list
-                cleaned_data["settings"]["asset_directory"] = _normalize_asset_directory_values(cleaned_data["settings"]["asset_directory"])
-            elif isinstance(cleaned_data["settings"]["asset_directory"], list):
-                # Ensure all list items are strings
-                cleaned_data["settings"]["asset_directory"] = _normalize_asset_directory_values(cleaned_data["settings"]["asset_directory"])
+        # Ensure settings multi-value inputs are normalized for YAML output.
+        if dump_name == "settings" and isinstance(cleaned_data.get("settings"), dict):
+            settings_block = cleaned_data["settings"]
+            for setting_key in list(settings_block.keys()):
+                normalized_value = _normalize_settings_section_value(setting_key, settings_block.get(setting_key))
+                if normalized_value is None:
+                    settings_block.pop(setting_key, None)
+                else:
+                    settings_block[setting_key] = normalized_value
+
+            if "asset_directory" in settings_block:
+                if isinstance(settings_block["asset_directory"], str):
+                    # Convert multi-line string into a list
+                    settings_block["asset_directory"] = _normalize_asset_directory_values(settings_block["asset_directory"])
+                elif isinstance(settings_block["asset_directory"], list):
+                    # Ensure all list items are strings
+                    settings_block["asset_directory"] = _normalize_asset_directory_values(settings_block["asset_directory"])
 
         # Dump the cleaned data to YAML
         with io.StringIO() as stream:
@@ -2736,6 +3389,7 @@ def build_config(header_style="standard", config_name=None):
         ("notifiarr", "070-notifiarr"),
         ("gotify", "080-gotify"),
         ("ntfy", "085-ntfy"),
+        ("apprise", "087-apprise"),
         ("anidb", "090-anidb"),
         ("radarr", "100-radarr"),
         ("sonarr", "110-sonarr"),
@@ -2748,6 +3402,7 @@ def build_config(header_style="standard", config_name=None):
         authorization_data = config_data["mal"]["mal"].get("authorization", {})
         authorization_data.pop("code_verifier", None)  # Remove safely
 
+    config_data = _normalize_legacy_collection_template_vars(config_data)
     optimize_defaults = helpers.booler(app.config.get("QS_OPTIMIZE_DEFAULTS", True))
     if optimize_defaults:
         config_data = optimize_template_variables(config_data, library_types)

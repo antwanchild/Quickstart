@@ -1,5 +1,6 @@
 import argparse
 import gzip
+import inspect
 import io
 import json
 import os
@@ -9,7 +10,6 @@ import psutil
 import re
 import shutil
 import shlex
-import signal
 import socket
 import subprocess
 import sys
@@ -120,9 +120,12 @@ LOGSCAN_ANALYSIS_CACHE = {"mtime": None, "size": None, "data": None}
 LOGSCAN_PROGRESS_CACHE = {"mtime": None, "size": None, "data": None}
 KOMETA_CPU_CACHE = {}
 SYSTEM_CPU_CACHE = {"total": None, "idle": None}
+PROCESS_IO_CACHE = {"kometa": {}, "imagemaid": {}}
 MAINTENANCE_STATE = {
     "paused": False,
     "paused_since": None,
+    "imagemaid_paused": False,
+    "imagemaid_paused_since": None,
     "active": False,
     "window": None,
     "queued_started_at": None,
@@ -152,6 +155,7 @@ VALIDATION_DOCS = {
     "github": f"{VALIDATION_DOC_BASE}040-github",
     "gotify": f"{VALIDATION_DOC_BASE}080-gotify",
     "ntfy": f"{VALIDATION_DOC_BASE}085-ntfy",
+    "apprise": f"{VALIDATION_DOC_BASE}087-apprise",
     "mal": f"{VALIDATION_DOC_BASE}140-mal",
     "anidb": f"{VALIDATION_DOC_BASE}100-anidb",
     "webhooks": f"{VALIDATION_DOC_BASE}090-webhooks",
@@ -164,12 +168,17 @@ VALIDATION_REASON_LABELS = {
     "missing_plex_validation": "Plex not validated",
     "no_libraries": "No libraries selected",
     "invalid_paths": "Invalid paths",
+    "invalid_arr_overrides": "Invalid Arr overrides",
     "missing_library_defaults": "Missing library defaults",
     "missing_placeholder_imdb": "Missing placeholder IMDb ID",
+    "invalid_metadata_files": "Invalid metadata files",
+    "invalid_collection_files": "Invalid collection files",
+    "invalid_overlay_files": "Invalid overlay files",
     "invalid_fields": "Invalid fields",
     "no_webhooks": "No webhooks configured",
     "disabled": "Disabled",
     "missing_settings": "Settings missing",
+    "missing_location": "Missing location",
     "missing_tokens": "Missing tokens",
     "token_invalid": "Invalid tokens",
     "account_locked": "Account locked",
@@ -367,6 +376,7 @@ QS_VALIDATION_STEP_KEYS = {
     "070-notifiarr",
     "080-gotify",
     "085-ntfy",
+    "087-apprise",
     "090-webhooks",
     "100-anidb",
     "110-radarr",
@@ -386,14 +396,78 @@ QS_WARN_REASONS = {
 }
 QS_ERROR_REASONS = {
     "missing_plex_validation",
+    "missing_location",
     "token_invalid",
     "account_locked",
     "validation_error",
     "invalid_paths",
+    "invalid_arr_overrides",
+    "invalid_collection_files",
+    "invalid_overlay_files",
     "invalid_fields",
+    "invalid_metadata_files",
     "missing_library_defaults",
     "missing_placeholder_imdb",
 }
+LIBRARY_RADARR_FIELDS = [
+    "url",
+    "token",
+    "root_folder_path",
+    "quality_profile",
+    "availability",
+    "tag",
+    "monitor",
+    "search",
+    "add_missing",
+    "add_existing",
+    "upgrade_existing",
+    "monitor_existing",
+    "ignore_cache",
+    "radarr_path",
+    "plex_path",
+]
+LIBRARY_RADARR_BOOL_FIELDS = {
+    "monitor",
+    "search",
+    "add_missing",
+    "add_existing",
+    "upgrade_existing",
+    "monitor_existing",
+    "ignore_cache",
+}
+LIBRARY_RADARR_AVAILABILITY_VALUES = {"announced", "cinemas", "released", "db"}
+LIBRARY_SONARR_FIELDS = [
+    "url",
+    "token",
+    "root_folder_path",
+    "quality_profile",
+    "language_profile",
+    "series_type",
+    "season_folder",
+    "monitor",
+    "tag",
+    "search",
+    "cutoff_search",
+    "add_missing",
+    "add_existing",
+    "upgrade_existing",
+    "monitor_existing",
+    "ignore_cache",
+    "sonarr_path",
+    "plex_path",
+]
+LIBRARY_SONARR_BOOL_FIELDS = {
+    "season_folder",
+    "search",
+    "cutoff_search",
+    "add_missing",
+    "add_existing",
+    "upgrade_existing",
+    "monitor_existing",
+    "ignore_cache",
+}
+LIBRARY_SONARR_MONITOR_VALUES = {"all", "none", "future", "missing", "existing", "pilot", "first", "latest"}
+LIBRARY_SONARR_SERIES_TYPE_VALUES = {"standard", "daily", "anime"}
 QS_TAUTULLI_REQUIRED_STEP_KEY = "030-tautulli"
 QS_OMDB_REQUIRED_STEP_KEY = "050-omdb"
 QS_MDBLIST_REQUIRED_STEP_KEY = "060-mdblist"
@@ -437,20 +511,76 @@ def utc_now_iso():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def apply_validation_metadata(stored_data, status, reason=None, details=None, updated_at=None):
+    if not isinstance(stored_data, dict):
+        stored_data = {}
+    stored_data["validation_status"] = status
+    if reason is not None:
+        stored_data["validation_reason"] = reason
+    if details is not None:
+        stored_data["validation_details"] = details
+    stored_data["validation_updated_at"] = updated_at or utc_now_iso()
+    return stored_data
+
+
 def build_validation_summary(errors):
+    def infer_section_from_text(text):
+        lowered = str(text or "").strip().lower()
+        if any(token in lowered for token in ("metadata_files[", "collection_files[", "overlay_files[")):
+            return "libraries"
+        if "playlist_files[" in lowered:
+            return "playlist_files"
+        if lowered.startswith("plex"):
+            return "plex"
+        if lowered.startswith("tmdb"):
+            return "tmdb"
+        if lowered.startswith("settings"):
+            return "settings"
+        return "config"
+
     summary = []
     if not errors:
         return summary
     for err in errors[:20]:
-        path_parts = [str(p) for p in err.path]
+        if isinstance(err, str):
+            section = infer_section_from_text(err)
+            summary.append(
+                {
+                    "title": err,
+                    "details": "",
+                    "doc_url": VALIDATION_DOCS.get(section, VALIDATION_DOC_FALLBACK),
+                    "section": section,
+                    "suggestions": [],
+                }
+            )
+            continue
+
+        if isinstance(err, dict):
+            section = str(err.get("section") or infer_section_from_text(err.get("title") or err.get("message") or "") or "config")
+            summary.append(
+                {
+                    "title": str(err.get("title") or err.get("message") or "Validation error"),
+                    "details": str(err.get("details") or ""),
+                    "doc_url": err.get("doc_url") or VALIDATION_DOCS.get(section, VALIDATION_DOC_FALLBACK),
+                    "section": section,
+                    "suggestions": list(err.get("suggestions") or []),
+                }
+            )
+            continue
+
+        path_parts = [str(p) for p in getattr(err, "path", [])]
         section = path_parts[0] if path_parts else ""
         path_display = ".".join(path_parts) if path_parts else (section or "config")
         doc_url = VALIDATION_DOCS.get(section, VALIDATION_DOC_FALLBACK)
-        title = f"{path_display}: {err.message}"
+        message = str(getattr(err, "message", err) or "Validation error")
+        title = f"{path_display}: {message}"
         details = ""
         suggestions = []
 
-        if err.validator == "additionalProperties":
+        validator = getattr(err, "validator", "")
+        validator_value = getattr(err, "validator_value", None)
+
+        if validator == "additionalProperties":
             extras = []
             try:
                 extras = list(err.params.get("additionalProperties") or [])
@@ -463,17 +593,17 @@ def build_validation_summary(errors):
                     suggestion = VALIDATION_KEY_SUGGESTIONS.get(section, {}).get(key)
                     if suggestion:
                         suggestions.append(f"{key} → {suggestion}")
-        elif err.validator == "type":
-            expected = err.validator_value
+        elif validator == "type":
+            expected = validator_value
             details = f"Expected type: {expected}."
-        elif err.validator == "enum":
-            values = err.validator_value or []
+        elif validator == "enum":
+            values = validator_value or []
             details = f"Expected one of: {', '.join(map(str, values))}."
-        elif err.validator == "minimum":
-            details = f"Minimum allowed: {err.validator_value}."
-        elif err.validator == "maximum":
-            details = f"Maximum allowed: {err.validator_value}."
-        elif err.validator == "pattern":
+        elif validator == "minimum":
+            details = f"Minimum allowed: {validator_value}."
+        elif validator == "maximum":
+            details = f"Maximum allowed: {validator_value}."
+        elif validator == "pattern":
             details = "Value does not match the expected format."
 
         summary.append(
@@ -531,6 +661,948 @@ def _parse_json_array(value):
     except (TypeError, ValueError):
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def _parse_metadata_file_entries(value):
+    if isinstance(value, list):
+        raw_entries = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            raw_entries = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return []
+
+    if not isinstance(raw_entries, list):
+        return None
+
+    entries = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = str(entry.get("type") or "").strip().lower()
+        location = str(entry.get("location") or "").strip()
+        validated = helpers.booler(entry.get("validated"))
+        if not entry_type and not location:
+            continue
+        parsed_entry = {"type": entry_type, "location": location}
+        if validated:
+            parsed_entry["validated"] = True
+        entries.append(parsed_entry)
+    return entries
+
+
+def _parse_collection_file_entries(value):
+    if isinstance(value, list):
+        raw_entries = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            raw_entries = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return []
+
+    if not isinstance(raw_entries, list):
+        return None
+
+    entries = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = str(entry.get("type") or "").strip().lower()
+        location = str(entry.get("location") or "").strip()
+        validated = helpers.booler(entry.get("validated"))
+        if not entry_type and not location:
+            continue
+        parsed_entry = {"type": entry_type, "location": location}
+        if validated:
+            parsed_entry["validated"] = True
+        entries.append(parsed_entry)
+    return entries
+
+
+def _parse_overlay_file_entries(value):
+    if isinstance(value, list):
+        raw_entries = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            raw_entries = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return []
+
+    if not isinstance(raw_entries, list):
+        return None
+
+    entries = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = str(entry.get("type") or "").strip().lower()
+        location = str(entry.get("location") or "").strip()
+        validated = helpers.booler(entry.get("validated"))
+        if not entry_type and not location:
+            continue
+        parsed_entry = {"type": entry_type, "location": location}
+        if validated:
+            parsed_entry["validated"] = True
+        entries.append(parsed_entry)
+    return entries
+
+
+LIBRARY_FILE_KINDS = ("metadata_files", "collection_files", "overlay_files")
+LOCAL_LIBRARY_FILE_TYPES = {"file", "folder"}
+LIBRARY_FILE_VALIDATORS = {
+    "metadata_files": (
+        "metadata_file_type",
+        "metadata_file_location",
+        validations.validate_metadata_file_payload,
+    ),
+    "collection_files": (
+        "collection_file_type",
+        "collection_file_location",
+        validations.validate_collection_file_payload,
+    ),
+    "overlay_files": (
+        "overlay_file_type",
+        "overlay_file_location",
+        validations.validate_overlay_file_payload,
+    ),
+}
+LIBRARY_FILE_PARSE_FUNCTIONS = {
+    "metadata_files": _parse_metadata_file_entries,
+    "collection_files": _parse_collection_file_entries,
+    "overlay_files": _parse_overlay_file_entries,
+}
+
+
+def _format_library_file_validation_error(lib_id, kind, idx, message, entry, details=None):
+    location = str((entry or {}).get("location") or "").strip()
+    detail_text = ""
+    if isinstance(details, dict):
+        detail_text = str(details.get("message") or "").strip()
+    if location:
+        path_label = "Path"
+        if detail_text and detail_text not in message:
+            return f"{lib_id} {kind}[{idx}]: {message} {detail_text} {path_label}: {location}"
+        return f"{lib_id} {kind}[{idx}]: {message} {path_label}: {location}"
+    if detail_text and detail_text not in message:
+        return f"{lib_id} {kind}[{idx}]: {message} {detail_text}"
+    return f"{lib_id} {kind}[{idx}]: {message}"
+
+
+def _safe_external_artifact_slug(value, fallback="artifact"):
+    safe = secure_filename(str(value or "").strip())
+    return safe or fallback
+
+
+def _managed_library_folder_slug(source_path, kind):
+    raw_name = str(getattr(source_path, "name", "") or "").strip().lower()
+    folder_name = _safe_external_artifact_slug(getattr(source_path, "name", ""), "folder")
+    if raw_name in set(LIBRARY_FILE_KINDS):
+        parent_name = _safe_external_artifact_slug(getattr(source_path.parent, "name", ""), "")
+        if parent_name:
+            return f"{parent_name}_{folder_name}"
+    return folder_name
+
+
+def _managed_library_config_root(config_name):
+    config_slug = helpers.require_config_name_for_storage(config_name, context="Managed library artifact paths")
+    return (Path(helpers.CONFIG_DIR) / config_slug).resolve()
+
+
+def _managed_library_file_root(kind, config_name):
+    return (_managed_library_config_root(config_name) / kind).resolve()
+
+
+def _parse_managed_library_relative_path(path_value):
+    raw = str(path_value or "").strip().replace("\\", "/")
+    if not raw:
+        return None
+    parts = [part for part in raw.split("/") if part]
+    if not parts:
+        return None
+    has_config_prefix = parts[0] == "config"
+    if has_config_prefix:
+        parts = parts[1:]
+    if len(parts) >= 3 and parts[1] in LIBRARY_FILE_KINDS:
+        return {
+            "layout": "config_first",
+            "config_name": parts[0],
+            "kind": parts[1],
+            "remainder": parts[2:],
+            "has_config_prefix": has_config_prefix,
+            "parts": parts,
+        }
+    if len(parts) >= 3 and parts[0] in LIBRARY_FILE_KINDS:
+        return {
+            "layout": "type_first",
+            "config_name": parts[1],
+            "kind": parts[0],
+            "remainder": parts[2:],
+            "has_config_prefix": has_config_prefix,
+            "parts": parts,
+        }
+    return None
+
+
+def _normalized_managed_library_relative_path(path_value):
+    info = _parse_managed_library_relative_path(path_value)
+    if not info:
+        return None
+    return Path(info["config_name"], info["kind"], *info["remainder"]).as_posix()
+
+
+def _is_bundled_library_archive_member(path_value):
+    return _normalized_managed_library_relative_path(str(path_value or "").replace("\\", "/").lstrip("/")) is not None
+
+
+def _yaml_path_suffix(path_value):
+    return str(path_value or "").strip().lower().endswith((".yml", ".yaml"))
+
+
+def _normalize_bundle_member_name(path_value):
+    normalized = str(path_value or "").replace("\\", "/").lstrip("/")
+    return "/".join(part for part in normalized.split("/") if part)
+
+
+def _is_allowed_bundle_member(path_value):
+    normalized = _normalize_bundle_member_name(path_value)
+    if not normalized:
+        return True
+    lowered = normalized.lower()
+    if _is_bundled_library_archive_member(normalized):
+        return _yaml_path_suffix(normalized)
+    if _yaml_path_suffix(normalized):
+        return True
+    if lowered.endswith((".ttf", ".otf")):
+        return True
+    if lowered == "readme.txt":
+        return True
+    return False
+
+
+def _dump_yaml_text(data):
+    buffer = io.StringIO()
+    YAML().dump(data, buffer)
+    return buffer.getvalue()
+
+
+def _resolve_local_library_source(location):
+    raw = str(location or "").strip()
+    if not raw:
+        return None
+    expanded = Path(os.path.expandvars(os.path.expanduser(raw)))
+    if expanded.is_absolute():
+        try:
+            return expanded.resolve()
+        except OSError:
+            return expanded
+    managed_info = _parse_managed_library_relative_path(expanded)
+    if managed_info:
+        if managed_info["layout"] == "config_first":
+            managed_relative = Path(managed_info["config_name"], managed_info["kind"], *managed_info["remainder"])
+        else:
+            managed_relative = Path(*managed_info["parts"])
+        try:
+            return (Path(helpers.CONFIG_DIR) / managed_relative).resolve()
+        except OSError:
+            return Path(helpers.CONFIG_DIR) / managed_relative
+    normalized_parts = [part for part in str(expanded).replace("\\", "/").split("/") if part]
+    if normalized_parts and normalized_parts[0] in LIBRARY_FILE_KINDS:
+        try:
+            return (Path(helpers.CONFIG_DIR) / expanded).resolve()
+        except OSError:
+            return Path(helpers.CONFIG_DIR) / expanded
+    try:
+        return (Path.cwd() / expanded).resolve()
+    except OSError:
+        return Path.cwd() / expanded
+
+
+def _managed_bundle_location_for_path(path):
+    config_root = Path(helpers.CONFIG_DIR).resolve()
+    try:
+        relative = Path(path).resolve().relative_to(config_root)
+    except Exception:
+        return None
+    normalized_relative = _normalized_managed_library_relative_path(Path(*relative.parts).as_posix())
+    if not normalized_relative:
+        return None
+    info = _parse_managed_library_relative_path(normalized_relative)
+    if not info or info["layout"] != "config_first":
+        return None
+    return normalized_relative
+
+
+def _display_library_managed_location(location):
+    raw = str(location or "").strip().replace("\\", "/")
+    if not raw:
+        return raw
+    normalized_relative = _normalized_managed_library_relative_path(raw)
+    if normalized_relative:
+        return Path("config", *normalized_relative.split("/")).as_posix()
+    return raw
+
+
+def _validate_library_file_entry(kind, entry):
+    validator_info = LIBRARY_FILE_VALIDATORS.get(kind)
+    if not validator_info:
+        return False, f"Unsupported library file kind: {kind}", {}
+    type_key, location_key, validator = validator_info
+    payload = {
+        type_key: str((entry or {}).get("type") or "").strip().lower(),
+        location_key: str((entry or {}).get("location") or "").strip(),
+    }
+    return validations._normalize_metadata_validation_result(validator(payload))
+
+
+def _remove_managed_path(path, root):
+    resolved_root = Path(root).resolve()
+    resolved_path = Path(path).resolve()
+    try:
+        resolved_path.relative_to(resolved_root)
+    except Exception as exc:
+        raise RuntimeError(f"Refusing to remove unmanaged path: {resolved_path}") from exc
+    if resolved_path.is_dir():
+        shutil.rmtree(resolved_path, ignore_errors=False)
+    elif resolved_path.exists():
+        resolved_path.unlink()
+
+
+def _copy_library_artifact_to_managed_store(kind, entry_type, location, config_name, library_scope, force_clone_managed=False):
+    source_path = _resolve_local_library_source(location)
+    if source_path is None:
+        raise RuntimeError("Path is required.")
+
+    managed_location = _managed_bundle_location_for_path(source_path)
+    if managed_location and not force_clone_managed:
+        return managed_location
+
+    managed_root = _managed_library_file_root(kind, config_name)
+    library_slug = _safe_external_artifact_slug(library_scope, "library")
+    source_token = str(source_path).replace("\\", "/").lower()
+    digest = hashlib.sha1(source_token.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    target_dir = managed_root / library_slug
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    if entry_type == "file":
+        stem = _safe_external_artifact_slug(source_path.stem, "file")
+        suffix = source_path.suffix or ".yml"
+        target_path = (target_dir / f"{stem}_{digest}{suffix}").resolve()
+        if source_path != target_path:
+            shutil.copy2(source_path, target_path)
+    else:
+        folder_name = _managed_library_folder_slug(source_path, kind)
+        target_path = (target_dir / f"{folder_name}_{digest}").resolve()
+        if source_path != target_path:
+            if target_path.exists():
+                _remove_managed_path(target_path, managed_root)
+            shutil.copytree(source_path, target_path)
+
+    try:
+        relative = target_path.relative_to(Path(helpers.CONFIG_DIR).resolve())
+    except Exception as exc:
+        raise RuntimeError(f"Managed artifact path escaped config directory: {target_path}") from exc
+    return Path(*relative.parts).as_posix()
+
+
+def _normalize_library_external_entry(kind, entry, config_name, library_scope, validate_local=True, force_clone_managed=False, require_managed_context=False):
+    parsed_entry = dict(entry) if isinstance(entry, dict) else {}
+    entry_type = str(parsed_entry.get("type") or "").strip().lower()
+    location = str(parsed_entry.get("location") or "").strip()
+    is_validated = helpers.booler(parsed_entry.get("validated"))
+    if entry_type not in {"file", "folder", "url", "git", "repo"} or not location:
+        return parsed_entry, False, None
+    if entry_type in LOCAL_LIBRARY_FILE_TYPES and require_managed_context:
+        if not str(config_name or "").strip():
+            return None, False, "Managed library files require an explicit config name."
+        if not str(library_scope or "").strip():
+            return None, False, "Managed library files require a library scope."
+    if entry_type not in LOCAL_LIBRARY_FILE_TYPES or not config_name or not library_scope:
+        normalized_entry = {"type": entry_type, "location": location}
+        if is_validated:
+            normalized_entry["validated"] = True
+        return normalized_entry, False, None
+
+    if validate_local:
+        valid, message, _details = _validate_library_file_entry(kind, {"type": entry_type, "location": location})
+        if not valid:
+            return None, False, message
+
+    try:
+        normalized_location = _copy_library_artifact_to_managed_store(
+            kind,
+            entry_type,
+            location,
+            config_name,
+            library_scope,
+            force_clone_managed=force_clone_managed,
+        )
+    except Exception as exc:
+        return None, False, f"Unable to organize {kind}: {exc}"
+
+    display_location = _display_library_managed_location(normalized_location)
+    changed = display_location != location
+    normalized_entry = {"type": entry_type, "location": display_location}
+    if is_validated:
+        normalized_entry["validated"] = True
+    return normalized_entry, changed, None
+
+
+def _clone_library_file_entries_for_target(kind, raw_value, config_name, target_library_id):
+    parser = LIBRARY_FILE_PARSE_FUNCTIONS.get(kind)
+    if not parser:
+        return raw_value
+    entries = parser(raw_value)
+    if entries is None:
+        return raw_value
+    cloned_entries = []
+    for idx, entry in enumerate(entries, start=1):
+        normalized_entry, _changed, entry_error = _normalize_library_external_entry(
+            kind,
+            entry,
+            config_name,
+            target_library_id,
+            validate_local=False,
+            force_clone_managed=True,
+            require_managed_context=True,
+        )
+        if entry_error:
+            raise RuntimeError(_format_library_file_validation_error(target_library_id, kind, idx, entry_error, entry))
+        cloned_entries.append(normalized_entry if normalized_entry is not None else entry)
+    return json.dumps(cloned_entries, ensure_ascii=True)
+
+
+def _normalize_library_file_entries_payload(libraries_data, config_name, validate_local=True):
+    if not isinstance(libraries_data, dict):
+        return {}, [], False
+
+    normalized = dict(libraries_data)
+    errors = []
+    changed = False
+    for kind in LIBRARY_FILE_KINDS:
+        parser = LIBRARY_FILE_PARSE_FUNCTIONS[kind]
+        suffix = f"-{kind}"
+        for key, raw_value in list(normalized.items()):
+            if not isinstance(key, str) or not key.endswith(suffix):
+                continue
+            library_scope = key[: -len(suffix)]
+            entries = parser(raw_value)
+            if entries is None:
+                errors.append(f"{library_scope}: {kind} must be a valid list.")
+                continue
+            new_entries = []
+            for idx, entry in enumerate(entries, start=1):
+                normalized_entry, entry_changed, entry_error = _normalize_library_external_entry(
+                    kind,
+                    entry,
+                    config_name,
+                    library_scope,
+                    validate_local=validate_local,
+                    require_managed_context=True,
+                )
+                if entry_error:
+                    errors.append(_format_library_file_validation_error(library_scope, kind, idx, entry_error, entry))
+                    continue
+                if normalized_entry:
+                    new_entries.append(normalized_entry)
+                changed = changed or bool(entry_changed)
+            normalized[key] = json.dumps(new_entries, ensure_ascii=True)
+    return normalized, errors, changed
+
+
+def _normalize_imported_libraries_payload(payload_section, config_name):
+    if not isinstance(payload_section, dict):
+        return payload_section, []
+    libraries_data = payload_section.get("libraries") if isinstance(payload_section.get("libraries"), dict) else payload_section
+    if not isinstance(libraries_data, dict):
+        return payload_section, []
+    normalized, errors, _changed = _normalize_library_file_entries_payload(libraries_data, config_name, validate_local=True)
+    if errors:
+        return None, errors
+    updated = dict(payload_section)
+    if "libraries" in updated and isinstance(updated.get("libraries"), dict):
+        updated["libraries"] = normalized
+    else:
+        updated = normalized
+    return updated, []
+
+
+def _rewrite_bundle_library_paths(config_data, bundle_root):
+    if not isinstance(config_data, dict):
+        return config_data
+    libraries = config_data.get("libraries")
+    if not isinstance(libraries, dict):
+        return config_data
+    root = Path(bundle_root).resolve()
+    for lib_cfg in libraries.values():
+        if not isinstance(lib_cfg, dict):
+            continue
+        for kind in LIBRARY_FILE_KINDS:
+            entries = lib_cfg.get(kind)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for entry_type in LOCAL_LIBRARY_FILE_TYPES:
+                    location = entry.get(entry_type)
+                    if not location:
+                        continue
+                    raw_location = str(location).strip()
+                    candidate = root / Path(raw_location)
+                    if not candidate.exists():
+                        normalized_relative = _normalized_managed_library_relative_path(raw_location)
+                        if normalized_relative:
+                            candidate = root / Path(normalized_relative)
+                    if not candidate.exists():
+                        continue
+                    entry[entry_type] = str(candidate.resolve())
+                    break
+    return config_data
+
+
+def _normalize_generated_config_library_files(config_data, config_name):
+    if not isinstance(config_data, dict):
+        return config_data, False, []
+    libraries = config_data.get("libraries")
+    if not isinstance(libraries, dict):
+        return config_data, False, []
+
+    changed = False
+    errors = []
+    for library_name, lib_cfg in libraries.items():
+        if not isinstance(lib_cfg, dict):
+            continue
+        for kind in LIBRARY_FILE_KINDS:
+            entries = lib_cfg.get(kind)
+            if not isinstance(entries, list):
+                continue
+            new_entries = []
+            for idx, entry in enumerate(entries, start=1):
+                if not isinstance(entry, dict):
+                    new_entries.append(entry)
+                    continue
+                handled = False
+                for entry_type in LOCAL_LIBRARY_FILE_TYPES:
+                    location = entry.get(entry_type)
+                    if not location:
+                        continue
+                    normalized_entry, entry_changed, entry_error = _normalize_library_external_entry(
+                        kind,
+                        {"type": entry_type, "location": location},
+                        config_name,
+                        library_name,
+                        validate_local=True,
+                        require_managed_context=True,
+                    )
+                    if entry_error:
+                        errors.append(
+                            _format_library_file_validation_error(
+                                library_name,
+                                kind,
+                                idx,
+                                entry_error,
+                                {"type": entry_type, "location": location},
+                            )
+                        )
+                        new_entries.append(entry)
+                    else:
+                        new_entries.append({entry_type: normalized_entry["location"]})
+                        changed = changed or bool(entry_changed)
+                    handled = True
+                    break
+                if not handled:
+                    new_entries.append(entry)
+            lib_cfg[kind] = new_entries
+    return config_data, changed, errors
+
+
+def _iter_bundle_artifacts(config_data):
+    seen = set()
+    if not isinstance(config_data, dict):
+        return []
+    libraries = config_data.get("libraries")
+    if not isinstance(libraries, dict):
+        return []
+    artifacts = []
+    for lib_cfg in libraries.values():
+        if not isinstance(lib_cfg, dict):
+            continue
+        for kind in LIBRARY_FILE_KINDS:
+            entries = lib_cfg.get(kind)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for entry_type in LOCAL_LIBRARY_FILE_TYPES:
+                    location = entry.get(entry_type)
+                    if not location:
+                        continue
+                    raw_location = str(location).strip()
+                    if not raw_location:
+                        continue
+                    source_path = _resolve_local_library_source(raw_location)
+                    if source_path is None:
+                        continue
+                    if not source_path.exists():
+                        continue
+                    archive_path = _managed_bundle_location_for_path(source_path)
+                    if not archive_path:
+                        archive_path = _normalized_managed_library_relative_path(raw_location) or Path(raw_location).as_posix()
+                    dedupe_key = (str(source_path), archive_path)
+                    if dedupe_key in seen:
+                        break
+                    seen.add(dedupe_key)
+                    artifacts.append(
+                        {
+                            "source": source_path,
+                            "archive": archive_path,
+                            "type": entry_type,
+                        }
+                    )
+                    break
+    return artifacts
+
+
+def _bundle_write_path(zf, archive_name, source_path, redacted=False):
+    source_path = Path(source_path)
+    archive_name = Path(archive_name).as_posix()
+    if redacted and source_path.is_file() and _yaml_path_suffix(source_path.name):
+        text = source_path.read_text(encoding="utf-8", errors="replace")
+        zf.writestr(archive_name, helpers.redact_sensitive_data(text))
+        return
+    zf.write(source_path, archive_name)
+
+
+def _bundle_write_artifact(zf, artifact, redacted=False):
+    source_path = Path((artifact or {}).get("source", ""))
+    archive_path = Path(str((artifact or {}).get("archive", "")).replace("\\", "/"))
+    if not source_path.exists() or not str(archive_path):
+        return
+    if source_path.is_dir():
+        for child in sorted(source_path.rglob("*"), key=lambda item: item.as_posix().lower()):
+            if not child.is_file():
+                continue
+            relative_child = child.relative_to(source_path)
+            _bundle_write_path(zf, (archive_path / relative_child).as_posix(), child, redacted=redacted)
+        return
+    _bundle_write_path(zf, archive_path.as_posix(), source_path, redacted=redacted)
+
+
+def _is_blank_override_value(value):
+    if value is None:
+        return True
+    if isinstance(value, str):
+        text = value.strip()
+        return text == "" or text.lower() == "none"
+    return False
+
+
+def _coerce_override_bool(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1", "on"}:
+            return True
+        if lowered in {"false", "no", "0", "off"}:
+            return False
+    return None
+
+
+def _library_service_definition(service_name):
+    if service_name == "radarr":
+        return {
+            "template_key": "110-radarr",
+            "section_name": "radarr",
+            "fields": LIBRARY_RADARR_FIELDS,
+            "bool_fields": LIBRARY_RADARR_BOOL_FIELDS,
+            "label": "Radarr",
+        }
+    if service_name == "sonarr":
+        return {
+            "template_key": "120-sonarr",
+            "section_name": "sonarr",
+            "fields": LIBRARY_SONARR_FIELDS,
+            "bool_fields": LIBRARY_SONARR_BOOL_FIELDS,
+            "label": "Sonarr",
+        }
+    return None
+
+
+def _extract_library_service_overrides(libraries_data, library_id, service_name):
+    definition = _library_service_definition(service_name)
+    if not definition or not isinstance(libraries_data, dict):
+        return {}
+    overrides = {}
+    for field in definition["fields"]:
+        value = libraries_data.get(f"{library_id}-attribute_{service_name}_{field}")
+        if field in definition["bool_fields"]:
+            bool_value = _coerce_override_bool(value)
+            if bool_value is not None:
+                overrides[field] = bool_value
+            continue
+        if not _is_blank_override_value(value):
+            overrides[field] = str(value).strip() if isinstance(value, str) else value
+    return overrides
+
+
+def _validate_library_service_overrides(library_id, libraries_data, force_validate=False):
+    service_name = "radarr" if str(library_id or "").startswith("mov-library_") else "sonarr" if str(library_id or "").startswith("sho-library_") else None
+    definition = _library_service_definition(service_name)
+    if not definition:
+        return {"valid": True, "skipped": True, "service": None, "errors": []}
+
+    overrides = _extract_library_service_overrides(libraries_data, library_id, service_name)
+    if not overrides and not force_validate:
+        return {"valid": True, "skipped": True, "service": service_name, "overrides": {}, "errors": []}
+
+    settings = persistence.retrieve_settings(definition["template_key"]) or {}
+    global_section = settings.get(definition["section_name"], {}) if isinstance(settings, dict) else {}
+    if not isinstance(global_section, dict):
+        global_section = {}
+
+    effective_url = overrides.get("url") or global_section.get("url")
+    effective_token = overrides.get("token") or global_section.get("token")
+    library_name = libraries_data.get(f"{library_id}-library") if isinstance(libraries_data, dict) else None
+    display_name = str(library_name or library_id or "").strip() or str(library_id or "")
+    scoped_label = f"{display_name} {definition['label']}"
+
+    if _is_blank_override_value(effective_url) or _is_blank_override_value(effective_token):
+        return {
+            "valid": False,
+            "skipped": False,
+            "service": service_name,
+            "overrides": overrides,
+            "errors": [f"{scoped_label}: URL and token are required after applying overrides."],
+        }
+
+    if service_name == "radarr":
+        response_data, _status = validations.validate_radarr_payload({"url": effective_url, "token": effective_token})
+    else:
+        response_data, _status = validations.validate_sonarr_payload({"url": effective_url, "token": effective_token})
+
+    if not response_data.get("valid"):
+        return {
+            "valid": False,
+            "skipped": False,
+            "service": service_name,
+            "overrides": overrides,
+            "errors": [f"{scoped_label}: {response_data.get('error') or 'Validation failed.'}"],
+        }
+
+    errors = []
+    root_folders = response_data.get("root_folders", []) if isinstance(response_data, dict) else []
+    quality_profiles = response_data.get("quality_profiles", []) if isinstance(response_data, dict) else []
+    language_profiles = response_data.get("language_profiles", []) if isinstance(response_data, dict) else []
+
+    root_folder_names = {str(item.get("path") or "").strip() for item in root_folders if isinstance(item, dict)}
+    quality_profile_names = {str(item.get("name") or "").strip() for item in quality_profiles if isinstance(item, dict)}
+    language_profile_names = {str(item.get("name") or "").strip() for item in language_profiles if isinstance(item, dict)}
+
+    root_folder_path = overrides.get("root_folder_path")
+    if root_folder_path and root_folder_path not in root_folder_names:
+        errors.append(f"{scoped_label}: unknown root folder path '{root_folder_path}'.")
+
+    quality_profile = overrides.get("quality_profile")
+    if quality_profile and quality_profile not in quality_profile_names:
+        errors.append(f"{scoped_label}: unknown quality profile '{quality_profile}'.")
+
+    if service_name == "radarr":
+        availability = overrides.get("availability")
+        if availability and availability not in LIBRARY_RADARR_AVAILABILITY_VALUES:
+            errors.append(f"{scoped_label}: unsupported availability '{availability}'.")
+    else:
+        language_profile = overrides.get("language_profile")
+        if language_profile and language_profile not in language_profile_names:
+            errors.append(f"{scoped_label}: unknown language profile '{language_profile}'.")
+
+        series_type = overrides.get("series_type")
+        if series_type and series_type not in LIBRARY_SONARR_SERIES_TYPE_VALUES:
+            errors.append(f"{scoped_label}: unsupported series_type '{series_type}'.")
+
+        monitor_value = overrides.get("monitor")
+        if monitor_value and monitor_value not in LIBRARY_SONARR_MONITOR_VALUES:
+            errors.append(f"{scoped_label}: unsupported monitor value '{monitor_value}'.")
+
+    return {
+        "valid": not errors,
+        "skipped": False,
+        "service": service_name,
+        "overrides": overrides,
+        "errors": errors,
+        "root_folders": root_folders,
+        "quality_profiles": quality_profiles,
+        "language_profiles": language_profiles,
+    }
+
+
+def _validate_library_metadata_files(libraries_data, selected_library_ids):
+    if not isinstance(libraries_data, dict):
+        return []
+
+    errors = []
+    for lib_id in selected_library_ids or []:
+        raw_value = libraries_data.get(f"{lib_id}-metadata_files")
+        if raw_value in [None, "", "[]"]:
+            continue
+
+        entries = _parse_metadata_file_entries(raw_value)
+        if entries is None:
+            errors.append(f"{lib_id}: metadata_files must be a valid list.")
+            continue
+
+        for idx, entry in enumerate(entries, start=1):
+            valid, message, details = validations._normalize_metadata_validation_result(
+                validations.validate_metadata_file_payload(
+                    {
+                        "metadata_file_type": entry.get("type"),
+                        "metadata_file_location": entry.get("location"),
+                    }
+                )
+            )
+            if not valid:
+                errors.append(_format_library_file_validation_error(lib_id, "metadata_files", idx, message, entry, details))
+
+    return errors
+
+
+def _validate_library_collection_files(libraries_data, selected_library_ids):
+    if not isinstance(libraries_data, dict):
+        return []
+
+    errors = []
+    for lib_id in selected_library_ids or []:
+        raw_value = libraries_data.get(f"{lib_id}-collection_files")
+        if raw_value in [None, "", "[]"]:
+            continue
+
+        entries = _parse_collection_file_entries(raw_value)
+        if entries is None:
+            errors.append(f"{lib_id}: collection_files must be a valid list.")
+            continue
+
+        for idx, entry in enumerate(entries, start=1):
+            valid, message, details = validations._normalize_metadata_validation_result(
+                validations.validate_collection_file_payload(
+                    {
+                        "collection_file_type": entry.get("type"),
+                        "collection_file_location": entry.get("location"),
+                    }
+                )
+            )
+            if not valid:
+                errors.append(_format_library_file_validation_error(lib_id, "collection_files", idx, message, entry, details))
+
+    return errors
+
+
+def _validate_library_overlay_files(libraries_data, selected_library_ids):
+    if not isinstance(libraries_data, dict):
+        return []
+
+    errors = []
+    for lib_id in selected_library_ids or []:
+        raw_value = libraries_data.get(f"{lib_id}-overlay_files")
+        if raw_value in [None, "", "[]"]:
+            continue
+
+        entries = _parse_overlay_file_entries(raw_value)
+        if entries is None:
+            errors.append(f"{lib_id}: overlay_files must be a valid list.")
+            continue
+
+        for idx, entry in enumerate(entries, start=1):
+            valid, message, details = validations._normalize_metadata_validation_result(
+                validations.validate_overlay_file_payload(
+                    {
+                        "overlay_file_type": entry.get("type"),
+                        "overlay_file_location": entry.get("location"),
+                    }
+                )
+            )
+            if not valid:
+                errors.append(_format_library_file_validation_error(lib_id, "overlay_files", idx, message, entry, details))
+
+    return errors
+
+
+def _validate_and_organize_library_file_request(kind, data, type_key, location_key):
+    validator_info = LIBRARY_FILE_VALIDATORS.get(kind)
+    if not validator_info:
+        return jsonify({"valid": False, "error": f"Unsupported library file kind: {kind}"}), 400
+
+    _payload_type_key, _payload_location_key, validator = validator_info
+    valid, message, details = validations._normalize_metadata_validation_result(validator(data))
+    if not valid:
+        payload = {"valid": False, "error": message}
+        if details.get("message") or isinstance(details.get("files"), list):
+            payload["error_details"] = {
+                "text": details.get("message") or message,
+                "files": details.get("files") if isinstance(details.get("files"), list) else [],
+            }
+        if isinstance(details.get("files"), list):
+            payload["files"] = details["files"]
+        return jsonify(payload), 400
+
+    payload = {"valid": True}
+    if details.get("message"):
+        payload["message"] = details["message"]
+    if "validated_files" in details:
+        payload["validated_files"] = details["validated_files"]
+    if isinstance(details.get("files"), list):
+        payload["files"] = details["files"]
+
+    config_name = _resolve_request_config_name(data if isinstance(data, dict) else {})
+    library_scope = str((data or {}).get("library_id") or (data or {}).get("library_scope") or "").strip()
+    entry_type = str((data or {}).get(type_key) or "").strip().lower()
+    entry_location = str((data or {}).get(location_key) or "").strip()
+    if entry_type in LOCAL_LIBRARY_FILE_TYPES and entry_location and config_name and library_scope:
+        normalized_entry, changed, normalize_error = _normalize_library_external_entry(
+            kind,
+            {"type": entry_type, "location": entry_location},
+            config_name,
+            library_scope,
+            validate_local=False,
+        )
+        if normalize_error:
+            return jsonify({"valid": False, "error": normalize_error}), 400
+        payload["normalized_location"] = normalized_entry["location"]
+        payload["organized"] = bool(changed)
+        if changed:
+            payload["message"] = payload.get("message") or f"Source validated and organized into Quickstart {kind}."
+
+    return jsonify(payload)
+
+
+def _selected_library_ids_from_libraries_data(libraries_data):
+    if not isinstance(libraries_data, dict):
+        return []
+
+    return [
+        key[: -len("-library")]
+        for key, value in libraries_data.items()
+        if isinstance(key, str) and key.startswith(("mov-library_", "sho-library_")) and key.endswith("-library") and _is_truthy_setting_value(value)
+    ]
 
 
 def _library_prefix_from_key(key):
@@ -1190,6 +2262,180 @@ def _build_final_gate(workspace_status, template_list, validation_bulk_rollup_at
     }
 
 
+def _step_href(step_key):
+    target = str(step_key or "").strip()
+    if not target:
+        target = "001-start"
+    if has_request_context():
+        try:
+            return url_for("step", name=target)
+        except Exception:
+            return f"/step/{target}"
+    return f"/step/{target}"
+
+
+def _latest_bulk_validation_timestamp(config_name):
+    if not config_name:
+        return ""
+    try:
+        stored_validation = database.retrieve_section_data(config_name, "validation_summary")
+        stored_payload = stored_validation[2] if stored_validation else None
+        if isinstance(stored_payload, dict):
+            return str(stored_payload.get("updated_at") or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _workspace_step_status_from_app_readiness(state):
+    normalized = str(state or "").strip().lower()
+    if normalized in {"ready", "review", "running", "queued"}:
+        return "ok"
+    if normalized == "needs_validation":
+        return "warn"
+    if normalized in {"needs_prepare", "needs_setup", "blocked", "error"}:
+        return "error"
+    return "unknown"
+
+
+def _build_workspace_app_readiness_from_status(config_name, workspace_status, template_list=None):
+    template_list = template_list or helpers.get_menu_list()
+    final_gate = _build_final_gate(
+        workspace_status,
+        template_list,
+        _latest_bulk_validation_timestamp(config_name),
+    )
+    install_context = _build_kometa_install_context(config_name)
+
+    first_blocker = {}
+    todo_blockers = final_gate.get("todo_blockers") or []
+    if todo_blockers:
+        first_blocker = todo_blockers[0] if isinstance(todo_blockers[0], dict) else {}
+    blocker_key = first_blocker.get("key") or "001-start"
+    blocker_label = first_blocker.get("label") or "setup"
+    todo_count = int(final_gate.get("todo_count") or 0)
+
+    kometa = {
+        "name": "Kometa",
+        "href": _step_href("900-kometa"),
+        "action_label": "Open Kometa",
+        "state": "review",
+        "summary": "Open Kometa",
+        "detail": "Use the Kometa page to review build status, prepare the runtime, and run this config.",
+        "target_step": "900-kometa",
+        "final_gate_stage": final_gate.get("stage") or "todo",
+        "todo_count": todo_count,
+        "install_mode": install_context.get("kometa_install_mode") or "",
+        "mode_label": install_context.get("kometa_mode_label") or "",
+        "can_launch": bool(install_context.get("kometa_can_launch")),
+        "can_sync_config": bool(install_context.get("kometa_can_sync_config")),
+    }
+
+    if final_gate.get("stage") == "todo":
+        noun = "item" if todo_count == 1 else "items"
+        kometa.update(
+            state="needs_setup",
+            summary=f"{todo_count} setup {noun} left" if todo_count else "Finish setup first",
+            detail=f"Finish {blocker_label} before Kometa is ready to review in Quickstart.",
+            action_label="Finish setup",
+            href=_step_href(blocker_key),
+            target_step=blocker_key,
+        )
+    elif final_gate.get("stage") == "freshness":
+        kometa.update(
+            state="review",
+            summary="Validation refresh recommended",
+            detail=f"Open Kometa to refresh bulk validation before running. Quickstart expects validation within the last {QS_FINAL_VALIDATION_TTL_HOURS} hours, but the app itself is still available.",
+            action_label="Open Kometa",
+            href=_step_href("900-kometa"),
+            target_step="900-kometa",
+        )
+    elif install_context.get("kometa_can_launch"):
+        kometa.update(
+            state="ready",
+            summary="Ready in Quickstart",
+            detail="Open Kometa to prepare the runtime if needed, then review or run this config.",
+        )
+    elif install_context.get("kometa_can_sync_config"):
+        detail = "Open Kometa to review and sync this config."
+        if install_context.get("kometa_is_external_install"):
+            detail = "Open Kometa to review and sync this config for your external Kometa install."
+        kometa.update(
+            state="review",
+            summary="Config ready",
+            detail=detail,
+        )
+
+    imagemaid_settings, imagemaid_section = _get_imagemaid_settings_section(config_name)
+    imagemaid_state = _probe_imagemaid_root_state(helpers.get_imagemaid_root_path())
+    imagemaid_row = database.retrieve_section_data(config_name, "imagemaid") if config_name else None
+    imagemaid_validated = helpers.booler(imagemaid_row[0]) if imagemaid_row else helpers.booler(imagemaid_settings.get("validated", False))
+    imagemaid_is_valid, imagemaid_reason, imagemaid_details = _validate_imagemaid_settings(imagemaid_section, config_name=config_name)
+
+    imagemaid = {
+        "name": "ImageMaid",
+        "href": _step_href("915-imagemaid"),
+        "action_label": "Open ImageMaid",
+        "state": "needs_prepare",
+        "summary": "Prepare ImageMaid",
+        "detail": "Install or prepare ImageMaid before validating and running it in Quickstart.",
+        "target_step": "915-imagemaid",
+        "validated": bool(imagemaid_validated),
+        "settings_valid": bool(imagemaid_is_valid),
+        "installed": bool(imagemaid_state.get("imagemaid_installed")),
+        "venv_ready": bool(imagemaid_state.get("venv_python_exists")),
+    }
+
+    if imagemaid_state.get("imagemaid_installed") and imagemaid_state.get("venv_python_exists"):
+        if imagemaid_is_valid and imagemaid_validated:
+            imagemaid.update(
+                state="ready",
+                summary="Ready to run",
+                detail="Open ImageMaid to review the command preview and run it.",
+            )
+        elif imagemaid_is_valid:
+            imagemaid.update(
+                state="needs_validation",
+                summary="Ready to validate",
+                detail="Open ImageMaid and validate the saved settings to unlock run controls.",
+            )
+        else:
+            summary_map = {
+                "missing_plex_validation": "Plex validation required",
+                "missing_credentials": "Saved Plex credentials required",
+                "invalid_path": "Plex path needs attention",
+            }
+            imagemaid.update(
+                state="needs_setup",
+                summary=summary_map.get(imagemaid_reason, "ImageMaid needs attention"),
+                detail=str(imagemaid_details or "Open ImageMaid to finish setup.").strip(),
+            )
+            if imagemaid_reason == "missing_plex_validation":
+                imagemaid.update(
+                    href=_step_href("010-plex"),
+                    action_label="Open Plex",
+                    target_step="010-plex",
+                )
+
+    return {
+        "generated_at": utc_now_iso(),
+        "kometa": kometa,
+        "imagemaid": imagemaid,
+    }
+
+
+def _build_workspace_app_readiness(config_name, template_list=None, available_configs=None):
+    template_list = template_list or helpers.get_menu_list()
+    available_configs = available_configs or database.get_unique_config_names() or []
+    workspace_status = _build_workspace_status_context(
+        config_name,
+        template_list,
+        available_configs=available_configs,
+        include_app_readiness_overrides=False,
+    )
+    return _build_workspace_app_readiness_from_status(config_name, workspace_status, template_list=template_list)
+
+
 def _is_nonblank_setting(value):
     if value is None:
         return False
@@ -1208,7 +2454,7 @@ def _is_meaningful_optional_status_input(value):
         return False
     text = str(value).strip().lower()
     # UI template placeholders can be persisted as defaults; they should not
-    # make an optional page look user-configured in the workspace menu.
+    # make an optional page look user-configured in the workspace menu
     return not (text.startswith("enter ") and any(token in text for token in ("token", "api key", "url", "client")))
 
 
@@ -1223,6 +2469,12 @@ def _has_meaningful_optional_input(template_key, payload):
     if template_key == "100-anidb":
         anidb = payload.get("anidb", {})
         return isinstance(anidb, dict) and helpers.booler(anidb.get("enable"))
+
+    if template_key == "087-apprise":
+        apprise = payload.get("apprise", {})
+        if not isinstance(apprise, dict):
+            return False
+        return _is_meaningful_optional_status_input(apprise.get("location"))
 
     simple_key_requirements = {
         "030-tautulli": ("tautulli", ("url", "apikey")),
@@ -1285,7 +2537,18 @@ def _has_meaningful_optional_input(template_key, payload):
 
 def _derive_step_status(template_key, group, section_rows, config_exists):
     if template_key == "001-start":
-        return "ok" if config_exists else "error"
+        if not config_exists:
+            return "error"
+        kometa_entry = section_rows.get("kometa") if isinstance(section_rows, dict) else None
+        kometa_entry = kometa_entry if isinstance(kometa_entry, dict) else {}
+        kometa_payload = kometa_entry.get("data")
+        kometa_payload = kometa_payload if isinstance(kometa_payload, dict) else {}
+        kometa_section = kometa_payload.get("kometa") if isinstance(kometa_payload.get("kometa"), dict) else {}
+        kometa_selection = _canonicalize_kometa_section(kometa_section)
+        if kometa_selection.get("install_mode") == KOMETA_INSTALL_MODE_MANAGED:
+            return "ok"
+        is_valid, _reason, _details = _validate_saved_kometa_selection(kometa_selection)
+        return "ok" if is_valid else "error"
 
     if template_key == "900-kometa":
         return "warn"
@@ -1376,7 +2639,7 @@ def _derive_step_status(template_key, group, section_rows, config_exists):
     return "ok"
 
 
-def _build_workspace_status_context(config_name, template_list, available_configs=None):
+def _build_workspace_status_context(config_name, template_list, available_configs=None, include_app_readiness_overrides=True):
     template_keys = []
     for file_entry, _ in template_list or []:
         template_key = file_entry.rsplit(".", 1)[0]
@@ -1439,6 +2702,29 @@ def _build_workspace_status_context(config_name, template_list, available_config
         step_statuses[template_key] = _derive_step_status(template_key, group, section_rows, config_exists)
     if "900-kometa" in template_keys:
         step_statuses["900-kometa"] = _derive_live_final_validation_status(step_statuses, template_keys)
+
+    if include_app_readiness_overrides and config_name:
+        provisional_status = {
+            "step_statuses": dict(step_statuses),
+            "required_keys": list(required_keys),
+            "optional_keys": list(optional_keys),
+            "review_keys": list(review_keys),
+            "tautulli_requirement_reasons": tautulli_requirement_reasons,
+            "omdb_requirement_reasons": omdb_requirement_reasons,
+            "mdblist_requirement_reasons": mdblist_requirement_reasons,
+            "anidb_requirement_reasons": anidb_requirement_reasons,
+            "radarr_requirement_reasons": radarr_requirement_reasons,
+            "sonarr_requirement_reasons": sonarr_requirement_reasons,
+            "trakt_requirement_reasons": trakt_requirement_reasons,
+            "mal_requirement_reasons": mal_requirement_reasons,
+        }
+        app_readiness = _build_workspace_app_readiness_from_status(config_name, provisional_status, template_list=template_list)
+        kometa_readiness = app_readiness.get("kometa") if isinstance(app_readiness, dict) else None
+        imagemaid_readiness = app_readiness.get("imagemaid") if isinstance(app_readiness, dict) else None
+        if "900-kometa" in step_statuses and isinstance(kometa_readiness, dict):
+            step_statuses["900-kometa"] = _workspace_step_status_from_app_readiness(kometa_readiness.get("state"))
+        if "915-imagemaid" in step_statuses and isinstance(imagemaid_readiness, dict):
+            step_statuses["915-imagemaid"] = _workspace_step_status_from_app_readiness(imagemaid_readiness.get("state"))
 
     required_rollup = _worst_status(step_statuses.get(key, "warn") for key in required_keys) if required_keys else "ok"
     review_rollup = _worst_status(step_statuses.get(key, "ok") for key in review_keys) if review_keys else "ok"
@@ -1581,6 +2867,68 @@ def _calculate_system_cpu_percent():
     return max(0.0, min(100.0, percent))
 
 
+def _calculate_process_io_stats(proc, cache_name):
+    bucket = PROCESS_IO_CACHE.setdefault(cache_name, {})
+    total_read = 0
+    total_write = 0
+    saw_counters = False
+
+    def _accumulate_io(target_proc):
+        nonlocal total_read, total_write, saw_counters
+        try:
+            counters = target_proc.io_counters()
+        except Exception:
+            return
+        read_bytes = getattr(counters, "read_bytes", None)
+        write_bytes = getattr(counters, "write_bytes", None)
+        if read_bytes is None or write_bytes is None:
+            return
+        saw_counters = True
+        total_read += max(0, int(read_bytes))
+        total_write += max(0, int(write_bytes))
+
+    _accumulate_io(proc)
+    try:
+        for child in proc.children(recursive=True):
+            _accumulate_io(child)
+    except Exception:
+        pass
+
+    if not saw_counters:
+        return None
+
+    now = time.time()
+    entry = bucket.get(proc.pid)
+    bucket[proc.pid] = {"time": now, "read": total_read, "write": total_write}
+
+    read_rate_mb_s = None
+    write_rate_mb_s = None
+    if entry:
+        elapsed = now - entry.get("time", now)
+        if elapsed > 0:
+            delta_read = total_read - entry.get("read", total_read)
+            delta_write = total_write - entry.get("write", total_write)
+            if delta_read >= 0:
+                read_rate_mb_s = delta_read / (1024 * 1024) / elapsed
+            if delta_write >= 0:
+                write_rate_mb_s = delta_write / (1024 * 1024) / elapsed
+
+    return {
+        "disk_read_mb": total_read / (1024 * 1024),
+        "disk_write_mb": total_write / (1024 * 1024),
+        "disk_read_rate_mb_s": read_rate_mb_s,
+        "disk_write_rate_mb_s": write_rate_mb_s,
+    }
+
+
+def _clear_process_metric_cache(pid, cache_name=None):
+    if pid is None:
+        return
+    KOMETA_CPU_CACHE.pop(pid, None)
+    if cache_name:
+        PROCESS_IO_CACHE.setdefault(cache_name, {}).pop(pid, None)
+
+
 def _parse_maintenance_window_minutes(window_str):
     if not window_str or "Unavailable" in str(window_str):
         return None
@@ -1606,14 +2954,22 @@ def _is_within_maintenance_window(now_dt, start_min, end_min):
     return now_min >= start_min or now_min < end_min
 
 
-def _get_maintenance_window_from_db():
-    config_name = database.get_last_used_config_name()
+def _get_maintenance_window_from_db(config_name=None):
+    config_name = helpers.normalize_config_name_for_storage(config_name) or database.get_last_used_config_name()
     if not config_name:
         return None, None, None
     try:
         _validated, _user_entered, data = database.retrieve_section_data(name=config_name, section="plex_telemetry")
         telemetry = data.get("plex_telemetry", {}) if isinstance(data, dict) else {}
         window_str = telemetry.get("maintenance_window")
+        if not window_str:
+            legacy_telemetry = persistence.retrieve_settings("plex_telemetry")
+            if isinstance(legacy_telemetry, dict):
+                window_str = legacy_telemetry.get("plex_telemetry", {}).get("maintenance_window")
+        if not window_str:
+            legacy_plex = persistence.retrieve_settings("010-plex")
+            if isinstance(legacy_plex, dict):
+                window_str = legacy_plex.get("plex", {}).get("telemetry", {}).get("maintenance_window")
         minutes = _parse_maintenance_window_minutes(window_str)
         if not minutes:
             return None, None, None
@@ -1623,8 +2979,8 @@ def _get_maintenance_window_from_db():
         return None, None, None
 
 
-def _get_plex_credentials_from_db():
-    config_name = database.get_last_used_config_name()
+def _get_plex_credentials_from_db(config_name=None):
+    config_name = helpers.normalize_config_name_for_storage(config_name) or database.get_last_used_config_name()
     if not config_name:
         return None, None
     try:
@@ -1638,8 +2994,8 @@ def _get_plex_credentials_from_db():
         return None, None
 
 
-def _get_maintenance_window_live():
-    plex_url, plex_token = _get_plex_credentials_from_db()
+def _get_maintenance_window_live(config_name=None):
+    plex_url, plex_token = _get_plex_credentials_from_db(config_name=config_name)
     if not plex_url or not plex_token:
         return None, None, None
     start_hour, end_hour = helpers.get_plex_maintenance_hours(plex_url, plex_token)
@@ -1647,6 +3003,82 @@ def _get_maintenance_window_live():
         return None, None, None
     window_str = f"{start_hour:02d}:00 – {end_hour:02d}:00"
     return start_hour * 60, end_hour * 60, window_str
+
+
+def _get_active_maintenance_lookup_config_name():
+    def normalize_optional_config_name(value):
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        return helpers.normalize_config_name_for_storage(raw)
+
+    kometa_running = bool(helpers.get_kometa_pid() and helpers.is_kometa_running())
+    imagemaid_running = bool(helpers.get_imagemaid_pid() and helpers.is_imagemaid_running())
+
+    try:
+        kometa_ctx = _get_run_context()
+    except Exception:
+        kometa_ctx = {}
+    kometa_config = normalize_optional_config_name((kometa_ctx or {}).get("config_name"))
+    if kometa_running and kometa_config:
+        return kometa_config
+
+    try:
+        imagemaid_ctx = _get_imagemaid_run_context()
+    except Exception:
+        imagemaid_ctx = {}
+    imagemaid_config = normalize_optional_config_name((imagemaid_ctx or {}).get("config_name"))
+    if imagemaid_running and imagemaid_config:
+        return imagemaid_config
+
+    pending = _peek_pending_kometa_start()
+    pending_config = normalize_optional_config_name((pending or {}).get("config_name"))
+    if pending_config:
+        return pending_config
+
+    return database.get_last_used_config_name()
+
+
+def _resolve_maintenance_window_live(config_name=None):
+    try:
+        return _get_maintenance_window_live(config_name=config_name)
+    except TypeError:
+        return _get_maintenance_window_live()
+
+
+def _resolve_maintenance_window_from_db(config_name=None):
+    try:
+        return _get_maintenance_window_from_db(config_name=config_name)
+    except TypeError:
+        return _get_maintenance_window_from_db()
+
+
+def _refresh_maintenance_window_availability(preserve_active_state=False):
+    maintenance_config_name = _get_active_maintenance_lookup_config_name()
+    start_min, end_min, window_str = _resolve_maintenance_window_live(config_name=maintenance_config_name)
+    if start_min is None or end_min is None:
+        start_min, end_min, window_str = _resolve_maintenance_window_from_db(config_name=maintenance_config_name)
+    window_unavailable = start_min is None or end_min is None
+
+    kometa_running = bool(helpers.get_kometa_pid() and helpers.is_kometa_running())
+    imagemaid_running = bool(helpers.get_imagemaid_pid() and helpers.is_imagemaid_running())
+    has_pending = bool(_peek_pending_kometa_start())
+    active = _is_within_maintenance_window(datetime.now(), start_min, end_min)
+
+    with MAINTENANCE_STATE_LOCK:
+        if preserve_active_state and (MAINTENANCE_STATE.get("paused") or MAINTENANCE_STATE.get("imagemaid_paused")):
+            if window_str:
+                MAINTENANCE_STATE["window"] = window_str
+        else:
+            MAINTENANCE_STATE["active"] = active
+            MAINTENANCE_STATE["window"] = window_str
+        if window_unavailable and (kometa_running or imagemaid_running or has_pending):
+            if not MAINTENANCE_STATE.get("window_unavailable"):
+                MAINTENANCE_STATE["window_unavailable_since"] = datetime.now(timezone.utc).isoformat()
+            MAINTENANCE_STATE["window_unavailable"] = True
+        else:
+            MAINTENANCE_STATE["window_unavailable"] = False
+            MAINTENANCE_STATE["window_unavailable_since"] = None
 
 
 def _normalize_kometa_start_mode(raw_mode):
@@ -1696,16 +3128,28 @@ def _find_running_kometa_processes():
     except Exception:
         kometa_root = None
     matches = []
-    for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
+    for proc in psutil.process_iter():
         try:
-            cmdline = proc.info.get("cmdline") or []
+            cmdline = []
+            if hasattr(proc, "info"):
+                cmdline = proc.info.get("cmdline") or []
+            if not cmdline:
+                cmdline = proc.cmdline() or []
             joined = " ".join(cmdline)
         except Exception:
             continue
         if "kometa.py" not in joined:
             continue
         has_root = bool(kometa_root and kometa_root in joined)
-        create_time = proc.info.get("create_time") or 0
+        try:
+            create_time = proc.info.get("create_time") if hasattr(proc, "info") else None
+        except Exception:
+            create_time = None
+        if create_time is None:
+            try:
+                create_time = proc.create_time()
+            except Exception:
+                create_time = 0
         matches.append((has_root, create_time, proc))
     matches.sort(key=lambda item: (1 if item[0] else 0, item[1]), reverse=True)
     return [entry[2] for entry in matches]
@@ -1723,16 +3167,28 @@ def _find_running_imagemaid_processes():
     except Exception:
         imagemaid_root = None
     matches = []
-    for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
+    for proc in psutil.process_iter():
         try:
-            cmdline = proc.info.get("cmdline") or []
+            cmdline = []
+            if hasattr(proc, "info"):
+                cmdline = proc.info.get("cmdline") or []
+            if not cmdline:
+                cmdline = proc.cmdline() or []
             joined = " ".join(cmdline)
         except Exception:
             continue
         if "imagemaid.py" not in joined:
             continue
         has_root = bool(imagemaid_root and imagemaid_root in joined)
-        create_time = proc.info.get("create_time") or 0
+        try:
+            create_time = proc.info.get("create_time") if hasattr(proc, "info") else None
+        except Exception:
+            create_time = None
+        if create_time is None:
+            try:
+                create_time = proc.create_time()
+            except Exception:
+                create_time = 0
         matches.append((has_root, create_time, proc))
     matches.sort(key=lambda item: (1 if item[0] else 0, item[1]), reverse=True)
     return [entry[2] for entry in matches]
@@ -1854,7 +3310,12 @@ def _launch_imagemaid_command(command, mode=None, config_name=None):
     if not any(p.endswith("imagemaid.py") for p in command_parts):
         command_parts.insert(1, str(imagemaid_py))
 
+    env_ready, env_result = _reset_imagemaid_runtime_env(imagemaid_root)
+    if not env_ready:
+        return False, env_result or "Quickstart could not reset the ImageMaid runtime .env file."
+
     helpers.ts_log(f"argv={command_parts!r}", level="DEBUG")
+    _update_imagemaid_run_context(command_parts, mode=mode, config_name=config_name)
     launch_log_path = Path(helpers.get_imagemaid_launch_log_file())
     launch_log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1885,6 +3346,17 @@ def _launch_imagemaid_command(command, mode=None, config_name=None):
 
     _schedule_quickstart_imagemaid_run_marker(imagemaid_root, mode=mode, config_name=config_name)
     return True, proc.pid
+
+
+def _reset_imagemaid_runtime_env(imagemaid_root):
+    try:
+        env_path = Path(imagemaid_root) / "config" / ".env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("", encoding="utf-8")
+        helpers.ts_log(f"Reset ImageMaid runtime env override file: {env_path}", level="DEBUG")
+        return True, str(env_path)
+    except Exception as exc:
+        return False, f"Quickstart could not reset ImageMaid env file before launch: {exc}"
 
 
 def _extract_selected_libraries(command):
@@ -1955,6 +3427,49 @@ def _get_run_context():
         return dict(RUN_CONTEXT)
 
 
+def _clear_run_context():
+    with RUN_CONTEXT_LOCK:
+        RUN_CONTEXT["command"] = None
+        RUN_CONTEXT["selected_libraries"] = None
+        RUN_CONTEXT["run_option"] = None
+        RUN_CONTEXT["run_mode"] = "all"
+        RUN_CONTEXT["start_mode"] = "current"
+        RUN_CONTEXT["config_name"] = None
+        RUN_CONTEXT["config_path"] = None
+        RUN_CONTEXT["started_at"] = None
+        RUN_CONTEXT["updated_at"] = None
+        RUN_CONTEXT["stop_requested_at"] = None
+
+
+def _normalize_imagemaid_command_text(command):
+    if isinstance(command, (list, tuple)):
+        return " ".join(str(part) for part in command if str(part).strip())
+    return str(command or "").strip()
+
+
+def _update_imagemaid_run_context(command, mode=None, config_name=None):
+    with IMAGEMAID_RUN_CONTEXT_LOCK:
+        IMAGEMAID_RUN_CONTEXT["command"] = _normalize_imagemaid_command_text(command)
+        IMAGEMAID_RUN_CONTEXT["mode"] = str(mode or "").strip().lower() or None
+        IMAGEMAID_RUN_CONTEXT["config_name"] = str(config_name or "").strip() or None
+        IMAGEMAID_RUN_CONTEXT["started_at"] = datetime.now()
+        IMAGEMAID_RUN_CONTEXT["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _get_imagemaid_run_context():
+    with IMAGEMAID_RUN_CONTEXT_LOCK:
+        return dict(IMAGEMAID_RUN_CONTEXT)
+
+
+def _clear_imagemaid_run_context():
+    with IMAGEMAID_RUN_CONTEXT_LOCK:
+        IMAGEMAID_RUN_CONTEXT["command"] = None
+        IMAGEMAID_RUN_CONTEXT["mode"] = None
+        IMAGEMAID_RUN_CONTEXT["config_name"] = None
+        IMAGEMAID_RUN_CONTEXT["started_at"] = None
+        IMAGEMAID_RUN_CONTEXT["updated_at"] = None
+
+
 def _suspend_process_tree(proc):
     try:
         for child in proc.children(recursive=True):
@@ -1993,20 +3508,33 @@ def _maintenance_guard_loop(app_in):
     with app_in.app_context():
         while True:
             time.sleep(interval)
-            pid = helpers.get_kometa_pid()
-            start_min, end_min, window_str = _get_maintenance_window_live()
+            maintenance_config_name = _get_active_maintenance_lookup_config_name()
+            start_min, end_min, window_str = _resolve_maintenance_window_live(config_name=maintenance_config_name)
             if start_min is None or end_min is None:
-                start_min, end_min, window_str = _get_maintenance_window_from_db()
+                start_min, end_min, window_str = _resolve_maintenance_window_from_db(config_name=maintenance_config_name)
             window_unavailable = start_min is None or end_min is None
+            pid = helpers.get_kometa_pid()
             kometa_running = pid and helpers.is_kometa_running()
+            imagemaid_pid = helpers.get_imagemaid_pid()
+            imagemaid_running = imagemaid_pid and helpers.is_imagemaid_running()
+            if not imagemaid_running:
+                imagemaid_proc = _find_running_imagemaid_process()
+                if imagemaid_proc:
+                    imagemaid_running = True
+                    imagemaid_pid = imagemaid_proc.pid
+                    try:
+                        with open(helpers.get_imagemaid_pid_file(), "w", encoding="utf-8") as handle:
+                            handle.write(str(imagemaid_pid))
+                    except Exception:
+                        pass
             has_pending = bool(_peek_pending_kometa_start())
-            if window_unavailable and (kometa_running or has_pending):
+            if window_unavailable and (kometa_running or imagemaid_running or has_pending):
                 with MAINTENANCE_STATE_LOCK:
                     if not MAINTENANCE_STATE.get("window_unavailable"):
                         MAINTENANCE_STATE["window_unavailable"] = True
                         MAINTENANCE_STATE["window_unavailable_since"] = datetime.now(timezone.utc).isoformat()
                         helpers.ts_log(
-                            "Plex maintenance window unavailable; keeping Kometa paused/queued until Plex is reachable.",
+                            "Plex maintenance window unavailable; keeping Quickstart work paused/queued until Plex is reachable.",
                             level="WARNING",
                         )
             else:
@@ -2039,63 +3567,134 @@ def _maintenance_guard_loop(app_in):
                                 MAINTENANCE_STATE["queued_started_at"] = datetime.now(timezone.utc).isoformat()
                         else:
                             helpers.ts_log(f"Failed to start Kometa after maintenance: {result}", level="ERROR")
+            elif start_min is not None and end_min is not None:
+                try:
+                    proc = psutil.Process(pid)
+                except psutil.NoSuchProcess:
+                    with MAINTENANCE_STATE_LOCK:
+                        MAINTENANCE_STATE["paused"] = False
+                        MAINTENANCE_STATE["paused_since"] = None
+                else:
+                    if active:
+                        with MAINTENANCE_STATE_LOCK:
+                            already_paused = MAINTENANCE_STATE["paused"]
+                        if not already_paused and _suspend_process_tree(proc):
+                            window_label = f" ({window_str})" if window_str else ""
+                            helpers.ts_log(f"Kometa paused due to Plex maintenance window{window_label}.", level="INFO")
+                            try:
+                                if not _write_quickstart_maintenance_marker(helpers.get_kometa_root_path(), "paused", window=window_str):
+                                    helpers.ts_log("Failed to append Quickstart paused maintenance marker to meta.log.", level="WARNING")
+                            except Exception:
+                                helpers.ts_log("Failed to append Quickstart paused maintenance marker to meta.log.", level="WARNING")
+                            with MAINTENANCE_STATE_LOCK:
+                                MAINTENANCE_STATE["paused"] = True
+                                MAINTENANCE_STATE["paused_since"] = datetime.now(timezone.utc).isoformat()
+                    else:
+                        with MAINTENANCE_STATE_LOCK:
+                            was_paused = MAINTENANCE_STATE["paused"]
+                            paused_since = MAINTENANCE_STATE["paused_since"]
+                        if was_paused and _resume_process_tree(proc):
+                            window_label = f" ({window_str})" if window_str else ""
+                            helpers.ts_log(f"Plex maintenance ended{window_label}. Kometa resumed.", level="INFO")
+                            paused_seconds = None
+                            if paused_since:
+                                try:
+                                    paused_at = datetime.fromisoformat(str(paused_since).replace("Z", "+00:00"))
+                                    if paused_at.tzinfo is None:
+                                        paused_at = paused_at.replace(tzinfo=timezone.utc)
+                                    paused_seconds = max(0, int((datetime.now(timezone.utc) - paused_at).total_seconds()))
+                                except Exception:
+                                    paused_seconds = None
+                            try:
+                                if not _write_quickstart_maintenance_marker(
+                                    helpers.get_kometa_root_path(),
+                                    "resumed",
+                                    window=window_str,
+                                    paused_seconds=paused_seconds,
+                                ):
+                                    helpers.ts_log("Failed to append Quickstart resumed maintenance marker to meta.log.", level="WARNING")
+                            except Exception:
+                                helpers.ts_log("Failed to append Quickstart resumed maintenance marker to meta.log.", level="WARNING")
+                            with MAINTENANCE_STATE_LOCK:
+                                MAINTENANCE_STATE["paused"] = False
+                                MAINTENANCE_STATE["paused_since"] = None
+
+            if not imagemaid_running:
+                with MAINTENANCE_STATE_LOCK:
+                    MAINTENANCE_STATE["imagemaid_paused"] = False
+                    MAINTENANCE_STATE["imagemaid_paused_since"] = None
                 continue
 
             if start_min is None or end_min is None:
                 continue
 
             try:
-                proc = psutil.Process(pid)
+                imagemaid_proc = psutil.Process(imagemaid_pid)
             except psutil.NoSuchProcess:
                 with MAINTENANCE_STATE_LOCK:
-                    MAINTENANCE_STATE["paused"] = False
-                    MAINTENANCE_STATE["paused_since"] = None
+                    MAINTENANCE_STATE["imagemaid_paused"] = False
+                    MAINTENANCE_STATE["imagemaid_paused_since"] = None
                 continue
+
+            imagemaid_ctx = _get_imagemaid_run_context()
+            imagemaid_mode = imagemaid_ctx.get("mode")
+            imagemaid_config_name = imagemaid_ctx.get("config_name")
+            imagemaid_log_path = _get_latest_imagemaid_log_path()
 
             if active:
                 with MAINTENANCE_STATE_LOCK:
-                    already_paused = MAINTENANCE_STATE["paused"]
-                if not already_paused:
-                    if _suspend_process_tree(proc):
-                        window_label = f" ({window_str})" if window_str else ""
-                        helpers.ts_log(f"Kometa paused due to Plex maintenance window{window_label}.", level="INFO")
-                        try:
-                            _write_quickstart_maintenance_marker(helpers.get_kometa_root_path(), "paused", window=window_str)
-                        except Exception:
-                            pass
-                        with MAINTENANCE_STATE_LOCK:
-                            MAINTENANCE_STATE["paused"] = True
-                            MAINTENANCE_STATE["paused_since"] = datetime.now(timezone.utc).isoformat()
+                    imagemaid_already_paused = MAINTENANCE_STATE["imagemaid_paused"]
+                if not imagemaid_already_paused and _suspend_process_tree(imagemaid_proc):
+                    window_label = f" ({window_str})" if window_str else ""
+                    helpers.ts_log(f"ImageMaid paused due to Plex maintenance window{window_label}.", level="INFO")
+                    try:
+                        if not _write_quickstart_imagemaid_maintenance_marker(
+                            helpers.get_imagemaid_root_path(),
+                            "paused",
+                            mode=imagemaid_mode,
+                            config_name=imagemaid_config_name,
+                            window=window_str,
+                            log_path=imagemaid_log_path,
+                        ):
+                            helpers.ts_log("Failed to append Quickstart paused ImageMaid maintenance marker to the live log.", level="WARNING")
+                    except Exception:
+                        helpers.ts_log("Failed to append Quickstart paused ImageMaid maintenance marker to the live log.", level="WARNING")
+                    with MAINTENANCE_STATE_LOCK:
+                        MAINTENANCE_STATE["imagemaid_paused"] = True
+                        MAINTENANCE_STATE["imagemaid_paused_since"] = datetime.now(timezone.utc).isoformat()
                 continue
 
             with MAINTENANCE_STATE_LOCK:
-                was_paused = MAINTENANCE_STATE["paused"]
-                paused_since = MAINTENANCE_STATE["paused_since"]
-            if was_paused:
-                if _resume_process_tree(proc):
-                    window_label = f" ({window_str})" if window_str else ""
-                    helpers.ts_log(f"Plex maintenance ended{window_label}. Kometa resumed.", level="INFO")
-                    paused_seconds = None
-                    if paused_since:
-                        try:
-                            paused_at = datetime.fromisoformat(str(paused_since).replace("Z", "+00:00"))
-                            if paused_at.tzinfo is None:
-                                paused_at = paused_at.replace(tzinfo=timezone.utc)
-                            paused_seconds = max(0, int((datetime.now(timezone.utc) - paused_at).total_seconds()))
-                        except Exception:
-                            paused_seconds = None
+                imagemaid_was_paused = MAINTENANCE_STATE["imagemaid_paused"]
+                imagemaid_paused_since = MAINTENANCE_STATE["imagemaid_paused_since"]
+            if imagemaid_was_paused and _resume_process_tree(imagemaid_proc):
+                window_label = f" ({window_str})" if window_str else ""
+                helpers.ts_log(f"Plex maintenance ended{window_label}. ImageMaid resumed.", level="INFO")
+                imagemaid_paused_seconds = None
+                if imagemaid_paused_since:
                     try:
-                        _write_quickstart_maintenance_marker(
-                            helpers.get_kometa_root_path(),
-                            "resumed",
-                            window=window_str,
-                            paused_seconds=paused_seconds,
-                        )
+                        paused_at = datetime.fromisoformat(str(imagemaid_paused_since).replace("Z", "+00:00"))
+                        if paused_at.tzinfo is None:
+                            paused_at = paused_at.replace(tzinfo=timezone.utc)
+                        imagemaid_paused_seconds = max(0, int((datetime.now(timezone.utc) - paused_at).total_seconds()))
                     except Exception:
-                        pass
-                    with MAINTENANCE_STATE_LOCK:
-                        MAINTENANCE_STATE["paused"] = False
-                        MAINTENANCE_STATE["paused_since"] = None
+                        imagemaid_paused_seconds = None
+                try:
+                    if not _write_quickstart_imagemaid_maintenance_marker(
+                        helpers.get_imagemaid_root_path(),
+                        "resumed",
+                        mode=imagemaid_mode,
+                        config_name=imagemaid_config_name,
+                        window=window_str,
+                        log_path=imagemaid_log_path,
+                        paused_seconds=imagemaid_paused_seconds,
+                    ):
+                        helpers.ts_log("Failed to append Quickstart resumed ImageMaid maintenance marker to the live log.", level="WARNING")
+                except Exception:
+                    helpers.ts_log("Failed to append Quickstart resumed ImageMaid maintenance marker to the live log.", level="WARNING")
+                with MAINTENANCE_STATE_LOCK:
+                    MAINTENANCE_STATE["imagemaid_paused"] = False
+                    MAINTENANCE_STATE["imagemaid_paused_since"] = None
 
 
 def _write_quickstart_run_marker(kometa_root, config_name=None, start_mode="current"):
@@ -2111,6 +3710,7 @@ def _write_quickstart_run_marker(kometa_root, config_name=None, start_mode="curr
             f"config={safe_config} quickstart={qs_version} branch={qs_branch} "
             f"maintenance_markers=1 start_mode={safe_start_mode}"
         )
+        _reset_kometa_maintenance_sidecar(kometa_root)
         _append_quickstart_meta_log_line(kometa_root, marker)
     except Exception:
         pass
@@ -2130,6 +3730,41 @@ def _append_quickstart_meta_log_line(kometa_root, line):
         return False
 
 
+def _get_kometa_maintenance_sidecar_path(kometa_root):
+    return Path(kometa_root) / "config" / "logs" / "meta.quickstart-maintenance.log"
+
+
+def _reset_kometa_maintenance_sidecar(kometa_root):
+    try:
+        sidecar_path = _get_kometa_maintenance_sidecar_path(kometa_root)
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        sidecar_path.write_text("", encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def _append_kometa_maintenance_sidecar_line(kometa_root, line):
+    if not line:
+        return False
+    try:
+        sidecar_path = _get_kometa_maintenance_sidecar_path(kometa_root)
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        with sidecar_path.open("a", encoding="utf-8", errors="ignore") as handle:
+            handle.write(str(line).rstrip() + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def _is_logscan_maintenance_sidecar(path):
+    try:
+        name = Path(path).name.lower()
+    except Exception:
+        return False
+    return name in {"meta.quickstart-maintenance.log", "imagemaid.quickstart-maintenance.log"}
+
+
 def _append_quickstart_imagemaid_log_line(imagemaid_root, line, log_path=None):
     if not line:
         return False
@@ -2139,6 +3774,33 @@ def _append_quickstart_imagemaid_log_line(imagemaid_root, line, log_path=None):
         log_dir.mkdir(parents=True, exist_ok=True)
         target = Path(log_path) if log_path else (log_dir / "imagemaid.log")
         with target.open("a", encoding="utf-8", errors="ignore") as handle:
+            handle.write(str(line).rstrip() + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def _get_imagemaid_maintenance_sidecar_path(imagemaid_root):
+    return Path(imagemaid_root) / "config" / "logs" / "imagemaid.quickstart-maintenance.log"
+
+
+def _reset_imagemaid_maintenance_sidecar(imagemaid_root):
+    try:
+        sidecar_path = _get_imagemaid_maintenance_sidecar_path(imagemaid_root)
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        sidecar_path.write_text("", encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def _append_imagemaid_maintenance_sidecar_line(imagemaid_root, line):
+    if not line:
+        return False
+    try:
+        sidecar_path = _get_imagemaid_maintenance_sidecar_path(imagemaid_root)
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        with sidecar_path.open("a", encoding="utf-8", errors="ignore") as handle:
             handle.write(str(line).rstrip() + "\n")
         return True
     except Exception:
@@ -2160,7 +3822,12 @@ def _write_quickstart_maintenance_marker(kometa_root, event, window=None, paused
         parts.append(f"window={str(window).strip()}")
     if event_name == "resumed" and isinstance(paused_seconds, (int, float)):
         parts.append(f"paused_seconds={max(0, int(paused_seconds))}")
-    return _append_quickstart_meta_log_line(kometa_root, " ".join(parts))
+    line = " ".join(parts)
+    meta_ok = _append_quickstart_meta_log_line(kometa_root, line)
+    sidecar_ok = _append_kometa_maintenance_sidecar_line(kometa_root, line) if not meta_ok else False
+    if not meta_ok and sidecar_ok:
+        helpers.ts_log("Quickstart maintenance marker could not be appended to meta.log; preserved in sidecar instead.", level="WARNING")
+    return bool(meta_ok or sidecar_ok)
 
 
 def _write_quickstart_imagemaid_run_marker(imagemaid_root, mode=None, config_name=None, log_path=None):
@@ -2172,6 +3839,7 @@ def _write_quickstart_imagemaid_run_marker(imagemaid_root, mode=None, config_nam
         safe_config = (config_name or "default").strip() or "default"
         timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         marker = f"[Quickstart] Run marker: started={timestamp} " f"config={safe_config} quickstart={qs_version} branch={qs_branch} " f"tool=imagemaid mode={safe_mode}"
+        _reset_imagemaid_maintenance_sidecar(imagemaid_root)
         return _append_quickstart_imagemaid_log_line(imagemaid_root, marker, log_path=log_path)
     except Exception:
         return False
@@ -2212,9 +3880,9 @@ def _write_quickstart_imagemaid_stop_marker(imagemaid_root, mode=None, config_na
         return False
 
 
-def _write_quickstart_imagemaid_maintenance_marker(imagemaid_root, event, mode=None, config_name=None, window=None, log_path=None):
+def _write_quickstart_imagemaid_maintenance_marker(imagemaid_root, event, mode=None, config_name=None, window=None, log_path=None, paused_seconds=None):
     event_name = str(event or "").strip().lower()
-    if event_name not in {"blocked_start"}:
+    if event_name not in {"blocked_start", "paused", "resumed"}:
         return False
     try:
         version_info = app.config.get("VERSION_CHECK") or {}
@@ -2236,7 +3904,14 @@ def _write_quickstart_imagemaid_maintenance_marker(imagemaid_root, event, mode=N
         ]
         if window:
             parts.append(f"window={str(window).strip()}")
-        return _append_quickstart_imagemaid_log_line(imagemaid_root, " ".join(parts), log_path=log_path)
+        if event_name == "resumed" and isinstance(paused_seconds, (int, float)):
+            parts.append(f"paused_seconds={max(0, int(paused_seconds))}")
+        line = " ".join(parts)
+        meta_ok = _append_quickstart_imagemaid_log_line(imagemaid_root, line, log_path=log_path)
+        sidecar_ok = _append_imagemaid_maintenance_sidecar_line(imagemaid_root, line) if not meta_ok else False
+        if not meta_ok and sidecar_ok:
+            helpers.ts_log("ImageMaid maintenance marker could not be appended to the live log; preserved in sidecar instead.", level="WARNING")
+        return bool(meta_ok or sidecar_ok)
     except Exception:
         return False
 
@@ -2420,6 +4095,12 @@ def _rename_config_files(old_name: str, new_name: str, dry_run: bool = False) ->
     archive_root = config_dir / "archives"
     old_archive = archive_root / old_norm
     new_archive = archive_root / new_norm
+    old_managed_root = helpers.get_managed_config_artifact_root(old_norm)
+    new_managed_root = helpers.get_managed_config_artifact_root(new_norm)
+    old_managed_dirs = helpers.get_managed_library_artifact_paths(old_norm)
+    new_managed_dirs = helpers.get_managed_library_artifact_paths(new_norm)
+    old_legacy_managed_dirs = helpers.get_legacy_managed_library_artifact_paths(old_norm)
+    new_legacy_managed_dirs = helpers.get_legacy_managed_library_artifact_paths(new_norm)
     if old_archive.exists():
         if new_archive.exists():
             result["errors"].append("Target archive directory already exists.")
@@ -2430,6 +4111,23 @@ def _rename_config_files(old_name: str, new_name: str, dry_run: bool = False) ->
             if target_name in existing_names and target_name != path.name:
                 result["errors"].append(f"Archive file already exists: {target_name}")
                 return result
+
+    if old_managed_root.exists() and new_managed_root.exists():
+        result["errors"].append(f"Target managed config directory already exists: {new_managed_root}")
+        return result
+
+    for old_managed, new_managed in zip(old_managed_dirs, new_managed_dirs):
+        if old_managed.exists() and new_managed.exists():
+            result["errors"].append(f"Target managed library directory already exists: {new_managed}")
+            return result
+    for old_managed, new_managed in zip(old_legacy_managed_dirs, new_managed_dirs):
+        if old_managed.exists() and new_managed.exists():
+            result["errors"].append(f"Target managed library directory already exists: {new_managed}")
+            return result
+    for old_managed, new_managed in zip(old_legacy_managed_dirs, new_legacy_managed_dirs):
+        if old_managed.exists() and new_managed.exists():
+            result["errors"].append(f"Target legacy managed library directory already exists: {new_managed}")
+            return result
 
     if dry_run:
         result["success"] = True
@@ -2445,6 +4143,23 @@ def _rename_config_files(old_name: str, new_name: str, dry_run: bool = False) ->
             kometa_file.rename(new_kometa_file)
             completed.append((kometa_file, new_kometa_file))
             result["renamed"].append(str(new_kometa_file))
+        if old_managed_root.exists():
+            new_managed_root.parent.mkdir(parents=True, exist_ok=True)
+            old_managed_root.rename(new_managed_root)
+            completed.append((old_managed_root, new_managed_root))
+            result["renamed"].append(str(new_managed_root))
+        for old_managed, new_managed in zip(old_managed_dirs, new_managed_dirs):
+            if old_managed.exists():
+                new_managed.parent.mkdir(parents=True, exist_ok=True)
+                old_managed.rename(new_managed)
+                completed.append((old_managed, new_managed))
+                result["renamed"].append(str(new_managed))
+        for old_managed, new_managed in zip(old_legacy_managed_dirs, new_managed_dirs):
+            if old_managed.exists():
+                new_managed.parent.mkdir(parents=True, exist_ok=True)
+                old_managed.rename(new_managed)
+                completed.append((old_managed, new_managed))
+                result["renamed"].append(str(new_managed))
 
         if old_archive.exists():
             old_archive.rename(new_archive)
@@ -2490,7 +4205,6 @@ for folder in UPLOAD_FOLDERS.values():
 IMAGES_FOLDER = os.path.join(helpers.MEIPASS_DIR, "static", "images")
 OVERLAY_FOLDER = os.path.join(IMAGES_FOLDER, "overlays")
 FONTS_FOLDER = os.path.join(helpers.MEIPASS_DIR, "static", "fonts")
-CUSTOM_FONTS_FOLDER = os.path.join(helpers.CONFIG_DIR, "fonts")
 DEFAULT_IMAGE_MAP = {
     "movie": os.path.join(IMAGES_FOLDER, "default.png"),
     "show": os.path.join(IMAGES_FOLDER, "default-sho_preview.png"),
@@ -2512,7 +4226,7 @@ os.makedirs(PREVIEW_FOLDER, exist_ok=True)
 OVERLAY_CACHE_FOLDER = os.path.join(helpers.CONFIG_DIR, "cache", "overlays")
 os.makedirs(OVERLAY_CACHE_FOLDER, exist_ok=True)
 OVERLAY_CACHE_TTL_SECONDS = 60 * 60 * 24 * 30
-_FONT_CACHE: list[str] = []
+_FONT_CACHE: dict[str, list[str]] = {}
 
 
 def _list_preview_images_for_type(image_type: str) -> list[str]:
@@ -2554,10 +4268,17 @@ def _resolve_preview_base_image_path(img_type: str, selected_image: str) -> str:
 # Font discovery (TTF/OTF) across common static dirs
 def list_overlay_fonts() -> list[str]:
     global _FONT_CACHE
-    if _FONT_CACHE:
-        return _FONT_CACHE
+    config_name = session.get("config_name") if has_request_context() else None
+    if config_name:
+        migration = helpers.migrate_legacy_custom_fonts_to_config(config_name)
+        if migration.get("copied"):
+            _FONT_CACHE = {}
+    cache_key = helpers.normalize_config_name_for_storage(config_name) if config_name else "__default__"
+    cached = _FONT_CACHE.get(cache_key)
+    if cached:
+        return cached
     fonts: list[str] = []
-    font_dirs = helpers.get_font_dirs(include_static=True, include_custom=True)
+    font_dirs = helpers.get_font_dirs(include_static=True, include_custom=True, config_name=config_name)
     for fdir in font_dirs:
         try:
             if os.path.isdir(fdir):
@@ -2566,8 +4287,21 @@ def list_overlay_fonts() -> list[str]:
                         fonts.append(fname)
         except Exception:
             continue
-    _FONT_CACHE = fonts
+    _FONT_CACHE[cache_key] = fonts
     return fonts
+
+
+def _config_name_from_yaml_filename(filename: str | None) -> str | None:
+    text = str(filename or "").strip()
+    if not text:
+        return None
+    base = Path(text).name
+    lowered = base.lower()
+    if lowered.endswith("_config.yml"):
+        return base[:-11]
+    if lowered.endswith("_config.yaml"):
+        return base[:-12]
+    return None
 
 
 # Initialize logging
@@ -2588,6 +4322,10 @@ app.config["VERSION_CHECK"] = helpers.check_for_update()
 kometa_path = os.path.abspath(os.path.join(helpers.CONFIG_DIR, "kometa"))
 
 app.config["KOMETA_ROOT"] = os.environ.get("QS_KOMETA_PATH", kometa_path)
+
+KOMETA_INSTALL_MODE_MANAGED = "managed"
+KOMETA_INSTALL_MODE_EXISTING = "existing"
+KOMETA_INSTALL_MODE_EXTERNAL = "external"
 
 
 def start_update_thread():
@@ -2613,6 +4351,479 @@ def inject_version_info():
 
 def inject_kometa_root():
     return {"kometa_root": app.config["KOMETA_ROOT"]}
+
+
+def _default_managed_kometa_root() -> Path:
+    return Path(helpers.CONFIG_DIR).resolve() / "kometa"
+
+
+def _normalize_kometa_install_mode(value) -> str:
+    raw = str(value or "").strip().lower()
+    if raw == KOMETA_INSTALL_MODE_EXISTING:
+        return KOMETA_INSTALL_MODE_EXISTING
+    if raw == KOMETA_INSTALL_MODE_EXTERNAL:
+        return KOMETA_INSTALL_MODE_EXTERNAL
+    return KOMETA_INSTALL_MODE_MANAGED
+
+
+def _canonicalize_kometa_section(section_data):
+    section = dict(section_data) if isinstance(section_data, dict) else {}
+    canonical = {
+        "install_mode": KOMETA_INSTALL_MODE_MANAGED,
+        "existing_root": "",
+        "external_config_root": "",
+        "external_log_root": "",
+    }
+    canonical.update(section)
+    canonical["install_mode"] = _normalize_kometa_install_mode(canonical.get("install_mode"))
+    canonical["existing_root"] = str(canonical.get("existing_root") or "").strip()
+    canonical["external_config_root"] = str(canonical.get("external_config_root") or "").strip()
+    canonical["external_log_root"] = str(canonical.get("external_log_root") or "").strip()
+    if canonical["install_mode"] != KOMETA_INSTALL_MODE_EXISTING:
+        canonical["existing_root"] = ""
+    if canonical["install_mode"] != KOMETA_INSTALL_MODE_EXTERNAL:
+        canonical["external_config_root"] = ""
+        canonical["external_log_root"] = ""
+    return canonical
+
+
+def _resolve_kometa_selection(section_data=None):
+    section = _canonicalize_kometa_section(section_data)
+    managed_root = _default_managed_kometa_root().resolve()
+    managed_config_dir = managed_root / "config"
+    managed_log_dir = managed_config_dir / "logs"
+    mode = section["install_mode"]
+    existing_root_raw = section.get("existing_root", "")
+    external_config_root_raw = section.get("external_config_root", "")
+    external_log_root_raw = section.get("external_log_root", "")
+    selected_root = managed_root
+    primary_path = managed_root
+    config_dir = managed_config_dir
+    log_dir = managed_log_dir
+    selection_valid = True
+    status_message = "Quickstart will create and manage its own Kometa install under this workspace."
+    mode_label = "Quickstart-managed install"
+    can_launch = True
+    can_update = True
+    can_probe_runtime = True
+    can_read_logs = True
+    can_sync_config = True
+    can_sync_managed_artifacts = True
+
+    if mode == KOMETA_INSTALL_MODE_EXISTING:
+        selection_valid = False
+        status_message = (
+            "Quickstart will use an existing Kometa install visible from this environment. Quickstart will not update that install; update it manually outside Quickstart."
+        )
+        mode_label = "Existing direct install"
+        can_update = False
+        if existing_root_raw:
+            resolved_existing = _resolve_user_dir(existing_root_raw)
+            if resolved_existing:
+                selected_root = resolved_existing
+                primary_path = resolved_existing
+                config_dir = resolved_existing / "config"
+                log_dir = config_dir / "logs"
+                selection_valid = True
+                if not resolved_existing.exists():
+                    status_message = "The selected existing Kometa path is saved, but it is not currently visible from this Quickstart environment."
+                else:
+                    status_message = (
+                        "Quickstart will use the selected existing Kometa install. Quickstart can validate and launch it, but updates must be done manually outside Quickstart."
+                    )
+            else:
+                selected_root = None
+                primary_path = None
+                config_dir = None
+                log_dir = None
+                status_message = "The saved existing Kometa path is invalid."
+        else:
+            selected_root = None
+            primary_path = None
+            config_dir = None
+            log_dir = None
+            status_message = "Choose an existing Kometa path for this config before using the Kometa run page."
+    elif mode == KOMETA_INSTALL_MODE_EXTERNAL:
+        selected_root = None
+        primary_path = None
+        config_dir = None
+        log_dir = None
+        selection_valid = False
+        mode_label = "External/containerized config+logs"
+        can_launch = False
+        can_update = False
+        can_probe_runtime = False
+        can_sync_config = True
+        can_sync_managed_artifacts = True
+        status_message = "Quickstart will manage config and optional logs for an external Kometa runtime. It will not launch or update Kometa directly."
+        if external_config_root_raw:
+            resolved_config = _resolve_user_dir(external_config_root_raw)
+            if resolved_config:
+                primary_path = resolved_config
+                config_dir = resolved_config
+                selection_valid = True
+                if external_log_root_raw:
+                    resolved_log = _resolve_user_dir(external_log_root_raw)
+                    if resolved_log:
+                        log_dir = resolved_log
+                    else:
+                        selection_valid = False
+                else:
+                    log_dir = resolved_config / "logs"
+                can_read_logs = bool(log_dir)
+                if not resolved_config.exists():
+                    status_message = "The selected external Kometa config path is saved, but it is not currently visible from this Quickstart environment."
+                else:
+                    status_message = "Quickstart will sync generated config and managed artifacts to the selected external Kometa config path."
+                if log_dir and not log_dir.exists():
+                    can_read_logs = False
+                    status_message += " Log viewing and logscan will stay limited until the log path is accessible."
+            else:
+                status_message = "The saved external Kometa config path is invalid."
+        else:
+            status_message = "Choose the external Kometa config path for this config before using the Kometa run page."
+
+    return {
+        "install_mode": mode,
+        "existing_root": existing_root_raw,
+        "external_config_root": external_config_root_raw,
+        "external_log_root": external_log_root_raw,
+        "managed_root": managed_root,
+        "managed_config_dir": managed_config_dir,
+        "managed_log_dir": managed_log_dir,
+        "selected_root": selected_root,
+        "primary_path": primary_path,
+        "config_dir": config_dir,
+        "log_dir": log_dir,
+        "selection_valid": selection_valid,
+        "status_message": status_message,
+        "is_managed": mode == KOMETA_INSTALL_MODE_MANAGED,
+        "is_external": mode == KOMETA_INSTALL_MODE_EXTERNAL,
+        "mode_label": mode_label,
+        "can_launch": can_launch,
+        "can_update": can_update,
+        "can_probe_runtime": can_probe_runtime,
+        "can_read_logs": can_read_logs,
+        "can_sync_config": can_sync_config,
+        "can_sync_managed_artifacts": can_sync_managed_artifacts,
+    }
+
+
+def _get_kometa_settings_section(config_name=None):
+    resolved_config = config_name or persistence.ensure_session_config_name()
+    settings = _retrieve_settings_for_config(resolved_config, "900-kometa") or {}
+    section = settings.get("kometa", {}) if isinstance(settings, dict) else {}
+    return settings, _canonicalize_kometa_section(section)
+
+
+def _apply_kometa_selection(selection):
+    selection = selection if isinstance(selection, dict) else {}
+    mode = _normalize_kometa_install_mode(selection.get("install_mode"))
+    selected_root = selection.get("selected_root")
+    config_dir = selection.get("config_dir")
+    log_dir = selection.get("log_dir")
+    resolved_root = Path(selected_root).resolve() if selected_root else None
+    resolved_config_dir = Path(config_dir).resolve() if config_dir else None
+    resolved_log_dir = Path(log_dir).resolve() if log_dir else None
+    fallback_root = None
+    if resolved_root is None and resolved_config_dir is not None:
+        fallback_root = resolved_config_dir.parent if resolved_config_dir.name.lower() == "config" else resolved_config_dir
+
+    if has_request_context():
+        session["kometa_install_mode"] = mode
+        session["kometa_root"] = resolved_root.as_posix() if resolved_root else (fallback_root.as_posix() if fallback_root else "")
+        session["kometa_config_dir"] = resolved_config_dir.as_posix() if resolved_config_dir else ""
+        session["kometa_log_dir"] = resolved_log_dir.as_posix() if resolved_log_dir else ""
+
+    if resolved_root:
+        app.config["KOMETA_ROOT"] = str(resolved_root)
+    elif fallback_root:
+        app.config["KOMETA_ROOT"] = str(fallback_root)
+    app.config["KOMETA_INSTALL_MODE"] = mode
+    app.config["KOMETA_CONFIG_DIR"] = str(resolved_config_dir) if resolved_config_dir else ""
+    app.config["KOMETA_LOG_DIR"] = str(resolved_log_dir) if resolved_log_dir else ""
+
+
+def _build_kometa_install_context(config_name=None):
+    _settings, section = _get_kometa_settings_section(config_name)
+    selection = _resolve_kometa_selection(section)
+    _apply_kometa_selection(selection)
+    selected_root = selection.get("selected_root")
+    primary_path = selection.get("primary_path")
+    config_dir = selection.get("config_dir")
+    log_dir = selection.get("log_dir")
+    return {
+        "kometa_install_mode": selection["install_mode"],
+        "kometa_existing_root": selection["existing_root"],
+        "kometa_external_config_root": selection["external_config_root"],
+        "kometa_external_log_root": selection["external_log_root"],
+        "kometa_managed_root": selection["managed_root"].as_posix(),
+        "kometa_managed_root_display": str(selection["managed_root"]),
+        "kometa_managed_config_dir": selection["managed_config_dir"].as_posix(),
+        "kometa_managed_config_dir_display": str(selection["managed_config_dir"]),
+        "kometa_managed_log_dir": selection["managed_log_dir"].as_posix(),
+        "kometa_managed_log_dir_display": str(selection["managed_log_dir"]),
+        "kometa_selected_root": selected_root.as_posix() if selected_root else "",
+        "kometa_selected_root_display": str(selected_root) if selected_root else "",
+        "kometa_primary_path": primary_path.as_posix() if primary_path else "",
+        "kometa_primary_path_display": str(primary_path) if primary_path else "",
+        "kometa_active_config_dir": config_dir.as_posix() if config_dir else "",
+        "kometa_active_config_dir_display": str(config_dir) if config_dir else "",
+        "kometa_active_log_dir": log_dir.as_posix() if log_dir else "",
+        "kometa_active_log_dir_display": str(log_dir) if log_dir else "",
+        "kometa_selection_valid": bool(selection["selection_valid"]),
+        "kometa_install_status_message": selection["status_message"],
+        "kometa_is_managed_install": bool(selection["is_managed"]),
+        "kometa_is_external_install": bool(selection["is_external"]),
+        "kometa_mode_label": selection["mode_label"],
+        "kometa_can_launch": bool(selection["can_launch"]),
+        "kometa_can_update": bool(selection["can_update"]),
+        "kometa_can_probe_runtime": bool(selection["can_probe_runtime"]),
+        "kometa_can_read_logs": bool(selection["can_read_logs"]),
+        "kometa_can_sync_config": bool(selection["can_sync_config"]),
+        "kometa_can_sync_managed_artifacts": bool(selection["can_sync_managed_artifacts"]),
+    }
+
+
+def _resolve_kometa_request_target(payload, logs=None, require_existing_root=False):
+    request_payload = payload if isinstance(payload, dict) else {}
+    config_name = _resolve_request_config_name(request_payload)
+    _settings, stored_section = _get_kometa_settings_section(config_name)
+    requested_mode = request_payload.get("install_mode")
+    install_mode = _normalize_kometa_install_mode(requested_mode if requested_mode not in [None, ""] else stored_section.get("install_mode"))
+    raw_path = str(request_payload.get("path") or "").strip()
+    existing_root = str(request_payload.get("existing_root") or stored_section.get("existing_root") or "").strip()
+    external_config_root = str(request_payload.get("external_config_root") or stored_section.get("external_config_root") or "").strip()
+    external_log_root = str(request_payload.get("external_log_root") or stored_section.get("external_log_root") or "").strip()
+
+    if install_mode == KOMETA_INSTALL_MODE_MANAGED:
+        selection = _resolve_kometa_selection({"install_mode": KOMETA_INSTALL_MODE_MANAGED})
+        if raw_path:
+            resolved_managed = _resolve_user_dir(raw_path)
+            if not resolved_managed:
+                if logs is not None:
+                    logs.append("❌ Invalid path provided.")
+                return {"error": "Invalid path provided."}
+            selection["selected_root"] = resolved_managed
+            selection["primary_path"] = resolved_managed
+            selection["config_dir"] = resolved_managed / "config"
+            selection["log_dir"] = selection["config_dir"] / "logs"
+            selection["selection_valid"] = True
+        _apply_kometa_selection(selection)
+        return {
+            "config_name": config_name,
+            "install_mode": install_mode,
+            "path_obj": selection["selected_root"],
+            "runtime_root": selection["selected_root"],
+            "config_dir": selection["config_dir"],
+            "log_dir": selection["log_dir"],
+            "existing_root": "",
+            "external_config_root": "",
+            "external_log_root": "",
+            "selection_valid": True,
+        }
+
+    if install_mode == KOMETA_INSTALL_MODE_EXTERNAL:
+        candidate = raw_path or external_config_root
+        if not candidate:
+            if logs is not None:
+                logs.append("❌ External Kometa mode requires a config path.")
+            return {"error": "External Kometa mode requires a config path."}
+
+        resolved_config = _resolve_user_dir(candidate)
+        if not resolved_config:
+            if logs is not None:
+                logs.append("❌ Invalid external config path provided.")
+            return {"error": "Invalid external config path provided."}
+
+        resolved_log = None
+        if external_log_root:
+            resolved_log = _resolve_user_dir(external_log_root)
+            if not resolved_log:
+                if logs is not None:
+                    logs.append("❌ Invalid external log path provided.")
+                return {"error": "Invalid external log path provided."}
+
+        if require_existing_root and not resolved_config.exists():
+            if logs is not None:
+                logs.append("❌ The selected external Kometa config path does not exist in this Quickstart environment.")
+            return {"error": "The selected external Kometa config path does not exist in this Quickstart environment."}
+
+        selection = _resolve_kometa_selection(
+            {
+                "install_mode": KOMETA_INSTALL_MODE_EXTERNAL,
+                "external_config_root": candidate,
+                "external_log_root": external_log_root,
+            }
+        )
+        _apply_kometa_selection(selection)
+        return {
+            "config_name": config_name,
+            "install_mode": install_mode,
+            "path_obj": selection["config_dir"],
+            "runtime_root": None,
+            "config_dir": selection["config_dir"],
+            "log_dir": selection["log_dir"],
+            "existing_root": "",
+            "external_config_root": candidate,
+            "external_log_root": external_log_root,
+            "selection_valid": selection["selection_valid"],
+        }
+
+    candidate = raw_path or existing_root
+    if not candidate:
+        if logs is not None:
+            logs.append("❌ Existing Kometa mode requires a path.")
+        return {"error": "Existing Kometa mode requires a path."}
+
+    resolved_existing = _resolve_user_dir(candidate)
+    if not resolved_existing:
+        if logs is not None:
+            logs.append("❌ Invalid path provided.")
+        return {"error": "Invalid path provided."}
+
+    if require_existing_root and not resolved_existing.exists():
+        if logs is not None:
+            logs.append("❌ The selected existing Kometa path does not exist in this Quickstart environment.")
+        return {"error": "The selected existing Kometa path does not exist in this Quickstart environment."}
+
+    selection = _resolve_kometa_selection(
+        {
+            "install_mode": KOMETA_INSTALL_MODE_EXISTING,
+            "existing_root": candidate,
+        }
+    )
+    _apply_kometa_selection(selection)
+    return {
+        "config_name": config_name,
+        "install_mode": install_mode,
+        "path_obj": selection["selected_root"],
+        "runtime_root": selection["selected_root"],
+        "config_dir": selection["config_dir"],
+        "log_dir": selection["log_dir"],
+        "existing_root": candidate,
+        "external_config_root": "",
+        "external_log_root": "",
+        "selection_valid": resolved_existing.exists(),
+    }
+
+
+def _validate_existing_kometa_root(path_obj):
+    p = Path(path_obj).resolve()
+    missing = []
+    if not p.exists():
+        missing.append("path")
+    if not (p / "config").exists():
+        missing.append("config")
+    if not (p / "kometa.py").exists():
+        missing.append("kometa.py")
+    if not (p / "requirements.txt").exists():
+        missing.append("requirements.txt")
+    return missing
+
+
+def _validate_saved_kometa_selection(section_data):
+    section = _canonicalize_kometa_section(section_data)
+    install_mode = section.get("install_mode")
+
+    if install_mode == KOMETA_INSTALL_MODE_MANAGED:
+        return True, None, None
+
+    if install_mode == KOMETA_INSTALL_MODE_EXISTING:
+        existing_root = str(section.get("existing_root") or "").strip()
+        if not existing_root:
+            return False, "missing_location", "Choose the Kometa root folder that contains kometa.py, requirements.txt, and config/."
+        resolved_existing = _resolve_user_dir(existing_root)
+        if not resolved_existing:
+            return False, "invalid_paths", [f"Saved existing Kometa root is invalid. Path: {existing_root}"]
+        if not resolved_existing.exists():
+            return False, "invalid_paths", [f"Existing Kometa root does not exist. Path: {resolved_existing}"]
+        missing = _validate_existing_kometa_root(resolved_existing)
+        if missing:
+            if "path" in missing:
+                return False, "invalid_paths", [f"Existing Kometa root does not exist. Path: {resolved_existing}"]
+            missing_labels = []
+            if "kometa.py" in missing:
+                missing_labels.append("kometa.py")
+            if "requirements.txt" in missing:
+                missing_labels.append("requirements.txt")
+            if "config" in missing:
+                missing_labels.append("config/")
+            label_text = ", ".join(missing_labels) if missing_labels else ", ".join(missing)
+            return False, "invalid_paths", [f"Existing Kometa root is missing required items: {label_text}. Path: {resolved_existing}"]
+        return True, None, None
+
+    external_config_root = str(section.get("external_config_root") or "").strip()
+    external_log_root = str(section.get("external_log_root") or "").strip()
+    if not external_config_root:
+        return False, "missing_location", "Choose the external Kometa config path Quickstart should use for this config."
+    resolved_external_config = _resolve_user_dir(external_config_root)
+    if not resolved_external_config:
+        return False, "invalid_paths", [f"Saved external Kometa config path is invalid. Path: {external_config_root}"]
+    if not resolved_external_config.exists() or not resolved_external_config.is_dir():
+        return False, "invalid_paths", [f"External Kometa config path does not exist. Path: {resolved_external_config}"]
+    if external_log_root:
+        resolved_external_log = _resolve_user_dir(external_log_root)
+        if not resolved_external_log:
+            return False, "invalid_paths", [f"Saved external Kometa log path is invalid. Path: {external_log_root}"]
+        if not resolved_external_log.exists() or not resolved_external_log.is_dir():
+            return False, "invalid_paths", [f"External Kometa log path does not exist. Path: {resolved_external_log}"]
+    return True, None, None
+
+
+def _sync_generated_yaml_and_assets_to_kometa_config(config_dir, config_filename, logs=None):
+    target_config_dir = Path(config_dir).resolve()
+
+    def log(msg):
+        if logs is not None:
+            logs.append(msg)
+
+    config_name = _safe_rel_path(config_filename or "kometa")
+    if not config_name:
+        raise ValueError("Invalid config filename.")
+
+    src_yaml = _safe_join(Path("config"), config_name)
+    if not src_yaml or not src_yaml.exists():
+        raise FileNotFoundError(f"Generated YAML not found: {src_yaml}")
+
+    target_config_dir.mkdir(parents=True, exist_ok=True)
+    dest_yaml = _safe_join(target_config_dir, config_name)
+    if not dest_yaml:
+        raise ValueError("Invalid config destination.")
+
+    shutil.copy2(src_yaml, dest_yaml)
+    log(f"✅ YAML copied to Kometa config folder at: {dest_yaml}")
+
+    yaml_parser = YAML(typ="safe")
+    with src_yaml.open("r", encoding="utf-8") as f:
+        parsed_config = yaml_parser.load(f) or {}
+    active_config_name = session.get("config_name") if has_request_context() else None
+    config_scope = _config_name_from_yaml_filename(config_name) or active_config_name
+    font_refs = helpers.collect_font_references(parsed_config)
+    if font_refs:
+        font_result = helpers.copy_fonts_to_kometa(font_refs, kometa_config_dir=target_config_dir, config_name=config_scope)
+        copied = font_result.get("copied", [])
+        missing = font_result.get("missing", [])
+        errors = font_result.get("errors", [])
+        if copied:
+            log(f"✅ Synced {len(copied)} font(s) referenced in the config to Kometa fonts.")
+        if missing:
+            log(f"⚠️ Fonts referenced in the config not found: {', '.join(missing)}")
+        for err in errors:
+            log(f"⚠️ {err}")
+    if config_scope:
+        artifact_result = helpers.sync_managed_library_artifacts_to_kometa(config_scope, kometa_config_dir=target_config_dir)
+        synced = artifact_result.get("synced", [])
+        removed = artifact_result.get("removed", [])
+        errors = artifact_result.get("errors", [])
+        if synced:
+            log(f"✅ Synced {len(synced)} managed library artifact tree(s) to Kometa config/{config_scope}.")
+        if removed:
+            log(f"ℹ️ Removed {len(removed)} stale managed library artifact tree(s) from Kometa config/{config_scope}.")
+        for err in errors:
+            log(f"⚠️ {err}")
+
+    return {"config_filename": config_name, "destination": dest_yaml}
 
 
 # Use booler() for FLASK_DEBUG conversion
@@ -2706,7 +4917,7 @@ logscan_reingest_state = {
 # Bump this integer when a release needs a one-time Analytics reset + log reingest
 # on startup. Quickstart persists the highest successful level to config/.env so
 # skipped releases still catch up automatically.
-REQUIRED_LOGSCAN_MIGRATION_LEVEL = 2
+REQUIRED_LOGSCAN_MIGRATION_LEVEL = 9
 LOGSCAN_STARTUP_MIGRATIONS_ENV = "QS_LOGSCAN_STARTUP_MIGRATIONS"
 LOGSCAN_MIGRATION_LEVEL_DONE_ENV = "QS_LOGSCAN_MIGRATION_LEVEL_DONE"
 LOGSCAN_STARTUP_MIGRATION_JOB_ID = "startup-logscan-migration"
@@ -2827,6 +5038,14 @@ RUN_CONTEXT = {
     "updated_at": None,
     "stop_requested_at": None,
 }
+IMAGEMAID_RUN_CONTEXT_LOCK = threading.Lock()
+IMAGEMAID_RUN_CONTEXT = {
+    "command": None,
+    "mode": None,
+    "config_name": None,
+    "started_at": None,
+    "updated_at": None,
+}
 
 # Ensure json-schema files are up to date at startup
 helpers.ensure_json_schema()
@@ -2916,7 +5135,10 @@ def upload_fonts():
     if not files:
         return jsonify({"status": "error", "message": "No fonts uploaded"}), 400
 
-    os.makedirs(CUSTOM_FONTS_FOLDER, exist_ok=True)
+    config_name = (request.form.get("config_name") or session.get("config_name") or "").strip()
+    fonts_dir = helpers.get_custom_fonts_dir(config_name or None)
+
+    os.makedirs(fonts_dir, exist_ok=True)
     saved = []
     errors = []
 
@@ -2928,13 +5150,13 @@ def upload_fonts():
         if ext not in helpers.FONT_EXTENSIONS:
             errors.append(f"Invalid font type: {filename}")
             continue
-        save_path = os.path.join(CUSTOM_FONTS_FOLDER, filename)
+        save_path = os.path.join(str(fonts_dir), filename)
         font_file.save(save_path)
         saved.append(filename)
 
     if saved:
         global _FONT_CACHE
-        _FONT_CACHE = []
+        _FONT_CACHE = {}
 
     if not saved:
         return jsonify({"status": "error", "message": "No valid fonts uploaded.", "errors": errors}), 400
@@ -2958,7 +5180,8 @@ def custom_fonts(filename):
     if not safe_name.lower().endswith((".ttf", ".otf")):
         abort(404)
 
-    for fdir in helpers.get_font_dirs(include_static=True, include_custom=True):
+    current_config = session.get("config_name") if has_request_context() else None
+    for fdir in helpers.get_font_dirs(include_static=True, include_custom=True, config_name=current_config):
         candidate = os.path.join(str(fdir), safe_name)
         if os.path.exists(candidate):
             return send_from_directory(str(fdir), safe_name)
@@ -4070,6 +6293,55 @@ def logscan_trends_log_delete():
     return jsonify(response)
 
 
+@app.route("/logscan/trends/log/invalid/delete", methods=["POST"])
+def logscan_trends_log_invalid_delete():
+    invalid_entries = _get_logscan_invalid_archived_logs()
+    if not invalid_entries:
+        return jsonify({"success": True, "deleted": 0, "results": [], "failures": []})
+
+    deleted = []
+    failures = []
+    for entry in invalid_entries:
+        raw_path = entry.get("path")
+        if not raw_path:
+            failures.append({"error": "Invalid archived log path missing.", "name": entry.get("name"), "status": 500})
+            continue
+        path = Path(raw_path)
+        deleted_file = False
+        try:
+            path.unlink()
+            deleted_file = True
+        except FileNotFoundError:
+            deleted_file = False
+        except Exception as exc:
+            failures.append({"error": f"Failed to delete invalid archived log: {exc}", "name": entry.get("name"), "path": raw_path, "status": 500})
+            continue
+        _remove_logscan_ingest_cache_entries(raw_path=str(path.resolve()))
+        deleted.append(
+            {
+                "name": entry.get("name"),
+                "path": raw_path,
+                "tool_name": entry.get("tool_name"),
+                "reason": entry.get("reason"),
+                "deleted_file": deleted_file,
+            }
+        )
+
+    if not deleted and failures:
+        first = failures[0]
+        return jsonify({"success": False, "error": first.get("error"), "failures": failures}), int(first.get("status", 500))
+
+    return jsonify(
+        {
+            "success": not failures,
+            "deleted": len(deleted),
+            "deleted_file_count": sum(1 for item in deleted if item.get("deleted_file")),
+            "results": deleted,
+            "failures": failures,
+        }
+    )
+
+
 @app.route("/logscan/trends/log/compress", methods=["POST"])
 def logscan_trends_log_compress():
     payload = request.get_json(silent=True) or {}
@@ -4174,6 +6446,28 @@ def count_annotated_lines(text: str) -> dict:
     return {"imported": imported, "not_imported": not_imported}
 
 
+def _import_preview_json_default(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, set):
+        return sorted(str(item) for item in value)
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return isoformat()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _coerce_validation_response_payload(response):
+    if isinstance(response, tuple) and response:
+        response = response[0]
+    if hasattr(response, "get_json"):
+        response = response.get_json()
+    return response if isinstance(response, dict) else {}
+
+
 @app.route("/import-config/preview", methods=["POST"])
 def import_config_preview():
     def count_comment_lines(text: str) -> int:
@@ -4231,7 +6525,31 @@ def import_config_preview():
     if file_name.endswith(".zip"):
         try:
             with zipfile.ZipFile(BytesIO(raw_text)) as archive:
-                config_files = [n for n in archive.namelist() if n.lower().endswith((".yml", ".yaml"))]
+                archive_members = archive.namelist()
+                unexpected_members = []
+                bundled_library_files = []
+                config_files = []
+                font_files = []
+
+                for member_name in archive_members:
+                    normalized_member = _normalize_bundle_member_name(member_name)
+                    if not normalized_member:
+                        continue
+                    if not _is_allowed_bundle_member(normalized_member):
+                        unexpected_members.append(normalized_member)
+                        continue
+                    if _is_bundled_library_archive_member(normalized_member):
+                        bundled_library_files.append(member_name)
+                    elif _yaml_path_suffix(normalized_member):
+                        config_files.append(member_name)
+                    elif normalized_member.lower().endswith((".ttf", ".otf")):
+                        font_files.append(member_name)
+
+                if unexpected_members:
+                    preview = ", ".join(unexpected_members[:5])
+                    if len(unexpected_members) > 5:
+                        preview += ", ..."
+                    return jsonify(success=False, message=f"Zip file contains unsupported entries: {preview}"), 400
                 if not config_files:
                     return jsonify(success=False, message="No YAML config found in zip file."), 400
                 if len(config_files) > 1:
@@ -4243,30 +6561,47 @@ def import_config_preview():
                 except Exception:
                     return jsonify(success=False, message="Unable to read config from zip."), 400
 
-                font_files = [n for n in archive.namelist() if n.lower().endswith((".ttf", ".otf"))]
-                if font_files:
+                if font_files or bundled_library_files:
                     cache_dir = Path(helpers.CONFIG_DIR) / "import_cache"
                     cache_dir.mkdir(parents=True, exist_ok=True)
-                    extracted_dir = cache_dir / f"fonts_{secrets.token_urlsafe(8)}"
+                    extracted_dir = cache_dir / f"bundle_{secrets.token_urlsafe(8)}"
                     extracted_dir.mkdir(parents=True, exist_ok=True)
-                    seen_names = set()
-                    for font_name in font_files:
-                        base_name = os.path.basename(font_name)
-                        if not base_name:
+                    if font_files:
+                        fonts_dir = extracted_dir / "fonts"
+                        fonts_dir.mkdir(parents=True, exist_ok=True)
+                        seen_names = set()
+                        for font_name in font_files:
+                            base_name = os.path.basename(font_name)
+                            if not base_name:
+                                continue
+                            safe_name = base_name
+                            counter = 1
+                            while safe_name in seen_names:
+                                stem, ext = os.path.splitext(base_name)
+                                safe_name = f"{stem}_{counter}{ext}"
+                                counter += 1
+                            seen_names.add(safe_name)
+                            try:
+                                with archive.open(font_name) as source:
+                                    target = fonts_dir / safe_name
+                                    with open(target, "wb") as dest:
+                                        dest.write(source.read())
+                                    extracted_fonts.append(safe_name)
+                            except Exception:
+                                continue
+                    for member_name in bundled_library_files:
+                        normalized_member = str(member_name).replace("\\", "/").lstrip("/")
+                        if not normalized_member or normalized_member.endswith("/"):
                             continue
-                        safe_name = base_name
-                        counter = 1
-                        while safe_name in seen_names:
-                            stem, ext = os.path.splitext(base_name)
-                            safe_name = f"{stem}_{counter}{ext}"
-                            counter += 1
-                        seen_names.add(safe_name)
+                        target = (extracted_dir / Path(normalized_member)).resolve()
                         try:
-                            with archive.open(font_name) as source:
-                                target = extracted_dir / safe_name
-                                with open(target, "wb") as dest:
-                                    dest.write(source.read())
-                                extracted_fonts.append(safe_name)
+                            target.relative_to(extracted_dir.resolve())
+                        except Exception:
+                            continue
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            with archive.open(member_name) as source, open(target, "wb") as dest:
+                                dest.write(source.read())
                         except Exception:
                             continue
         except Exception:
@@ -4285,6 +6620,8 @@ def import_config_preview():
             except OSError:
                 pass
         return jsonify(success=False, message="Unable to parse config file."), 400
+    if extracted_dir:
+        parsed = _rewrite_bundle_library_paths(parsed, extracted_dir)
 
     def parse_list(value):
         if isinstance(value, str):
@@ -4425,7 +6762,7 @@ def import_config_preview():
                 used_plex_url = form_plex_url
                 used_plex_token = form_plex_token
                 plex_response = validations.validate_plex_server({"plex_url": form_plex_url, "plex_token": form_plex_token})
-                plex_result = plex_response.get_json() if isinstance(plex_response, Flask.response_class) else plex_response
+                plex_result = _coerce_validation_response_payload(plex_response)
                 if not plex_result or not plex_result.get("validated"):
                     if isinstance(plex_result, dict):
                         last_error = plex_result.get("error")
@@ -4456,7 +6793,7 @@ def import_config_preview():
                     used_plex_url = candidate_url
                     used_plex_token = candidate_token
                     plex_response = validations.validate_plex_server({"plex_url": used_plex_url, "plex_token": used_plex_token})
-                    plex_result = plex_response.get_json() if isinstance(plex_response, Flask.response_class) else plex_response
+                    plex_result = _coerce_validation_response_payload(plex_response)
                     if plex_result and plex_result.get("validated"):
                         last_error = None
                         break
@@ -4472,7 +6809,7 @@ def import_config_preview():
                         jsonify(
                             success=False,
                             needs_plex_credentials=True,
-                            message=("Plex credentials from the import/base config could not be validated. " "Please enter a valid Plex URL and token."),
+                            message=last_error or ("Plex credentials from the import/base config could not be validated. " "Please enter a valid Plex URL and token."),
                             plex_url=imported_plex_url or base_plex_url or "",
                             plex_token=imported_plex_token or base_plex_token or "",
                         ),
@@ -4536,7 +6873,7 @@ def import_config_preview():
         if has_form:
             used_tmdb_key = form_tmdb_key
             tmdb_response = validations.validate_tmdb_server({"tmdb_apikey": form_tmdb_key})
-            tmdb_result = tmdb_response.get_json() if isinstance(tmdb_response, Flask.response_class) else tmdb_response
+            tmdb_result = _coerce_validation_response_payload(tmdb_response)
             if not tmdb_result or not tmdb_result.get("valid"):
                 if isinstance(tmdb_result, dict):
                     last_error = tmdb_result.get("message")
@@ -4565,7 +6902,7 @@ def import_config_preview():
             for candidate_key in candidates:
                 used_tmdb_key = candidate_key
                 tmdb_response = validations.validate_tmdb_server({"tmdb_apikey": used_tmdb_key})
-                tmdb_result = tmdb_response.get_json() if isinstance(tmdb_response, Flask.response_class) else tmdb_response
+                tmdb_result = _coerce_validation_response_payload(tmdb_response)
                 if tmdb_result and tmdb_result.get("valid"):
                     last_error = None
                     break
@@ -4581,7 +6918,7 @@ def import_config_preview():
                     jsonify(
                         success=False,
                         needs_tmdb_credentials=True,
-                        message="TMDb API key from the import/base config could not be validated. Please enter a valid key.",
+                        message=last_error or "TMDb API key from the import/base config could not be validated. Please enter a valid key.",
                         tmdb_apikey=imported_tmdb_key or base_tmdb_key or "",
                     ),
                     400,
@@ -4594,85 +6931,96 @@ def import_config_preview():
                 parsed["tmdb"] = tmdb_block
             tmdb_block["apikey"] = used_tmdb_key
 
-    _library_types, library_inference, _ = importer.build_library_type_plan(parsed, movie_names, show_names)
-    payload, report = importer.prepare_import_payload(
-        parsed,
-        movie_names,
-        show_names,
-    )
-    if not payload:
+    try:
+        _library_types, library_inference, _ = importer.build_library_type_plan(parsed, movie_names, show_names)
+        payload, report = importer.prepare_import_payload(
+            parsed,
+            movie_names,
+            show_names,
+        )
+        if not payload:
+            if extracted_dir:
+                try:
+                    shutil.rmtree(extracted_dir)
+                except OSError:
+                    pass
+            return jsonify(success=False, message="No importable sections found."), 400
+        importable_sections = sorted(payload.keys())
+
+        report_lines = list(report.lines)
+        if extracted_fonts:
+            for font in extracted_fonts:
+                report_lines.append(f"imported: bundle.fonts.{font}")
+        annotated_report = importer.annotate_yaml_with_report(config_text, report_lines, binary=True)
+        comments_count = count_comment_lines(config_text)
+        blank_count = count_blank_lines(config_text)
+        total_lines = len(config_text.splitlines()) if isinstance(config_text, str) else 0
+        annotated_counts = count_annotated_lines(annotated_report)
+        diff_count = total_lines - (annotated_counts.get("imported", 0) + annotated_counts.get("not_imported", 0) + blank_count + comments_count)
+        line_counts = {
+            "imported_lines": annotated_counts.get("imported", 0),
+            "not_imported_lines": annotated_counts.get("not_imported", 0),
+            "comments": comments_count,
+            "blank": blank_count,
+            "total": total_lines,
+            "diff": diff_count,
+        }
+
+        previous_path = session.get("import_preview_path")
+        if previous_path:
+            try:
+                os.remove(previous_path)
+            except OSError:
+                pass
+        previous_dir = session.get("import_preview_bundle_dir")
+        if previous_dir:
+            try:
+                shutil.rmtree(previous_dir)
+            except OSError:
+                pass
+
+        cache_dir = Path(helpers.CONFIG_DIR) / "import_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_urlsafe(12)
+        cache_path = cache_dir / f"import_{token}.json"
+        with cache_path.open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "config_name": config_name,
+                    "config_data": parsed,
+                    "config_text": config_text,
+                    "payload": payload,
+                    "bundle_dir": str(extracted_dir) if extracted_dir else None,
+                    "fonts_dir": str((extracted_dir / "fonts").resolve()) if extracted_dir and extracted_fonts else None,
+                    "fonts": extracted_fonts,
+                    "report_lines": report_lines,
+                    "report_summary": report.summary(),
+                    "annotated_report": annotated_report,
+                    "comments_count": comments_count,
+                    "line_counts": line_counts,
+                    "plex_movie_names": sorted(movie_names) if isinstance(movie_names, (set, list)) else [],
+                    "plex_show_names": sorted(show_names) if isinstance(show_names, (set, list)) else [],
+                    "merge_mode": merge_mode,
+                    "base_config": base_config,
+                    "importable_sections": importable_sections,
+                },
+                handle,
+                ensure_ascii=True,
+                default=_import_preview_json_default,
+            )
+    except Exception as exc:
         if extracted_dir:
             try:
                 shutil.rmtree(extracted_dir)
             except OSError:
                 pass
-        return jsonify(success=False, message="No importable sections found."), 400
-    importable_sections = sorted(payload.keys())
-
-    report_lines = list(report.lines)
-    if extracted_fonts:
-        for font in extracted_fonts:
-            report_lines.append(f"imported: bundle.fonts.{font}")
-    annotated_report = importer.annotate_yaml_with_report(config_text, report_lines, binary=True)
-    comments_count = count_comment_lines(config_text)
-    blank_count = count_blank_lines(config_text)
-    total_lines = len(config_text.splitlines()) if isinstance(config_text, str) else 0
-    annotated_counts = count_annotated_lines(annotated_report)
-    diff_count = total_lines - (annotated_counts.get("imported", 0) + annotated_counts.get("not_imported", 0) + blank_count + comments_count)
-    line_counts = {
-        "imported_lines": annotated_counts.get("imported", 0),
-        "not_imported_lines": annotated_counts.get("not_imported", 0),
-        "comments": comments_count,
-        "blank": blank_count,
-        "total": total_lines,
-        "diff": diff_count,
-    }
-
-    previous_path = session.get("import_preview_path")
-    if previous_path:
-        try:
-            os.remove(previous_path)
-        except OSError:
-            pass
-    previous_dir = session.get("import_preview_fonts_dir")
-    if previous_dir:
-        try:
-            shutil.rmtree(previous_dir)
-        except OSError:
-            pass
-
-    cache_dir = Path(helpers.CONFIG_DIR) / "import_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    token = secrets.token_urlsafe(12)
-    cache_path = cache_dir / f"import_{token}.json"
-    with cache_path.open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "config_name": config_name,
-                "config_data": parsed,
-                "config_text": config_text,
-                "payload": payload,
-                "fonts_dir": str(extracted_dir) if extracted_dir else None,
-                "fonts": extracted_fonts,
-                "report_lines": report_lines,
-                "report_summary": report.summary(),
-                "annotated_report": annotated_report,
-                "comments_count": comments_count,
-                "line_counts": line_counts,
-                "plex_movie_names": sorted(movie_names) if isinstance(movie_names, (set, list)) else [],
-                "plex_show_names": sorted(show_names) if isinstance(show_names, (set, list)) else [],
-                "merge_mode": merge_mode,
-                "base_config": base_config,
-                "importable_sections": importable_sections,
-            },
-            handle,
-            ensure_ascii=True,
-        )
+        helpers.ts_log(f"Import preview failed: {exc}", level="ERROR")
+        return jsonify(success=False, message=f"Import preview failed: {exc}"), 500
 
     session["import_preview_token"] = token
     session["import_preview_path"] = str(cache_path)
     session["import_preview_name"] = config_name
-    session["import_preview_fonts_dir"] = str(extracted_dir) if extracted_dir else ""
+    session["import_preview_bundle_dir"] = str(extracted_dir) if extracted_dir else ""
 
     lines = list(report_lines)
     max_lines = 500
@@ -4864,7 +7212,7 @@ def import_config_preview_mapped():
         plex_token = session.get("import_preview_plex_token") or ""
         if plex_url and plex_token:
             plex_response = validations.validate_plex_server({"plex_url": plex_url, "plex_token": plex_token})
-            plex_result = plex_response.get_json() if isinstance(plex_response, Flask.response_class) else plex_response
+            plex_result = _coerce_validation_response_payload(plex_response)
             if plex_result and plex_result.get("validated"):
                 movie_names = parse_list(plex_result.get("movie_libraries", []))
                 show_names = parse_list(plex_result.get("show_libraries", []))
@@ -5000,7 +7348,7 @@ def import_config_preview_mapped():
     cached["importable_sections"] = importable_sections
 
     with open(cache_path, "w", encoding="utf-8") as handle:
-        json.dump(cached, handle, ensure_ascii=True)
+        json.dump(cached, handle, ensure_ascii=True, default=_import_preview_json_default)
 
     lines = list(report_lines)
     max_lines = 500
@@ -5060,6 +7408,7 @@ def import_config_confirm():
     config_name = cached.get("config_name")
     payload = cached.get("payload") or {}
     config_data = cached.get("config_data") or {}
+    bundle_dir = cached.get("bundle_dir")
     fonts_dir = cached.get("fonts_dir")
     fonts = cached.get("fonts") or []
     cached_merge_mode = helpers.booler(cached.get("merge_mode"))
@@ -5302,6 +7651,12 @@ def import_config_confirm():
     if not payload:
         return jsonify(success=False, message="No importable sections found."), 400
 
+    if "libraries" in payload:
+        normalized_libraries_section, normalize_errors = _normalize_imported_libraries_payload(payload.get("libraries"), config_name)
+        if normalize_errors:
+            return jsonify(success=False, message="Imported library files could not be organized.", errors=normalize_errors), 400
+        payload["libraries"] = normalized_libraries_section
+
     imported_sections = []
     if merge_mode:
         base_sections = database.retrieve_config_sections(base_config)
@@ -5334,10 +7689,11 @@ def import_config_confirm():
     fonts_skipped_existing = []
     fonts_skipped_failed = []
     if fonts_dir and fonts:
-        os.makedirs(CUSTOM_FONTS_FOLDER, exist_ok=True)
+        config_fonts_dir = helpers.get_custom_fonts_dir(config_name)
+        os.makedirs(config_fonts_dir, exist_ok=True)
         for font_name in fonts:
             src_path = os.path.join(fonts_dir, font_name)
-            dest_path = os.path.join(CUSTOM_FONTS_FOLDER, font_name)
+            dest_path = os.path.join(str(config_fonts_dir), font_name)
             if os.path.exists(dest_path):
                 fonts_skipped.append(font_name)
                 fonts_skipped_existing.append(font_name)
@@ -5350,22 +7706,22 @@ def import_config_confirm():
                 fonts_skipped_failed.append(font_name)
         if fonts_copied:
             global _FONT_CACHE
-            _FONT_CACHE = []
+            _FONT_CACHE = {}
 
     try:
         os.remove(cache_path)
     except OSError:
         pass
-    if fonts_dir:
+    if bundle_dir:
         try:
-            shutil.rmtree(fonts_dir)
+            shutil.rmtree(bundle_dir)
         except OSError:
             pass
 
     session.pop("import_preview_token", None)
     session.pop("import_preview_path", None)
     session.pop("import_preview_name", None)
-    session.pop("import_preview_fonts_dir", None)
+    session.pop("import_preview_bundle_dir", None)
     session.pop("import_preview_plex_url", None)
     session.pop("import_preview_plex_token", None)
     session.pop("import_preview_tmdb_apikey", None)
@@ -5398,6 +7754,7 @@ def step(name):
     page_info = {}
     header_style = "single line"
     save_error = None
+    autosave_only = request.method == "POST" and request.headers.get("X-QS-Autosave-Only") == "1"
     if name == "900-final":
         return redirect(url_for("step", name="900-kometa"), code=302)
     persistence.ensure_session_config_name()
@@ -5422,11 +7779,64 @@ def step(name):
         path_errors = path_validation.validate_payload(request.form)
         url_errors = url_validation.validate_payload(request.form)
         validation_errors = path_errors + url_errors
+        save_source, save_source_name = persistence.extract_names(request.referrer or name)
+        normalized_library_payload = None
+        if save_source_name == "libraries":
+            clean_payload = persistence.clean_form_data(request.form)
+            incoming_libraries = helpers.build_config_dict("libraries", clean_payload).get("libraries", {})
+            selected_library_ids = _selected_library_ids_from_libraries_data(incoming_libraries)
+            validation_errors += _validate_library_collection_files(incoming_libraries, selected_library_ids)
+            validation_errors += _validate_library_metadata_files(incoming_libraries, selected_library_ids)
+            validation_errors += _validate_library_overlay_files(incoming_libraries, selected_library_ids)
+            for lib_id in selected_library_ids:
+                override_result = _validate_library_service_overrides(lib_id, incoming_libraries)
+                if not override_result.get("valid") and not override_result.get("skipped"):
+                    validation_errors += list(override_result.get("errors") or [])
+            if not validation_errors:
+                normalized_library_payload, normalization_errors, _ = _normalize_library_file_entries_payload(
+                    incoming_libraries,
+                    session.get("config_name") or request.form.get("config_name") or request.form.get("configSelector"),
+                    validate_local=False,
+                )
+                if normalization_errors:
+                    validation_errors += normalization_errors
         if validation_errors:
             save_error = "Invalid values: " + " ".join(validation_errors)
         else:
-            persistence.save_settings(request.referrer, request.form)
+            if save_source_name == "imagemaid":
+                request_payload = request.form.to_dict(flat=True)
+                request_payload["config_name"] = session.get("config_name") or request_payload.get("config_name") or request_payload.get("configSelector")
+                config_name = _resolve_request_config_name(request_payload)
+                existing_settings, _existing_section = _get_imagemaid_settings_section(config_name)
+                was_validated = helpers.booler(existing_settings.get("validated", False))
+                # Step navigation posts the page's native form field names (imagemaid_*),
+                # unlike the JSON autosave/validate routes, so save those directly.
+                form_payload = dict(request.form)
+                form_payload["config_name"] = config_name
+                changed = False
+                if form_payload:
+                    _saved_payload, changed = _save_imagemaid_settings_for_config(config_name, form_payload)
+                _settings_after, section_data = _get_imagemaid_settings_section(config_name)
+                if changed and was_validated:
+                    _persist_imagemaid_validation(
+                        config_name,
+                        section_data,
+                        False,
+                        reason="config_changed",
+                        details="Configuration changed. Validate ImageMaid again.",
+                    )
+            elif save_source_name == "libraries" and normalized_library_payload is not None:
+                libraries_form = {key: (request.form.getlist(key) if len(request.form.getlist(key)) > 1 else request.form.get(key)) for key in request.form}
+                libraries_form.update(normalized_library_payload)
+                persistence.save_settings("025-libraries", libraries_form)
+            else:
+                persistence.save_settings(request.referrer, request.form)
             header_style = request.form.get("header_style", "single line")
+
+        if autosave_only:
+            if save_error:
+                return jsonify(success=False, error=save_error), 400
+            return jsonify(success=True, config_name=session.get("config_name"))
 
     # --- Detect config change ---
     selected_config = request.form.get("configSelector") or previous_config
@@ -5498,9 +7908,19 @@ def step(name):
     page_info["header_style"] = header_style
     page_info["save_error"] = save_error
     page_info["template_name"] = name
+    page_info.update(_build_kometa_install_context(selected_config))
+    settings_payload = persistence.retrieve_settings("150-settings") or {}
+    settings_section = settings_payload.get("settings", {}) if isinstance(settings_payload, dict) else {}
+    custom_repo_setting = str(settings_section.get("custom_repo") or "").strip()
+    custom_repo_base = validations._normalize_custom_repo_base(custom_repo_setting) or ""
+    page_info["settings_custom_repo"] = custom_repo_setting
+    page_info["settings_custom_repo_base"] = custom_repo_base
     if "shutdown_nonce" not in session:
         session["shutdown_nonce"] = secrets.token_urlsafe(16)
+    if "restart_nonce" not in session:
+        session["restart_nonce"] = secrets.token_urlsafe(16)
     page_info["shutdown_nonce"] = session["shutdown_nonce"]
+    page_info["restart_nonce"] = session["restart_nonce"]
     if name == "905-analytics":
         return redirect(url_for("logscan_trends_page"))
 
@@ -5708,6 +8128,7 @@ def step(name):
         page_info["notifiarr_available"],
         page_info["gotify_available"],
         page_info["ntfy_available"],
+        page_info["apprise_available"],
     ) = persistence.notification_systems_available()
 
     # Ensure template variables exist
@@ -5733,9 +8154,29 @@ def step(name):
     attribute_config = {}
     collection_config = []
     overlay_config = []
-    service_validations = {}
+    service_validations = {
+        "plex": False,
+        "tmdb": False,
+        "omdb": False,
+        "mdblist": False,
+        "anidb": False,
+        "trakt": False,
+        "mal": False,
+    }
     overlay_fonts = []
     image_data = {}
+    service_validation_sources = [
+        ("010-plex", "plex"),
+        ("020-tmdb", "tmdb"),
+        ("050-omdb", "omdb"),
+        ("060-mdblist", "mdblist"),
+        ("100-anidb", "anidb"),
+        ("130-trakt", "trakt"),
+        ("140-mal", "mal"),
+    ]
+    for section, key in service_validation_sources:
+        settings = persistence.retrieve_settings(section)
+        service_validations[key] = helpers.booler(settings.get("validated", False))
 
     def add_offset_vars(config):  # noqa: ANN001
         """
@@ -5789,18 +8230,6 @@ def step(name):
         image_data = _build_preview_image_data()
         overlay_fonts = list_overlay_fonts()
 
-        service_validation_sources = [
-            ("010-plex", "plex"),
-            ("020-tmdb", "tmdb"),
-            ("050-omdb", "omdb"),
-            ("060-mdblist", "mdblist"),
-            ("100-anidb", "anidb"),
-            ("130-trakt", "trakt"),
-            ("140-mal", "mal"),
-        ]
-        for section, key in service_validation_sources:
-            settings = persistence.retrieve_settings(section)
-            service_validations[key] = helpers.booler(settings.get("validated", False))
     workspace_status = _build_workspace_status_context(config_name, file_list, available_configs=available_configs)
     jump_to_validations = workspace_status.get("jump_to_validations", {})
     step_statuses = workspace_status.get("step_statuses", {})
@@ -5908,6 +8337,13 @@ def step(name):
 
         if final_gate.get("can_build_config"):
             validated, validation_error, config_data, yaml_content, validation_errors = output.build_config(header_style, config_name=config_name)
+            if isinstance(config_data, dict):
+                config_data, _normalized_changed, normalization_errors = _normalize_generated_config_library_files(config_data, config_name)
+                if normalization_errors:
+                    validation_errors = list(validation_errors or []) + normalization_errors
+                    validated = False
+                if not isinstance(yaml_content, str) or not yaml_content.strip():
+                    yaml_content = _dump_yaml_text(config_data)
             validation_summary = build_validation_summary(validation_errors)
             used_fonts = helpers.collect_font_references(config_data)
             saved_filename = helpers.save_to_named_config(yaml_content, config_name, used_fonts)
@@ -5920,6 +8356,10 @@ def step(name):
         page_info["saved_filename"] = saved_filename
         page_info["yaml_valid"] = validated
         page_info["quickstart_root"] = helpers.get_app_root()
+        page_info["kometa_sync_target_display"] = str((helpers.get_kometa_config_dir() / saved_filename).resolve()) if saved_filename else ""
+        kometa_log_dir = helpers.get_kometa_log_dir()
+        page_info["kometa_log_dir_exists"] = bool(kometa_log_dir.exists())
+        page_info["kometa_log_dir_resolved_display"] = str(kometa_log_dir.resolve()) if kometa_log_dir else ""
         kometa_is_running = helpers.is_kometa_running()
         incomplete_resume_hint = None if kometa_is_running else _build_latest_incomplete_resume_hint()
         session["yaml_content"] = yaml_content
@@ -6069,6 +8509,14 @@ def workspace_status():
         mal_requirement_reasons=status.get("mal_requirement_reasons", []),
         readiness=status.get("readiness", {}),
     )
+
+
+@app.route("/workspace_app_readiness", methods=["GET"])
+def workspace_app_readiness():
+    persistence.ensure_session_config_name()
+    config_name = request.args.get("config_name") or session.get("config_name")
+    payload = _build_workspace_app_readiness(config_name)
+    return jsonify(success=True, config_name=config_name, apps=payload)
 
 
 @app.route("/get_top_imdb_items/<library_name>")
@@ -6251,11 +8699,34 @@ def autosave_library(library_id):
     """Merge-save a single library when switching cards without requiring full navigation submit."""
     try:
         incoming = request.get_json(silent=True) or request.form
+        config_name = _resolve_request_config_name(incoming if isinstance(incoming, dict) else {})
         errors = path_validation.validate_payload(incoming)
         if errors:
             return jsonify({"success": False, "error": "Invalid path values.", "errors": errors}), 400
-        persistence.save_settings("025-libraries", incoming)
-        return jsonify({"success": True})
+        clean_payload = persistence.clean_form_data(MultiDict(incoming))
+        incoming_libraries = helpers.build_config_dict("libraries", clean_payload).get("libraries", {})
+        selected_library_ids = _selected_library_ids_from_libraries_data(incoming_libraries)
+        collection_errors = _validate_library_collection_files(incoming_libraries, selected_library_ids)
+        metadata_errors = _validate_library_metadata_files(incoming_libraries, selected_library_ids)
+        overlay_errors = _validate_library_overlay_files(incoming_libraries, selected_library_ids)
+        if collection_errors:
+            return jsonify({"success": False, "error": "Invalid collection files.", "errors": collection_errors}), 400
+        if metadata_errors:
+            return jsonify({"success": False, "error": "Invalid metadata files.", "errors": metadata_errors}), 400
+        if overlay_errors:
+            return jsonify({"success": False, "error": "Invalid overlay files.", "errors": overlay_errors}), 400
+        normalized_libraries, normalization_errors, changed = _normalize_library_file_entries_payload(
+            incoming_libraries,
+            config_name,
+            validate_local=False,
+        )
+        if normalization_errors:
+            return jsonify({"success": False, "error": "Unable to organize library files.", "errors": normalization_errors}), 400
+        save_payload = dict(incoming) if isinstance(incoming, dict) else {}
+        save_payload.update(normalized_libraries)
+        save_payload["config_name"] = config_name
+        persistence.save_settings("025-libraries", save_payload)
+        return jsonify({"success": True, "normalized": bool(changed), "libraries": normalized_libraries})
     except Exception as e:
         helpers.ts_log(f"Autosave failed for library {library_id}: {e}", level="ERROR")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -6453,6 +8924,23 @@ def copy_library_settings():
             try:
                 clean_payload = persistence.clean_form_data(MultiDict(source_payload))
                 incoming_dict = helpers.build_config_dict("libraries", clean_payload).get("libraries", {})
+                normalized_incoming, normalization_errors, _ = _normalize_library_file_entries_payload(
+                    incoming_dict,
+                    session.get("config_name") or source_payload.get("config_name"),
+                    validate_local=False,
+                )
+                if normalization_errors:
+                    return (
+                        jsonify(
+                            {
+                                "success": False,
+                                "error": "Unable to organize library files in source payload.",
+                                "errors": normalization_errors,
+                            }
+                        ),
+                        400,
+                    )
+                incoming_dict = normalized_incoming
 
                 merged = libraries_data.copy()
 
@@ -6496,6 +8984,9 @@ def copy_library_settings():
 
         source_items = {k: v for k, v in libraries_data.items() if k.startswith(f"{source_prefix}-")}
         source_errors = path_validation.validate_payload(source_items)
+        source_collection_errors = _validate_library_collection_files(libraries_data, [source_prefix])
+        source_metadata_errors = _validate_library_metadata_files(libraries_data, [source_prefix])
+        source_overlay_errors = _validate_library_overlay_files(libraries_data, [source_prefix])
         if source_errors:
             return (
                 jsonify(
@@ -6503,6 +8994,39 @@ def copy_library_settings():
                         "success": False,
                         "error": "Invalid path values found in source library: " + " ".join(source_errors),
                         "errors": source_errors,
+                    }
+                ),
+                400,
+            )
+        if source_collection_errors:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "Invalid collection files found in source library: " + " ".join(source_collection_errors),
+                        "errors": source_collection_errors,
+                    }
+                ),
+                400,
+            )
+        if source_metadata_errors:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "Invalid metadata files found in source library: " + " ".join(source_metadata_errors),
+                        "errors": source_metadata_errors,
+                    }
+                ),
+                400,
+            )
+        if source_overlay_errors:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "Invalid overlay files found in source library: " + " ".join(source_overlay_errors),
+                        "errors": source_overlay_errors,
                     }
                 ),
                 400,
@@ -6539,6 +9063,7 @@ def copy_library_settings():
 
         merged = libraries_data.copy()
         targets_to_process = [source_prefix] + [tid for tid in filtered_targets if tid != source_prefix]
+        config_name = session.get("config_name") or source_payload.get("config_name") or namesgenerator.get_random_name()
 
         for target_id in targets_to_process:
             target_name = name_map.get(target_id, "")
@@ -6556,6 +9081,13 @@ def copy_library_settings():
                 new_value = value
                 if key.endswith("-library"):
                     new_value = target_name or value
+                elif target_id != source_prefix:
+                    if key.endswith("-metadata_files"):
+                        new_value = _clone_library_file_entries_for_target("metadata_files", value, config_name, target_id)
+                    elif key.endswith("-collection_files"):
+                        new_value = _clone_library_file_entries_for_target("collection_files", value, config_name, target_id)
+                    elif key.endswith("-overlay_files"):
+                        new_value = _clone_library_file_entries_for_target("overlay_files", value, config_name, target_id)
                 merged[new_key] = new_value
 
         # Update the aggregated libraries list to include all configured library names
@@ -6566,7 +9098,6 @@ def copy_library_settings():
         merged["libraries"] = ",".join(sorted(set(configured_names)))
 
         # Persist directly to the DB to avoid any loss of data during merge
-        config_name = session.get("config_name") or namesgenerator.get_random_name()
         database.save_section_data(
             name=config_name,
             section="libraries",
@@ -6597,42 +9128,71 @@ def _safe_bundle_name(raw_name: str | None) -> str:
     return safe or "default"
 
 
-def _get_custom_font_files() -> list[Path]:
-    custom_dir = helpers.get_custom_fonts_dir()
-    if not custom_dir.is_dir():
-        return []
-    fonts = [entry for entry in custom_dir.iterdir() if entry.is_file() and entry.suffix.lower() in helpers.FONT_EXTENSIONS]
-    return sorted(fonts, key=lambda p: p.name.lower())
+def _get_custom_font_files(config_name: str | None = None) -> list[Path]:
+    font_files: list[Path] = []
+    seen: set[str] = set()
+    candidate_dirs: list[Path] = []
+    if config_name:
+        helpers.migrate_legacy_custom_fonts_to_config(config_name)
+        candidate_dirs.append(helpers.get_custom_fonts_dir(config_name))
+    candidate_dirs.append(helpers.get_legacy_custom_fonts_dir())
+    for custom_dir in candidate_dirs:
+        if not custom_dir.is_dir():
+            continue
+        for entry in sorted(custom_dir.iterdir(), key=lambda p: p.name.lower()):
+            if not entry.is_file() or entry.suffix.lower() not in helpers.FONT_EXTENSIONS:
+                continue
+            if entry.name in seen:
+                continue
+            font_files.append(entry)
+            seen.add(entry.name)
+    return font_files
+
+
+def _bundle_artifacts_from_yaml(yaml_text):
+    parsed = importer.load_yaml_config(yaml_text)
+    return _iter_bundle_artifacts(parsed)
 
 
 def _build_config_bundle(
     config_text: str,
     config_filename: str,
     font_files: list[Path],
+    artifact_files: list[dict] | None = None,
     config_name: str | None = None,
     redacted: bool = False,
 ) -> BytesIO | None:
-    if not config_text or not font_files:
+    artifact_files = artifact_files or []
+    if not config_text or (not font_files and not artifact_files):
         return None
     name = _normalize_config_name(config_name)
     font_names = [font.name for font in font_files]
+    has_artifacts = bool(artifact_files)
     readme_lines = [
         "Quickstart config bundle",
         f"Config name: {name}",
         "",
         "This bundle includes:",
         f"- {config_filename}",
-        "- fonts/ (custom fonts uploaded in Quickstart)",
     ]
     if font_names:
+        readme_lines.append(f"- {name}/fonts/ (custom fonts uploaded in Quickstart)")
         readme_lines.append(f"- Fonts included: {', '.join(font_names)}")
+    if has_artifacts:
+        readme_lines.append(f"- {name}/metadata_files/, {name}/collection_files/, {name}/overlay_files/ (config-owned library files)")
     readme_lines += [
         "",
         "Install steps:",
         "1) Copy the config file into your Kometa config folder (config/).",
-        "2) Copy the font files from fonts/ into your Kometa config/fonts/ folder.",
+    ]
+    if font_names:
+        readme_lines.append(f"2) Copy the font files from {name}/fonts/ into your Kometa config/fonts/ folder.")
+    if has_artifacts:
+        readme_lines.append(f"3) Copy {name}/ into your Kometa config/ folder.")
+    readme_lines += [
         "",
-        "Note: The Quickstart Run Now button syncs fonts automatically.",
+        "Note: Validate Kometa and Run Now both sync config-owned library files automatically.",
+        "Note: The Quickstart Run Now button also syncs referenced fonts automatically.",
         "This bundle is for manual installs.",
     ]
     if redacted:
@@ -6646,7 +9206,9 @@ def _build_config_bundle(
     with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(config_filename, config_text)
         for font_path in font_files:
-            zf.write(font_path, f"fonts/{font_path.name}")
+            zf.write(font_path, f"{name}/fonts/{font_path.name}")
+        for artifact in artifact_files:
+            _bundle_write_artifact(zf, artifact, redacted=redacted)
         zf.writestr("README.txt", "\n".join(readme_lines))
     bundle.seek(0)
     return bundle
@@ -6656,10 +9218,17 @@ def _build_config_bundle(
 def download():
     yaml_content = session.get("yaml_content", "")
     if yaml_content:
-        custom_fonts = _get_custom_font_files()
         config_name = session.get("config_name")
-        if custom_fonts:
-            bundle = _build_config_bundle(yaml_content, "config.yml", custom_fonts, config_name=config_name)
+        custom_fonts = _get_custom_font_files(config_name)
+        artifact_files = _bundle_artifacts_from_yaml(yaml_content)
+        if custom_fonts or artifact_files:
+            bundle = _build_config_bundle(
+                yaml_content,
+                "config.yml",
+                custom_fonts,
+                artifact_files=artifact_files,
+                config_name=config_name,
+            )
             if bundle:
                 bundle_name = f"{_safe_bundle_name(config_name)}_config_bundle.zip"
                 return send_file(
@@ -6686,13 +9255,15 @@ def download_redacted():
         redacted_content = helpers.redact_sensitive_data(yaml_content)
 
         # Serve the redacted YAML as a file download
-        custom_fonts = _get_custom_font_files()
         config_name = session.get("config_name")
-        if custom_fonts:
+        custom_fonts = _get_custom_font_files(config_name)
+        artifact_files = _bundle_artifacts_from_yaml(yaml_content)
+        if custom_fonts or artifact_files:
             bundle = _build_config_bundle(
                 redacted_content,
                 "config_redacted.yml",
                 custom_fonts,
+                artifact_files=artifact_files,
                 config_name=config_name,
                 redacted=True,
             )
@@ -6732,13 +9303,45 @@ def validate_ntfy():
     return validations.validate_ntfy_server(data)
 
 
+@app.route("/validate_apprise", methods=["POST"])
+def validate_apprise():
+    data = request.get_json(silent=True) or {}
+    return validations.validate_apprise_server(data)
+
+
 @app.route("/validate_plex", methods=["POST"])
 def validate_plex():
     data = request.get_json(silent=True) or {}
     valid, message = url_validation.validate_url(data.get("plex_url"), allow_local=True)
     if not valid:
         return jsonify({"valid": False, "error": f"Plex URL: {message}"}), 400
-    return validations.validate_plex_server(data)
+    plex_response = validations.validate_plex_server(data)
+    plex_data = plex_response.get_json() if isinstance(plex_response, Flask.response_class) else plex_response
+    if not isinstance(plex_data, dict) or not plex_data.get("validated"):
+        return plex_response
+
+    config_name = _resolve_request_config_name(data)
+    telemetry = {}
+    try:
+        telemetry = helpers.get_plex_metadata(plex_url=data.get("plex_url"), plex_token=data.get("plex_token")) or {}
+        if telemetry:
+            persistence.save_settings("plex_telemetry", telemetry)
+            if config_name:
+                try:
+                    database.save_section_data(
+                        name=config_name,
+                        section="plex_telemetry",
+                        validated=True,
+                        user_entered=False,
+                        data={"plex_telemetry": telemetry},
+                    )
+                except Exception as e:
+                    helpers.ts_log(f"Failed to persist Plex telemetry during validation for {config_name}: {e}", level="WARNING")
+    except Exception as e:
+        helpers.ts_log(f"Failed to fetch Plex telemetry during validation: {e}", level="WARNING")
+
+    merged = {**plex_data, **telemetry}
+    return jsonify(merged)
 
 
 @app.route("/path-validation-rules", methods=["GET"])
@@ -6802,6 +9405,16 @@ def refresh_plex_libraries():
                 }
             }
             persistence.save_settings("plex_telemetry", cached_telemetry)
+            try:
+                database.save_section_data(
+                    name=config_name,
+                    section="plex_telemetry",
+                    validated=True,
+                    user_entered=False,
+                    data={"plex_telemetry": cached_telemetry},
+                )
+            except Exception as e:
+                helpers.ts_log(f"Failed to persist cached Plex telemetry for {config_name}: {e}", level="WARNING")
             return jsonify(cached_refresh)
 
         # Validate Plex server and get updated libraries
@@ -6823,6 +9436,16 @@ def refresh_plex_libraries():
         # Get fresh telemetry using helpers and store it
         telemetry = helpers.get_plex_metadata(plex_url=plex_url, plex_token=plex_token)
         persistence.save_settings("plex_telemetry", telemetry)
+        try:
+            database.save_section_data(
+                name=config_name,
+                section="plex_telemetry",
+                validated=True,
+                user_entered=False,
+                data={"plex_telemetry": telemetry},
+            )
+        except Exception as e:
+            helpers.ts_log(f"Failed to persist Plex telemetry for {config_name}: {e}", level="WARNING")
 
         # Merge both plex_data and telemetry for response
         merged_response = {**plex_data, **telemetry}
@@ -7062,22 +9685,40 @@ def validate_webhook():
 def validate_radarr():
     data = request.json
     result = validations.validate_radarr_server(data)
+    status_code = 200
+    if isinstance(result, tuple):
+        result, status_code = result
 
     if result.get_json().get("valid"):
         return jsonify(result.get_json())
     else:
-        return jsonify(result.get_json()), 400
+        return jsonify(result.get_json()), status_code or 400
 
 
 @app.route("/validate_sonarr", methods=["POST"])
 def validate_sonarr():
     data = request.json
     result = validations.validate_sonarr_server(data)
+    status_code = 200
+    if isinstance(result, tuple):
+        result, status_code = result
 
     if result.get_json().get("valid"):
         return jsonify(result.get_json())
     else:
-        return jsonify(result.get_json()), 400
+        return jsonify(result.get_json()), status_code or 400
+
+
+@app.route("/validate_library_service_overrides/<library_id>", methods=["POST"])
+def validate_library_service_overrides(library_id):
+    payload = request.get_json(silent=True) or request.form or {}
+    clean_payload = persistence.clean_form_data(MultiDict(payload))
+    libraries_data = helpers.build_config_dict("libraries", clean_payload).get("libraries", {})
+    if not isinstance(libraries_data, dict):
+        libraries_data = {}
+    result = _validate_library_service_overrides(library_id, libraries_data, force_validate=True)
+    status_code = 200 if result.get("valid") else 400
+    return jsonify(result), status_code
 
 
 @app.route("/validate_omdb", methods=["POST"])
@@ -7111,6 +9752,362 @@ def validate_tmdb():
         return jsonify(result.get_json())
     else:
         return jsonify(result.get_json()), 400
+
+
+def _get_active_tmdb_api_key():
+    config_name = session.get("config_name")
+    if not config_name:
+        return ""
+    try:
+        _validated, _user_entered, stored = database.retrieve_section_data(config_name, "tmdb")
+    except Exception:
+        return ""
+    if not isinstance(stored, dict):
+        return ""
+    tmdb_block = stored.get("tmdb", stored)
+    if not isinstance(tmdb_block, dict):
+        return ""
+    api_key = tmdb_block.get("apikey") or tmdb_block.get("api_key") or tmdb_block.get("tmdb_apikey") or tmdb_block.get("token") or ""
+    return str(api_key).strip()
+
+
+def _lookup_tmdb_by_imdb_id(imdb_id, media_type=""):
+    api_key = _get_active_tmdb_api_key()
+    if not api_key:
+        return {"valid": False, "verified": False, "message": "TMDb is not configured for the active config."}
+
+    try:
+        response = requests.get(
+            f"https://api.themoviedb.org/3/find/{imdb_id}",
+            params={"api_key": api_key, "external_source": "imdb_id"},
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        return {"valid": False, "verified": False, "message": f"TMDb lookup failed: {exc}."}
+
+    if response.status_code in {401, 403}:
+        return {"valid": False, "verified": False, "message": "TMDb lookup could not be verified with the configured API key."}
+
+    if response.status_code == 404:
+        return {"valid": False, "verified": True, "message": "TMDb did not find a matching IMDb ID."}
+
+    if response.status_code != 200:
+        return {"valid": False, "verified": False, "message": f"TMDb lookup failed with status {response.status_code}."}
+
+    payload = response.json() if response.content else {}
+    movie_results = payload.get("movie_results") if isinstance(payload.get("movie_results"), list) else []
+    tv_results = payload.get("tv_results") if isinstance(payload.get("tv_results"), list) else []
+
+    preferred_media_type = str(media_type or "").strip().lower()
+    ordered_results = []
+    if preferred_media_type == "movie":
+        ordered_results.extend(("movie", item) for item in movie_results)
+        ordered_results.extend(("show", item) for item in tv_results)
+    elif preferred_media_type == "show":
+        ordered_results.extend(("show", item) for item in tv_results)
+        ordered_results.extend(("movie", item) for item in movie_results)
+    else:
+        ordered_results.extend(("movie", item) for item in movie_results)
+        ordered_results.extend(("show", item) for item in tv_results)
+
+    for result_type, item in ordered_results:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("title") or item.get("name") or "").strip()
+        if not label:
+            continue
+        tmdb_id = item.get("id")
+        tmdb_suffix = f" (TMDb {tmdb_id})" if tmdb_id not in [None, ""] else ""
+        media_label = "movie" if result_type == "movie" else "show"
+        return {
+            "valid": True,
+            "verified": True,
+            "label": label,
+            "result_type": result_type,
+            "message": f"TMDb {media_label}: {label}{tmdb_suffix}",
+        }
+
+    return {"valid": False, "verified": True, "message": "TMDb did not find a matching IMDb ID."}
+
+
+def _lookup_tmdb_external_ids(endpoint, tmdb_id, api_key):
+    if endpoint not in {"movie", "tv"} or not tmdb_id or not api_key:
+        return {}
+
+    try:
+        response = requests.get(
+            f"https://api.themoviedb.org/3/{endpoint}/{tmdb_id}/external_ids",
+            params={"api_key": api_key},
+            timeout=10,
+        )
+    except requests.RequestException:
+        return {}
+
+    if response.status_code != 200:
+        return {}
+
+    payload = response.json() if response.content else {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _lookup_tmdb_numeric_id(tmdb_id, media_type=""):
+    api_key = _get_active_tmdb_api_key()
+    if not api_key:
+        return {"valid": False, "verified": False, "message": "TMDb is not configured for the active config."}
+
+    preferred_media_type = str(media_type or "").strip().lower()
+    endpoint_order = []
+    if preferred_media_type == "movie":
+        endpoint_order = [("movie", "movie"), ("tv", "show"), ("collection", "collection"), ("person", "person")]
+    elif preferred_media_type == "show":
+        endpoint_order = [("tv", "show"), ("movie", "movie"), ("collection", "collection"), ("person", "person")]
+    else:
+        endpoint_order = [("movie", "movie"), ("tv", "show"), ("collection", "collection"), ("person", "person")]
+
+    for endpoint, result_type in endpoint_order:
+        try:
+            response = requests.get(
+                f"https://api.themoviedb.org/3/{endpoint}/{tmdb_id}",
+                params={"api_key": api_key},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            return {"valid": False, "verified": False, "message": f"TMDb lookup failed: {exc}."}
+
+        if response.status_code in {401, 403}:
+            return {"valid": False, "verified": False, "message": "TMDb lookup could not be verified with the configured API key."}
+
+        if response.status_code == 404:
+            continue
+
+        if response.status_code != 200:
+            return {"valid": False, "verified": False, "message": f"TMDb lookup failed with status {response.status_code}."}
+
+        payload = response.json() if response.content else {}
+        label = str(payload.get("title") or payload.get("name") or "").strip()
+        if not label:
+            label = f"TMDb {result_type} {tmdb_id}"
+        external_ids = _lookup_tmdb_external_ids(endpoint, tmdb_id, api_key) if endpoint in {"movie", "tv"} else {}
+        tvdb_id = external_ids.get("tvdb_id")
+        id_suffix = f" (TMDb {tmdb_id})"
+        if tvdb_id not in [None, "", 0, "0"]:
+            id_suffix = f" (TMDb {tmdb_id}, TVDb {tvdb_id})"
+
+        return {
+            "valid": True,
+            "verified": True,
+            "label": label,
+            "result_type": result_type,
+            "tvdb_id": tvdb_id,
+            "message": f"TMDb {result_type}: {label}{id_suffix}",
+        }
+
+    return {"valid": False, "verified": True, "message": "TMDb did not find a matching numeric ID."}
+
+
+def _normalize_tmdb_library_media_type(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in {"movie", "movies", "mov"}:
+        return "movie"
+    if normalized in {"show", "shows", "sho", "tv", "season", "seasons", "episode", "episodes"}:
+        return "show"
+    return normalized
+
+
+def _build_tmdb_library_type_warning(tmdb_message, tmdb_result_type, expected_media_type, value_label="ID"):
+    resolved_type = _normalize_tmdb_library_media_type(tmdb_result_type)
+    expected_type = _normalize_tmdb_library_media_type(expected_media_type)
+    if not resolved_type or expected_type not in {"movie", "show"}:
+        return ""
+    if resolved_type == expected_type:
+        return ""
+
+    library_label = "movie library" if expected_type == "movie" else "show/season/episode library"
+    readable_type = {
+        "movie": "movie",
+        "show": "show",
+        "collection": "collection",
+        "person": "person",
+    }.get(resolved_type, resolved_type)
+    return f"{tmdb_message}. This {value_label} resolves to a {readable_type}, but the active library is a {library_label}."
+
+
+def _parse_optional_id_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    text = str(value).strip()
+    if not text or text.lower() == "none":
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+@app.route("/lookup_template_string_value", methods=["POST"])
+def lookup_template_string_value():
+    data = request.get_json(silent=True) or {}
+    preset = str(data.get("preset") or "").strip()
+    value = str(data.get("value") or "").strip()
+    library_name = str(data.get("library_name") or "").strip()
+    media_type = str(data.get("media_type") or "").strip()
+
+    if not preset or not value:
+        return jsonify({"error": "Lookup preset and value are required."}), 400
+
+    if preset == "tmdb_collection_id":
+        api_key = _get_active_tmdb_api_key()
+        if not api_key:
+            return jsonify({"valid": False, "verified": False, "message": "TMDb is not configured for the active config."})
+        try:
+            response = requests.get(
+                f"https://api.themoviedb.org/3/collection/{value}",
+                params={"api_key": api_key},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            return jsonify({"valid": False, "verified": False, "message": f"TMDb lookup failed: {exc}."})
+
+        if response.status_code == 200:
+            payload = response.json() if response.content else {}
+            label = str(payload.get("name") or "").strip()
+            if label:
+                return jsonify({"valid": True, "verified": True, "label": label, "message": f"TMDb: {label}"})
+            return jsonify({"valid": False, "verified": True, "message": "TMDb collection found, but no collection name was returned."})
+
+        if response.status_code == 404:
+            return jsonify({"valid": False, "verified": True, "message": "TMDb collection ID not found."})
+
+        if response.status_code in {401, 403}:
+            return jsonify({"valid": False, "verified": False, "message": "TMDb lookup could not be verified with the configured API key."})
+
+        return jsonify({"valid": False, "verified": False, "message": f"TMDb lookup failed with status {response.status_code}."})
+
+    if preset == "numeric_id":
+        tmdb_result = _lookup_tmdb_numeric_id(value, media_type=media_type)
+        tmdb_label = str(tmdb_result.get("label") or "").strip()
+        tmdb_message = str(tmdb_result.get("message") or "").strip()
+        tmdb_result_type = str(tmdb_result.get("result_type") or "").strip().lower()
+        expected_media_type = str(media_type or "").strip().lower()
+
+        warning_message = _build_tmdb_library_type_warning(tmdb_message, tmdb_result_type, expected_media_type, value_label="numeric ID")
+        if tmdb_result.get("valid") and tmdb_result.get("verified") and warning_message:
+            return jsonify(
+                {
+                    "valid": True,
+                    "verified": True,
+                    "label": tmdb_label,
+                    "level": "warning",
+                    "message": warning_message,
+                }
+            )
+
+        if tmdb_result.get("valid") and tmdb_result.get("verified") and tmdb_label and library_name and tmdb_result_type in {"movie", "show"}:
+            try:
+                plex_match = helpers.find_item_by_title(library_name, tmdb_label)
+            except Exception as exc:
+                return jsonify({"valid": False, "verified": False, "message": f"Plex lookup failed: {exc}."})
+
+            if plex_match and plex_match.get("title"):
+                plex_title = str(plex_match.get("title")).strip()
+                return jsonify(
+                    {
+                        "valid": True,
+                        "verified": True,
+                        "label": plex_title,
+                        "message": f"Plex title match: {plex_title}. {tmdb_message}",
+                    }
+                )
+
+            return jsonify(
+                {
+                    "valid": True,
+                    "verified": True,
+                    "label": tmdb_label,
+                    "level": "warning",
+                    "message": f"{tmdb_message}. Plex could not confirm a match in the active library.",
+                }
+            )
+
+        return jsonify(tmdb_result)
+
+    if preset in {"imdb_id_plex", "imdb_id_tmdb"}:
+        tmdb_result = _lookup_tmdb_by_imdb_id(value, media_type=media_type)
+        tmdb_label = str(tmdb_result.get("label") or "").strip()
+        tmdb_message = str(tmdb_result.get("message") or "").strip()
+        tmdb_result_type = str(tmdb_result.get("result_type") or "").strip().lower()
+        expected_media_type = str(media_type or "").strip().lower()
+
+        warning_message = _build_tmdb_library_type_warning(tmdb_message, tmdb_result_type, expected_media_type, value_label="IMDb ID")
+        if tmdb_result.get("valid") and tmdb_result.get("verified") and warning_message:
+            return jsonify(
+                {
+                    "valid": True,
+                    "verified": True,
+                    "label": tmdb_label,
+                    "level": "warning",
+                    "message": warning_message,
+                }
+            )
+
+        if preset == "imdb_id_tmdb":
+            return jsonify(tmdb_result)
+
+        if not library_name:
+            return jsonify({"valid": False, "verified": False, "message": "Active Plex library is required for IMDb lookup."})
+
+        find_item_by_imdb_id = helpers.find_item_by_imdb_id
+        try:
+            supports_fallback_title = "fallback_title" in inspect.signature(find_item_by_imdb_id).parameters
+        except (TypeError, ValueError):
+            supports_fallback_title = True
+
+        try:
+            if supports_fallback_title:
+                result = find_item_by_imdb_id(library_name, value, media_type, fallback_title=tmdb_label)
+            else:
+                result = find_item_by_imdb_id(library_name, value, media_type)
+        except Exception as exc:
+            return jsonify({"valid": False, "verified": False, "message": f"Plex lookup failed: {exc}."})
+
+        if result and result.get("title"):
+            title = str(result.get("title")).strip()
+            return jsonify({"valid": True, "verified": True, "label": title, "message": f"Plex: {title}"})
+
+        if tmdb_result.get("valid") and tmdb_result.get("verified"):
+            if tmdb_label and tmdb_message:
+                return jsonify(
+                    {
+                        "valid": True,
+                        "verified": True,
+                        "label": tmdb_label,
+                        "level": "warning",
+                        "message": f"{tmdb_message}. Plex could not confirm a match in the active library.",
+                    }
+                )
+            return jsonify(tmdb_result)
+
+        fallback_message = "IMDb ID format is valid, but no matching item was found in the active Plex library."
+        if tmdb_message:
+            fallback_message = f"{fallback_message} {tmdb_message}"
+        return jsonify(
+            {
+                "valid": False,
+                "verified": bool(tmdb_result.get("verified")),
+                "message": fallback_message,
+            }
+        )
+
+    return jsonify({"error": f"Unsupported lookup preset: {preset}"}), 400
 
 
 @app.route("/validate_mdblist", methods=["POST"])
@@ -7219,6 +10216,13 @@ def validate_all_services():
             ["ntfy_url", "ntfy_token", "ntfy_topic"],
         ),
         (
+            "087-apprise",
+            "apprise",
+            validations.validate_apprise_server,
+            lambda s: {"apprise_location": s.get("apprise", {}).get("location")},
+            ["apprise_location"],
+        ),
+        (
             "110-radarr",
             "radarr",
             validations.validate_radarr_server,
@@ -7241,6 +10245,18 @@ def validate_all_services():
         settings = persistence.retrieve_settings(template_key)
         validated_at = settings.get("validated_at")
         payload = payload_builder(settings) or {}
+        if section == "apprise":
+            apprise_settings = settings.get("apprise", {}) if isinstance(settings, dict) else {}
+            apprise_location = apprise_settings.get("location") if isinstance(apprise_settings, dict) else None
+            if is_blank_value(apprise_location):
+                results[template_key] = {
+                    "status": "skipped",
+                    "validated_at": validated_at or "",
+                    "reason": "missing_location",
+                }
+                persist_validation_metadata(section, "skipped", reason="missing_location")
+                summary["skipped"] += 1
+                continue
         if not has_required_credentials(payload, required_keys):
             results[template_key] = {
                 "status": "skipped",
@@ -7365,6 +10381,17 @@ def validate_all_services():
         results[template_key] = result
         summary["skipped"] += 1
 
+    kometa_settings, kometa_section = _get_kometa_settings_section(config_name)
+    del kometa_settings
+    kometa_valid, kometa_reason, kometa_details = _validate_saved_kometa_selection(kometa_section)
+    update_section_validation(
+        "001-start",
+        "kometa",
+        kometa_valid,
+        reason=kometa_reason,
+        details=kometa_details,
+    )
+
     # Bulk validation for libraries
     plex_settings = persistence.retrieve_settings("010-plex") or {}
     plex_is_valid = helpers.booler(plex_settings.get("validated", False)) if isinstance(plex_settings, dict) else False
@@ -7384,12 +10411,22 @@ def validate_all_services():
         else:
             libraries_reason = None
             path_errors = path_validation.validate_payload(libraries_data)
+            collection_file_errors = _validate_library_collection_files(libraries_data, selected_library_ids)
+            metadata_file_errors = _validate_library_metadata_files(libraries_data, selected_library_ids)
+            overlay_file_errors = _validate_library_overlay_files(libraries_data, selected_library_ids)
+            arr_override_errors = []
             if path_errors:
                 libraries_reason = "invalid_paths"
+            elif collection_file_errors:
+                libraries_reason = "invalid_collection_files"
+            elif overlay_file_errors:
+                libraries_reason = "invalid_overlay_files"
+            elif metadata_file_errors:
+                libraries_reason = "invalid_metadata_files"
             else:
 
                 def has_minimal_library_yaml_selection(lib_id):
-                    allowed_markers = ("-collection_", "-overlay_", "-attribute_", "-top_level_")
+                    allowed_markers = ("-collection_", "-overlay_", "-attribute_", "-top_level_", "-metadata_files", "-collection_files", "-overlay_files")
                     for key, value in libraries_data.items():
                         if not isinstance(key, str) or not key.startswith(f"{lib_id}-"):
                             continue
@@ -7436,12 +10473,20 @@ def validate_all_services():
                 if libraries_reason is None and missing_placeholders:
                     libraries_reason = "missing_placeholder_imdb"
 
+                if libraries_reason is None:
+                    for lib_id in selected_library_ids:
+                        override_result = _validate_library_service_overrides(lib_id, libraries_data)
+                        if not override_result.get("valid") and not override_result.get("skipped"):
+                            arr_override_errors.extend(list(override_result.get("errors") or []))
+                if libraries_reason is None and arr_override_errors:
+                    libraries_reason = "invalid_arr_overrides"
+
             update_section_validation(
                 "025-libraries",
                 "libraries",
                 libraries_reason is None,
                 reason=libraries_reason,
-                details=missing_placeholders if libraries_reason == "missing_placeholder_imdb" else None,
+                details=(missing_placeholders if libraries_reason == "missing_placeholder_imdb" else arr_override_errors if libraries_reason == "invalid_arr_overrides" else None),
             )
 
     # Bulk validation for settings
@@ -7473,8 +10518,14 @@ def validate_all_services():
         check_regex("item_refresh_delay", r"^(0|[1-9]\d*)$")
         check_regex("minimum_items", r"^[1-9]\d*$")
         check_regex("run_again_delay", r"^(0|[1-9]\d*)$")
-        check_regex("ignore_ids", r"^(None|\d{1,8}(,\d{1,8})*)$", flags=re.IGNORECASE, allow_blank=True)
-        check_regex("ignore_imdb_ids", r"^(None|tt\d{7,8}(,tt\d{7,8})*)$", flags=re.IGNORECASE, allow_blank=True)
+        ignore_ids_values = _parse_optional_id_list(settings_section.get("ignore_ids"))
+        if any(not re.match(r"^\d{1,8}$", item) for item in ignore_ids_values):
+            invalid_fields.append("ignore_ids")
+
+        ignore_imdb_ids_values = _parse_optional_id_list(settings_section.get("ignore_imdb_ids"))
+        if any(not re.match(r"^tt\d{7,8}$", item, re.IGNORECASE) for item in ignore_imdb_ids_values):
+            invalid_fields.append("ignore_imdb_ids")
+
         check_regex("custom_repo", r"^(None|https?:\/\/[\da-z.-]+\.[a-z.]{2,6}([/\w.-]*)*\/?)$", flags=re.IGNORECASE, allow_blank=True)
 
         asset_dirs = settings_section.get("asset_directory") if isinstance(settings_section, dict) else None
@@ -7580,7 +10631,9 @@ def validate_all_services():
         "missing_credentials": "Missing credentials",
         "missing_plex_validation": "Plex not validated",
         "no_libraries": "No libraries selected",
+        "missing_location": "Missing location",
         "invalid_paths": "Invalid paths",
+        "invalid_arr_overrides": "Invalid Arr overrides",
         "missing_library_defaults": "Missing library defaults",
         "missing_placeholder_imdb": "Missing placeholder IMDb ID",
         "invalid_fields": "Invalid fields",
@@ -7700,6 +10753,11 @@ def start_kometa():
     start_mode = _normalize_kometa_start_mode(data.get("start_mode"))
     if not command:
         return jsonify({"error": "No command provided"}), 400
+    config_name = session.get("config_name") if has_request_context() else None
+    _settings, kometa_section = _get_kometa_settings_section(config_name)
+    selection = _resolve_kometa_selection(kometa_section)
+    if selection.get("install_mode") == KOMETA_INSTALL_MODE_EXTERNAL:
+        return jsonify({"error": "External Kometa mode cannot launch Kometa from Quickstart. Quickstart can only sync config and optional logs in this mode."}), 400
 
     if helpers.is_kometa_running():
         pid = helpers.get_kometa_pid()
@@ -7740,9 +10798,10 @@ def start_kometa():
 
     _update_run_context(command, start_mode=start_mode)
 
-    start_min, end_min, window_str = _get_maintenance_window_live()
+    maintenance_config_name = session.get("config_name")
+    start_min, end_min, window_str = _resolve_maintenance_window_live(config_name=maintenance_config_name)
     if start_min is None or end_min is None:
-        start_min, end_min, window_str = _get_maintenance_window_from_db()
+        start_min, end_min, window_str = _resolve_maintenance_window_from_db(config_name=maintenance_config_name)
     if _is_within_maintenance_window(datetime.now(), start_min, end_min):
         _set_pending_kometa_start(command, session.get("config_name"), start_mode=start_mode)
         return jsonify({"status": "queued", "maintenance_window": window_str, "start_mode": start_mode}), 202
@@ -7793,7 +10852,8 @@ def stop_kometa():
             os.remove(pid_file)
         except Exception:
             pass
-        KOMETA_CPU_CACHE.pop(pid, None)
+        _clear_process_metric_cache(pid, "kometa")
+        _clear_run_context()
         try:
             _write_quickstart_stop_marker(helpers.get_kometa_root_path(), config_name=run_config_name, reason="user_stop")
         except Exception:
@@ -7812,6 +10872,7 @@ def stop_kometa():
             os.remove(pid_file)
         except Exception:
             pass
+        _clear_run_context()
         try:
             _write_quickstart_stop_marker(helpers.get_kometa_root_path(), config_name=session.get("config_name"), reason="process_missing")
         except Exception:
@@ -7823,6 +10884,10 @@ def stop_kometa():
 
 @app.route("/kometa-status", methods=["GET"])
 def kometa_status():
+    try:
+        _refresh_maintenance_window_availability(preserve_active_state=True)
+    except Exception:
+        pass
     pending = _peek_pending_kometa_start()
     pending_start = bool(pending)
     pending_requested_at = pending.get("requested_at") if pending else None
@@ -7844,6 +10909,7 @@ def kometa_status():
             _ingest_completed_live_logs("kometa")
         except Exception:
             pass
+        _clear_run_context()
         with MAINTENANCE_STATE_LOCK:
             maintenance_active = MAINTENANCE_STATE["active"]
             maintenance_paused = MAINTENANCE_STATE["paused"]
@@ -7878,6 +10944,7 @@ def kometa_status():
                 started_at = datetime.fromtimestamp(started_at_ts).isoformat()
                 elapsed_seconds = max(0, int(time.time() - started_at_ts))
                 cpu_percent = _calculate_process_cpu_percent(proc)
+                io_stats = _calculate_process_io_stats(proc, "kometa") or {}
                 mem_rss = proc.memory_info().rss
                 try:
                     for child in proc.children(recursive=True):
@@ -7910,6 +10977,10 @@ def kometa_status():
                     cpu_percent=round(cpu_percent, 1) if cpu_percent is not None else None,
                     memory_rss_mb=round(mem_rss_mb, 1),
                     memory_percent=round(mem_percent, 2) if mem_percent is not None else None,
+                    disk_read_mb=round(io_stats.get("disk_read_mb"), 1) if io_stats.get("disk_read_mb") is not None else None,
+                    disk_write_mb=round(io_stats.get("disk_write_mb"), 1) if io_stats.get("disk_write_mb") is not None else None,
+                    disk_read_rate_mb_s=round(io_stats.get("disk_read_rate_mb_s"), 2) if io_stats.get("disk_read_rate_mb_s") is not None else None,
+                    disk_write_rate_mb_s=round(io_stats.get("disk_write_rate_mb_s"), 2) if io_stats.get("disk_write_rate_mb_s") is not None else None,
                     system_cpu_percent=round(system_cpu_percent, 1) if system_cpu_percent is not None else None,
                     system_memory_percent=round(vm.percent, 1),
                     system_memory_used_mb=round(system_mem_used_mb, 1),
@@ -7941,7 +11012,8 @@ def kometa_status():
             _ingest_completed_live_logs("kometa")
         except Exception:
             pass
-        KOMETA_CPU_CACHE.pop(pid, None)
+        _clear_process_metric_cache(pid, "kometa")
+        _clear_run_context()
         with MAINTENANCE_STATE_LOCK:
             maintenance_active = MAINTENANCE_STATE["active"]
             maintenance_paused = MAINTENANCE_STATE["paused"]
@@ -7965,12 +11037,13 @@ def kometa_status():
             start_mode=_normalize_kometa_start_mode(ctx.get("start_mode")),
             active_command=ctx.get("command"),
         )
-    except psutil.NoSuchProcess:
-        KOMETA_CPU_CACHE.pop(pid, None)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        _clear_process_metric_cache(pid, "kometa")
         try:
             os.remove(helpers.get_kometa_pid_file())
         except Exception:
             pass
+        _clear_run_context()
         with MAINTENANCE_STATE_LOCK:
             maintenance_active = MAINTENANCE_STATE["active"]
             maintenance_paused = MAINTENANCE_STATE["paused"]
@@ -7998,7 +11071,7 @@ def kometa_status():
 @app.route("/tail-log")
 def tail_log():
     kometa_root = helpers.get_kometa_root_path()
-    log_path = kometa_root / "config" / "logs" / "meta.log"
+    log_path = helpers.get_kometa_log_dir() / "meta.log"
 
     if not log_path.exists():
         return jsonify({"error": f"Log file not found at: {log_path}"}), 404
@@ -8124,10 +11197,10 @@ def tail_log():
 @app.route("/logscan/analyze", methods=["GET"])
 def logscan_analyze():
     kometa_root = helpers.get_kometa_root_path()
-    log_path = kometa_root / "config" / "logs" / "meta.log"
+    log_path = helpers.get_kometa_log_dir() / "meta.log"
     config_name = session.get("config_name")
     normalized_name = (config_name or "").strip().lower().replace(" ", "_") or "default"
-    config_path = kometa_root / "config" / f"{normalized_name}_config.yml"
+    config_path = helpers.get_kometa_config_dir() / f"{normalized_name}_config.yml"
 
     if not log_path.exists():
         return jsonify({"error": f"Log file not found at: {log_path}"}), 404
@@ -8143,6 +11216,11 @@ def logscan_analyze():
         data["cached"] = True
         return jsonify(data)
 
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return jsonify({"error": f"Failed to read log: {str(e)}"}), 500
+
     analyzer = logscan.LogscanAnalyzer()
     result = analyzer.analyze_log_file(
         log_path,
@@ -8157,6 +11235,12 @@ def logscan_analyze():
         can_ingest = run_complete and has_finish and not is_running
         result["ingest_skipped"] = not can_ingest
         if can_ingest:
+            if str(summary.get("tool_name") or "kometa").strip().lower() == "kometa":
+                summary["progress_snapshot"] = _build_completed_log_progress_snapshot(
+                    summary=summary,
+                    content=content,
+                    analyzer=analyzer,
+                )
             ingest_cache = _load_logscan_ingest_cache()
             cache_logs = ingest_cache["logs"]
             cache_key = str(log_path.resolve())
@@ -8229,9 +11313,23 @@ def _get_progress_run_order(config_data=None):
     return normalized
 
 
-def _get_progress_library_list(selected_libraries=None, config_path=None, config_data=None):
-    settings = persistence.retrieve_settings("025-libraries")
-    library_settings = settings.get("libraries", {}) if isinstance(settings, dict) else {}
+def _get_progress_library_list(selected_libraries=None, config_path=None, config_data=None, config_name=None):
+    library_settings = {}
+    if has_request_context():
+        settings = persistence.retrieve_settings("025-libraries")
+        library_settings = settings.get("libraries", {}) if isinstance(settings, dict) else {}
+    elif config_name:
+        try:
+            _validated, _user_entered, stored = database.retrieve_section_data(config_name, "libraries")
+            if not isinstance(stored, dict):
+                _validated, _user_entered, stored = database.retrieve_section_data(config_name, "025-libraries")
+            if isinstance(stored, dict):
+                if isinstance(stored.get("libraries"), dict):
+                    library_settings = stored.get("libraries", {})
+                else:
+                    library_settings = stored
+        except Exception:
+            library_settings = {}
     libraries = []
     type_by_name = {}
     if isinstance(library_settings, dict):
@@ -8264,7 +11362,8 @@ def _get_progress_library_list(selected_libraries=None, config_path=None, config
 @app.route("/logscan/progress", methods=["GET"])
 def logscan_progress():
     kometa_root = helpers.get_kometa_root_path()
-    log_path = kometa_root / "config" / "logs" / "meta.log"
+    log_path = helpers.get_kometa_log_dir() / "meta.log"
+    sidecar_path = _get_kometa_maintenance_sidecar_path(kometa_root)
 
     if not log_path.exists():
         return jsonify({"error": f"Log file not found at: {log_path}"}), 404
@@ -8273,21 +11372,55 @@ def logscan_progress():
         from collections import deque
         from copy import deepcopy
 
-        size_param = request.args.get("size", "4000")
+        size_arg = request.args.get("size")
+        size_param = size_arg if size_arg is not None else "4000"
         max_lines = None
         if size_param.lower() not in ("all", "full"):
             try:
                 max_lines = max(1, min(int(size_param), 20000))
             except Exception:
                 max_lines = 4000
+        force_full_read = max_lines is None
 
         log_stats = None
         try:
             log_stats = log_path.stat()
         except Exception:
             log_stats = None
+        sidecar_stats = None
+        try:
+            if sidecar_path.exists():
+                sidecar_stats = sidecar_path.stat()
+        except Exception:
+            sidecar_stats = None
 
         cached = LOGSCAN_PROGRESS_CACHE
+
+        def _cache_matches_progress_signature():
+            if not log_stats:
+                return False
+            if cached.get("mtime") != log_stats.st_mtime or cached.get("size") != log_stats.st_size:
+                return False
+            cached_sidecar_mtime = cached.get("sidecar_mtime")
+            cached_sidecar_size = cached.get("sidecar_size")
+            current_sidecar_mtime = sidecar_stats.st_mtime if sidecar_stats else None
+            current_sidecar_size = sidecar_stats.st_size if sidecar_stats else None
+            return cached_sidecar_mtime == current_sidecar_mtime and cached_sidecar_size == current_sidecar_size
+
+        def _read_progress_log_content():
+            if force_full_read:
+                return _read_logscan_text(log_path)
+            with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+                lines = deque(handle, maxlen=max_lines)
+            content = "".join(lines)
+            try:
+                if sidecar_path.exists() and sidecar_path.is_file():
+                    sidecar_content = sidecar_path.read_text(encoding="utf-8", errors="replace").strip()
+                    if sidecar_content:
+                        content = f"{content.rstrip()}\n{sidecar_content}\n"
+            except Exception:
+                pass
+            return content
 
         def _coerce_progress_datetime(value):
             if not value:
@@ -8357,13 +11490,6 @@ def logscan_progress():
                             entry["status"] = "Stopped"
             return data
 
-        if max_lines:
-            with log_path.open("r", encoding="utf-8", errors="replace") as f:
-                lines = deque(f, maxlen=max_lines)
-            log_content = "".join(lines)
-        else:
-            log_content = log_path.read_text(encoding="utf-8", errors="replace")
-
         ctx = _get_run_context()
         selected = ctx.get("selected_libraries")
         started_at = ctx.get("started_at")
@@ -8371,18 +11497,27 @@ def logscan_progress():
         run_mode = ctx.get("run_mode") or "all"
         running = helpers.is_kometa_running()
         stopped_requested = bool(ctx.get("stop_requested_at"))
+        cached_data = LOGSCAN_PROGRESS_CACHE.get("data")
+        cache_matches_run = bool(cached_data and cached_data.get("run_started_at") == started_at)
 
-        if log_stats and cached.get("mtime") == log_stats.st_mtime and cached.get("size") == log_stats.st_size:
+        # Seed progress from the full log when no explicit size was requested and
+        # the current run has no matching cached progress state yet. After the
+        # cache is warm, later polls can safely use the faster tail parse.
+        if size_arg is None and not cache_matches_run:
+            max_lines = None
+            force_full_read = True
+
+        if not force_full_read and _cache_matches_progress_signature():
             data = cached.get("data") or {}
             data = refresh_live_progress_elapsed(data, running, started_at)
             data = normalize_progress_for_stopped(data, running, stopped_requested)
             return jsonify(data)
 
-        cached_data = LOGSCAN_PROGRESS_CACHE.get("data")
         if cached_data and cached_data.get("run_started_at") != started_at:
-            LOGSCAN_PROGRESS_CACHE.update({"mtime": None, "size": None, "data": None})
+            LOGSCAN_PROGRESS_CACHE.update({"mtime": None, "size": None, "sidecar_mtime": None, "sidecar_size": None, "data": None})
         analyzer = logscan.LogscanAnalyzer()
         config_data = _load_progress_config(config_path)
+        log_content = _read_progress_log_content()
         progress = analyzer.extract_progress(
             log_content,
             library_list=_get_progress_library_list(
@@ -8408,11 +11543,22 @@ def logscan_progress():
         progress["allowed_phases"] = allowed_phases
         progress["phase_order"] = allowed_phases
         progress["playlists_configured"] = playlists_configured
+        maintenance_summary = analyzer.extract_maintenance_summary(log_content)
+        progress["maintenance_summary"] = maintenance_summary if isinstance(maintenance_summary, dict) else {}
+        progress["maintenance_had_pause"] = bool((progress.get("maintenance_summary") or {}).get("had_pause"))
         progress = normalize_progress_for_stopped(progress, running, stopped_requested)
         if log_stats:
             progress["last_log_at"] = datetime.fromtimestamp(log_stats.st_mtime, tz=timezone.utc).isoformat()
             progress["run_started_at"] = started_at
-            LOGSCAN_PROGRESS_CACHE.update({"mtime": log_stats.st_mtime, "size": log_stats.st_size, "data": progress})
+            LOGSCAN_PROGRESS_CACHE.update(
+                {
+                    "mtime": log_stats.st_mtime,
+                    "size": log_stats.st_size,
+                    "sidecar_mtime": sidecar_stats.st_mtime if sidecar_stats else None,
+                    "sidecar_size": sidecar_stats.st_size if sidecar_stats else None,
+                    "data": progress,
+                }
+            )
         return jsonify(progress)
     except Exception as e:
         return jsonify({"error": f"Failed to analyze log progress: {str(e)}"}), 500
@@ -8554,7 +11700,7 @@ def _get_logscan_live_dir(tool_name="kometa", log_dir=None):
     normalized = _normalize_logscan_tool_name(tool_name)
     if normalized == "imagemaid":
         return helpers.get_imagemaid_root_path() / "config" / "logs"
-    return Path(log_dir) if log_dir else helpers.get_kometa_root_path() / "config" / "logs"
+    return Path(log_dir) if log_dir else helpers.get_kometa_log_dir()
 
 
 def _get_logscan_archive_root_dir():
@@ -8617,7 +11763,23 @@ def _read_logscan_text(path, encoding="utf-8", errors="replace"):
     if _is_logscan_gzip_path(path):
         with gzip.open(path, "rt", encoding=encoding, errors=errors) as handle:
             return handle.read()
-    return path.read_text(encoding=encoding, errors=errors)
+    content = path.read_text(encoding=encoding, errors=errors)
+    try:
+        if path.name.lower() == "meta.log":
+            sidecar_path = path.parent / "meta.quickstart-maintenance.log"
+            if sidecar_path.exists() and sidecar_path.is_file():
+                sidecar_content = sidecar_path.read_text(encoding=encoding, errors=errors).strip()
+                if sidecar_content:
+                    content = f"{content.rstrip()}\n{sidecar_content}\n"
+        elif path.suffix.lower() == ".log":
+            sidecar_path = path.parent / "imagemaid.quickstart-maintenance.log"
+            if sidecar_path.exists() and sidecar_path.is_file():
+                sidecar_content = sidecar_path.read_text(encoding=encoding, errors=errors).strip()
+                if sidecar_content:
+                    content = f"{content.rstrip()}\n{sidecar_content}\n"
+    except Exception:
+        pass
+    return content
 
 
 def _iter_logscan_text_lines(path, encoding="utf-8", errors="replace"):
@@ -8948,6 +12110,8 @@ def _analyze_imagemaid_log_content(content, log_path=None):
     )
     timestamp_pattern = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),")
     total_runtime_pattern = re.compile(r"\|\s*Total Runtime\s*\|\s*(.*?)\s*\|?$", re.IGNORECASE)
+    summary_header_pattern = re.compile(r"\|\s*=+\s*(.*?)\s*=+\s*\|?$")
+    summary_runtime_row_pattern = re.compile(r"\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|?$")
 
     started_at = None
     config_name = ""
@@ -8960,8 +12124,12 @@ def _analyze_imagemaid_log_content(content, log_path=None):
     finished_at = None
     finished_seen = False
     run_time_seconds = None
+    cache_count = 0
+    debug_count = 0
+    info_count = 0
     warning_count = 0
     error_count = 0
+    critical_count = 0
     trace_count = 0
     quickstart_run_marker = False
     local_version = ""
@@ -8989,6 +12157,8 @@ def _analyze_imagemaid_log_content(content, log_path=None):
     no_verify_ssl_enabled = False
     overlays_only_enabled = False
     current_runtime_section = ""
+    summary_section = ""
+    summary_section_runtimes = {}
     operation_started = {
         "empty_trash": False,
         "clean_bundles": False,
@@ -8999,10 +12169,18 @@ def _analyze_imagemaid_log_content(content, log_path=None):
         timestamp_match = timestamp_pattern.search(line)
         if timestamp_match and not first_timestamp:
             first_timestamp = timestamp_match.group(1)
+        if "[CACHE]" in line:
+            cache_count += 1
+        if "[DEBUG]" in line:
+            debug_count += 1
+        if "[INFO]" in line:
+            info_count += 1
         if "[WARNING]" in line:
             warning_count += 1
         if "[ERROR]" in line:
             error_count += 1
+        if "[CRITICAL]" in line:
+            critical_count += 1
         if "Traceback" in line:
             trace_count += 1
         stripped_line = line.strip().strip("|").strip()
@@ -9036,6 +12214,53 @@ def _analyze_imagemaid_log_content(content, log_path=None):
             if timestamp_match:
                 finished_at = timestamp_match.group(1)
 
+        summary_header_match = summary_header_pattern.search(line)
+        if summary_header_match:
+            header_text = str(summary_header_match.group(1) or "").strip().lower()
+            if header_text in {
+                "database",
+                "reporting bloat images",
+                "remove phototranscoder images",
+                "remove imagemaid restore bloat images",
+                "empty trash plex operation",
+                "clean bundles plex operation",
+                "optimize db plex operation",
+                "imagemaid summary",
+            }:
+                summary_section = header_text
+
+        summary_runtime_match = summary_runtime_row_pattern.search(line)
+        if summary_runtime_match:
+            summary_label = str(summary_runtime_match.group(1) or "").strip().lower()
+            parsed_summary_runtime = _parse_imagemaid_runtime_seconds(summary_runtime_match.group(2))
+            if parsed_summary_runtime is not None:
+                if summary_section == "database":
+                    if summary_label == "downloaded":
+                        summary_section_runtimes["database_download"] = parsed_summary_runtime
+                    elif summary_label == "query":
+                        summary_section_runtimes["database_query"] = parsed_summary_runtime
+                elif summary_section == "reporting bloat images":
+                    if summary_label == "scan time":
+                        summary_section_runtimes["report_bloat_scan"] = parsed_summary_runtime
+                    elif summary_label == "report time":
+                        summary_section_runtimes["report_bloat_action"] = parsed_summary_runtime
+                elif summary_section == "remove phototranscoder images":
+                    if summary_label == "scan time":
+                        summary_section_runtimes["photo_transcoder_scan"] = parsed_summary_runtime
+                    elif summary_label == "remove time":
+                        summary_section_runtimes["photo_transcoder_remove"] = parsed_summary_runtime
+                elif summary_section == "remove imagemaid restore bloat images":
+                    if summary_label == "scan time":
+                        summary_section_runtimes["restore_dir_scan"] = parsed_summary_runtime
+                    elif summary_label == "remove time":
+                        summary_section_runtimes["restore_dir_action"] = parsed_summary_runtime
+                elif summary_section == "empty trash plex operation" and summary_label == "runtime":
+                    summary_section_runtimes["empty_trash_action"] = parsed_summary_runtime
+                elif summary_section == "clean bundles plex operation" and summary_label == "runtime":
+                    summary_section_runtimes["clean_bundles_action"] = parsed_summary_runtime
+                elif summary_section == "optimize db plex operation" and summary_label == "runtime":
+                    summary_section_runtimes["optimize_db_action"] = parsed_summary_runtime
+
         runtime_match = total_runtime_pattern.search(line)
         if runtime_match:
             parsed_runtime = _parse_imagemaid_runtime_seconds(runtime_match.group(1))
@@ -9057,29 +12282,16 @@ def _analyze_imagemaid_log_content(content, log_path=None):
 
         if "Downloading Database via the Plex API" in line:
             database_section_seen = True
+            current_runtime_section = "database_download"
         if "Downloaded New Database" in line:
             database_downloaded_new = True
         if "Database File Could not Downloaded" in line:
             database_download_failed = True
+        if "Database Opened Querying For In-Use Images" in line or "Querying For In-Use Images" in line:
+            current_runtime_section = "database_query"
 
         if "PhotoTranscoder set to True" in line:
             photo_transcoder_enabled = True
-        if "--photo-transcoder" in line:
-            photo_transcoder_enabled = True
-        if "--empty-trash" in line:
-            empty_trash_enabled = True
-        if "--clean-bundles" in line:
-            clean_bundles_enabled = True
-        if "--optimize-db" in line:
-            optimize_db_enabled = True
-        if "--local" in line:
-            local_db_enabled = True
-        if "--existing" in line:
-            use_existing_enabled = True
-        if "--no-verify-ssl" in line:
-            no_verify_ssl_enabled = True
-        if "--overlays-only" in line:
-            overlays_only_enabled = True
 
         if "Empty Trash Plex Operation Started" in line:
             operation_started["empty_trash"] = True
@@ -9095,10 +12307,20 @@ def _analyze_imagemaid_log_content(content, log_path=None):
             current_runtime_section = "restore_scan"
         elif "Removing ImageMaid Restore Bloat Images" in line or ("Removing Complete:" in line and "ImageMaid Restore Bloat Images" in line):
             current_runtime_section = "restore_action"
+        elif "Scanning Metadata Directory For Bloat Images" in line:
+            current_runtime_section = "report_bloat_scan"
+        elif "Reporting Bloat Images" in line or ("Reporting Complete:" in line and "Bloat Images" in line):
+            current_runtime_section = "report_bloat_action"
         elif "Scanning for PhotoTranscoder Images" in line or ("Scanning Complete:" in line and "PhotoTranscoder Images" in line):
             current_runtime_section = "photo_scan"
         elif "Removing PhotoTranscoder Images" in line or ("Remove Complete:" in line and "PhotoTranscoder Images" in line):
             current_runtime_section = "photo_remove"
+        elif "Empty Trash Plex Operation Started" in line:
+            current_runtime_section = "empty_trash_action"
+        elif "Clean Bundles Plex Operation Started" in line:
+            current_runtime_section = "clean_bundles_action"
+        elif "Optimize DB Plex Operation Started" in line:
+            current_runtime_section = "optimize_db_action"
 
         restore_found_match = re.search(
             r"Found\s+(\d+)\s+Bloat Images in the ImageMaid Directory to Remove",
@@ -9144,14 +12366,28 @@ def _analyze_imagemaid_log_content(content, log_path=None):
         if runtime_line_match:
             parsed_runtime = _parse_imagemaid_runtime_seconds(runtime_line_match.group(1))
             if parsed_runtime is not None:
-                if current_runtime_section == "restore_scan":
+                if current_runtime_section == "database_download":
+                    summary_section_runtimes.setdefault("database_download", parsed_runtime)
+                elif current_runtime_section == "database_query":
+                    summary_section_runtimes.setdefault("database_query", parsed_runtime)
+                elif current_runtime_section == "restore_scan":
                     restore_scan_runtime = parsed_runtime
                 elif current_runtime_section == "restore_action":
                     restore_action_runtime = parsed_runtime
+                elif current_runtime_section == "report_bloat_scan":
+                    summary_section_runtimes.setdefault("report_bloat_scan", parsed_runtime)
+                elif current_runtime_section == "report_bloat_action":
+                    summary_section_runtimes.setdefault("report_bloat_action", parsed_runtime)
                 elif current_runtime_section == "photo_scan":
                     photo_scan_runtime = parsed_runtime
                 elif current_runtime_section == "photo_remove":
                     photo_remove_runtime = parsed_runtime
+                elif current_runtime_section == "empty_trash_action":
+                    summary_section_runtimes.setdefault("empty_trash_action", parsed_runtime)
+                elif current_runtime_section == "clean_bundles_action":
+                    summary_section_runtimes.setdefault("clean_bundles_action", parsed_runtime)
+                elif current_runtime_section == "optimize_db_action":
+                    summary_section_runtimes.setdefault("optimize_db_action", parsed_runtime)
 
     if finished_seen and not finished_at:
         finished_at = _iso_from_mtime(stats.st_mtime if stats else None)
@@ -9208,10 +12444,27 @@ def _analyze_imagemaid_log_content(content, log_path=None):
     config_name = str(config_name or "").strip() or "unknown"
     command_signature = f"--mode {mode}"
     run_command = run_command_text or f"imagemaid {command_signature}"
+    command_snapshot = _parse_imagemaid_command_snapshot(run_command_text, fallback_mode=mode)
+    photo_transcoder_enabled = bool(photo_transcoder_enabled or command_snapshot.get("photo_transcoder"))
+    empty_trash_enabled = bool(empty_trash_enabled or command_snapshot.get("empty_trash"))
+    clean_bundles_enabled = bool(clean_bundles_enabled or command_snapshot.get("clean_bundles"))
+    optimize_db_enabled = bool(optimize_db_enabled or command_snapshot.get("optimize_db"))
+    local_db_enabled = bool(local_db_enabled or command_snapshot.get("local_db"))
+    use_existing_enabled = bool(use_existing_enabled or command_snapshot.get("use_existing"))
+    no_verify_ssl_enabled = bool(no_verify_ssl_enabled or command_snapshot.get("no_verify_ssl"))
+    overlays_only_enabled = bool(overlays_only_enabled or command_snapshot.get("overlays_only"))
     timestamp_seed = started_at or finished_at or (stats.st_mtime if stats else 0)
     run_key_seed = f"imagemaid|{timestamp_seed}|{mode}|{path.name if path else 'imagemaid.log'}"
     created_at = finished_at or started_at or _iso_from_mtime(stats.st_mtime if stats else None)
     section_runtimes = {}
+    if summary_section_runtimes.get("database_download") is not None:
+        section_runtimes["database_download"] = summary_section_runtimes["database_download"]
+    if summary_section_runtimes.get("database_query") is not None:
+        section_runtimes["database_query"] = summary_section_runtimes["database_query"]
+    if summary_section_runtimes.get("report_bloat_scan") is not None:
+        section_runtimes["report_bloat_scan"] = summary_section_runtimes["report_bloat_scan"]
+    if summary_section_runtimes.get("report_bloat_action") is not None:
+        section_runtimes["report_bloat_action"] = summary_section_runtimes["report_bloat_action"]
     if restore_scan_runtime is not None:
         section_runtimes["restore_dir_scan"] = restore_scan_runtime
     if restore_action_runtime is not None:
@@ -9220,6 +12473,12 @@ def _analyze_imagemaid_log_content(content, log_path=None):
         section_runtimes["photo_transcoder_scan"] = photo_scan_runtime
     if photo_remove_runtime is not None:
         section_runtimes["photo_transcoder_remove"] = photo_remove_runtime
+    if summary_section_runtimes.get("empty_trash_action") is not None:
+        section_runtimes["empty_trash_action"] = summary_section_runtimes["empty_trash_action"]
+    if summary_section_runtimes.get("clean_bundles_action") is not None:
+        section_runtimes["clean_bundles_action"] = summary_section_runtimes["clean_bundles_action"]
+    if summary_section_runtimes.get("optimize_db_action") is not None:
+        section_runtimes["optimize_db_action"] = summary_section_runtimes["optimize_db_action"]
     total_found_files = restore_found_files + photo_found_files
     total_removed_files = restore_removed_files + photo_removed_files
     total_recovered_bytes = restore_recovered_bytes + photo_recovered_bytes
@@ -9270,11 +12529,12 @@ def _analyze_imagemaid_log_content(content, log_path=None):
         "section_runtimes": section_runtimes,
         "log_size": int(stats.st_size) if stats else None,
         "log_counts": {
-            "debug": 0,
-            "info": 0,
+            "cache": cache_count,
+            "debug": debug_count,
+            "info": info_count,
             "warning": warning_count,
             "error": error_count,
-            "critical": 0,
+            "critical": critical_count,
             "trace": trace_count,
         },
         "analysis_counts": analysis_counts,
@@ -9284,12 +12544,13 @@ def _analyze_imagemaid_log_content(content, log_path=None):
         "quiet_period_summary": {},
         "quickstart_run_marker": quickstart_run_marker,
         "config_line_count": None,
-        "cache_line_count": None,
+        "cache_line_count": cache_count,
         "created_at": created_at,
         "run_complete": run_complete,
         "completion_reason": completion_reason,
         "imagemaid_mode": mode,
     }
+    summary["progress_snapshot"] = _build_imagemaid_progress_snapshot(summary)
     recommendations = _build_imagemaid_recommendations(summary, error_lines=error_lines, completion_reason=completion_reason)
     return {"summary": summary, "recommendations": recommendations}
 
@@ -9352,6 +12613,8 @@ def _iter_logscan_candidate_files(log_dir=None, include_archive=True, include_co
             for pattern in patterns:
                 for path in base_dir.glob(pattern):
                     if not path.is_file():
+                        continue
+                    if _is_logscan_maintenance_sidecar(path):
                         continue
                     suffixes = [suffix.lower() for suffix in path.suffixes]
                     if suffixes and suffixes[-1] in (".zip", ".7z"):
@@ -9589,6 +12852,26 @@ def _normalize_logscan_archive_filenames(archive_dir=None):
     errors = []
     cache_dirty = False
 
+    archive_dirs = []
+    if archive_dir:
+        archive_dirs.append(Path(archive_dir))
+    else:
+        archive_dirs.extend([_get_logscan_archive_dir("kometa"), _get_logscan_archive_dir("imagemaid"), _get_logscan_archive_root_dir()])
+
+    for current_archive_dir in archive_dirs:
+        if not current_archive_dir.exists():
+            continue
+        for sidecar_path in current_archive_dir.glob("*.quickstart-maintenance.log"):
+            try:
+                source_key = str(sidecar_path.resolve())
+                sidecar_path.unlink()
+                if source_key in cache_logs:
+                    cache_logs.pop(source_key, None)
+                    cache_dirty = True
+                renamed += 1
+            except Exception as exc:
+                errors.append(f"Failed to remove archived maintenance sidecar {sidecar_path}: {exc}")
+
     for path in sorted(_iter_logscan_candidate_files(include_archive=True, include_compressed=True), key=lambda item: item.name.lower()):
         if _classify_logscan_file_location(path) != "archive":
             continue
@@ -9597,13 +12880,25 @@ def _normalize_logscan_archive_filenames(archive_dir=None):
             current_tool = _detect_logscan_tool_from_path(path)
             target_archive_dir = Path(archive_dir) if archive_dir else _get_logscan_archive_dir(current_tool)
             target_archive_dir.mkdir(parents=True, exist_ok=True)
-            target = _build_logscan_archive_destination(path, target_archive_dir, stats=stats)
+            target = _build_logscan_archive_destination(
+                path,
+                target_archive_dir,
+                stats=stats,
+                preferred_suffix=".log.gz" if not _is_logscan_gzip_path(path) else None,
+            )
             if target.resolve() == path.resolve():
                 skipped += 1
                 continue
             source_key = str(path.resolve())
             target_key = str(target.resolve())
-            shutil.move(str(path), str(target))
+            if _is_logscan_gzip_path(path):
+                shutil.move(str(path), str(target))
+            else:
+                archived_path = _archive_log_file(path, target_archive_dir)
+                if not archived_path:
+                    raise RuntimeError("archive compression failed")
+                target = archived_path
+                target_key = str(target.resolve())
             if source_key in cache_logs:
                 cache_logs[target_key] = cache_logs.pop(source_key)
                 cache_dirty = True
@@ -9614,17 +12909,6 @@ def _normalize_logscan_archive_filenames(archive_dir=None):
         ingest_cache["logs"] = cache_logs
         _save_logscan_ingest_cache(ingest_cache)
     return {"renamed": renamed, "skipped": skipped, "errors": errors}
-
-
-logscan_archive_result = _normalize_logscan_archive_filenames()
-if logscan_archive_result.get("renamed"):
-    helpers.ts_log(
-        f"Normalized {logscan_archive_result['renamed']} archived log file(s) to the canonical archive layout.",
-        level="INFO",
-    )
-if logscan_archive_result.get("errors"):
-    for msg in logscan_archive_result["errors"]:
-        helpers.ts_log(msg, level="WARNING")
 
 
 def _normalize_cli_whitespace(command):
@@ -9755,14 +13039,19 @@ def _should_suppress_recovery_for_completed_scope(original_command, progress_lib
 def _resolve_config_path_for_command(config_name=None):
     normalized_name = str(config_name or "").strip().lower().replace(" ", "_")
     if not normalized_name:
-        normalized_name = str(session.get("config_name") or "default").strip().lower().replace(" ", "_") or "default"
-    return str((helpers.get_kometa_root_path() / "config" / f"{normalized_name}_config.yml").resolve())
+        if has_request_context():
+            normalized_name = str(session.get("config_name") or "default").strip().lower().replace(" ", "_") or "default"
+        else:
+            normalized_name = "default"
+    return str((helpers.get_kometa_config_dir() / f"{normalized_name}_config.yml").resolve())
 
 
 def _inject_config_path_for_command(command, config_name=None):
     cleaned = _normalize_cli_whitespace(command)
     if not cleaned:
         return ""
+    if "<config>" not in cleaned and "--config" not in cleaned and "-c" not in cleaned and not str(config_name or "").strip():
+        return cleaned
     config_path = _resolve_config_path_for_command(config_name=config_name)
     quoted = _quote_cli_value(config_path)
     if "<config>" in cleaned:
@@ -9842,6 +13131,613 @@ def _iso_from_mtime(value):
         except Exception:
             return None
     return None
+
+
+def _extract_first_log_timestamp(content):
+    if not content:
+        return None
+    match = re.search(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d{3}\]", str(content), re.MULTILINE)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _extract_last_log_timestamp(content):
+    if not content:
+        return None
+    matches = re.findall(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d{3}\]", str(content), re.MULTILINE)
+    if not matches:
+        return None
+    return str(matches[-1]).strip()
+
+
+def _parse_log_display_datetime(value):
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S",):
+        try:
+            return datetime.strptime(raw, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _format_duration_brief(total_seconds):
+    if not isinstance(total_seconds, (int, float)):
+        return ""
+    seconds = max(0, int(total_seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs or not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def _format_compact_count_brief(value):
+    if not isinstance(value, (int, float)):
+        return ""
+    count = max(0, int(value))
+    if count >= 1000000:
+        return f"{(count / 1000000):.1f}".rstrip("0").rstrip(".") + "M"
+    if count >= 1000:
+        return f"{(count / 1000):.1f}".rstrip("0").rstrip(".") + "K"
+    return str(count)
+
+
+def _format_imagemaid_bytes_brief(value):
+    if not isinstance(value, (int, float)):
+        return ""
+    total = max(0, int(value))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(total)
+    unit_index = 0
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        display = str(int(size))
+    elif size >= 10:
+        display = f"{size:.1f}".rstrip("0").rstrip(".")
+    else:
+        display = f"{size:.2f}".rstrip("0").rstrip(".")
+    return f"{display} {units[unit_index]}"
+
+
+def _build_imagemaid_progress_snapshot(summary=None):
+    summary = summary if isinstance(summary, dict) else {}
+    if str(summary.get("tool_name") or "").strip().lower() != "imagemaid":
+        return {}
+
+    analysis_counts = summary.get("analysis_counts") if isinstance(summary.get("analysis_counts"), dict) else {}
+    section_runtimes = summary.get("section_runtimes") if isinstance(summary.get("section_runtimes"), dict) else {}
+    mode = str(summary.get("imagemaid_mode") or "report").strip().lower() or "report"
+    run_complete = bool(summary.get("run_complete"))
+    completion_reason = str(summary.get("completion_reason") or "").strip().lower()
+    error_total = 0
+    log_counts = summary.get("log_counts") if isinstance(summary.get("log_counts"), dict) else {}
+    for key in ("error", "critical", "trace"):
+        if isinstance(log_counts.get(key), (int, float)):
+            error_total += int(log_counts.get(key) or 0)
+    if isinstance(analysis_counts.get("imagemaid_error_lines"), (int, float)):
+        error_total = max(error_total, int(analysis_counts.get("imagemaid_error_lines") or 0))
+
+    rows = []
+    total_scan_seconds = 0
+    total_action_seconds = 0
+
+    def _runtime_cell(value):
+        if not isinstance(value, (int, float)):
+            return {}
+        seconds = max(0, int(value))
+        return {"label": _format_duration_brief(seconds), "tone": "primary"}
+
+    def _badge_cell(label, tone="success"):
+        text = str(label or "").strip()
+        return {"label": text, "tone": tone} if text else {}
+
+    def _row_status(observed=False, enabled=False):
+        if completion_reason == "maintenance_blocked_start":
+            return "Blocked", " text-bg-warning"
+        if observed:
+            if run_complete:
+                if error_total > 0:
+                    return "Completed", " text-bg-warning"
+                return "Completed", " text-bg-success"
+            if completion_reason == "user_stop":
+                return "Stopped", " text-bg-warning"
+            return "Observed", " text-bg-primary"
+        if enabled:
+            if completion_reason == "maintenance_blocked_start":
+                return "Blocked", " text-bg-warning"
+            return "Pending", " text-bg-secondary"
+        return "Skipped", " text-bg-secondary"
+
+    def _append_row(name, row_type, scan_seconds=None, action_seconds=None, items_label="", outcome_label="", enabled=False, items_tone="success", outcome_tone="success"):
+        nonlocal total_scan_seconds, total_action_seconds
+        observed = any(
+            [
+                isinstance(scan_seconds, (int, float)),
+                isinstance(action_seconds, (int, float)),
+                bool(str(items_label or "").strip()),
+                bool(str(outcome_label or "").strip()),
+            ]
+        )
+        if not enabled and not observed:
+            return
+        if isinstance(scan_seconds, (int, float)):
+            total_scan_seconds += max(0, int(scan_seconds))
+        if isinstance(action_seconds, (int, float)):
+            total_action_seconds += max(0, int(action_seconds))
+        status, status_class = _row_status(observed=observed, enabled=enabled)
+        rows.append(
+            {
+                "name": name,
+                "type": row_type,
+                "status": status,
+                "status_class": status_class,
+                "phase_cells": [
+                    _runtime_cell(scan_seconds),
+                    _runtime_cell(action_seconds),
+                    _badge_cell(items_label, tone=items_tone),
+                    _badge_cell(outcome_label, tone=outcome_tone),
+                ],
+            }
+        )
+
+    database_seen = bool(analysis_counts.get("imagemaid_database_seen"))
+    local_db_enabled = bool(analysis_counts.get("imagemaid_local_db_enabled"))
+    use_existing_enabled = bool(analysis_counts.get("imagemaid_use_existing_enabled"))
+    database_downloaded_new = bool(analysis_counts.get("imagemaid_database_downloaded_new"))
+    database_download_failed = bool(analysis_counts.get("imagemaid_database_download_failed"))
+    database_enabled = database_seen or "database_download" in section_runtimes or "database_query" in section_runtimes
+    database_items = ""
+    if local_db_enabled:
+        database_items = "Local DB"
+    elif use_existing_enabled:
+        database_items = "Existing DB"
+    elif database_downloaded_new:
+        database_items = "Downloaded"
+    elif database_seen:
+        database_items = "Plex API"
+    database_outcome = "Failed" if database_download_failed else ("Ready" if database_enabled else "")
+    _append_row(
+        "Database Prep",
+        "Source",
+        scan_seconds=section_runtimes.get("database_download"),
+        action_seconds=section_runtimes.get("database_query"),
+        items_label=database_items,
+        outcome_label=database_outcome,
+        enabled=database_enabled,
+        items_tone="secondary",
+        outcome_tone="danger" if database_download_failed else "success",
+    )
+
+    report_enabled = mode == "report" or "report_bloat_scan" in section_runtimes or "report_bloat_action" in section_runtimes
+    report_outcome = "Reported" if report_enabled and run_complete else ""
+    _append_row(
+        "Bloat Report",
+        "Metadata",
+        scan_seconds=section_runtimes.get("report_bloat_scan"),
+        action_seconds=section_runtimes.get("report_bloat_action"),
+        items_label="Mode report" if report_enabled else "",
+        outcome_label=report_outcome,
+        enabled=report_enabled,
+        items_tone="secondary",
+        outcome_tone="success",
+    )
+
+    restore_found = int(analysis_counts.get("imagemaid_restore_found_files") or 0) if isinstance(analysis_counts.get("imagemaid_restore_found_files"), (int, float)) else 0
+    restore_removed = int(analysis_counts.get("imagemaid_restore_removed_files") or 0) if isinstance(analysis_counts.get("imagemaid_restore_removed_files"), (int, float)) else 0
+    restore_recovered = (
+        int(analysis_counts.get("imagemaid_restore_recovered_bytes") or 0) if isinstance(analysis_counts.get("imagemaid_restore_recovered_bytes"), (int, float)) else 0
+    )
+    restore_enabled = mode in {"clear", "restore"} or "restore_dir_scan" in section_runtimes or "restore_dir_action" in section_runtimes or restore_found > 0 or restore_removed > 0
+    restore_items = ""
+    if restore_removed > 0:
+        restore_items = f"Removed {_format_compact_count_brief(restore_removed)}"
+    elif restore_found > 0:
+        restore_items = f"Found {_format_compact_count_brief(restore_found)}"
+    restore_outcome = _format_imagemaid_bytes_brief(restore_recovered) if restore_recovered > 0 else ""
+    _append_row(
+        "Restore Cache",
+        "File cleanup",
+        scan_seconds=section_runtimes.get("restore_dir_scan"),
+        action_seconds=section_runtimes.get("restore_dir_action"),
+        items_label=restore_items,
+        outcome_label=restore_outcome,
+        enabled=restore_enabled,
+        items_tone="primary",
+        outcome_tone="success",
+    )
+
+    photo_found = int(analysis_counts.get("imagemaid_photo_found_files") or 0) if isinstance(analysis_counts.get("imagemaid_photo_found_files"), (int, float)) else 0
+    photo_removed = int(analysis_counts.get("imagemaid_photo_removed_files") or 0) if isinstance(analysis_counts.get("imagemaid_photo_removed_files"), (int, float)) else 0
+    photo_recovered = int(analysis_counts.get("imagemaid_photo_recovered_bytes") or 0) if isinstance(analysis_counts.get("imagemaid_photo_recovered_bytes"), (int, float)) else 0
+    photo_enabled = (
+        bool(analysis_counts.get("imagemaid_photo_transcoder_enabled"))
+        or "photo_transcoder_scan" in section_runtimes
+        or "photo_transcoder_remove" in section_runtimes
+        or photo_found > 0
+        or photo_removed > 0
+    )
+    photo_items = ""
+    if photo_removed > 0:
+        photo_items = f"Removed {_format_compact_count_brief(photo_removed)}"
+    elif photo_found > 0:
+        photo_items = f"Found {_format_compact_count_brief(photo_found)}"
+    photo_outcome = _format_imagemaid_bytes_brief(photo_recovered) if photo_recovered > 0 else ""
+    _append_row(
+        "PhotoTranscoder",
+        "File cleanup",
+        scan_seconds=section_runtimes.get("photo_transcoder_scan"),
+        action_seconds=section_runtimes.get("photo_transcoder_remove"),
+        items_label=photo_items,
+        outcome_label=photo_outcome,
+        enabled=photo_enabled,
+        items_tone="primary",
+        outcome_tone="success",
+    )
+
+    for label, enabled_key, started_key, runtime_key in [
+        ("Empty Trash", "imagemaid_empty_trash_enabled", "imagemaid_empty_trash_started", "empty_trash_action"),
+        ("Clean Bundles", "imagemaid_clean_bundles_enabled", "imagemaid_clean_bundles_started", "clean_bundles_action"),
+        ("Optimize DB", "imagemaid_optimize_db_enabled", "imagemaid_optimize_db_started", "optimize_db_action"),
+    ]:
+        enabled = bool(analysis_counts.get(enabled_key)) or bool(analysis_counts.get(started_key)) or runtime_key in section_runtimes
+        runtime_value = section_runtimes.get(runtime_key)
+        items_label = "Enabled" if enabled else ""
+        outcome_label = "Done" if isinstance(runtime_value, (int, float)) and run_complete else ""
+        _append_row(
+            label,
+            "Plex task",
+            scan_seconds=None,
+            action_seconds=runtime_value,
+            items_label=items_label,
+            outcome_label=outcome_label,
+            enabled=enabled,
+            items_tone="secondary",
+            outcome_tone="success",
+        )
+
+    if not rows:
+        return {}
+
+    total_removed = int(analysis_counts.get("imagemaid_total_removed_files") or 0) if isinstance(analysis_counts.get("imagemaid_total_removed_files"), (int, float)) else 0
+    total_recovered = int(analysis_counts.get("imagemaid_total_recovered_bytes") or 0) if isinstance(analysis_counts.get("imagemaid_total_recovered_bytes"), (int, float)) else 0
+    completed_count = 0
+    for row in rows:
+        if row.get("status") in {"Completed", "Skipped"}:
+            completed_count += 1
+
+    return {
+        "name_label": "Operation",
+        "type_label": "Area",
+        "columns": [
+            {"key": "scan", "label": "Scan Time"},
+            {"key": "action", "label": "Action Time"},
+            {"key": "items", "label": "Observed"},
+            {"key": "outcome", "label": "Result"},
+        ],
+        "rows": rows,
+        "completed_count": completed_count,
+        "total_count": len(rows),
+        "preparation_label": "",
+        "footer_cells": [
+            _format_duration_brief(total_scan_seconds) if total_scan_seconds > 0 else "",
+            _format_duration_brief(total_action_seconds) if total_action_seconds > 0 else "",
+            f"Removed {_format_compact_count_brief(total_removed)}" if total_removed > 0 else "",
+            _format_imagemaid_bytes_brief(total_recovered) if total_recovered > 0 else "",
+        ],
+        "total_label": (
+            _format_duration_brief(summary.get("run_time_seconds")) if isinstance(summary.get("run_time_seconds"), (int, float)) and summary.get("run_time_seconds") else ""
+        ),
+    }
+
+
+def _build_incomplete_run_timing_summary(started_at=None, last_log_at=None, maintenance_summary=None):
+    summary = maintenance_summary if isinstance(maintenance_summary, dict) else {}
+    started_dt = _parse_log_display_datetime(started_at)
+    last_log_dt = _parse_log_display_datetime(last_log_at)
+    pause_seconds = int(summary.get("pause_seconds") or 0) if isinstance(summary.get("pause_seconds"), (int, float)) else 0
+    observed_seconds = None
+    active_seconds = None
+    if started_dt and last_log_dt and last_log_dt >= started_dt:
+        observed_seconds = int((last_log_dt - started_dt).total_seconds())
+        active_seconds = max(0, observed_seconds - pause_seconds)
+    return {
+        "started_at": started_at or "",
+        "last_log_at": last_log_at or "",
+        "window": summary.get("window") or "",
+        "pause_count": int(summary.get("pause_count") or 0) if isinstance(summary.get("pause_count"), (int, float)) else 0,
+        "pause_seconds": pause_seconds,
+        "pause_label": _format_duration_brief(pause_seconds) if pause_seconds else "",
+        "pause_display": _format_duration_brief(pause_seconds) if pause_seconds else "Not observed",
+        "observed_seconds": observed_seconds,
+        "observed_label": _format_duration_brief(observed_seconds) if observed_seconds is not None else "",
+        "active_seconds": active_seconds,
+        "active_label": _format_duration_brief(active_seconds) if active_seconds is not None else "",
+        "had_pause": bool(summary.get("had_pause")),
+    }
+
+
+def _dedupe_preserve_order(values):
+    seen = set()
+    ordered = []
+    for value in values or []:
+        name = str(value or "").strip()
+        if not name:
+            continue
+        lowered = name.casefold()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        ordered.append(name)
+    return ordered
+
+
+def _build_incomplete_scope_summary(original_command="", suggested_command="", progress_libraries=None):
+    progress_libraries = progress_libraries if isinstance(progress_libraries, list) else []
+    original_selected = _extract_selected_libraries(original_command)[1] or []
+    recovery_selected = _extract_selected_libraries(suggested_command)[1] or []
+    progress_names = _dedupe_preserve_order(entry.get("name") for entry in progress_libraries if isinstance(entry, dict))
+    completed = _dedupe_preserve_order(entry.get("name") for entry in progress_libraries if isinstance(entry, dict) and str(entry.get("status") or "").strip() == "Done")
+
+    original_scope = _dedupe_preserve_order(original_selected or progress_names)
+    recovery_scope = _dedupe_preserve_order(recovery_selected or original_scope)
+    pruned = []
+    if original_scope and recovery_scope:
+        recovery_lookup = {name.casefold() for name in recovery_scope}
+        pruned = [name for name in original_scope if name.casefold() not in recovery_lookup]
+
+    return {
+        "original_scope": original_scope,
+        "recovery_scope": recovery_scope,
+        "completed_libraries": completed,
+        "pruned_libraries": pruned,
+        "original_scope_label": " | ".join(original_scope) if original_scope else "",
+        "recovery_scope_label": " | ".join(recovery_scope) if recovery_scope else "",
+        "completed_label": " | ".join(completed) if completed else "",
+        "pruned_label": " | ".join(pruned) if pruned else "",
+    }
+
+
+def _build_maintenance_event_rows(maintenance_summary=None):
+    summary = maintenance_summary if isinstance(maintenance_summary, dict) else {}
+    rows = []
+    for event in summary.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        event_name = str(event.get("event") or "").strip().lower()
+        if event_name not in ("paused", "resumed"):
+            continue
+        label = "Paused" if event_name == "paused" else "Resumed"
+        at_value = str(event.get("local_at") or event.get("at") or "").strip()
+        pause_label = _format_duration_brief(event.get("paused_seconds")) if isinstance(event.get("paused_seconds"), (int, float)) else ""
+        window = str(event.get("window") or "").strip()
+        rows.append(
+            {
+                "label": label,
+                "at": at_value,
+                "pause_label": pause_label,
+                "window": window,
+            }
+        )
+    return rows
+
+
+def _build_incomplete_progress_snapshot(progress=None, last_log_at=None, config_data=None, original_command="", config_name=None):
+    progress = progress if isinstance(progress, dict) else {}
+    libraries = progress.get("libraries") if isinstance(progress.get("libraries"), list) else []
+    if not libraries:
+        return {}
+    phase_lookup = {
+        "operations": "Operations",
+        "metadata": "Metadata",
+        "collections": "Collections",
+        "overlays": "Overlays",
+        "playlists": "Playlists",
+    }
+    current_phase = str(progress.get("phase_current") or "").strip().lower()
+    current_library = str(progress.get("current_library") or "").strip()
+    preparation_seconds = progress.get("preparation_seconds")
+    if not isinstance(preparation_seconds, (int, float)):
+        preparation_seconds = progress.get("preparation_elapsed_seconds")
+    current_phase_elapsed_seconds = progress.get("current_phase_elapsed_seconds") if isinstance(progress.get("current_phase_elapsed_seconds"), (int, float)) else None
+    explicit_phase = _detect_explicit_phase_from_command(original_command)
+    run_mode = explicit_phase if explicit_phase in ("collections", "operations", "metadata", "overlays", "playlists") else "all"
+    allowed_phases = _get_progress_run_order(config_data=config_data)
+    if not allowed_phases:
+        allowed_phases = ["operations", "metadata", "collections", "overlays"]
+    playlists_configured = bool(config_data.get("playlists")) if isinstance(config_data, dict) else False
+    if run_mode in ("collections", "overlays", "operations", "metadata", "playlists"):
+        allowed_phases = [run_mode]
+    elif "playlists" not in allowed_phases:
+        allowed_phases = allowed_phases + ["playlists"]
+    columns = [{"key": key, "label": phase_lookup.get(key, key.title())} for key in allowed_phases]
+    configured_library_entries = []
+    configured_library_names = []
+    configured_type_by_name = {}
+    config_path = _extract_cli_option_value(original_command, "--config")
+    selected_libraries = _extract_selected_libraries(original_command)[1]
+    for entry in _get_progress_library_list(
+        selected_libraries=selected_libraries,
+        config_path=config_path,
+        config_data=config_data,
+        config_name=config_name,
+    ):
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        lib_type = str(entry.get("type") or "").strip()
+        if name:
+            configured_type_by_name[name] = lib_type or None
+    if isinstance(config_data, dict):
+        config_libraries = config_data.get("libraries")
+        if isinstance(config_libraries, dict):
+            configured_library_names = [str(name).strip() for name in config_libraries.keys() if str(name).strip()]
+            configured_library_entries = [{"name": name, "type": configured_type_by_name.get(name)} for name in configured_library_names]
+    elif configured_type_by_name:
+        configured_library_names = list(configured_type_by_name.keys())
+        configured_library_entries = [{"name": name, "type": configured_type_by_name.get(name)} for name in configured_library_names]
+
+    def _normalize_snapshot_library_name(raw_name):
+        name = str(raw_name or "").strip()
+        if not name:
+            return ""
+        if configured_library_entries:
+            matched = logscan.LogscanAnalyzer()._match_library_name(name, configured_library_entries)
+            if matched:
+                return matched
+            if name.lower().startswith("finished "):
+                alternate = name[9:].strip()
+                matched = logscan.LogscanAnalyzer()._match_library_name(alternate, configured_library_entries)
+                if matched:
+                    return matched
+        if name.lower().startswith("finished "):
+            return name[9:].strip()
+        return name
+
+    current_library = _normalize_snapshot_library_name(current_library)
+
+    rows = []
+    totals = {column["key"]: 0 for column in columns}
+    visible_libraries = [entry for entry in libraries if str((entry or {}).get("status") or "").strip() != "Skipped"]
+    for entry in visible_libraries:
+        name = _normalize_snapshot_library_name(entry.get("name"))
+        status = str(entry.get("status") or "Pending").strip() or "Pending"
+        status_class = "text-bg-secondary"
+        if status == "Done":
+            status_class = "text-bg-success"
+        elif status == "In progress":
+            status_class = "text-bg-primary"
+        elif status == "Stopped":
+            status_class = "text-bg-danger"
+
+        durations = entry.get("durations") if isinstance(entry.get("durations"), dict) else {}
+        phase_cells = []
+        for column in columns:
+            phase_key = column["key"]
+            label = ""
+            tone = ""
+            seconds = durations.get(phase_key)
+            if phase_key == "playlists":
+                playlist_total = progress.get("playlist_total_seconds") if isinstance(progress.get("playlist_total_seconds"), (int, float)) else None
+                playlist_running = bool(progress.get("playlist_running"))
+                playlist_elapsed = progress.get("playlist_elapsed_seconds") if isinstance(progress.get("playlist_elapsed_seconds"), (int, float)) else None
+                if playlist_running:
+                    label = _format_duration_brief(playlist_elapsed)
+                    tone = "primary"
+                elif isinstance(playlist_total, (int, float)) and (playlist_total > 0 or playlists_configured):
+                    label = _format_duration_brief(playlist_total)
+                    tone = "success" if label else ""
+                    if label:
+                        totals[phase_key] = max(0, int(playlist_total))
+                phase_cells.append({"label": label, "tone": tone})
+                continue
+            if current_library and current_phase and current_library == name and current_phase == phase_key and isinstance(current_phase_elapsed_seconds, (int, float)):
+                label = _format_duration_brief(current_phase_elapsed_seconds)
+                tone = "primary"
+            elif isinstance(seconds, (int, float)):
+                label = _format_duration_brief(seconds)
+                tone = "success"
+                totals[phase_key] = totals.get(phase_key, 0) + int(seconds or 0)
+            phase_cells.append({"label": label, "tone": tone})
+
+        row_type = configured_type_by_name.get(name) or entry.get("type")
+        rows.append(
+            {
+                "name": name,
+                "type": str(row_type or "—").strip() or "—",
+                "status": status,
+                "status_class": status_class,
+                "phase_cells": phase_cells,
+            }
+        )
+
+    total_seconds = 0
+    if isinstance(preparation_seconds, (int, float)):
+        total_seconds += int(preparation_seconds or 0)
+    for value in totals.values():
+        if isinstance(value, (int, float)):
+            total_seconds += int(value or 0)
+
+    return {
+        "columns": columns,
+        "rows": rows,
+        "completed_count": progress.get("completed_count"),
+        "total_count": progress.get("total_count"),
+        "current_library": current_library,
+        "phase_current": current_phase,
+        "last_log_at": last_log_at or "",
+        "preparation_label": _format_duration_brief(preparation_seconds) if isinstance(preparation_seconds, (int, float)) else "",
+        "footer_cells": [
+            _format_duration_brief(totals.get(column["key"])) if isinstance(totals.get(column["key"]), (int, float)) and totals.get(column["key"]) > 0 else "" for column in columns
+        ],
+        "total_label": _format_duration_brief(total_seconds) if total_seconds > 0 else "",
+    }
+
+
+def _build_completed_log_progress_snapshot(summary=None, content="", analyzer=None):
+    summary = summary if isinstance(summary, dict) else {}
+    if not content:
+        return {}
+    tool_name = str(summary.get("tool_name") or "kometa").strip().lower() or "kometa"
+    if tool_name != "kometa":
+        return {}
+
+    original_command = summary.get("run_command") or ""
+    if not original_command:
+        return {}
+    config_name = str(summary.get("config_name") or "").strip()
+    original_command = _inject_config_path_for_command(
+        original_command,
+        config_name=config_name,
+    )
+    config_path = _extract_cli_option_value(original_command, "--config")
+    if not config_path and config_name:
+        config_path = _resolve_config_path_for_command(config_name=config_name)
+    config_data = _load_progress_config(config_path) if config_path else {}
+    selected_libraries = _extract_selected_libraries(original_command)[1]
+    progress_analyzer = analyzer if analyzer is not None else logscan.LogscanAnalyzer()
+    progress = progress_analyzer.extract_progress(
+        content,
+        library_list=_get_progress_library_list(
+            selected_libraries=selected_libraries,
+            config_path=config_path,
+            config_data=config_data,
+            config_name=config_name,
+        ),
+        selected_libraries=selected_libraries,
+        previous=None,
+        run_started_at=summary.get("started_at"),
+        now_ts=datetime.now(timezone.utc),
+        is_running=False,
+    )
+    snapshot = _build_incomplete_progress_snapshot(
+        progress=progress,
+        last_log_at=summary.get("finished_at") or summary.get("started_at"),
+        config_data=config_data,
+        original_command=original_command,
+        config_name=config_name,
+    )
+    if not snapshot:
+        return {}
+    return snapshot
 
 
 def _build_incomplete_resume_message(phase_current=None, current_library=None, finished_at=None):
@@ -9974,6 +13870,7 @@ def _build_resume_explanation(
     current_library=None,
     current_collection=None,
     finished_at=None,
+    progress_libraries=None,
 ):
     lines = []
     if finished_at:
@@ -10047,6 +13944,13 @@ def _build_resume_explanation(
     if current_library:
         lines.append(f"Detected in-progress library '{current_library}', so the suggestion scopes with --run-libraries.")
 
+    if isinstance(progress_libraries, list):
+        completed_libraries = [
+            str(entry.get("name")).strip() for entry in progress_libraries if str(entry.get("status") or "").strip() == "Done" and str(entry.get("name") or "").strip()
+        ]
+        if completed_libraries:
+            lines.append(f"Completed libraries already seen in the log: {' | '.join(completed_libraries)}.")
+
     config_path = _extract_cli_option_value(suggested_command, "--config")
     if config_path:
         lines.append(f"Config path in the suggested command is: {config_path}.")
@@ -10063,6 +13967,7 @@ def _analyze_incomplete_log_for_resume(log_path, cache_entry=None, config_name=N
         content = _read_logscan_text(log_path, encoding="utf-8", errors="replace")
     except Exception:
         return None
+    started_at_fallback = _extract_first_log_timestamp(content)
 
     analyzer = logscan.LogscanAnalyzer()
     try:
@@ -10131,12 +14036,20 @@ def _analyze_incomplete_log_for_resume(log_path, cache_entry=None, config_name=N
     except Exception:
         current_collection = None
 
+    progress_libraries = progress.get("libraries") if isinstance(progress.get("libraries"), list) else []
+    last_log_at = _extract_last_log_timestamp(content)
+    timing_summary = _build_incomplete_run_timing_summary(
+        started_at=summary.get("started_at") or started_at_fallback,
+        last_log_at=last_log_at,
+        maintenance_summary=summary.get("maintenance_summary"),
+    )
+
     suggestions = _build_recovery_suggestions(
         original_command,
         phase_current=phase_current,
         current_library=current_library,
         current_collection=current_collection,
-        progress_libraries=progress.get("libraries"),
+        progress_libraries=progress_libraries,
     )
     primary = suggestions[0] if suggestions else ""
     scope_completed = not primary and not suggestions
@@ -10149,6 +14062,7 @@ def _analyze_incomplete_log_for_resume(log_path, cache_entry=None, config_name=N
             current_library=current_library,
             current_collection=current_collection,
             finished_at=summary.get("finished_at"),
+            progress_libraries=progress_libraries,
         )
     reason = _build_incomplete_resume_message(
         phase_current=phase_current,
@@ -10174,10 +14088,24 @@ def _analyze_incomplete_log_for_resume(log_path, cache_entry=None, config_name=N
     if not run_key:
         run_key_seed = f"incomplete|{log_path}|{mtime or 0}"
         run_key = hashlib.sha256(run_key_seed.encode("utf-8")).hexdigest()
+    started_at = summary.get("started_at") or started_at_fallback
+    scope_summary = _build_incomplete_scope_summary(
+        original_command=original_command,
+        suggested_command=primary,
+        progress_libraries=progress_libraries,
+    )
+    progress_snapshot = _build_incomplete_progress_snapshot(
+        progress,
+        last_log_at=last_log_at,
+        config_data=config_data,
+        original_command=original_command,
+    )
+    maintenance_events = _build_maintenance_event_rows(summary.get("maintenance_summary"))
 
     return {
         "run_key": run_key,
-        "started_at": summary.get("started_at"),
+        "started_at": started_at,
+        "last_log_at": last_log_at,
         "finished_at": summary.get("finished_at"),
         "run_time_seconds": summary.get("run_time_seconds"),
         "kometa_version": summary.get("kometa_version"),
@@ -10219,6 +14147,10 @@ def _analyze_incomplete_log_for_resume(log_path, cache_entry=None, config_name=N
         "resume_recommendations": suggestions,
         "resume_explanation": explanation,
         "resume_scope_completed": scope_completed,
+        "resume_timing_summary": timing_summary,
+        "resume_scope_summary": scope_summary,
+        "resume_progress_snapshot": progress_snapshot,
+        "resume_maintenance_events": maintenance_events,
     }
 
 
@@ -10245,16 +14177,25 @@ def _build_incomplete_run_from_cache_entry(log_path, cache_entry=None, config_na
     created_at = summary.get("created_at")
     if not created_at:
         created_at = cache_entry.get("updated_at") or _iso_from_mtime(mtime)
+    started_at = summary.get("started_at")
+    if not started_at:
+        try:
+            started_at = _extract_first_log_timestamp(_read_logscan_text(path, encoding="utf-8", errors="replace"))
+        except Exception:
+            started_at = None
     original_command = summary.get("run_command") or ""
     if tool_name == "kometa":
         original_command = _inject_config_path_for_command(
             original_command,
             config_name=summary.get("config_name") or config_name,
         )
+    progress_snapshot = summary.get("progress_snapshot") if isinstance(summary.get("progress_snapshot"), dict) else {}
+    if not progress_snapshot:
+        progress_snapshot = cache_entry.get("resume_progress_snapshot") if isinstance(cache_entry.get("resume_progress_snapshot"), dict) else {}
     return {
         "run_key": run_key,
         "tool_name": tool_name,
-        "started_at": summary.get("started_at"),
+        "started_at": started_at,
         "finished_at": summary.get("finished_at"),
         "run_time_seconds": summary.get("run_time_seconds"),
         "kometa_version": summary.get("kometa_version"),
@@ -10291,11 +14232,40 @@ def _build_incomplete_run_from_cache_entry(log_path, cache_entry=None, config_na
         "phase_current": cache_entry.get("phase_current"),
         "current_library": cache_entry.get("current_library"),
         "current_collection": cache_entry.get("current_collection"),
+        "progress_snapshot": progress_snapshot,
+        "resume_progress_snapshot": (progress_snapshot if isinstance(progress_snapshot, dict) else {}),
         "resume_reason": cache_entry.get("resume_reason") or "Run appears incomplete. Open the report for more detail or download the log for investigation.",
         "resume_primary": cache_entry.get("resume_primary") or "",
         "resume_recommendations": cache_entry.get("resume_recommendations") if isinstance(cache_entry.get("resume_recommendations"), list) else [],
         "resume_explanation": cache_entry.get("resume_explanation") if isinstance(cache_entry.get("resume_explanation"), list) else [],
     }
+
+
+def _build_incomplete_resume_cache_fields(log_path, cache_entry=None, config_name=None):
+    cache_entry = cache_entry if isinstance(cache_entry, dict) else {}
+    parsed = _analyze_incomplete_log_for_resume(log_path, cache_entry=cache_entry, config_name=config_name)
+    if not isinstance(parsed, dict):
+        return {}
+    fields = {}
+    for key in (
+        "phase_current",
+        "current_library",
+        "current_collection",
+        "resume_reason",
+        "resume_primary",
+        "resume_recommendations",
+        "resume_explanation",
+        "resume_progress_snapshot",
+        "resume_scope_completed",
+        "resume_timing_summary",
+        "resume_scope_summary",
+        "resume_maintenance_events",
+    ):
+        value = parsed.get(key)
+        if value is None:
+            continue
+        fields[key] = value
+    return fields
 
 
 def _build_incomplete_log_fallback(log_path, cache_entry=None, config_name=None):
@@ -10314,10 +14284,14 @@ def _build_incomplete_log_fallback(log_path, cache_entry=None, config_name=None)
         run_key_seed = f"incomplete|fallback|{path}|{mtime or 0}|{size or 0}"
         run_key = hashlib.sha256(run_key_seed.encode("utf-8")).hexdigest()
     created_at = cache_entry.get("updated_at") or _iso_from_mtime(mtime)
+    try:
+        started_at = _extract_first_log_timestamp(_read_logscan_text(path, encoding="utf-8", errors="replace"))
+    except Exception:
+        started_at = None
     return {
         "run_key": run_key,
         "tool_name": tool_name,
-        "started_at": None,
+        "started_at": started_at,
         "finished_at": None,
         "run_time_seconds": None,
         "kometa_version": "",
@@ -10465,7 +14439,7 @@ def _get_incomplete_resume_runs(limit=25, config_name=None):
         candidates.append((float(mtime), path, entry))
 
     try:
-        live_meta = (helpers.get_kometa_root_path() / "config" / "logs" / "meta.log").resolve()
+        live_meta = (helpers.get_kometa_log_dir() / "meta.log").resolve()
     except Exception:
         live_meta = None
     if live_meta and live_meta.exists() and live_meta.is_file():
@@ -10520,6 +14494,10 @@ def _build_latest_incomplete_resume_hint():
         "context_mismatch": context_mismatch,
         "explanation": latest.get("resume_explanation") if isinstance(latest.get("resume_explanation"), list) else [],
         "scope_completed": bool(latest.get("resume_scope_completed")),
+        "timing_summary": latest.get("resume_timing_summary") if isinstance(latest.get("resume_timing_summary"), dict) else {},
+        "scope_summary": latest.get("resume_scope_summary") if isinstance(latest.get("resume_scope_summary"), dict) else {},
+        "progress_snapshot": latest.get("resume_progress_snapshot") if isinstance(latest.get("resume_progress_snapshot"), dict) else {},
+        "maintenance_events": latest.get("resume_maintenance_events") if isinstance(latest.get("resume_maintenance_events"), list) else [],
     }
 
 
@@ -10527,8 +14505,74 @@ def _logscan_needs_reingest(cache_logs, log_dir):
     return bool(_get_logscan_delta_files(log_dir=log_dir, include_archive=True))
 
 
+def _get_logscan_invalid_archived_logs(log_dir=None, limit=None):
+    log_dir = Path(log_dir) if log_dir else helpers.get_kometa_log_dir()
+    ingest_cache = _load_logscan_ingest_cache()
+    cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
+    if not isinstance(cache_logs, dict):
+        cache_logs = {}
+
+    invalid_logs = []
+    kometa_analyzer = None
+    for path in _get_logscan_log_files(log_dir=log_dir, include_archive=True):
+        if _classify_logscan_file_location(path, log_dir=log_dir) != "archive":
+            continue
+        cache_key = str(path.resolve())
+        cache_entry = cache_logs.get(cache_key)
+        if _logscan_cache_entry_matches(path, cache_entry=cache_entry):
+            continue
+
+        tool_name = _detect_logscan_tool_from_path(path, log_dir=log_dir)
+        reason = "unrecognized"
+        reason_detail = None
+        try:
+            content = _read_logscan_text(path, encoding="utf-8", errors="replace")
+            if tool_name == "imagemaid":
+                result = _analyze_imagemaid_log_content(content, log_path=path)
+            else:
+                if kometa_analyzer is None:
+                    kometa_analyzer = logscan.LogscanAnalyzer()
+                result = kometa_analyzer.analyze_content(content, log_path=path, include_people_scan=False)
+            summary = result.get("summary") if isinstance(result, dict) else None
+            if summary:
+                continue
+            if not str(content or "").strip():
+                reason = "empty"
+        except Exception as exc:
+            reason = "read_error"
+            reason_detail = str(exc)
+
+        try:
+            stats = path.stat()
+            size = int(stats.st_size)
+            mtime = stats.st_mtime
+        except Exception:
+            size = None
+            mtime = None
+        invalid_logs.append(
+            {
+                "name": path.name,
+                "path": cache_key,
+                "tool_name": tool_name,
+                "reason": reason,
+                "reason_detail": reason_detail,
+                "size": size,
+                "mtime": mtime,
+            }
+        )
+
+    invalid_logs.sort(key=lambda item: item.get("mtime") or 0, reverse=True)
+    if limit is None:
+        return invalid_logs
+    try:
+        safe_limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        safe_limit = 0
+    return invalid_logs[:safe_limit]
+
+
 def _logscan_ingest_health(log_dir=None):
-    log_dir = Path(log_dir) if log_dir else helpers.get_kometa_root_path() / "config" / "logs"
+    log_dir = Path(log_dir) if log_dir else helpers.get_kometa_log_dir()
     log_dir_exists = log_dir.exists()
     imagemaid_log_dir = _get_logscan_live_dir("imagemaid")
     imagemaid_dir_exists = imagemaid_log_dir.exists()
@@ -10569,6 +14613,7 @@ def _logscan_ingest_health(log_dir=None):
     if total < 0:
         total = 0
     needs_reingest = bool(missing or incomplete)
+    invalid_archived = _get_logscan_invalid_archived_logs(log_dir=log_dir)
 
     return {
         "source": "health",
@@ -10580,6 +14625,8 @@ def _logscan_ingest_health(log_dir=None):
         "incomplete": len(incomplete),
         "missing_sample": missing[:5],
         "incomplete_sample": incomplete[:5],
+        "invalid_archived_count": len(invalid_archived),
+        "invalid_archived_sample": [entry.get("name") for entry in invalid_archived[:5] if entry.get("name")],
         "needs_reingest": needs_reingest,
         "pending_active": pending_active,
         "last_updated": latest_updated,
@@ -10671,6 +14718,21 @@ def _ingest_completed_live_logs(tool_name="kometa", log_dir=None):
             if not isinstance(summary, dict):
                 continue
             if not summary.get("run_complete"):
+                incomplete_cache_fields = {}
+                if tool_name == "kometa":
+                    incomplete_cache_fields = _build_incomplete_resume_cache_fields(
+                        path,
+                        cache_entry={
+                            "mtime": stats.st_mtime,
+                            "size": stats.st_size,
+                            "run_key": summary.get("run_key"),
+                            "tool_name": tool_name,
+                            "run_complete": False,
+                            "summary": summary,
+                            "recommendations": recommendations,
+                        },
+                        config_name=summary.get("config_name"),
+                    )
                 cache_logs[cache_key] = {
                     "mtime": stats.st_mtime,
                     "size": stats.st_size,
@@ -10680,10 +14742,17 @@ def _ingest_completed_live_logs(tool_name="kometa", log_dir=None):
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                     "summary": summary,
                     "recommendations": recommendations,
+                    **incomplete_cache_fields,
                 }
                 cache_dirty = True
                 continue
 
+            if tool_name == "kometa":
+                summary["progress_snapshot"] = _build_completed_log_progress_snapshot(
+                    summary=summary,
+                    content=content,
+                    analyzer=analyzer,
+                )
             cached_run_key = cached_entry.get("run_key")
             if not (cached_entry.get("run_complete") is True and cached_run_key == summary.get("run_key")):
                 if database.save_log_run(summary, recommendations=recommendations):
@@ -10734,6 +14803,8 @@ def _archive_log_file(path, archive_dir, log_dir=None, allow_live_meta=False):
         path = Path(path)
         if not path.exists() or not path.is_file():
             return None
+        if _is_logscan_maintenance_sidecar(path):
+            return None
         if path.name.lower() == "meta.log" and not allow_live_meta:
             return None
         if log_dir and path.resolve().parent != Path(log_dir).resolve():
@@ -10767,8 +14838,19 @@ def _archive_log_file(path, archive_dir, log_dir=None, allow_live_meta=False):
         return None
 
 
+logscan_archive_result = _normalize_logscan_archive_filenames()
+if logscan_archive_result.get("renamed"):
+    helpers.ts_log(
+        f"Normalized {logscan_archive_result['renamed']} archived log file(s) to the canonical archive layout.",
+        level="INFO",
+    )
+if logscan_archive_result.get("errors"):
+    for msg in logscan_archive_result["errors"]:
+        helpers.ts_log(msg, level="WARNING")
+
+
 def _archive_finished_live_meta_log_if_idle(log_dir=None):
-    log_dir = Path(log_dir) if log_dir else helpers.get_kometa_root_path() / "config" / "logs"
+    log_dir = Path(log_dir) if log_dir else helpers.get_kometa_log_dir()
     live_path = (log_dir / "meta.log").resolve()
     if helpers.is_kometa_running():
         return None
@@ -10876,6 +14958,8 @@ def _prune_logscan_archive(archive_dir):
     for path in archive_dir.glob("*.log*"):
         if not path.is_file():
             continue
+        if _is_logscan_maintenance_sidecar(path):
+            continue
         suffixes = [suffix.lower() for suffix in path.suffixes]
         if suffixes and suffixes[-1] in (".zip", ".7z"):
             continue
@@ -10957,8 +15041,7 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
             cache_dirty = True
         cache_logs = ingest_cache["logs"]
 
-        kometa_root = helpers.get_kometa_root_path()
-        kometa_log_dir = kometa_root / "config" / "logs"
+        kometa_log_dir = helpers.get_kometa_log_dir()
         imagemaid_log_dir = _get_logscan_live_dir("imagemaid")
         if not kometa_log_dir.exists() and not imagemaid_log_dir.exists():
             message = f"Log folders not found at: {kometa_log_dir} or {imagemaid_log_dir}"
@@ -11025,6 +15108,10 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                         if archived_path:
                             cache_dirty = True
                     continue
+                if not summary.get("started_at"):
+                    first_log_timestamp = _extract_first_log_timestamp(content)
+                    if first_log_timestamp:
+                        summary["started_at"] = first_log_timestamp
                 if not summary.get("run_complete"):
                     skipped_incomplete += 1
                     if len(sample_incomplete) < 5:
@@ -11032,6 +15119,22 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                     incomplete_recommendations = result.get("recommendations") if isinstance(result, dict) else None
                     if not isinstance(incomplete_recommendations, list):
                         incomplete_recommendations = []
+                    incomplete_cache_fields = {}
+                    if tool_name == "kometa":
+                        incomplete_cache_fields = _build_incomplete_resume_cache_fields(
+                            path,
+                            cache_entry={
+                                "mtime": stats.st_mtime,
+                                "size": stats.st_size,
+                                "run_key": summary.get("run_key"),
+                                "tool_name": tool_name,
+                                "run_complete": False,
+                                "summary": summary,
+                                "recommendations": incomplete_recommendations,
+                                "start_mode": summary.get("start_mode"),
+                            },
+                            config_name=summary.get("config_name"),
+                        )
                     cache_logs[cache_key] = {
                         "mtime": stats.st_mtime,
                         "size": stats.st_size,
@@ -11058,6 +15161,7 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                             "library_counts": summary.get("library_counts") if isinstance(summary.get("library_counts"), dict) else {},
                             "maintenance_summary": summary.get("maintenance_summary") if isinstance(summary.get("maintenance_summary"), dict) else {},
                             "quiet_period_summary": summary.get("quiet_period_summary") if isinstance(summary.get("quiet_period_summary"), dict) else {},
+                            "progress_snapshot": summary.get("progress_snapshot") if isinstance(summary.get("progress_snapshot"), dict) else {},
                             "quickstart_run_marker": bool(summary.get("quickstart_run_marker")),
                             "start_mode": summary.get("start_mode"),
                             "config_line_count": summary.get("config_line_count"),
@@ -11066,6 +15170,7 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                         },
                         "start_mode": summary.get("start_mode"),
                         "recommendations": incomplete_recommendations,
+                        **incomplete_cache_fields,
                     }
                     cache_dirty = True
                     if path.parent.resolve() == live_dir.resolve() and path.name.lower() != "meta.log":
@@ -11101,6 +15206,12 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                 if skip_save_if_cached and cached_run_key == summary.get("run_key"):
                     duplicates += 1
                 else:
+                    if tool_name == "kometa":
+                        summary["progress_snapshot"] = _build_completed_log_progress_snapshot(
+                            summary=summary,
+                            content=content,
+                            analyzer=analyzer,
+                        )
                     if database.save_log_run(summary, recommendations=result.get("recommendations")):
                         ingested += 1
                     else:
@@ -11264,8 +15375,7 @@ def _get_pending_logscan_startup_migration():
     if completed_level >= required_level:
         state["reason"] = "up_to_date"
         return state
-    kometa_root = helpers.get_kometa_root_path()
-    log_dir = kometa_root / "config" / "logs"
+    log_dir = helpers.get_kometa_log_dir()
     if not log_dir.exists():
         state["reason"] = "waiting_for_logs"
         return state
@@ -11427,6 +15537,7 @@ def background_job_status(job_id):
         lines=logs[start_idx:],
         next_index=len(logs),
         done=job.get("status") in {"complete", "error"},
+        update_success=bool(job.get("success")),
     )
 
 
@@ -11499,6 +15610,8 @@ def logscan_trends_page():
     persistence.ensure_session_config_name()
     if "shutdown_nonce" not in session:
         session["shutdown_nonce"] = secrets.token_urlsafe(16)
+    if "restart_nonce" not in session:
+        session["restart_nonce"] = secrets.token_urlsafe(16)
 
     page_info = {
         "title": "Analytics",
@@ -11514,6 +15627,7 @@ def logscan_trends_page():
         "qs_session_lifetime_days": app.config.get("QS_SESSION_LIFETIME_DAYS", 30),
         "qs_flask_session_dir": app.config.get("QS_FLASK_SESSION_DIR", ""),
         "shutdown_nonce": session["shutdown_nonce"],
+        "restart_nonce": session["restart_nonce"],
         "hide_step_nav": False,
     }
 
@@ -11545,6 +15659,7 @@ def logscan_trends_page():
         progress_index = max(total_steps - 1, 0)
     page_info["progress"] = round(((progress_index + 1) / total_steps) * 100) if total_steps else 0
     available_configs = database.get_unique_config_names() or []
+    page_info.update(_build_kometa_install_context(page_info.get("config_name")))
     workspace_status = _build_workspace_status_context(page_info.get("config_name"), template_list, available_configs=available_configs)
     return render_template(
         "905-analytics.html",
@@ -12029,39 +16144,206 @@ def header_style_previews():
     return jsonify(success=True, previews=previews)
 
 
+@app.route("/save-kometa-install-mode", methods=["POST"])
+def save_kometa_install_mode():
+    payload = request.get_json(silent=True) or {}
+    config_name = _resolve_request_config_name(payload)
+    install_mode = _normalize_kometa_install_mode(payload.get("install_mode"))
+    existing_root = str(payload.get("existing_root") or "").strip()
+    external_config_root = str(payload.get("external_config_root") or "").strip()
+    external_log_root = str(payload.get("external_log_root") or "").strip()
+    managed_root = _default_managed_kometa_root().resolve()
+
+    if install_mode == KOMETA_INSTALL_MODE_EXISTING:
+        if not existing_root:
+            return jsonify(success=False, error="Choose the existing Kometa path Quickstart should use for this config."), 400
+        resolved_existing = _resolve_user_dir(existing_root)
+        if not resolved_existing:
+            return jsonify(success=False, error="The existing Kometa path is invalid."), 400
+        if not resolved_existing.exists():
+            return jsonify(success=False, error="The selected existing Kometa path does not exist in this Quickstart environment."), 400
+        missing = _validate_existing_kometa_root(resolved_existing)
+        if missing:
+            if "kometa.py" in missing or "requirements.txt" in missing or "config" in missing:
+                return (
+                    jsonify(
+                        success=False,
+                        error="Choose the Kometa root folder that contains kometa.py, requirements.txt, and config/.",
+                    ),
+                    400,
+                )
+        section_payload_update = {
+            "install_mode": install_mode,
+            "existing_root": existing_root,
+            "external_config_root": "",
+            "external_log_root": "",
+        }
+    elif install_mode == KOMETA_INSTALL_MODE_EXTERNAL:
+        if not external_config_root:
+            return jsonify(success=False, error="Choose the external Kometa config path Quickstart should use for this config."), 400
+        resolved_external_config = _resolve_user_dir(external_config_root)
+        if not resolved_external_config:
+            return jsonify(success=False, error="The external Kometa config path is invalid."), 400
+        if not resolved_external_config.exists() or not resolved_external_config.is_dir():
+            return jsonify(success=False, error="The selected external Kometa config path does not exist in this Quickstart environment."), 400
+        if external_log_root:
+            resolved_external_log = _resolve_user_dir(external_log_root)
+            if not resolved_external_log:
+                return jsonify(success=False, error="The external Kometa log path is invalid."), 400
+        section_payload_update = {
+            "install_mode": install_mode,
+            "existing_root": "",
+            "external_config_root": external_config_root,
+            "external_log_root": external_log_root,
+        }
+    else:
+        existing_root = ""
+        external_config_root = ""
+        external_log_root = ""
+        section_payload_update = {
+            "install_mode": install_mode,
+            "existing_root": "",
+            "external_config_root": "",
+            "external_log_root": "",
+        }
+
+    stored_validated, stored_user_entered, stored_payload = database.retrieve_section_data(config_name, "kometa")
+    section_payload = stored_payload if isinstance(stored_payload, dict) else {}
+    section_payload["kometa"] = _canonicalize_kometa_section(
+        {
+            **(section_payload.get("kometa") if isinstance(section_payload.get("kometa"), dict) else {}),
+            **section_payload_update,
+        }
+    )
+    section_payload = apply_validation_metadata(section_payload, "validated")
+    database.save_section_data(
+        name=config_name,
+        section="kometa",
+        validated=True,
+        user_entered=True,
+        data=section_payload,
+    )
+    selection = _resolve_kometa_selection(section_payload["kometa"])
+    _apply_kometa_selection(selection)
+
+    if install_mode == KOMETA_INSTALL_MODE_EXISTING:
+        message = "Quickstart will now use the selected existing Kometa install for this config."
+    elif install_mode == KOMETA_INSTALL_MODE_EXTERNAL:
+        message = "Quickstart will now sync config and optional logs for the selected external Kometa setup."
+    else:
+        message = "Quickstart will now use its managed Kometa install for this config."
+    return jsonify(
+        success=True,
+        message=message,
+        install_mode=install_mode,
+        kometa_root=selection["selected_root"].as_posix() if selection.get("selected_root") else "",
+        kometa_root_display=str(selection["selected_root"]) if selection.get("selected_root") else "",
+        kometa_primary_path=selection["primary_path"].as_posix() if selection.get("primary_path") else "",
+        kometa_primary_path_display=str(selection["primary_path"]) if selection.get("primary_path") else "",
+        kometa_config_dir=selection["config_dir"].as_posix() if selection.get("config_dir") else "",
+        kometa_config_dir_display=str(selection["config_dir"]) if selection.get("config_dir") else "",
+        kometa_log_dir=selection["log_dir"].as_posix() if selection.get("log_dir") else "",
+        kometa_log_dir_display=str(selection["log_dir"]) if selection.get("log_dir") else "",
+        managed_root=managed_root.as_posix(),
+        managed_root_display=str(managed_root),
+        existing_root=existing_root,
+        external_config_root=external_config_root,
+        external_log_root=external_log_root,
+        can_launch=selection.get("can_launch"),
+        can_update=selection.get("can_update"),
+        can_probe_runtime=selection.get("can_probe_runtime"),
+        can_read_logs=selection.get("can_read_logs"),
+    )
+
+
 @app.route("/validate-kometa-root", methods=["POST"])
 def validate_kometa_root():
     payload = request.get_json(silent=True) or {}
-    root_path = str(payload.get("path", "")).strip()
     logs = []
 
     def log(msg):
         print(msg, file=sys.stderr)
         logs.append(msg)
 
-    if not root_path:
-        log("❌ No path provided.")
-        return jsonify(success=False, error="No path provided.", log=logs), 400
+    target = _resolve_kometa_request_target(payload, logs=logs, require_existing_root=True)
+    if target.get("error"):
+        return jsonify(success=False, error=target["error"], log=logs), 400
+    install_mode = target["install_mode"]
+    p = target["path_obj"]
+    config_dir = target.get("config_dir")
+    log_dir = target.get("log_dir")
 
-    p = _resolve_user_dir(root_path)
-    if not p:
-        log("❌ Invalid path provided.")
-        return jsonify(success=False, error="Invalid path provided.", log=logs), 400
-
-    session["kometa_root"] = p.as_posix()
-    app.config["KOMETA_ROOT"] = str(p)
+    if install_mode == KOMETA_INSTALL_MODE_EXTERNAL:
+        if not p or not p.exists() or not p.is_dir():
+            log("❌ The selected external Kometa config path does not exist in this Quickstart environment.")
+            return jsonify(success=False, error="The selected external Kometa config path does not exist in this Quickstart environment.", log=logs), 400
+        log(f"🔍 Checking external Kometa config path: {p}")
+        if log_dir and Path(log_dir).exists():
+            log(f"📄 External Kometa logs are accessible at: {log_dir}")
+        else:
+            log("ℹ️ External Kometa logs are not currently accessible from this Quickstart environment.")
+        try:
+            sync_result = _sync_generated_yaml_and_assets_to_kometa_config(config_dir, payload.get("config_name", "kometa"), logs=logs)
+        except FileNotFoundError:
+            log("❌ Generated YAML not found.")
+            return jsonify(success=False, error="Generated YAML not found.", log=logs), 500
+        except ValueError as exc:
+            log(f"❌ {exc}")
+            return jsonify(success=False, error=str(exc), log=logs), 400
+        except Exception as exc:
+            log(f"⚠️ Failed to sync config-owned assets referenced in the config: {exc}")
+            return jsonify(success=False, error="Failed to sync generated config to the external Kometa config path.", log=logs), 500
+        log("✅ External Kometa config path is valid and synced.")
+        return (
+            jsonify(
+                success=True,
+                kometa_root="",
+                kometa_root_display="",
+                kometa_config_dir=Path(config_dir).resolve().as_posix() if config_dir else "",
+                kometa_config_dir_display=str(Path(config_dir).resolve()) if config_dir else "",
+                kometa_log_dir=Path(log_dir).resolve().as_posix() if log_dir else "",
+                kometa_log_dir_display=str(Path(log_dir).resolve()) if log_dir else "",
+                venv_python="",
+                venv_python_display="",
+                kometa_version="External / unmanaged",
+                external_mode=True,
+                log=logs,
+                synced_config=str(sync_result.get("destination")),
+            ),
+            200,
+        )
 
     # Auto-create the Kometa root and config/ if missing
-    if not p.exists():
+    if install_mode == KOMETA_INSTALL_MODE_MANAGED and not p.exists():
         try:
             p.mkdir(parents=True, exist_ok=True)
             log(f"📁 Created Kometa root: {p}")
         except Exception as e:
             log(f"❌ Failed to create Kometa root: {e}")
             return jsonify(success=False, error="Failed to create Kometa root.", log=logs), 500
+    elif install_mode == KOMETA_INSTALL_MODE_EXISTING and not p.exists():
+        log("❌ The selected existing Kometa path does not exist in this Quickstart environment.")
+        return jsonify(success=False, error="The selected existing Kometa path does not exist in this Quickstart environment.", log=logs), 400
+    elif install_mode == KOMETA_INSTALL_MODE_EXISTING:
+        missing = _validate_existing_kometa_root(p)
+        if missing:
+            log("❌ The selected existing Kometa path does not look like a Kometa root.")
+            log("ℹ️ Choose the folder that contains kometa.py, requirements.txt, and config/.")
+            return (
+                jsonify(
+                    success=False,
+                    error="Choose the Kometa root folder that contains kometa.py, requirements.txt, and config/.",
+                    log=logs,
+                ),
+                400,
+            )
 
     try:
-        (p / "config").mkdir(parents=True, exist_ok=True)
+        if install_mode == KOMETA_INSTALL_MODE_MANAGED:
+            (p / "config").mkdir(parents=True, exist_ok=True)
+        elif not (p / "config").exists():
+            log("❌ The selected existing Kometa path is missing its config folder.")
+            return jsonify(success=False, error="The selected existing Kometa path is missing its config folder.", log=logs), 400
     except Exception as e:
         log(f"❌ Failed to create config folder: {e}")
         return jsonify(success=False, error="Failed to create config folder.", log=logs), 500
@@ -12168,45 +16450,16 @@ def validate_kometa_root():
         log(f"❌ Error installing requirements: {str(e)}")
         return jsonify(success=False, error="Failed pip install.", log=logs), 500
 
-    # Copy generated YAML into <root>/config/<file>
-    config_name = _safe_rel_path(payload.get("config_name", "kometa"))
-    if not config_name:
-        log("❌ Invalid config filename.")
-        return jsonify(success=False, error="Invalid config filename.", log=logs), 400
-
-    src_yaml = _safe_join(Path("config"), config_name)
-    if not src_yaml or not src_yaml.exists():
-        log(f"❌ Source YAML does not exist: {src_yaml}")
+    try:
+        _sync_generated_yaml_and_assets_to_kometa_config(p / "config", payload.get("config_name", "kometa"), logs=logs)
+    except FileNotFoundError:
+        log("❌ Generated YAML not found.")
         return jsonify(success=False, error="Generated YAML not found.", log=logs), 500
-
-    dest_yaml = _safe_join(p / "config", config_name)
-    if not dest_yaml:
-        log("❌ Invalid config destination.")
-        return jsonify(success=False, error="Invalid config destination.", log=logs), 400
-    try:
-        shutil.copy2(src_yaml, dest_yaml)
-        log(f"✅ YAML copied to Kometa config folder at: {dest_yaml}")
+    except ValueError as exc:
+        log(f"❌ {exc}")
+        return jsonify(success=False, error=str(exc), log=logs), 400
     except Exception as e:
-        log(f"⚠️ Failed to copy YAML: {e}")
-
-    try:
-        yaml_parser = YAML(typ="safe")
-        with src_yaml.open("r", encoding="utf-8") as f:
-            parsed_config = yaml_parser.load(f) or {}
-        font_refs = helpers.collect_font_references(parsed_config)
-        if font_refs:
-            font_result = helpers.copy_fonts_to_kometa(font_refs, kometa_root=p)
-            copied = font_result.get("copied", [])
-            missing = font_result.get("missing", [])
-            errors = font_result.get("errors", [])
-            if copied:
-                log(f"✅ Synced {len(copied)} font(s) referenced in the config to Kometa config/fonts.")
-            if missing:
-                log(f"⚠️ Fonts referenced in the config not found: {', '.join(missing)}")
-            for err in errors:
-                log(f"⚠️ {err}")
-    except Exception as e:
-        log(f"⚠️ Failed to sync fonts referenced in the config: {e}")
+        log(f"⚠️ Failed to sync config-owned assets referenced in the config: {e}")
 
     log("✅ Kometa root is valid and ready.")
 
@@ -12263,24 +16516,62 @@ def _probe_kometa_root_state(path_obj):
 @app.route("/probe-kometa-root", methods=["POST"])
 def probe_kometa_root():
     payload = request.get_json(silent=True) or {}
-    root_path = str(payload.get("path", "")).strip()
     logs = []
 
     def log(msg):
         print(msg, file=sys.stderr)
         logs.append(msg)
 
-    if not root_path:
-        log("❌ No path provided.")
-        return jsonify(success=False, error="No path provided.", log=logs), 400
-
-    p = _resolve_user_dir(root_path)
-    if not p:
-        log("❌ Invalid path provided.")
-        return jsonify(success=False, error="Invalid path provided.", log=logs), 400
-
-    session["kometa_root"] = p.as_posix()
-    app.config["KOMETA_ROOT"] = str(p)
+    target = _resolve_kometa_request_target(payload, logs=logs, require_existing_root=False)
+    if target.get("error"):
+        return jsonify(success=False, error=target["error"], log=logs), 400
+    if target.get("install_mode") == KOMETA_INSTALL_MODE_EXTERNAL:
+        config_dir = target.get("config_dir")
+        log_dir = target.get("log_dir")
+        state = {
+            "kometa_root": "",
+            "kometa_root_display": "",
+            "kometa_config_dir": Path(config_dir).resolve().as_posix() if config_dir else "",
+            "kometa_config_dir_display": str(Path(config_dir).resolve()) if config_dir else "",
+            "kometa_log_dir": Path(log_dir).resolve().as_posix() if log_dir else "",
+            "kometa_log_dir_display": str(Path(log_dir).resolve()) if log_dir else "",
+            "venv_python": "",
+            "venv_python_display": "",
+            "kometa_version": "External / unmanaged",
+            "root_exists": bool(config_dir and Path(config_dir).exists()),
+            "config_dir_exists": bool(config_dir and Path(config_dir).exists()),
+            "log_dir_exists": bool(log_dir and Path(log_dir).exists()),
+            "kometa_installed": False,
+            "venv_exists": False,
+            "venv_python_exists": False,
+            "kometa_running": False,
+            "external_mode": True,
+        }
+        log(f"🔍 Probing external Kometa config path: {state['kometa_config_dir_display']}")
+        if state["config_dir_exists"]:
+            log("✅ External Kometa config path is accessible.")
+        else:
+            log("❌ External Kometa config path is not currently accessible.")
+        if state["log_dir_exists"]:
+            log(f"📄 External Kometa logs are accessible at: {state['kometa_log_dir_display']}")
+        else:
+            log("ℹ️ External Kometa log path is not currently accessible.")
+        log("ℹ️ Quickstart cannot probe or launch the external Kometa runtime directly in this mode.")
+        return jsonify(success=True, log=logs, **state), 200
+    if target.get("install_mode") == KOMETA_INSTALL_MODE_EXISTING:
+        missing = _validate_existing_kometa_root(target["path_obj"])
+        if missing:
+            log("❌ The selected existing Kometa path does not look like a Kometa root.")
+            log("ℹ️ Choose the folder that contains kometa.py, requirements.txt, and config/.")
+            return (
+                jsonify(
+                    success=False,
+                    error="Choose the Kometa root folder that contains kometa.py, requirements.txt, and config/.",
+                    log=logs,
+                ),
+                400,
+            )
+    p = target["path_obj"]
 
     state = _probe_kometa_root_state(p)
     log(f"🔍 Probing Kometa path: {state['kometa_root_display']}")
@@ -12305,7 +16596,6 @@ def probe_kometa_root():
 @app.route("/check-kometa-update", methods=["POST"])
 def check_kometa_update():
     payload = request.get_json(silent=True) or {}
-    root_path = str(payload.get("path", "")).strip()
     branch_override_raw = payload.get("branch_override")
     branch_override = helpers.normalize_kometa_branch_override(branch_override_raw)
     logs = []
@@ -12314,21 +16604,53 @@ def check_kometa_update():
         print(msg, file=sys.stderr)
         logs.append(msg)
 
-    if not root_path:
-        log("❌ No path provided.")
-        return jsonify(success=False, error="No path provided.", log=logs), 400
-
     if branch_override_raw and not branch_override:
         log(f"❌ Invalid Kometa branch override: {branch_override_raw}")
         return jsonify(success=False, error="Invalid Kometa branch override.", log=logs), 400
 
-    p = _resolve_user_dir(root_path)
-    if not p:
-        log("❌ Invalid path provided.")
-        return jsonify(success=False, error="Invalid path provided.", log=logs), 400
-
-    session["kometa_root"] = p.as_posix()
-    app.config["KOMETA_ROOT"] = str(p)
+    target = _resolve_kometa_request_target(payload, logs=logs, require_existing_root=False)
+    if target.get("error"):
+        return jsonify(success=False, error=target["error"], log=logs), 400
+    if target.get("install_mode") == KOMETA_INSTALL_MODE_EXTERNAL:
+        config_dir = target.get("config_dir")
+        log_dir = target.get("log_dir")
+        log("ℹ️ Quickstart cannot check or update an external Kometa runtime in config/log-only mode.")
+        return (
+            jsonify(
+                success=True,
+                log=logs,
+                update_check_completed=False,
+                kometa_update_check_skipped=True,
+                local_version="External / unmanaged",
+                remote_version="",
+                kometa_update_available=False,
+                cached=False,
+                kometa_installed=False,
+                kometa_running=False,
+                external_mode=True,
+                kometa_root="",
+                kometa_root_display="",
+                kometa_config_dir=Path(config_dir).resolve().as_posix() if config_dir else "",
+                kometa_config_dir_display=str(Path(config_dir).resolve()) if config_dir else "",
+                kometa_log_dir=Path(log_dir).resolve().as_posix() if log_dir else "",
+                kometa_log_dir_display=str(Path(log_dir).resolve()) if log_dir else "",
+            ),
+            200,
+        )
+    if target.get("install_mode") == KOMETA_INSTALL_MODE_EXISTING:
+        missing = _validate_existing_kometa_root(target["path_obj"])
+        if missing:
+            log("❌ The selected existing Kometa path does not look like a Kometa root.")
+            log("ℹ️ Choose the folder that contains kometa.py, requirements.txt, and config/.")
+            return (
+                jsonify(
+                    success=False,
+                    error="Choose the Kometa root folder that contains kometa.py, requirements.txt, and config/.",
+                    log=logs,
+                ),
+                400,
+            )
+    p = target["path_obj"]
 
     state = _probe_kometa_root_state(p)
     if not state["kometa_installed"]:
@@ -12434,10 +16756,40 @@ def update_kometa():
             409,
         )
     try:
-        cfg_dir = helpers.CONFIG_DIR
-
-        # (optional) allow the caller to pass qs branch; otherwise detect from repo
         data = request.get_json(silent=True) or {}
+        target = _resolve_kometa_request_target(data, require_existing_root=True)
+        if target.get("error"):
+            return jsonify({"success": False, "error": target["error"], "log": [f"❌ {target['error']}"]}), 400
+        if target.get("install_mode") == KOMETA_INSTALL_MODE_EXTERNAL:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "External Kometa mode does not support runtime updates. Change to a managed or existing direct install on the Start page to update from Quickstart.",
+                        "log": [
+                            "❌ External Kometa mode does not support runtime updates.",
+                            "ℹ️ Change to a managed or existing direct install on the Start page if Quickstart should update Kometa itself.",
+                        ],
+                    }
+                ),
+                400,
+            )
+        if target.get("install_mode") == KOMETA_INSTALL_MODE_EXISTING:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "Existing direct Kometa installs must be updated manually outside Quickstart. Quickstart can validate and check version status, but it will not modify that install.",
+                        "log": [
+                            "❌ Existing direct Kometa installs are manual-update only in Quickstart.",
+                            "ℹ️ Quickstart can validate and check version status for this install, but update it manually outside Quickstart to reduce the risk of runtime failures.",
+                        ],
+                    }
+                ),
+                400,
+            )
+        kometa_root = target["path_obj"]
+        install_mode = target["install_mode"]
         branch_override_raw = data.get("branch_override")
         branch_override = helpers.normalize_kometa_branch_override(branch_override_raw)
         if branch_override_raw and not branch_override:
@@ -12488,6 +16840,8 @@ def update_kometa():
                 logs = _ProgressLog()
                 _update_background_job(job_id, phase="running", status="running")
                 logs.append(f"🔎 Quickstart branch: {qs_branch}")
+                logs.append(f"📍 Kometa install mode: {install_mode}")
+                logs.append(f"📁 Target Kometa root: {kometa_root}")
                 if branch_override:
                     logs.append(f"⚠️ Kometa branch override selected: {branch_override}")
                 else:
@@ -12497,9 +16851,13 @@ def update_kometa():
                     logs.append("Force update enabled.")
 
                 try:
-                    result = helpers.perform_kometa_update_zip_only(cfg_dir, branch=kometa_branch, force=force_update, logs=logs)
+                    if install_mode == KOMETA_INSTALL_MODE_EXISTING:
+                        result = helpers.perform_kometa_update_zip_only_at_root(kometa_root, branch=kometa_branch, force=force_update, logs=logs)
+                    else:
+                        result = helpers.perform_kometa_update_zip_only(helpers.CONFIG_DIR, branch=kometa_branch, force=force_update, logs=logs)
                     try:
-                        helpers.invalidate_cached_kometa_update(cfg_dir)
+                        invalidate_target = kometa_root if install_mode == KOMETA_INSTALL_MODE_EXISTING else helpers.CONFIG_DIR
+                        helpers.invalidate_cached_kometa_update(invalidate_target)
                     except Exception:
                         pass
                     if result.get("success", False):
@@ -12532,6 +16890,8 @@ def update_kometa():
 
         logs = []
         logs.append(f"🔎 Quickstart branch: {qs_branch}")
+        logs.append(f"📍 Kometa install mode: {install_mode}")
+        logs.append(f"📁 Target Kometa root: {kometa_root}")
         if branch_override:
             logs.append(f"⚠️ Kometa branch override selected: {branch_override}")
         else:
@@ -12540,9 +16900,13 @@ def update_kometa():
         if force_update:
             logs.append("Force update enabled.")
 
-        result = helpers.perform_kometa_update_zip_only(cfg_dir, branch=kometa_branch, force=force_update, logs=logs)
+        if install_mode == KOMETA_INSTALL_MODE_EXISTING:
+            result = helpers.perform_kometa_update_zip_only_at_root(kometa_root, branch=kometa_branch, force=force_update, logs=logs)
+        else:
+            result = helpers.perform_kometa_update_zip_only(helpers.CONFIG_DIR, branch=kometa_branch, force=force_update, logs=logs)
         try:
-            helpers.invalidate_cached_kometa_update(cfg_dir)
+            invalidate_target = kometa_root if install_mode == KOMETA_INSTALL_MODE_EXISTING else helpers.CONFIG_DIR
+            helpers.invalidate_cached_kometa_update(invalidate_target)
         except Exception:
             pass
         status = 200 if result.get("success") else 500
@@ -12653,22 +17017,148 @@ def _imagemaid_settings_to_form_payload(payload):
         "overlays_only",
     ]
     form_payload = {}
+    raw_config_name = str(payload.get("config_name") or "").strip()
+    config_name = helpers.normalize_config_name_for_storage(raw_config_name) if raw_config_name else ""
+    if config_name:
+        form_payload["config_name"] = config_name
     for key in keys:
         if key in payload:
             form_payload[f"imagemaid_{key}"] = payload.get(key)
     return form_payload
 
 
-def _get_imagemaid_settings_section():
-    settings = persistence.retrieve_settings("915-imagemaid") or {}
+def _resolve_request_config_name(payload=None):
+    raw_config_name = str((payload or {}).get("config_name") or "").strip() if isinstance(payload, dict) else ""
+    normalized = helpers.normalize_config_name_for_storage(raw_config_name) if raw_config_name else ""
+    if normalized:
+        if has_request_context():
+            session["config_name"] = normalized
+        return normalized
+    resolved = session.get("config_name") or persistence.ensure_session_config_name()
+    if has_request_context() and resolved:
+        session["config_name"] = resolved
+    return resolved
+
+
+def _retrieve_settings_for_config(config_name, target):
+    source, source_name = persistence.extract_names(target)
+    stored_validated, stored_user_entered, stored_payload = database.retrieve_section_data(config_name, source_name)
+    payload = stored_payload if isinstance(stored_payload, dict) else {}
+    section = payload.get(source_name, {}) if isinstance(payload.get(source_name), dict) else {}
+    if not section:
+        section = persistence.get_dummy_data(source_name)
+    return {
+        "validated": helpers.booler(stored_validated),
+        "user_entered": helpers.booler(stored_user_entered),
+        "validated_at": payload.get("validated_at") if isinstance(payload, dict) else None,
+        source_name: section,
+    }
+
+
+def _get_stored_plex_credentials_for_config(config_name):
+    try:
+        stored_validated, stored_user_entered, stored_payload = database.retrieve_section_data(name=config_name, section="plex")
+        payload = stored_payload if isinstance(stored_payload, dict) else {}
+        plex_settings = payload.get("plex", {})
+        if not plex_settings:
+            plex_settings = persistence.get_dummy_data("plex")
+        plex_url = plex_settings.get("url")
+        plex_token = plex_settings.get("token")
+        if plex_url and plex_token:
+            return plex_url, plex_token
+    except Exception as exc:
+        if app.config["QS_DEBUG"]:
+            helpers.ts_log(f"Failed to retrieve Plex credentials for config {config_name}: {exc}", level="ERROR")
+    return None, None
+
+
+def _save_imagemaid_settings_for_config(config_name, form_payload):
+    clean_data = persistence.clean_form_data(form_payload)
+    data = helpers.build_config_dict("imagemaid", clean_data)
+    stored_validated, stored_user_entered, stored_payload = database.retrieve_section_data(config_name, "imagemaid")
+    existing_payload = stored_payload if isinstance(stored_payload, dict) else {}
+    existing_section = existing_payload.get("imagemaid", {}) if isinstance(existing_payload.get("imagemaid"), dict) else {}
+    canonical_existing_section = _canonicalize_imagemaid_section(existing_section)
+    canonical_new_section = _canonicalize_imagemaid_section(data.get("imagemaid", {}) if isinstance(data.get("imagemaid"), dict) else {})
+    payload = dict(existing_payload)
+    payload["imagemaid"] = canonical_new_section
+    if "validated_at" in data:
+        payload["validated_at"] = data.get("validated_at")
+    elif existing_payload.get("validated_at") is not None:
+        payload["validated_at"] = existing_payload.get("validated_at")
+    user_entered = bool(canonical_new_section.get("plex_path"))
+    database.save_section_data(
+        name=config_name,
+        section="imagemaid",
+        validated=helpers.booler(stored_validated),
+        user_entered=user_entered,
+        data=payload,
+    )
+    changed = canonical_new_section != canonical_existing_section
+    return payload, changed
+
+
+def _canonicalize_imagemaid_section(section_data):
+    section = dict(section_data) if isinstance(section_data, dict) else {}
+    canonical = {
+        "branch_override": "",
+        "plex_path": "",
+        "mode": "report",
+        "timeout": 600,
+        "sleep": 60,
+        "photo_transcoder": False,
+        "empty_trash": False,
+        "clean_bundles": False,
+        "optimize_db": False,
+        "local_db": False,
+        "use_existing": False,
+        "ignore_running": False,
+        "trace": False,
+        "log_requests": False,
+        "no_verify_ssl": False,
+        "overlays_only": False,
+    }
+    canonical.update(section)
+
+    canonical["branch_override"] = helpers.normalize_imagemaid_branch_override(canonical.get("branch_override")) or ""
+    canonical["plex_path"] = str(canonical.get("plex_path") or "").strip()
+    canonical["mode"] = str(canonical.get("mode") or "report").strip().lower() or "report"
+
+    for numeric_key, default_value in (("timeout", 600), ("sleep", 60)):
+        raw_value = canonical.get(numeric_key)
+        try:
+            canonical[numeric_key] = int(raw_value)
+        except (TypeError, ValueError):
+            canonical[numeric_key] = default_value
+
+    for bool_key in (
+        "photo_transcoder",
+        "empty_trash",
+        "clean_bundles",
+        "optimize_db",
+        "local_db",
+        "use_existing",
+        "ignore_running",
+        "trace",
+        "log_requests",
+        "no_verify_ssl",
+        "overlays_only",
+    ):
+        canonical[bool_key] = helpers.booler(canonical.get(bool_key))
+
+    return canonical
+
+
+def _get_imagemaid_settings_section(config_name=None):
+    resolved_config = config_name or persistence.ensure_session_config_name()
+    settings = _retrieve_settings_for_config(resolved_config, "915-imagemaid") or {}
     section = settings.get("imagemaid", {}) if isinstance(settings, dict) else {}
     if not isinstance(section, dict):
         section = {}
     return settings, section
 
 
-def _persist_imagemaid_validation(section_data, is_valid, reason=None, details=None):
-    config_name = persistence.ensure_session_config_name()
+def _persist_imagemaid_validation(config_name, section_data, is_valid, reason=None, details=None):
     stored_validated, user_entered, stored_payload = database.retrieve_section_data(config_name, "imagemaid")
     payload = stored_payload if isinstance(stored_payload, dict) else {}
     payload["imagemaid"] = section_data if isinstance(section_data, dict) else {}
@@ -12804,16 +17294,25 @@ def _build_imagemaid_command(section_data, plex_url, plex_token, imagemaid_root=
     return subprocess.list2cmdline(parts)
 
 
-def _validate_imagemaid_settings(section_data):
+def _validate_imagemaid_settings(section_data, config_name=None):
+    if config_name:
+        resolved_config = config_name
+    elif has_request_context():
+        resolved_config = session.get("config_name") or persistence.ensure_session_config_name()
+    else:
+        resolved_config = None
     mode = str(section_data.get("mode") or "report").strip().lower() or "report"
     valid_modes = {"report", "move", "restore", "clear", "remove", "nothing"}
     if mode not in valid_modes:
         return False, "invalid_mode", f"ImageMaid mode must be one of: {', '.join(sorted(valid_modes))}."
 
-    plex_settings = persistence.retrieve_settings("010-plex") or {}
+    plex_settings = _retrieve_settings_for_config(resolved_config, "010-plex") if resolved_config else (persistence.retrieve_settings("010-plex") or {})
     if not helpers.booler(plex_settings.get("validated", False)):
         return False, "missing_plex_validation", "Validate the Plex page before running ImageMaid."
-    plex_url, plex_token = persistence.get_stored_plex_credentials("010-plex")
+    if resolved_config:
+        plex_url, plex_token = _get_stored_plex_credentials_for_config(resolved_config)
+    else:
+        plex_url, plex_token = persistence.get_stored_plex_credentials()
     if not plex_url or not plex_token:
         return False, "missing_credentials", "Saved Plex URL/token are required."
     valid_path, reason, details = _validate_imagemaid_plex_path(
@@ -12841,13 +17340,36 @@ def _get_latest_imagemaid_log_path():
     log_dir = helpers.get_imagemaid_root_path() / "config" / "logs"
     if not log_dir.exists():
         return None
-    candidates = sorted(log_dir.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
+    candidates = sorted(
+        [path for path in log_dir.glob("*.log") if path.name.lower() != "imagemaid.quickstart-maintenance.log"],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
     return candidates[0] if candidates else None
 
 
 def _read_text_tail(path, max_lines=200):
-    with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
-        return "".join(deque(handle, maxlen=max_lines))
+    content = _read_logscan_text(path, encoding="utf-8", errors="replace")
+    return "".join(deque(content.splitlines(keepends=True), maxlen=max_lines))
+
+
+def _read_text_tail_payload(path, max_lines=200):
+    path_obj = Path(path)
+    content = _read_logscan_text(path_obj, encoding="utf-8", errors="replace")
+    lines = content.splitlines()
+    tail_text = "\n".join(lines[-max_lines:]) if lines else ""
+    if tail_text and content.endswith("\n"):
+        tail_text += "\n"
+    try:
+        stats = path_obj.stat()
+        log_age_seconds = max(0, int(time.time() - stats.st_mtime))
+    except Exception:
+        log_age_seconds = None
+    return {
+        "text": tail_text,
+        "total_lines": len(lines),
+        "log_age_seconds": log_age_seconds,
+    }
 
 
 def _sanitize_imagemaid_log_tail(text):
@@ -13220,15 +17742,16 @@ def update_imagemaid_progress():
 @app.route("/validate-imagemaid", methods=["POST"])
 def validate_imagemaid():
     payload = request.get_json(silent=True) or {}
+    config_name = _resolve_request_config_name(payload)
     form_payload = _imagemaid_settings_to_form_payload(payload)
     if form_payload:
-        persistence.save_settings("915-imagemaid", form_payload)
+        _save_imagemaid_settings_for_config(config_name, form_payload)
 
-    settings, section_data = _get_imagemaid_settings_section()
-    is_valid, reason, details = _validate_imagemaid_settings(section_data)
-    _persist_imagemaid_validation(section_data, is_valid, reason=reason, details=details)
+    settings, section_data = _get_imagemaid_settings_section(config_name)
+    is_valid, reason, details = _validate_imagemaid_settings(section_data, config_name=config_name)
+    _persist_imagemaid_validation(config_name, section_data, is_valid, reason=reason, details=details)
 
-    plex_url, plex_token = persistence.get_stored_plex_credentials("010-plex")
+    plex_url, plex_token = _get_stored_plex_credentials_for_config(config_name)
     preview_command = _build_imagemaid_command(section_data, plex_url or "", plex_token or "", redact=True)
     return jsonify(success=is_valid, validated=is_valid, reason=reason, details=details, command_preview=preview_command), (200 if is_valid else 400)
 
@@ -13236,29 +17759,35 @@ def validate_imagemaid():
 @app.route("/autosave-imagemaid", methods=["POST"])
 def autosave_imagemaid():
     payload = request.get_json(silent=True) or {}
+    config_name = _resolve_request_config_name(payload)
     form_payload = _imagemaid_settings_to_form_payload(payload)
+    changed = False
     if form_payload:
-        persistence.save_settings("915-imagemaid", form_payload)
+        _saved_payload, changed = _save_imagemaid_settings_for_config(config_name, form_payload)
 
-    settings, section_data = _get_imagemaid_settings_section()
-    if helpers.booler(settings.get("validated", False)):
+    settings, section_data = _get_imagemaid_settings_section(config_name)
+    if changed and helpers.booler(settings.get("validated", False)):
         _persist_imagemaid_validation(
+            config_name,
             section_data,
             False,
             reason="config_changed",
             details="Configuration changed. Validate ImageMaid again.",
         )
+        validated = False
+    else:
+        validated = helpers.booler(settings.get("validated", False))
 
-    return jsonify(success=True, validated=False)
+    return jsonify(success=True, changed=changed, validated=validated)
 
 
 @app.route("/start-imagemaid", methods=["POST"])
 def start_imagemaid():
-    config_name = session.get("config_name") or persistence.ensure_session_config_name()
     payload = request.get_json(silent=True) or {}
+    config_name = _resolve_request_config_name(payload)
     form_payload = _imagemaid_settings_to_form_payload(payload)
     if form_payload:
-        persistence.save_settings("915-imagemaid", form_payload)
+        _save_imagemaid_settings_for_config(config_name, form_payload)
 
     if helpers.is_imagemaid_running():
         pid = helpers.get_imagemaid_pid()
@@ -13299,15 +17828,15 @@ def start_imagemaid():
             response["phase"] = job.get("phase")
         return jsonify(response), 409
 
-    settings, section_data = _get_imagemaid_settings_section()
-    is_valid, reason, details = _validate_imagemaid_settings(section_data)
-    _persist_imagemaid_validation(section_data, is_valid, reason=reason, details=details)
+    settings, section_data = _get_imagemaid_settings_section(config_name)
+    is_valid, reason, details = _validate_imagemaid_settings(section_data, config_name=config_name)
+    _persist_imagemaid_validation(config_name, section_data, is_valid, reason=reason, details=details)
     if not is_valid:
         return jsonify({"error": details or "ImageMaid settings are not valid.", "status": "invalid", "reason": reason}), 400
 
-    start_min, end_min, window_str = _get_maintenance_window_live()
+    start_min, end_min, window_str = _resolve_maintenance_window_live(config_name=config_name)
     if start_min is None or end_min is None:
-        start_min, end_min, window_str = _get_maintenance_window_from_db()
+        start_min, end_min, window_str = _resolve_maintenance_window_from_db(config_name=config_name)
     if _is_within_maintenance_window(datetime.now(), start_min, end_min):
         try:
             _write_quickstart_imagemaid_maintenance_marker(
@@ -13332,7 +17861,7 @@ def start_imagemaid():
             409,
         )
 
-    plex_url, plex_token = persistence.get_stored_plex_credentials("010-plex")
+    plex_url, plex_token = _get_stored_plex_credentials_for_config(config_name)
     command = _build_imagemaid_command_parts(section_data, plex_url, plex_token, redact=False)
     ok, result = _launch_imagemaid_command(command, mode=section_data.get("mode"), config_name=config_name)
     if ok:
@@ -13380,6 +17909,7 @@ def stop_imagemaid():
             os.remove(pid_file)
         except Exception:
             pass
+        _clear_imagemaid_run_context()
         try:
             _write_quickstart_imagemaid_stop_marker(
                 helpers.get_imagemaid_root_path(),
@@ -13402,6 +17932,7 @@ def stop_imagemaid():
             os.remove(pid_file)
         except Exception:
             pass
+        _clear_imagemaid_run_context()
         try:
             _settings, section_data = _get_imagemaid_settings_section()
             imagemaid_mode = section_data.get("mode") if isinstance(section_data, dict) else None
@@ -13421,8 +17952,18 @@ def stop_imagemaid():
 
 @app.route("/imagemaid-status", methods=["GET"])
 def imagemaid_status():
+    try:
+        _refresh_maintenance_window_availability(preserve_active_state=True)
+    except Exception:
+        pass
     pid = helpers.get_imagemaid_pid()
     pid_file = Path(helpers.get_imagemaid_pid_file())
+    imagemaid_ctx = _get_imagemaid_run_context()
+    with MAINTENANCE_STATE_LOCK:
+        maintenance_active = MAINTENANCE_STATE["active"]
+        maintenance_window = MAINTENANCE_STATE["window"]
+        maintenance_paused = MAINTENANCE_STATE["imagemaid_paused"]
+        maintenance_paused_since = MAINTENANCE_STATE["imagemaid_paused_since"]
 
     def pid_file_age_seconds():
         try:
@@ -13446,7 +17987,14 @@ def imagemaid_status():
             _ingest_completed_live_logs("imagemaid")
         except Exception:
             pass
-        return jsonify(status="not started")
+        _clear_imagemaid_run_context()
+        return jsonify(
+            status="not started",
+            maintenance_active=maintenance_active,
+            maintenance_paused=maintenance_paused,
+            maintenance_window=maintenance_window,
+            maintenance_paused_since=maintenance_paused_since,
+        )
 
     try:
         proc = psutil.Process(pid)
@@ -13469,12 +18017,57 @@ def imagemaid_status():
                 cmdline = ""
             if "imagemaid.py" in cmdline:
                 started_at = datetime.fromtimestamp(started_at_ts).isoformat()
-                return jsonify(status="running", pid=pid, started_at=started_at, started_at_ts=started_at_ts, elapsed_seconds=elapsed_seconds)
+                cpu_percent = _calculate_process_cpu_percent(proc)
+                io_stats = _calculate_process_io_stats(proc, "imagemaid") or {}
+                mem_rss = proc.memory_info().rss
+                try:
+                    for child in proc.children(recursive=True):
+                        try:
+                            mem_rss += child.memory_info().rss
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                mem_rss_mb = mem_rss / (1024 * 1024)
+                system_cpu_percent = _calculate_system_cpu_percent()
+                vm = psutil.virtual_memory()
+                system_mem_used_mb = (vm.total - vm.available) / (1024 * 1024)
+                system_mem_total_mb = vm.total / (1024 * 1024)
+                mem_percent = (mem_rss / vm.total) * 100.0 if vm.total else None
+                return jsonify(
+                    status="running",
+                    pid=pid,
+                    started_at=started_at,
+                    started_at_ts=started_at_ts,
+                    elapsed_seconds=elapsed_seconds,
+                    cpu_percent=round(cpu_percent, 1) if cpu_percent is not None else None,
+                    memory_rss_mb=round(mem_rss_mb, 1),
+                    memory_percent=round(mem_percent, 2) if mem_percent is not None else None,
+                    disk_read_mb=round(io_stats.get("disk_read_mb"), 1) if io_stats.get("disk_read_mb") is not None else None,
+                    disk_write_mb=round(io_stats.get("disk_write_mb"), 1) if io_stats.get("disk_write_mb") is not None else None,
+                    disk_read_rate_mb_s=round(io_stats.get("disk_read_rate_mb_s"), 2) if io_stats.get("disk_read_rate_mb_s") is not None else None,
+                    disk_write_rate_mb_s=round(io_stats.get("disk_write_rate_mb_s"), 2) if io_stats.get("disk_write_rate_mb_s") is not None else None,
+                    system_cpu_percent=round(system_cpu_percent, 1) if system_cpu_percent is not None else None,
+                    system_memory_percent=round(vm.percent, 1),
+                    system_memory_used_mb=round(system_mem_used_mb, 1),
+                    system_memory_total_mb=round(system_mem_total_mb, 1),
+                    maintenance_active=maintenance_active,
+                    maintenance_paused=maintenance_paused,
+                    maintenance_window=maintenance_window,
+                    maintenance_paused_since=maintenance_paused_since,
+                    active_command=imagemaid_ctx.get("command"),
+                    mode=imagemaid_ctx.get("mode"),
+                    config_name=imagemaid_ctx.get("config_name"),
+                )
             if within_grace:
                 payload = {"status": "starting", "pid": pid, "elapsed_seconds": elapsed_seconds}
                 if started_at_ts is not None:
                     payload["started_at"] = datetime.fromtimestamp(started_at_ts).isoformat()
                     payload["started_at_ts"] = started_at_ts
+                payload["maintenance_active"] = maintenance_active
+                payload["maintenance_paused"] = maintenance_paused
+                payload["maintenance_window"] = maintenance_window
+                payload["maintenance_paused_since"] = maintenance_paused_since
                 return jsonify(payload)
         try:
             rc = proc.wait(timeout=0.1)
@@ -13484,6 +18077,10 @@ def imagemaid_status():
                 if started_at_ts is not None:
                     payload["started_at"] = datetime.fromtimestamp(started_at_ts).isoformat()
                     payload["started_at_ts"] = started_at_ts
+                payload["maintenance_active"] = maintenance_active
+                payload["maintenance_paused"] = maintenance_paused
+                payload["maintenance_window"] = maintenance_window
+                payload["maintenance_paused_since"] = maintenance_paused_since
                 return jsonify(payload)
             rc = None
         finally:
@@ -13492,37 +18089,73 @@ def imagemaid_status():
                     os.remove(pid_file)
                 except Exception:
                     pass
+                _clear_process_metric_cache(pid, "imagemaid")
+                _clear_imagemaid_run_context()
         if not within_grace:
             try:
                 _ingest_completed_live_logs("imagemaid")
             except Exception:
                 pass
-        return jsonify(status="done", return_code=rc if rc is not None else -1)
+        return jsonify(
+            status="done",
+            return_code=rc if rc is not None else -1,
+            maintenance_active=maintenance_active,
+            maintenance_paused=maintenance_paused,
+            maintenance_window=maintenance_window,
+            maintenance_paused_since=maintenance_paused_since,
+        )
     except psutil.NoSuchProcess:
         age = pid_file_age_seconds()
         if age is not None and age < IMAGEMAID_STARTUP_GRACE_SECONDS:
-            return jsonify(status="starting", pid=pid, elapsed_seconds=max(0, int(age)))
+            return jsonify(
+                status="starting",
+                pid=pid,
+                elapsed_seconds=max(0, int(age)),
+                maintenance_active=maintenance_active,
+                maintenance_paused=maintenance_paused,
+                maintenance_window=maintenance_window,
+                maintenance_paused_since=maintenance_paused_since,
+            )
         try:
             os.remove(pid_file)
         except Exception:
             pass
-        return jsonify(status="not started")
+        _clear_process_metric_cache(pid, "imagemaid")
+        _clear_imagemaid_run_context()
+        return jsonify(
+            status="not started",
+            maintenance_active=maintenance_active,
+            maintenance_paused=maintenance_paused,
+            maintenance_window=maintenance_window,
+            maintenance_paused_since=maintenance_paused_since,
+        )
 
 
 @app.route("/tail-imagemaid-log", methods=["GET"])
 def tail_imagemaid_log():
     latest_log = _get_latest_imagemaid_log_path()
     path = latest_log if latest_log and Path(latest_log).exists() else None
+    try:
+        lines_param = str(request.args.get("lines", "2000")).strip().lower()
+        max_lines = None
+        if lines_param not in ("all", "full"):
+            max_lines = max(1, min(int(lines_param), 20000))
+    except Exception:
+        max_lines = 2000
 
     if not path or not Path(path).exists():
         return jsonify({"error": "No ImageMaid log found."}), 404
     try:
-        text = _sanitize_imagemaid_log_tail(_read_text_tail(path))
+        payload = _read_text_tail_payload(path, max_lines=max_lines)
+        text = _sanitize_imagemaid_log_tail(payload.get("text"))
         return jsonify(
             {
                 "success": True,
                 "path": str(path),
                 "text": text,
+                "total_lines": payload.get("total_lines"),
+                "log_age_seconds": payload.get("log_age_seconds"),
+                "requested_lines": "all" if max_lines is None else max_lines,
             }
         )
     except Exception as e:
@@ -13854,7 +18487,7 @@ def clone_test_libraries_start():
             set_job_progress(
                 phase="download",
                 pct=0 if total_size else None,  # None => indeterminate until we know size
-                text="Downloading zip…",
+                text="Downloading zip...",
                 downloaded=0,
                 total=total_size,
                 estimated=estimated,
@@ -13908,7 +18541,7 @@ def clone_test_libraries_start():
                                 set_job_progress(
                                     phase="download",
                                     pct=pct,
-                                    text="Downloading zip…",
+                                    text="Downloading zip...",
                                     downloaded=downloaded,
                                     total=total_size,
                                     estimated=estimated,
@@ -13920,7 +18553,7 @@ def clone_test_libraries_start():
                 set_job_progress(
                     phase="extract",
                     pct=0,
-                    text="Extracting…",
+                    text="Extracting...",
                     files_done=0,
                     files_total=0,
                 )
@@ -13940,7 +18573,7 @@ def clone_test_libraries_start():
                             set_job_progress(
                                 phase="extract",
                                 pct=pct,
-                                text=f"Extracting… {files_done}/{total_files} files",
+                                text=f"Extracting... {files_done}/{total_files} files",
                                 files_done=files_done,
                                 files_total=total_files,
                             )
@@ -13949,7 +18582,7 @@ def clone_test_libraries_start():
                 extracted_dir = os.path.join(tmpdir, "plex-test-libraries-main")
 
                 # Finalize (replace folder)
-                set_job_progress(phase="finalize", pct=95, text="Finalizing…")
+                set_job_progress(phase="finalize", pct=95, text="Finalizing...")
                 if os.path.exists(target_path):
                     if not _safe_to_replace_test_libraries(target_path):
                         raise RuntimeError("Target path exists but does not look like test libraries. Choose an empty folder or one containing test libraries.")
@@ -14178,9 +18811,49 @@ def purge_test_libraries():
         return jsonify(success=False, message=f"Failed to delete folder:\n{str(e)}")
 
 
+@app.route("/validate_metadata_file", methods=["POST"])
+def validate_metadata_file():
+    data = request.get_json(silent=True) or {}
+    return _validate_and_organize_library_file_request(
+        "metadata_files",
+        data,
+        "metadata_file_type",
+        "metadata_file_location",
+    )
+
+
+@app.route("/validate_collection_file", methods=["POST"])
+def validate_collection_file():
+    data = request.get_json(silent=True) or {}
+    return _validate_and_organize_library_file_request(
+        "collection_files",
+        data,
+        "collection_file_type",
+        "collection_file_location",
+    )
+
+
+@app.route("/validate_overlay_file", methods=["POST"])
+def validate_overlay_file():
+    data = request.get_json(silent=True) or {}
+    return _validate_and_organize_library_file_request(
+        "overlay_files",
+        data,
+        "overlay_file_type",
+        "overlay_file_location",
+    )
+
+
 @app.route("/restart", methods=["POST"])
 def restart_quickstart():
     data = request.get_json(silent=True) or {}
+    nonce = data.get("nonce")
+    session_nonce = session.get("restart_nonce")
+
+    if not nonce or nonce != session_nonce:
+        return jsonify(success=False, message="Restart not authorized."), 403
+
+    session.pop("restart_nonce", None)
     reason = data.get("reason")
     if reason == "update":
         helpers.set_restart_notice(

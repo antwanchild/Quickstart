@@ -63,12 +63,49 @@ MAX_LOG_BACKUPS = 10
 RESTART_NOTICE_FILE = os.path.join(CONFIG_DIR, ".restart_notice.json")
 PLEX_DISCOVERY_CACHE_TTL_SECONDS = int(os.environ.get("QS_PLEX_DISCOVERY_CACHE_TTL_SECONDS", "300"))
 _PLEX_DISCOVERY_CACHE = {}
+JSON_SCHEMA_REFRESH_TTL_SECONDS = int(os.environ.get("QS_JSON_SCHEMA_REFRESH_TTL_SECONDS", "1800"))
+_JSON_SCHEMA_LAST_REFRESH_AT = 0.0
+QS_UPDATE_CACHE_TTL_SECONDS = int(os.environ.get("QS_UPDATE_CACHE_TTL_SECONDS", "600"))
+_QS_UPDATE_CACHE = {}
 KOMETA_UPDATE_CACHE_TTL_SECONDS = int(os.environ.get("QS_KOMETA_UPDATE_CACHE_TTL_SECONDS", "600"))
 _KOMETA_UPDATE_CACHE = {}
 KOMETA_BRANCH_OVERRIDES = {"master", "develop", "nightly"}
 IMAGEMAID_UPDATE_CACHE_TTL_SECONDS = int(os.environ.get("QS_IMAGEMAID_UPDATE_CACHE_TTL_SECONDS", "600"))
 _IMAGEMAID_UPDATE_CACHE = {}
 IMAGEMAID_BRANCH_OVERRIDES = {"master", "develop"}
+
+JSON_SCHEMA_SYNC_FILES = (
+    ("README.md", "json-schema/README.md"),
+    ("MODULE.md", "json-schema/MODULE.md"),
+    ("collection-schema.json", "json-schema/collection-schema.json"),
+    ("config-schema.json", "json-schema/config-schema.json"),
+    ("kitchen_sink_config.yml", "json-schema/kitchen_sink_config.yml"),
+    ("metadata-schema.json", "json-schema/metadata-schema.json"),
+    ("overlay-schema.json", "json-schema/overlay-schema.json"),
+    ("playlist-schema.json", "json-schema/playlist-schema.json"),
+    ("prototype_comprehensive.yml", "json-schema/prototype_comprehensive.yml"),
+    ("prototype_config.yml", "json-schema/prototype_config.yml"),
+    ("template-schema.json", "json-schema/template-schema.json"),
+    ("builders/anidb.yml", "json-schema/builders/anidb.yml"),
+    ("builders/anilist.yml", "json-schema/builders/anilist.yml"),
+    ("builders/dynamic_collections.yml", "json-schema/builders/dynamic_collections.yml"),
+    ("builders/imdb.yml", "json-schema/builders/imdb.yml"),
+    ("builders/letterboxd.yml", "json-schema/builders/letterboxd.yml"),
+    ("builders/mdblist.yml", "json-schema/builders/mdblist.yml"),
+    ("builders/metadata.yml", "json-schema/builders/metadata.yml"),
+    ("builders/myanimelist.yml", "json-schema/builders/myanimelist.yml"),
+    ("builders/other.yml", "json-schema/builders/other.yml"),
+    ("builders/overlays.yml", "json-schema/builders/overlays.yml"),
+    ("builders/playlists.yml", "json-schema/builders/playlists.yml"),
+    ("builders/plex.yml", "json-schema/builders/plex.yml"),
+    ("builders/radarr.yml", "json-schema/builders/radarr.yml"),
+    ("builders/sonarr.yml", "json-schema/builders/sonarr.yml"),
+    ("builders/tautulli.yml", "json-schema/builders/tautulli.yml"),
+    ("builders/tmdb.yml", "json-schema/builders/tmdb.yml"),
+    ("builders/trakt.yml", "json-schema/builders/trakt.yml"),
+    ("builders/tvdb.yml", "json-schema/builders/tvdb.yml"),
+    ("config.yml.template", "config/config.yml.template"),
+)
 
 
 def detect_git_branch(repo_root=None, default="develop"):
@@ -214,6 +251,42 @@ def get_cached_kometa_update(kometa_root=None, force_refresh=False, branch_overr
     }
 
 
+def _managed_kometa_root_default() -> Path:
+    return Path(os.path.join(CONFIG_DIR, "kometa")).resolve()
+
+
+def _get_persisted_kometa_runtime_section() -> dict:
+    try:
+        settings = persistence.retrieve_settings("900-kometa") or {}
+    except Exception:
+        return {}
+    section = settings.get("kometa", {}) if isinstance(settings, dict) else {}
+    return section if isinstance(section, dict) else {}
+
+
+def get_kometa_install_mode() -> str:
+    mode = None
+    if has_app_context():
+        mode = app.config.get("KOMETA_INSTALL_MODE")
+    if not mode and has_request_context():
+        mode = session.get("kometa_install_mode")
+    if not mode and has_request_context():
+        mode = _get_persisted_kometa_runtime_section().get("install_mode")
+    normalized = str(mode or "").strip().lower()
+    if normalized in {"existing", "external"}:
+        return normalized
+    return "managed"
+
+
+def get_kometa_install_mode_label(mode=None) -> str:
+    normalized = str(mode or get_kometa_install_mode()).strip().lower()
+    if normalized == "existing":
+        return "Existing direct install"
+    if normalized == "external":
+        return "External/containerized config+logs"
+    return "Quickstart-managed install"
+
+
 def invalidate_cached_kometa_update(kometa_root=None):
     if kometa_root is None:
         _KOMETA_UPDATE_CACHE.clear()
@@ -346,7 +419,7 @@ def extract_library_name(key):
     # known section marker. This avoids greedy matches when template variable
     # keys themselves contain hyphens (e.g. `use_South-Eastern Asia`).
     match = re.match(
-        r"^(?:mov|sho)-library_(.+?)-(?:library$|collection_|template_|attribute_|overlay_|top_level_)",
+        r"^(?:mov|sho)-library_(.+?)-(?:library$|collection_|template_|attribute_|overlay_|top_level_|metadata_files$)",
         key,
     )
     return match.group(1) if match else None
@@ -381,6 +454,10 @@ def calculate_hash(content):
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _schema_files_present():
+    return all(os.path.exists(os.path.join(JSON_SCHEMA_DIR, filename)) for filename, _remote_path in JSON_SCHEMA_SYNC_FILES)
+
+
 def load_previous_hashes():
     """Load the last known hashes of schema files."""
     if not os.path.exists(HASH_FILE):
@@ -403,26 +480,28 @@ def save_hashes(hashes):
 
 def ensure_json_schema():
     """Ensure json-schema files exist and are up-to-date based on hash checks."""
+    global _JSON_SCHEMA_LAST_REFRESH_AT
+
     # branch = get_kometa_branch()
     branch = "nightly"
+
+    if _schema_files_present() and _JSON_SCHEMA_LAST_REFRESH_AT <= 0:
+        try:
+            reference_path = Path(HASH_FILE if os.path.exists(HASH_FILE) else os.path.join(JSON_SCHEMA_DIR, "config-schema.json"))
+            _JSON_SCHEMA_LAST_REFRESH_AT = time.monotonic() - max(0, time.time() - reference_path.stat().st_mtime)
+        except Exception:
+            _JSON_SCHEMA_LAST_REFRESH_AT = time.monotonic()
+
+    if _schema_files_present():
+        age = time.monotonic() - _JSON_SCHEMA_LAST_REFRESH_AT
+        if _JSON_SCHEMA_LAST_REFRESH_AT > 0 and age <= JSON_SCHEMA_REFRESH_TTL_SECONDS:
+            return
 
     previous_hashes = load_previous_hashes()
     new_hashes = {}
 
-    for filename, url in [
-        (
-            "prototype_config.yml",
-            f"{GITHUB_BASE_URL}/{branch}/json-schema/prototype_config.yml",
-        ),
-        (
-            "config-schema.json",
-            f"{GITHUB_BASE_URL}/{branch}/json-schema/config-schema.json",
-        ),
-        (
-            "config.yml.template",
-            f"{GITHUB_BASE_URL}/{branch}/config/config.yml.template",
-        ),
-    ]:
+    for filename, remote_path in JSON_SCHEMA_SYNC_FILES:
+        url = f"{GITHUB_BASE_URL}/{branch}/{remote_path}"
         file_path = os.path.join(JSON_SCHEMA_DIR, filename)  # Store everything in json-schema
 
         try:
@@ -437,6 +516,7 @@ def ensure_json_schema():
                 continue
 
             # Save the new file if hash has changed
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(new_content)
 
@@ -448,6 +528,8 @@ def ensure_json_schema():
 
     # Save updated hashes
     save_hashes(new_hashes)
+    if _schema_files_present():
+        _JSON_SCHEMA_LAST_REFRESH_AT = time.monotonic()
 
 
 def get_remote_version(branch):
@@ -515,6 +597,13 @@ def check_for_update():
     """Compare the local version with the remote version and determine Kometa branch."""
     branch = get_branch()
     local_version = get_version(branch)
+    cache_key = (branch, local_version)
+    cached = _QS_UPDATE_CACHE.get(cache_key)
+    if cached:
+        age = time.monotonic() - cached.get("created_at", 0)
+        if age <= QS_UPDATE_CACHE_TTL_SECONDS:
+            return copy.deepcopy(cached.get("payload") or {})
+
     remote_version = get_remote_version(branch)
 
     update_available = remote_version and remote_version != local_version
@@ -526,7 +615,7 @@ def check_for_update():
     # Get OS name and correct extension
     os_name, os_ext = get_running_os()
 
-    return {
+    payload = {
         "local_version": local_version,
         "remote_version": remote_version,
         "branch": branch,
@@ -535,6 +624,11 @@ def check_for_update():
         "running_on": os_name,
         "file_ext": os_ext,
     }
+    _QS_UPDATE_CACHE[cache_key] = {
+        "created_at": time.monotonic(),
+        "payload": copy.deepcopy(payload),
+    }
+    return payload
 
 
 def get_running_os():
@@ -770,6 +864,9 @@ def get_quickstart_settings_summary():
         value = get_value(key, "")
         lines.append(f"# {label}: {formatter(value)}")
 
+    kometa_mode = get_kometa_install_mode()
+    lines.append(f"# Kometa Runtime Mode: {get_kometa_install_mode_label(kometa_mode)}")
+
     extra_keys = sorted(key for key in app.config.keys() if key.startswith("QS_") and key not in handled and key not in skip)
     for key in extra_keys:
         value = get_value(key, "")
@@ -994,27 +1091,90 @@ def get_plex_key_by_name(full_list, target_name):
     return None  # Or raise an exception if you prefer
 
 
-def find_item_by_imdb_id(library_name, imdb_id, media_type):
-    from modules import plex_connection
+def _extract_imdb_id_from_item(item):
+    for guid in getattr(item, "guids", []) or []:
+        guid_id = str(getattr(guid, "id", "") or "").strip().lower()
+        if guid_id.startswith("imdb://"):
+            return guid_id.replace("imdb://", "", 1)
+    return ""
 
-    if not imdb_id:
+
+def _normalize_lookup_title(value):
+    normalized = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    return normalized
+
+
+def find_item_by_title(library_name, title):
+    normalized_title = _normalize_lookup_title(title)
+    if not normalized_title:
         return None
 
-    plex = plex_connection.connect_to_plex()
-    if not plex:
+    plex_url, plex_token = persistence.get_stored_plex_credentials("010-plex")
+    if not plex_url or not plex_token:
         return None
 
-    section = plex.library.section(library_name)
-    if not section:
+    plex = PlexServer(plex_url, plex_token, timeout=8)
+
+    try:
+        section = plex.library.section(library_name)
+    except Exception:
         return None
 
-    # Search by IMDb ID
-    results = section.search(guid=f"imdb://{imdb_id}")
-    if not results:
+    results = section.search(title=title, maxresults=20)
+    for item in results or []:
+        item_title = str(getattr(item, "title", "") or "").strip()
+        if _normalize_lookup_title(item_title) == normalized_title:
+            return {"title": item_title}
+    return None
+
+
+def find_item_by_imdb_id(library_name, imdb_id, media_type, fallback_title=None):
+    normalized_imdb_id = str(imdb_id or "").strip().lower()
+    if not normalized_imdb_id:
         return None
 
-    item = results[0]
-    return {"id": imdb_id, "title": item.title}
+    plex_url, plex_token = persistence.get_stored_plex_credentials("010-plex")
+    if not plex_url or not plex_token:
+        return None
+
+    plex = PlexServer(plex_url, plex_token, timeout=8)
+
+    try:
+        section = plex.library.section(library_name)
+    except Exception:
+        return None
+
+    def build_match(item, source):
+        title = str(getattr(item, "title", "") or "").strip()
+        if not title:
+            return None
+        return {"id": normalized_imdb_id, "title": title, "source": source}
+
+    def find_exact_imdb_match(candidates, source):
+        for item in candidates or []:
+            if _extract_imdb_id_from_item(item) == normalized_imdb_id:
+                return build_match(item, source)
+        return None
+
+    direct_guid_match = find_exact_imdb_match(
+        section.search(guid=f"imdb://{normalized_imdb_id}"),
+        "plex-guid",
+    )
+    if direct_guid_match:
+        return direct_guid_match
+
+    if fallback_title:
+        title_results = section.search(title=fallback_title, maxresults=20)
+        exact_title_guid_match = find_exact_imdb_match(title_results, "plex-title-guid")
+        if exact_title_guid_match:
+            return exact_title_guid_match
+
+        normalized_fallback_title = _normalize_lookup_title(fallback_title)
+        for item in title_results or []:
+            if _normalize_lookup_title(getattr(item, "title", "")) == normalized_fallback_title:
+                return build_match(item, "plex-title")
+
+    return None
 
 
 def allowed_extensions_string():
@@ -1023,51 +1183,32 @@ def allowed_extensions_string():
 
 def get_plex_summary():
     try:
-        plex_url, plex_token = persistence.get_stored_plex_credentials("010-plex")
-        plex = PlexServer(plex_url, plex_token)
+        metadata = get_plex_metadata()
+        if not isinstance(metadata, dict):
+            return "Plex summary unavailable."
 
-        # Core metadata
-        server_name = plex.friendlyName or "Plex Server"
-        version = plex.version or "Unknown Version"
-        platform = plex.platform or "Unknown OS"
-        platform_version = plex.platformVersion or "Unknown Version"
+        server_name = metadata.get("server_name") or "Plex Server"
+        version = metadata.get("version") or "Unknown Version"
+        platform = metadata.get("platform") or "Unknown OS"
+        platform_version = metadata.get("platformVersion") or "Unknown Version"
+        db_cache_str = metadata.get("db_cache") or "Unknown"
 
-        # Settings
-        settings = plex.settings
-
-        # DB Cache
-        try:
-            db_cache_size = settings.get("DatabaseCacheSize").value
-            db_cache_str = f"{db_cache_size} MB"
-        except NotFound:
-            db_cache_str = "Unknown"
-
-        # Update Channel
-        try:
-            update_channel = settings.get("butlerUpdateChannel").value
-            if update_channel == "16":
-                update_channel_str = "Public update channel."
-            elif update_channel == "8":
-                update_channel_str = "PlexPass update channel."
-            else:
-                update_channel_str = f"Unknown update channel ({update_channel})."
-        except NotFound:
+        update_channel = metadata.get("update_channel")
+        if update_channel == "Public update channel":
+            update_channel_str = "Public update channel."
+        elif update_channel == "PlexPass update channel":
+            update_channel_str = "PlexPass update channel."
+        elif update_channel:
+            update_channel_str = f"{update_channel}."
+        else:
             update_channel_str = "Unknown update channel."
 
-        # Plex Pass Status
-        try:
-            plex_pass = plex.myPlexAccount().subscriptionActive
-        except Exception:
-            plex_pass = "Unknown"
-
+        plex_pass = metadata.get("plex_pass", "Unknown")
         plex_pass_str = f"PlexPass: {plex_pass} on {update_channel_str}"
-
-        # Maintenance Window
-        try:
-            start_hour = int(settings.get("butlerStartHour").value)
-            end_hour = int(settings.get("butlerEndHour").value)
-            maintenance_window = f"Scheduled maintenance running between {start_hour}:00 and {end_hour}:00"
-        except Exception:
+        maintenance_window_value = metadata.get("maintenance_window") or "Unavailable"
+        if maintenance_window_value and maintenance_window_value != "Unavailable":
+            maintenance_window = f"Scheduled maintenance running between {maintenance_window_value}"
+        else:
             maintenance_window = "Scheduled maintenance times could not be found."
 
         # Final summary string
@@ -1275,12 +1416,36 @@ def contains_non_latin(text):
     return bool(re.search(r"[^\x00-\x7F]", text))
 
 
+def _read_text_if_exists(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+
+def _directory_tree_signature(root: Path) -> list[tuple[str, int, int]]:
+    if not root.exists() or not root.is_dir():
+        return []
+
+    entries: list[tuple[str, int, int]] = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_dir():
+            entries.append((f"{relative}/", 0, 0))
+            continue
+        try:
+            stats = path.stat()
+            entries.append((relative, int(stats.st_size), int(stats.st_mtime_ns)))
+        except Exception:
+            entries.append((relative, -1, -1))
+    return entries
+
+
 def save_to_named_config(yaml_text, config_name, font_refs=None):
     config_dir = Path(CONFIG_DIR)
-    kometa_root = Path(app.config.get("KOMETA_ROOT", "."))
-    kometa_config_dir = kometa_root / "config"
-    # Normalize config name
-    name = config_name.strip().lower().replace(" ", "_") or "default"
+    kometa_root = get_kometa_root_path()
+    kometa_config_dir = get_kometa_config_dir()
+    name = require_config_name_for_storage(config_name, context="Saving a named config")
     latest_filename = f"{name}_config.yml"
     latest_path = config_dir / latest_filename
     kometa_path = kometa_config_dir / latest_filename
@@ -1292,8 +1457,25 @@ def save_to_named_config(yaml_text, config_name, font_refs=None):
     if history_limit < 0:
         history_limit = 0
 
-    # If latest exists, archive it to _1, _2, etc.
-    if latest_path.exists():
+    existing_local_yaml = _read_text_if_exists(latest_path)
+    local_needs_write = existing_local_yaml != yaml_text
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+    kometa_write_ok = True
+    try:
+        kometa_config_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        kometa_write_ok = False
+        ts_log(f"Failed to create Kometa config directory {kometa_config_dir}: {exc}", level="WARNING")
+
+    if kometa_write_ok:
+        existing_kometa_yaml = _read_text_if_exists(kometa_path)
+        kometa_needs_write = existing_kometa_yaml != yaml_text
+    else:
+        kometa_needs_write = False
+
+    # Only rotate config history when the generated YAML actually changed.
+    if local_needs_write and latest_path.exists():
         archive_dir = config_dir / "archives" / name
         archive_dir.mkdir(parents=True, exist_ok=True)
         counter = 1
@@ -1313,18 +1495,15 @@ def save_to_named_config(yaml_text, config_name, font_refs=None):
                     except Exception as exc:
                         ts_log(f"Failed to prune archive {old_path}: {exc}", level="WARNING")
 
-    # Save the new config to both locations
-    config_dir.mkdir(parents=True, exist_ok=True)
-    kometa_write_ok = True
-    try:
-        kometa_config_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        kometa_write_ok = False
-        ts_log(f"Failed to create Kometa config directory {kometa_config_dir}: {exc}", level="WARNING")
+    if local_needs_write:
+        try:
+            with open(latest_path, "w", encoding="utf-8") as f:
+                f.write(yaml_text)
+        except OSError as exc:
+            ts_log(f"Failed to write Quickstart config to {latest_path}: {exc}", level="WARNING")
+            raise
 
-    with open(latest_path, "w", encoding="utf-8") as f:
-        f.write(yaml_text)
-    if kometa_write_ok:
+    if kometa_write_ok and kometa_needs_write:
         try:
             with open(kometa_path, "w", encoding="utf-8") as f:
                 f.write(yaml_text)
@@ -1334,7 +1513,7 @@ def save_to_named_config(yaml_text, config_name, font_refs=None):
 
     if font_refs and kometa_write_ok:
         try:
-            font_result = copy_fonts_to_kometa(font_refs, kometa_root=kometa_root)
+            font_result = copy_fonts_to_kometa(font_refs, kometa_root=kometa_root, kometa_config_dir=kometa_config_dir, config_name=name)
             missing = font_result.get("missing", [])
             errors = font_result.get("errors", [])
             if missing:
@@ -1344,9 +1523,29 @@ def save_to_named_config(yaml_text, config_name, font_refs=None):
         except Exception as exc:
             ts_log(f"Failed to sync fonts to Kometa: {exc}", level="WARNING")
 
-    ts_log(f"Saved new config to: {latest_path}")
     if kometa_write_ok:
+        try:
+            artifact_result = sync_managed_library_artifacts_to_kometa(name, kometa_root=kometa_root, kometa_config_dir=kometa_config_dir)
+            synced = artifact_result.get("synced", [])
+            removed = artifact_result.get("removed", [])
+            errors = artifact_result.get("errors", [])
+            if synced:
+                ts_log(f"Synced {len(synced)} managed library artifact tree(s) to Kometa target/{name}.")
+            if removed:
+                ts_log(f"Removed {len(removed)} stale managed library artifact tree(s) from Kometa target/{name}.")
+            for err in errors:
+                ts_log(err, level="WARNING")
+        except Exception as exc:
+            ts_log(f"Failed to sync managed library artifacts to Kometa: {exc}", level="WARNING")
+
+    if local_needs_write:
+        ts_log(f"Saved new config to: {latest_path}")
+    else:
+        ts_log(f"Config unchanged; reused existing Quickstart config at: {latest_path}")
+    if kometa_write_ok and kometa_needs_write:
         ts_log(f"Also copied config to: {kometa_path}")
+    elif kometa_write_ok:
+        ts_log(f"Kometa config unchanged; reused existing copy at: {kometa_path}")
 
     # Return POSIX-style filename (used for CLI path like --config config/name_config.yml)
     return latest_path.name
@@ -2128,7 +2327,7 @@ def _ensure_venv(kometa_dir: Path, logs: list[str], venv_name: str = "kometa-ven
     # Create venv if needed
     if not venv_dir.exists() or not _venv_ok():
         if venv_dir.exists() and not _venv_ok():
-            logs.append(f"⚠️ Existing {venv_name} looks invalid; recreating…")
+            logs.append(f"⚠️ Existing {venv_name} looks invalid; recreating...")
             try:
                 shutil.rmtree(venv_dir, ignore_errors=True)
             except Exception as e:
@@ -2192,7 +2391,7 @@ def _ensure_venv(kometa_dir: Path, logs: list[str], venv_name: str = "kometa-ven
 def _pip_install(python_bin: Path, kometa_dir: Path, logs: list[str], requirements_file: str = "requirements.txt") -> bool:
     is_windows = os.name == "nt"
 
-    logs.append("⬆️ Upgrading pip…")
+    logs.append("⬆️ Upgrading pip...")
     p = subprocess.run(
         [str(python_bin), "-m", "pip", "install", "--upgrade", "pip"],
         capture_output=True,
@@ -2206,7 +2405,7 @@ def _pip_install(python_bin: Path, kometa_dir: Path, logs: list[str], requiremen
         logs.append((p.stderr or p.stdout or "").strip() or "pip upgrade failed")
         return False
 
-    logs.append("📦 Installing requirements…")
+    logs.append("📦 Installing requirements...")
     p = subprocess.run(
         [str(python_bin), "-m", "pip", "install", "--no-cache-dir", "--upgrade", "-r", requirements_file],
         capture_output=True,
@@ -2286,6 +2485,65 @@ def perform_kometa_update_zip_only(config_root: str | Path, branch: str = "night
         return {"success": False, "log": logs}
 
 
+def perform_kometa_update_zip_only_at_root(kometa_root: str | Path, branch: str = "nightly", force: bool = False, logs=None):
+    """
+    Update Kometa by downloading/extracting the branch ZIP into an explicit Kometa root.
+    """
+    logs = logs if logs is not None else []
+    try:
+        kometa_dir = Path(kometa_root).resolve()
+        sha_file = kometa_dir / ".kometa_sha"
+        branch_file = kometa_dir / ".kometa_branch"
+
+        logs.append(f"⚙️ ZIP updater → branch '{branch}'")
+        _ensure_dir(kometa_dir)
+
+        upstream_sha = _get_upstream_sha(branch, logs)
+        if not upstream_sha:
+            return {"success": False, "log": logs}
+
+        local_sha = _read_text(sha_file)
+        if local_sha == upstream_sha and not force:
+            logs.append("✅ Up to date (SHA matches). Skipping download.")
+            return {"success": True, "log": logs, "up_to_date": True, "skipped": True}
+        if force:
+            logs.append("Force update requested; proceeding without SHA match check.")
+
+        zip_bytes = _download_zip(branch, logs)
+        if not zip_bytes:
+            return {"success": False, "log": logs}
+
+        backup_dir = _backup_kometa_runtime_assets(kometa_dir, logs)
+
+        if not _extract_zip_bytes(zip_bytes, kometa_dir, logs):
+            if backup_dir:
+                restored = _restore_kometa_runtime_assets(kometa_dir, backup_dir, logs)
+                if restored:
+                    _cleanup_kometa_backup(backup_dir, logs)
+            return {"success": False, "log": logs}
+
+        if backup_dir:
+            restored = _restore_kometa_runtime_assets(kometa_dir, backup_dir, logs)
+            if restored:
+                _cleanup_kometa_backup(backup_dir, logs)
+
+        res = _ensure_venv(kometa_dir, logs, venv_name="kometa-venv")
+        if not res:
+            return {"success": False, "log": logs}
+        python_bin, _pip_bin_unused = res
+        if not _pip_install(python_bin, kometa_dir, logs):
+            return {"success": False, "log": logs}
+
+        _write_text(sha_file, upstream_sha)
+        _write_text(branch_file, branch)
+        logs.append("✅ Kometa updated via ZIP.")
+        return {"success": True, "log": logs}
+
+    except Exception as e:
+        logs.append(f"❌ Exception: {e}")
+        return {"success": False, "log": logs}
+
+
 def perform_imagemaid_update_zip_only(config_root: str | Path, branch: str = "develop", force: bool = False, logs=None):
     """
     Update ImageMaid by downloading/extracting the branch ZIP into:
@@ -2341,18 +2599,114 @@ def get_kometa_root_path() -> Path:
     """
     Resolve the Kometa root folder consistently.
     Priority:
-        1) app.config["KOMETA_ROOT"] (set during validation)
-        2) session["kometa_root"] (legacy)
-        3) <CONFIG_DIR>/kometa  (works with ZIP-only updater)
+        1) app.config["KOMETA_ROOT"] if it differs from the managed default
+        2) session["kometa_root"] if it differs from the managed default
+        3) persisted existing-install override for the active config
+        4) managed default under <CONFIG_DIR>/kometa
     """
+    managed_default = str(_managed_kometa_root_default())
     base = None
+    install_mode = get_kometa_install_mode()
     if has_app_context():
-        base = app.config.get("KOMETA_ROOT")
+        configured = app.config.get("KOMETA_ROOT")
+        if configured and os.path.normpath(str(configured)) != managed_default:
+            base = configured
     if not base and has_request_context():
-        base = session.get("kometa_root")
+        session_root = session.get("kometa_root")
+        if session_root and os.path.normpath(str(session_root)) != managed_default:
+            base = session_root
+    if not base and has_request_context():
+        try:
+            section = _get_persisted_kometa_runtime_section()
+            if isinstance(section, dict):
+                mode = str(section.get("install_mode") or "").strip().lower()
+                existing_root = str(section.get("existing_root") or "").strip()
+                if mode == "existing" and existing_root:
+                    base = existing_root
+        except Exception:
+            base = None
     if not base:
-        base = os.path.join(CONFIG_DIR, "kometa")
+        if has_app_context():
+            base = app.config.get("KOMETA_ROOT")
+        if not base and has_request_context():
+            base = session.get("kometa_root")
+    if not base:
+        if install_mode == "external":
+            config_dir = None
+            if has_app_context():
+                config_dir = app.config.get("KOMETA_CONFIG_DIR")
+            if not config_dir and has_request_context():
+                config_dir = session.get("kometa_config_dir")
+            if not config_dir and has_request_context():
+                config_dir = _get_persisted_kometa_runtime_section().get("external_config_root")
+            if config_dir:
+                return Path(os.path.normpath(str(config_dir))).resolve()
+        base = managed_default
     return Path(os.path.normpath(base)).resolve()
+
+
+def get_kometa_config_dir() -> Path:
+    install_mode = get_kometa_install_mode()
+    if install_mode != "external":
+        if has_request_context():
+            section = _get_persisted_kometa_runtime_section()
+            mode = str(section.get("install_mode") or "").strip().lower()
+            external_config_root = str(section.get("external_config_root") or "").strip()
+            session_config_dir = str(session.get("kometa_config_dir") or "").strip()
+            app_config_dir = str(app.config.get("KOMETA_CONFIG_DIR") or "") if has_app_context() else ""
+            if mode == "external" and external_config_root and not session_config_dir and not app_config_dir:
+                return Path(os.path.normpath(external_config_root)).resolve()
+        return get_kometa_root_path() / "config"
+
+    configured = None
+    if has_app_context():
+        configured = app.config.get("KOMETA_CONFIG_DIR")
+    if not configured and has_request_context():
+        configured = session.get("kometa_config_dir")
+    if not configured and has_request_context():
+        section = _get_persisted_kometa_runtime_section()
+        mode = str(section.get("install_mode") or "").strip().lower()
+        if mode == "external":
+            configured = section.get("external_config_root")
+    if configured:
+        return Path(os.path.normpath(str(configured))).resolve()
+    return get_kometa_root_path() / "config"
+
+
+def get_kometa_log_dir() -> Path:
+    install_mode = get_kometa_install_mode()
+    if install_mode != "external":
+        if has_request_context():
+            section = _get_persisted_kometa_runtime_section()
+            mode = str(section.get("install_mode") or "").strip().lower()
+            external_log_root = str(section.get("external_log_root") or "").strip()
+            external_config_root = str(section.get("external_config_root") or "").strip()
+            session_log_dir = str(session.get("kometa_log_dir") or "").strip()
+            app_log_dir = str(app.config.get("KOMETA_LOG_DIR") or "") if has_app_context() else ""
+            if mode == "external" and not session_log_dir and not app_log_dir:
+                if external_log_root:
+                    return Path(os.path.normpath(external_log_root)).resolve()
+                if external_config_root:
+                    return Path(os.path.normpath(external_config_root)).resolve() / "logs"
+        return get_kometa_config_dir() / "logs"
+
+    configured = None
+    if has_app_context():
+        configured = app.config.get("KOMETA_LOG_DIR")
+    if not configured and has_request_context():
+        configured = session.get("kometa_log_dir")
+    if not configured and has_request_context():
+        section = _get_persisted_kometa_runtime_section()
+        mode = str(section.get("install_mode") or "").strip().lower()
+        if mode == "external":
+            configured = section.get("external_log_root") or ""
+            if not configured:
+                config_dir = section.get("external_config_root") or ""
+                if config_dir:
+                    return Path(os.path.normpath(str(config_dir))).resolve() / "logs"
+    if configured:
+        return Path(os.path.normpath(str(configured))).resolve()
+    return get_kometa_config_dir() / "logs"
 
 
 def get_imagemaid_pid_file():
@@ -2391,21 +2745,32 @@ def is_imagemaid_running():
         return False
 
 
-def get_custom_fonts_dir() -> Path:
+def get_legacy_custom_fonts_dir() -> Path:
     return Path(CONFIG_DIR) / "fonts"
 
 
+def get_custom_fonts_dir(config_name: str | None = None) -> Path:
+    if config_name:
+        return get_managed_config_artifact_root(config_name) / "fonts"
+    return get_legacy_custom_fonts_dir()
+
+
 def get_kometa_fonts_dir(kometa_root: Path | None = None) -> Path:
-    root = Path(kometa_root) if kometa_root else get_kometa_root_path()
-    return root / "config" / "fonts"
+    if kometa_root is not None:
+        return Path(kometa_root) / "config" / "fonts"
+    return get_kometa_config_dir() / "fonts"
 
 
-def get_font_dirs(include_static: bool = True, include_custom: bool = True) -> list[Path]:
+def get_font_dirs(include_static: bool = True, include_custom: bool = True, config_name: str | None = None) -> list[Path]:
     dirs: list[Path] = []
     seen: set[str] = set()
 
     if include_custom:
-        for path in (get_custom_fonts_dir(), get_kometa_fonts_dir()):
+        custom_paths = []
+        if config_name:
+            custom_paths.append(get_custom_fonts_dir(config_name))
+        custom_paths.extend((get_legacy_custom_fonts_dir(), get_kometa_fonts_dir()))
+        for path in custom_paths:
             key = str(path)
             if key not in seen:
                 dirs.append(path)
@@ -2422,9 +2787,12 @@ def get_font_dirs(include_static: bool = True, include_custom: bool = True) -> l
     return dirs
 
 
-def list_custom_fonts() -> list[str]:
+def list_custom_fonts(config_name: str | None = None) -> list[str]:
     fonts: set[str] = set()
-    for folder in (get_custom_fonts_dir(), get_kometa_fonts_dir()):
+    folders = [get_kometa_fonts_dir(), get_legacy_custom_fonts_dir()]
+    if config_name:
+        folders.insert(0, get_custom_fonts_dir(config_name))
+    for folder in folders:
         if not folder.is_dir():
             continue
         for entry in folder.iterdir():
@@ -2433,9 +2801,9 @@ def list_custom_fonts() -> list[str]:
     return sorted(fonts)
 
 
-def list_available_fonts(include_static: bool = True, include_custom: bool = True) -> list[str]:
+def list_available_fonts(include_static: bool = True, include_custom: bool = True, config_name: str | None = None) -> list[str]:
     fonts: set[str] = set()
-    for folder in get_font_dirs(include_static=include_static, include_custom=include_custom):
+    for folder in get_font_dirs(include_static=include_static, include_custom=include_custom, config_name=config_name):
         if not folder.is_dir():
             continue
         for entry in folder.iterdir():
@@ -2444,8 +2812,49 @@ def list_available_fonts(include_static: bool = True, include_custom: bool = Tru
     return sorted(fonts)
 
 
-def sync_custom_fonts(kometa_root: Path | None = None) -> list[str]:
-    source_dir = get_custom_fonts_dir()
+def migrate_legacy_custom_fonts_to_config(config_name: str | None, font_names: list[str] | tuple[str, ...] | set[str] | None = None) -> dict:
+    try:
+        normalized = require_config_name_for_storage(config_name, context="Config-scoped font migration")
+    except ValueError as exc:
+        return {"copied": [], "skipped": [], "errors": [str(exc)]}
+
+    source_dir = get_legacy_custom_fonts_dir()
+    destination_dir = get_custom_fonts_dir(normalized)
+    copied: list[str] = []
+    skipped: list[str] = []
+    errors: list[str] = []
+
+    if not source_dir.is_dir():
+        return {"copied": copied, "skipped": skipped, "errors": errors}
+
+    requested: set[str] | None = None
+    if font_names is not None:
+        requested = {str(name or "").strip() for name in font_names if str(name or "").strip()}
+        if not requested:
+            return {"copied": copied, "skipped": skipped, "errors": errors}
+
+    destination_dir.mkdir(parents=True, exist_ok=True)
+
+    for entry in sorted(source_dir.iterdir(), key=lambda p: p.name.lower()):
+        if not entry.is_file() or entry.suffix.lower() not in FONT_EXTENSIONS:
+            continue
+        if requested is not None and entry.name not in requested:
+            continue
+        target = destination_dir / entry.name
+        if target.exists():
+            skipped.append(entry.name)
+            continue
+        try:
+            shutil.copy2(entry, target)
+            copied.append(entry.name)
+        except Exception as exc:
+            errors.append(f"Failed to migrate legacy font {entry} -> {target}: {exc}")
+
+    return {"copied": copied, "skipped": skipped, "errors": errors}
+
+
+def sync_custom_fonts(kometa_root: Path | None = None, config_name: str | None = None) -> list[str]:
+    source_dir = get_custom_fonts_dir(config_name)
     if not source_dir.is_dir():
         return []
     dest_dir = get_kometa_fonts_dir(kometa_root)
@@ -2487,13 +2896,14 @@ def collect_font_references(config_data) -> list[str]:
     return sorted(fonts)
 
 
-def copy_fonts_to_kometa(font_refs, kometa_root: Path | None = None) -> dict:
-    dest_dir = get_kometa_fonts_dir(kometa_root)
+def copy_fonts_to_kometa(font_refs, kometa_root: Path | None = None, kometa_config_dir: Path | None = None, config_name: str | None = None) -> dict:
+    dest_dir = Path(kometa_config_dir) / "fonts" if kometa_config_dir is not None else get_kometa_fonts_dir(kometa_root)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    sources = get_font_dirs(include_static=True, include_custom=True)
+    migration = migrate_legacy_custom_fonts_to_config(config_name, font_refs) if config_name else {"copied": [], "skipped": [], "errors": []}
+    sources = get_font_dirs(include_static=True, include_custom=True, config_name=config_name)
     copied: list[str] = []
     missing: list[str] = []
-    errors: list[str] = []
+    errors: list[str] = list(migration.get("errors", []))
 
     for ref in font_refs or []:
         ref_str = str(ref or "").strip()
@@ -2600,12 +3010,122 @@ def migrate_config_archives(history_limit: int | None = None) -> dict:
 
 
 def normalize_config_name_for_storage(config_name: str | None) -> str:
-    name = str(config_name or "").strip().lower().replace(" ", "_")
+    raw = str(config_name or "").strip()
+    if not raw:
+        return "default"
+
+    name = Path(raw).name.strip().lower()
+    if name.endswith("_config.yml"):
+        name = name[:-11]
+    elif name.endswith("_config.yaml"):
+        name = name[:-12]
+    elif name.endswith(".yml"):
+        name = name[:-4]
+    elif name.endswith(".yaml"):
+        name = name[:-5]
+
+    name = name.replace(" ", "_")
     return name or "default"
 
 
-def delete_config_artifacts(config_name: str | None, kometa_root: str | Path | None = None) -> dict:
-    normalized = normalize_config_name_for_storage(config_name)
+def require_config_name_for_storage(config_name: str | None, context: str = "Artifact operation") -> str:
+    raw = str(config_name or "").strip()
+    if not raw:
+        raise ValueError(f"{context} requires an explicit config name.")
+    normalized = normalize_config_name_for_storage(raw)
+    if not normalized:
+        raise ValueError(f"{context} requires an explicit config name.")
+    return normalized
+
+
+MANAGED_LIBRARY_FILE_DIRS = ("metadata_files", "collection_files", "overlay_files")
+MANAGED_CONFIG_ARTIFACT_DIRS = ("fonts",) + MANAGED_LIBRARY_FILE_DIRS
+
+
+def get_managed_config_artifact_root(config_name: str | None) -> Path:
+    normalized = require_config_name_for_storage(config_name, context="Managed config artifact paths")
+    return Path(CONFIG_DIR) / normalized
+
+
+def get_managed_library_artifact_paths(config_name: str | None) -> list[Path]:
+    config_root = get_managed_config_artifact_root(config_name)
+    return [config_root / folder for folder in MANAGED_LIBRARY_FILE_DIRS]
+
+
+def get_legacy_managed_library_artifact_paths(config_name: str | None) -> list[Path]:
+    normalized = require_config_name_for_storage(config_name, context="Legacy managed library artifact paths")
+    config_dir = Path(CONFIG_DIR)
+    return [config_dir / folder / normalized for folder in MANAGED_LIBRARY_FILE_DIRS]
+
+
+def sync_managed_library_artifacts_to_kometa(config_name: str | None, kometa_root: str | Path | None = None, kometa_config_dir: str | Path | None = None) -> dict:
+    normalized = require_config_name_for_storage(config_name, context="Managed library artifact sync")
+    source_root = get_managed_config_artifact_root(normalized)
+    if kometa_config_dir is not None:
+        destination_base = Path(kometa_config_dir)
+    elif kometa_root is not None:
+        destination_base = Path(kometa_root) / "config"
+    else:
+        destination_base = get_kometa_config_dir()
+    destination_root = destination_base / normalized
+
+    synced: list[str] = []
+    removed: list[str] = []
+    missing: list[str] = []
+    errors: list[str] = []
+
+    for folder in MANAGED_LIBRARY_FILE_DIRS:
+        source_dir = source_root / folder
+        destination_dir = destination_root / folder
+
+        if source_dir.exists():
+            try:
+                source_resolved = source_dir.resolve()
+                destination_resolved = destination_dir.resolve()
+                if source_resolved == destination_resolved:
+                    synced.append(str(destination_dir))
+                    continue
+            except Exception:
+                pass
+
+            try:
+                if destination_dir.exists() and _directory_tree_signature(source_dir) == _directory_tree_signature(destination_dir):
+                    synced.append(str(destination_dir))
+                    continue
+                destination_dir.parent.mkdir(parents=True, exist_ok=True)
+                if destination_dir.exists():
+                    shutil.rmtree(destination_dir, onerror=handle_remove_readonly)
+                shutil.copytree(source_dir, destination_dir)
+                synced.append(str(destination_dir))
+            except Exception as exc:
+                errors.append(f"Failed to sync {source_dir} -> {destination_dir}: {exc}")
+            continue
+
+        missing.append(folder)
+        if not destination_dir.exists():
+            continue
+        try:
+            shutil.rmtree(destination_dir, onerror=handle_remove_readonly)
+            removed.append(str(destination_dir))
+        except Exception as exc:
+            errors.append(f"Failed to remove stale Kometa artifact directory {destination_dir}: {exc}")
+
+    if destination_root.exists():
+        try:
+            if not any(destination_root.iterdir()):
+                destination_root.rmdir()
+        except Exception:
+            pass
+
+    return {"synced": synced, "removed": removed, "missing": missing, "errors": errors}
+
+
+def delete_config_artifacts(
+    config_name: str | None,
+    kometa_root: str | Path | None = None,
+    kometa_config_dir: str | Path | None = None,
+) -> dict:
+    normalized = require_config_name_for_storage(config_name, context="Config artifact cleanup")
     config_dir = Path(CONFIG_DIR)
     archive_root = config_dir / "archives"
     removed: list[str] = []
@@ -2614,10 +3134,17 @@ def delete_config_artifacts(config_name: str | None, kometa_root: str | Path | N
     targets = [
         config_dir / f"{normalized}_config.yml",
         archive_root / normalized,
+        get_managed_config_artifact_root(normalized),
     ]
+    targets.extend(get_managed_library_artifact_paths(normalized))
+    targets.extend(get_legacy_managed_library_artifact_paths(normalized))
 
-    if kometa_root:
+    if kometa_config_dir is not None:
+        targets.append(Path(kometa_config_dir) / f"{normalized}_config.yml")
+    elif kometa_root:
         targets.append(Path(kometa_root) / "config" / f"{normalized}_config.yml")
+    else:
+        targets.append(get_kometa_config_dir() / f"{normalized}_config.yml")
 
     for target in targets:
         try:
@@ -2676,7 +3203,11 @@ def delete_orphaned_artifact_bundle(bundle: dict | None) -> dict:
     return {"removed": removed, "errors": errors, "config_name": bundle_name}
 
 
-def list_orphaned_config_artifacts(active_config_names: list[str] | None = None, kometa_root: str | Path | None = None) -> dict:
+def list_orphaned_config_artifacts(
+    active_config_names: list[str] | None = None,
+    kometa_root: str | Path | None = None,
+    kometa_config_dir: str | Path | None = None,
+) -> dict:
     config_dir = Path(CONFIG_DIR)
     archive_root = config_dir / "archives"
     current_pattern = re.compile(r"^(?P<name>.+)_config\.yml$", re.IGNORECASE)
@@ -2707,8 +3238,8 @@ def list_orphaned_config_artifacts(active_config_names: list[str] | None = None,
             bundles[normalized] = bundle
         return bundle
 
-    for path in config_dir.glob("*_config.yml"):
-        if not path.is_file():
+    for path in config_dir.iterdir():
+        if not path.is_file() or not path.name.lower().endswith("_config.yml"):
             continue
         match = current_pattern.match(path.name)
         if not match:
@@ -2716,6 +3247,27 @@ def list_orphaned_config_artifacts(active_config_names: list[str] | None = None,
         bundle = ensure_bundle(match.group("name"))
         bundle["has_current_file"] = True
         bundle["paths"].append(str(path))
+
+    for path in config_dir.iterdir():
+        if not path.is_dir():
+            continue
+        if any((path / folder_name).exists() and (path / folder_name).is_dir() for folder_name in MANAGED_CONFIG_ARTIFACT_DIRS):
+            bundle = ensure_bundle(path.name)
+            path_text = str(path)
+            if path_text not in bundle["paths"]:
+                bundle["paths"].append(path_text)
+
+    for folder_name in MANAGED_LIBRARY_FILE_DIRS:
+        managed_root = config_dir / folder_name
+        if not managed_root.exists() or not managed_root.is_dir():
+            continue
+        for path in managed_root.iterdir():
+            if not path.is_dir():
+                continue
+            bundle = ensure_bundle(path.name)
+            path_text = str(path)
+            if path_text not in bundle["paths"]:
+                bundle["paths"].append(path_text)
 
     if archive_root.exists():
         for path in archive_root.iterdir():
@@ -2726,18 +3278,67 @@ def list_orphaned_config_artifacts(active_config_names: list[str] | None = None,
             bundle["archive_count"] = sum(1 for child in path.glob("*.yml") if child.is_file())
             bundle["paths"].append(str(path))
 
-    if kometa_root:
-        kometa_config_dir = Path(kometa_root) / "config"
-        if kometa_config_dir.exists():
-            for path in kometa_config_dir.glob("*_config.yml"):
-                if not path.is_file():
-                    continue
-                match = current_pattern.match(path.name)
-                if not match:
-                    continue
-                bundle = ensure_bundle(match.group("name"))
+    active_kometa_config_dir = None
+    if kometa_config_dir is not None:
+        active_kometa_config_dir = Path(kometa_config_dir)
+    elif kometa_root:
+        active_kometa_config_dir = Path(kometa_root) / "config"
+    else:
+        active_kometa_config_dir = get_kometa_config_dir()
+
+    if active_kometa_config_dir and active_kometa_config_dir.exists():
+        for path in active_kometa_config_dir.iterdir():
+            if not path.is_file() or not path.name.lower().endswith("_config.yml"):
+                continue
+            match = current_pattern.match(path.name)
+            if not match:
+                continue
+            bundle = ensure_bundle(match.group("name"))
+            bundle["has_kometa_copy"] = True
+            bundle["paths"].append(str(path))
+
+    for bundle in bundles.values():
+        name = bundle.get("name")
+        if not name:
+            continue
+        current_file = config_dir / f"{name}_config.yml"
+        if current_file.exists() and current_file.is_file():
+            bundle["has_current_file"] = True
+            path_text = str(current_file)
+            if path_text not in bundle["paths"]:
+                bundle["paths"].append(path_text)
+
+        archive_dir = archive_root / name
+        if archive_dir.exists() and archive_dir.is_dir():
+            bundle["has_archive_dir"] = True
+            bundle["archive_count"] = sum(1 for child in archive_dir.glob("*.yml") if child.is_file())
+            path_text = str(archive_dir)
+            if path_text not in bundle["paths"]:
+                bundle["paths"].append(path_text)
+
+        if active_kometa_config_dir is not None:
+            kometa_file = active_kometa_config_dir / f"{name}_config.yml"
+            if kometa_file.exists() and kometa_file.is_file():
                 bundle["has_kometa_copy"] = True
-                bundle["paths"].append(str(path))
+                path_text = str(kometa_file)
+                if path_text not in bundle["paths"]:
+                    bundle["paths"].append(path_text)
+
+        for managed_path in get_managed_library_artifact_paths(name):
+            if managed_path.exists() and managed_path.is_dir():
+                path_text = str(managed_path)
+                if path_text not in bundle["paths"]:
+                    bundle["paths"].append(path_text)
+        managed_root = get_managed_config_artifact_root(name)
+        if managed_root.exists() and managed_root.is_dir():
+            path_text = str(managed_root)
+            if path_text not in bundle["paths"]:
+                bundle["paths"].append(path_text)
+        for legacy_path in get_legacy_managed_library_artifact_paths(name):
+            if legacy_path.exists() and legacy_path.is_dir():
+                path_text = str(legacy_path)
+                if path_text not in bundle["paths"]:
+                    bundle["paths"].append(path_text)
 
     orphans = [bundle for name, bundle in sorted(bundles.items()) if name not in active_names]
     return {"orphans": orphans, "errors": [], "active_names": sorted(active_names)}

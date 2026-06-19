@@ -31,6 +31,7 @@ let logscanAnalyzeInFlight = false
 let runProgressInFlight = false
 let activeRunCommandOverride = null
 let activeRunCommandMode = null
+let latestKometaStatusPayload = null
 const KOMETA_BRANCH_OVERRIDE_STORAGE_KEY = 'qs-kometa-branch-override'
 let kometaUpdatePollInterval = null
 let kometaUpdateJobId = null
@@ -440,6 +441,43 @@ $(document).ready(function () {
     updateSectionStyleHeaderBadge(value)
   }
 
+  function initBootstrapTooltips (scope, selector, options) {
+    if (typeof bootstrap === 'undefined' || !bootstrap.Tooltip) return
+    const root = scope || document
+    const query = selector || '[data-bs-toggle="tooltip"]'
+    const nodes = []
+    if (root && typeof root.matches === 'function' && root.matches(query)) nodes.push(root)
+    if (root && typeof root.querySelectorAll === 'function') {
+      root.querySelectorAll(query).forEach(el => nodes.push(el))
+    }
+    const seen = new Set()
+    nodes.forEach(el => {
+      if (!el || seen.has(el)) return
+      seen.add(el)
+      const existing = bootstrap.Tooltip.getInstance(el)
+      if (existing) existing.dispose()
+      bootstrap.Tooltip.getOrCreateInstance(el, Object.assign({ html: true, sanitize: false }, options || {}))
+    })
+  }
+
+  function disposeBootstrapTooltips (scope, selector) {
+    if (typeof bootstrap === 'undefined' || !bootstrap.Tooltip) return
+    const root = scope || document
+    const query = selector || '[data-bs-toggle="tooltip"]'
+    const nodes = []
+    if (root && typeof root.matches === 'function' && root.matches(query)) nodes.push(root)
+    if (root && typeof root.querySelectorAll === 'function') {
+      root.querySelectorAll(query).forEach(el => nodes.push(el))
+    }
+    const seen = new Set()
+    nodes.forEach(el => {
+      if (!el || seen.has(el)) return
+      seen.add(el)
+      const existing = bootstrap.Tooltip.getInstance(el)
+      if (existing) existing.dispose()
+    })
+  }
+
   function setActiveGridCard (fontName) {
     if (!headerGrid) return
     const activeFont = normalizeFontName(fontName)
@@ -706,7 +744,7 @@ $(document).ready(function () {
     updateLabels(logFlags, 'opt-')
     updateLabels(otherFlags, 'opt-')
 
-    $('[data-bs-toggle="tooltip"]').tooltip({ html: true })
+    initBootstrapTooltips(document)
     syncFinalAccordionRollups()
   }
 
@@ -730,8 +768,11 @@ $(document).ready(function () {
 
     if (!$panel.length) return
 
+    const installMode = getConfiguredKometaInstallMode()
     let title = 'Run command is not ready yet'
-    let message = 'Open Prepare Kometa to install, validate, or update the local Kometa setup before running.'
+    let message = installMode === 'existing'
+      ? 'Open Prepare Kometa to validate the existing Kometa setup and check whether it needs a manual update before running.'
+      : 'Open Prepare Kometa to install, validate, or update the local Kometa setup before running.'
     let showButton = true
 
     if (!showYAML) {
@@ -822,6 +863,17 @@ $(document).ready(function () {
       .addClass('d-none')
       .removeClass('text-bg-warning text-bg-secondary text-bg-primary')
       .text('Recovery Active')
+  }
+
+  function resolveFreshnessGateAfterBulkValidation () {
+    const gateEl = document.getElementById('final-gate-state')
+    if (gateEl) {
+      gateEl.dataset.stage = 'config'
+      gateEl.dataset.autoValidate = 'false'
+      gateEl.dataset.bulkFresh = 'true'
+    }
+    const panel = document.getElementById('final-gate-panel')
+    if (panel) panel.classList.add('d-none')
   }
 
   function updateRunNowState () {
@@ -1002,7 +1054,55 @@ $(document).ready(function () {
     if (checkbox.length) checkbox.on('change', buildCommand)
   })
 
+  function getConfiguredKometaInstallMode () {
+    const $out = $('#run-command-output')
+    const raw = ($out.data('kometa-install-mode') || 'managed').toString().trim().toLowerCase()
+    if (raw === 'existing' || raw === 'external') return raw
+    return 'managed'
+  }
+
+  function getConfiguredKometaRootPosix () {
+    const $out = $('#run-command-output')
+    const selected = ($out.data('kometa-root-selected') || '').toString().trim()
+    const fallback = ($out.data('kometa-root-default') || '').toString().trim()
+    const configDir = ($out.data('kometa-config-dir') || '').toString().trim()
+    if (getConfiguredKometaInstallMode() === 'external') return configDir
+    return selected || fallback
+  }
+
+  function getConfiguredKometaRootDisplay () {
+    const $out = $('#run-command-output')
+    const selected = ($out.data('kometa-root-selected-display') || '').toString().trim()
+    const fallback = ($out.data('kometa-root-default-display') || getConfiguredKometaRootPosix())
+    const configDir = ($out.data('kometa-config-dir-display') || '').toString().trim()
+    if (getConfiguredKometaInstallMode() === 'external') return configDir || getConfiguredKometaRootPosix()
+    return selected || fallback
+  }
+
+  function kometaCanLaunch () {
+    return ($('#run-command-output').data('kometa-can-launch') || '').toString().toLowerCase() === 'true'
+  }
+
+  function kometaCanCheckUpdateStatus () {
+    return getConfiguredKometaInstallMode() !== 'external' && kometaCanProbeRuntime()
+  }
+
+  function kometaCanProbeRuntime () {
+    return ($('#run-command-output').data('kometa-can-probe-runtime') || '').toString().toLowerCase() === 'true'
+  }
+
+  function kometaCanReadLogs () {
+    return ($('#run-command-output').data('kometa-can-read-logs') || '').toString().toLowerCase() === 'true'
+  }
+
   function validateKometaRoot (options = {}) {
+    if (!kometaCanProbeRuntime()) {
+      appendKometaStatusLine('ℹ️ Runtime validation is not available in external Kometa mode. Quickstart can sync config and optional logs, but it cannot validate or launch the runtime directly.')
+      KOMETA_VALIDATION_IN_PROGRESS = false
+      KOMETA_VALIDATED = false
+      syncKometaRollupBadge()
+      return
+    }
     if (KOMETA_VALIDATION_IN_PROGRESS) return
     KOMETA_VALIDATION_IN_PROGRESS = true
     setKometaUpdatePhaseBadge('validating')
@@ -1016,9 +1116,20 @@ $(document).ready(function () {
     const $out = $('#run-command-output')
 
     const configName = $out.data('config-filename')
-    const defaultRootPosix = ($out.data('kometa-root-default') || '').toString().trim()
-    const defaultRootDisplay = ($out.data('kometa-root-default-display') || defaultRootPosix)
+    const configuredRootPosix = getConfiguredKometaRootPosix()
+    const configuredRootDisplay = getConfiguredKometaRootDisplay()
+    const configuredInstallMode = getConfiguredKometaInstallMode()
     const appendStatus = Boolean(options.appendStatus)
+
+    if (!configuredRootPosix) {
+      $logBox.text('❌ Quickstart does not have a Kometa install path selected for this config yet.\nOpen the Start page and choose whether this config uses a Quickstart-managed install or an existing install.\n')
+      if ($spinner.length) $spinner.hide()
+      $runNow.prop('disabled', true)
+      KOMETA_VALIDATION_IN_PROGRESS = false
+      KOMETA_VALIDATED = false
+      syncKometaRollupBadge()
+      return
+    }
 
     if (appendStatus) {
       $logBox.append(
@@ -1038,8 +1149,7 @@ $(document).ready(function () {
       type: 'POST',
       url: '/validate-kometa-root',
       contentType: 'application/json',
-      // ✅ send the *normalized* path to the backend
-      data: JSON.stringify({ path: defaultRootPosix, config_name: configName }),
+      data: JSON.stringify({ path: configuredRootPosix, config_name: configName, install_mode: configuredInstallMode }),
       success: (res) => {
         KOMETA_LOCAL_CHECK_COMPLETED = true
         if (Array.isArray(res.log)) res.log.forEach(line => $logBox.append(`${line}\n`))
@@ -1050,9 +1160,9 @@ $(document).ready(function () {
           if (res.kometa_version) $logBox.append(`📦 Local Kometa version: ${res.kometa_version}\n`)
 
           // ✅ Prefer display paths for UI; keep posix for internal if needed
-          const kometaRootDisplay = (res.kometa_root_display || res.kometa_root || defaultRootDisplay)
+          const kometaRootDisplay = (res.kometa_root_display || res.kometa_root || configuredRootDisplay)
           const venvPythonDisplay = (res.venv_python_display || res.venv_python || 'python3')
-          const kometaRootPosix = (res.kometa_root || defaultRootPosix)
+          const kometaRootPosix = (res.kometa_root || configuredRootPosix)
           const venvPythonPosix = (res.venv_python || venvPythonDisplay)
 
           // For command builder (UI shows native separators)
@@ -1129,23 +1239,27 @@ $(document).ready(function () {
 
   function probeKometaRoot () {
     const $out = $('#run-command-output')
-    const defaultRootPosix = ($out.data('kometa-root-default') || '').toString().trim()
-    const defaultRootDisplay = ($out.data('kometa-root-default-display') || defaultRootPosix)
-    if (!defaultRootPosix) return Promise.resolve(null)
+    const configuredRootPosix = getConfiguredKometaRootPosix()
+    const configuredRootDisplay = getConfiguredKometaRootDisplay()
+    const configuredInstallMode = getConfiguredKometaInstallMode()
+    if (!configuredRootPosix) {
+      appendKometaStatusLine('❌ No Kometa install path is selected for this config yet.')
+      return Promise.resolve(null)
+    }
 
     return $.ajax({
       type: 'POST',
       url: '/probe-kometa-root',
       contentType: 'application/json',
-      data: JSON.stringify({ path: defaultRootPosix }),
+      data: JSON.stringify({ path: configuredRootPosix, install_mode: configuredInstallMode }),
       success: (res) => {
         KOMETA_LOCAL_CHECK_COMPLETED = true
         KOMETA_INSTALLED = !!res.kometa_installed
         if (Array.isArray(res.log)) res.log.forEach(line => appendKometaStatusLine(line))
 
-        const kometaRootDisplay = (res.kometa_root_display || res.kometa_root || defaultRootDisplay)
+        const kometaRootDisplay = (res.kometa_root_display || res.kometa_root || configuredRootDisplay)
         const venvPythonDisplay = (res.venv_python_display || res.venv_python || 'python3')
-        const kometaRootPosix = (res.kometa_root || defaultRootPosix)
+        const kometaRootPosix = (res.kometa_root || configuredRootPosix)
         const venvPythonPosix = (res.venv_python || venvPythonDisplay)
 
         $out.data('kometa-root', kometaRootDisplay)
@@ -1178,15 +1292,24 @@ $(document).ready(function () {
   }
 
   function checkKometaUpdate (forceRefresh = false) {
-    const $out = $('#run-command-output')
-    const defaultRootPosix = ($out.data('kometa-root-default') || '').toString().trim()
+    if (!kometaCanCheckUpdateStatus()) {
+      appendKometaStatusLine('ℹ️ Update checks are not available in external Kometa mode.')
+      return Promise.resolve({
+        success: true,
+        update_check_completed: false,
+        kometa_update_check_skipped: true,
+        kometa_update_available: false
+      })
+    }
+    const configuredRootPosix = getConfiguredKometaRootPosix()
+    const configuredInstallMode = getConfiguredKometaInstallMode()
     const branchOverride = getKometaBranchOverride()
-    if (!defaultRootPosix) return Promise.resolve(null)
+    if (!configuredRootPosix) return Promise.resolve(null)
 
     return fetch('/check-kometa-update', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: defaultRootPosix, force: forceRefresh, branch_override: branchOverride })
+      body: JSON.stringify({ path: configuredRootPosix, install_mode: configuredInstallMode, force: forceRefresh, branch_override: branchOverride })
     })
       .then(async res => {
         const data = await res.json()
@@ -1235,13 +1358,8 @@ $(document).ready(function () {
     buildCommand()
   }
 
-  $('[title]').tooltip({ placement: 'top', trigger: 'hover' })
-
-  const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'))
-  tooltipTriggerList.forEach(function (tooltipTriggerEl) {
-    // eslint-disable-next-line no-new
-    new bootstrap.Tooltip(tooltipTriggerEl, { html: true })
-  })
+  initBootstrapTooltips(document, '[title]', { html: false, sanitize: true, placement: 'top', trigger: 'hover' })
+  initBootstrapTooltips(document)
 
   function copyTextToClipboard (text) {
     if (!text) return Promise.reject(new Error('Empty text'))
@@ -1516,6 +1634,12 @@ $(document).ready(function () {
     invalidateKometaUpdateStatus()
     return probeKometaRoot()
       .then((res) => {
+        if (getConfiguredKometaInstallMode() === 'external') {
+          appendKometaStatusLine('')
+          appendKometaStatusLine('ℹ️ External Kometa mode detected. Quickstart will not perform runtime update checks in this mode.')
+          if (!KOMETA_UPDATING) setKometaUpdatePhaseBadge('idle')
+          return res
+        }
         if (!res || !res.kometa_installed) {
           appendKometaStatusLine('')
           appendKometaStatusLine('ℹ️ Remote update check skipped because Kometa is not installed.')
@@ -1836,6 +1960,20 @@ $(document).ready(function () {
     kometaProgressInterval = setInterval(fetchRunProgress, 5000)
   }
 
+  function resumeKometaLiveView () {
+    if (document.hidden) return
+    checkKometaStatus()
+      .catch(() => null)
+      .finally(() => {
+        if (KOMETA_STATUS === 'running' || KOMETA_PENDING_START) {
+          kometaPollingStarted = false
+          startPollingIfNeeded()
+          fetchRunProgress(true)
+          fetchKometaLog()
+        }
+      })
+  }
+
   function stopProgressPolling () {
     if (kometaProgressInterval) {
       clearInterval(kometaProgressInterval)
@@ -1915,6 +2053,51 @@ $(document).ready(function () {
         prepRow.classList.remove('d-none')
       } else {
         prepRow.classList.add('d-none')
+      }
+    }
+
+    const maintenanceRow = document.getElementById('run-maintenance-row')
+    if (maintenanceRow) {
+      const statusData = latestKometaStatusPayload || {}
+      const progressMaintenance = payload && payload.maintenance_summary && typeof payload.maintenance_summary === 'object'
+        ? payload.maintenance_summary
+        : {}
+      const windowLabel = statusData.maintenance_window ? ` (${statusData.maintenance_window})` : ''
+      if (statusData.maintenance_paused) {
+        let pauseLabel = 'Paused'
+        const pausedSince = statusData.maintenance_paused_since ? new Date(statusData.maintenance_paused_since) : null
+        if (pausedSince && !Number.isNaN(pausedSince.getTime())) {
+          const elapsedSeconds = Math.max(0, Math.floor((Date.now() - pausedSince.getTime()) / 1000))
+          pauseLabel = formatRunSeconds(elapsedSeconds) || 'Paused'
+        }
+        maintenanceRow.innerHTML = `
+          <span class="me-2 fw-semibold">Maintenance</span>
+          <span class="badge text-bg-warning text-dark">Paused${windowLabel}</span>
+          <span class="badge text-bg-secondary">${pauseLabel}</span>
+        `
+        maintenanceRow.classList.remove('d-none')
+      } else if (statusData.maintenance_active) {
+        maintenanceRow.innerHTML = `
+          <span class="me-2 fw-semibold">Maintenance</span>
+          <span class="badge text-bg-warning text-dark">Window Active${windowLabel}</span>
+        `
+        maintenanceRow.classList.remove('d-none')
+      } else if (progressMaintenance.had_pause) {
+        const summaryWindow = progressMaintenance.window ? ` (${progressMaintenance.window})` : ''
+        const pauseCount = Number(progressMaintenance.pause_count || 0)
+        const pauseSeconds = Number(progressMaintenance.pause_seconds || 0)
+        const summaryLabel = pauseSeconds > 0
+          ? (formatRunSeconds(pauseSeconds) || `${pauseCount || 1} pause${(pauseCount || 1) === 1 ? '' : 's'}`)
+          : `${pauseCount || 1} pause${(pauseCount || 1) === 1 ? '' : 's'}`
+        const stateLabel = progressMaintenance.open_pause ? 'Paused (log)' : 'Completed'
+        maintenanceRow.innerHTML = `
+          <span class="me-2 fw-semibold">Maintenance</span>
+          <span class="badge text-bg-primary">${stateLabel}${summaryWindow}</span>
+          <span class="badge text-bg-secondary">${summaryLabel}</span>
+        `
+        maintenanceRow.classList.remove('d-none')
+      } else {
+        maintenanceRow.classList.add('d-none')
       }
     }
 
@@ -2082,15 +2265,20 @@ $(document).ready(function () {
     if (container) {
       container.classList.add('d-none')
     }
+    const maintenanceRow = document.getElementById('run-maintenance-row')
+    if (maintenanceRow) {
+      maintenanceRow.classList.add('d-none')
+    }
     if (resetCache) {
       lastRunProgressPayload = null
     }
   }
 
-  function fetchRunProgress () {
+  function fetchRunProgress (forceFull = false) {
     if (runProgressInFlight) return Promise.resolve(null)
     runProgressInFlight = true
-    return fetch('/logscan/progress')
+    const url = forceFull ? '/logscan/progress?size=all' : '/logscan/progress'
+    return fetch(url)
       .then(res => {
         if (!res.ok) return null
         return res.json()
@@ -2119,6 +2307,10 @@ $(document).ready(function () {
   }
 
   function getUpdateButtonLabel () {
+    const installMode = getConfiguredKometaInstallMode()
+    if (installMode === 'existing') {
+      return `<i class="bi bi-arrow-clockwise me-1"></i> ${KOMETA_UPDATE_CHECK_COMPLETED ? 'Recheck Existing Status' : 'Check Existing Status'}`
+    }
     const force = $forceUpdateToggle.is(':checked')
     const label = force
       ? (KOMETA_INSTALLED ? 'Force Update Kometa' : 'Force Install Kometa')
@@ -2136,6 +2328,35 @@ $(document).ready(function () {
   }
 
   function callUpdateKometa () {
+    const installMode = getConfiguredKometaInstallMode()
+    if (installMode === 'external') {
+      showToast('info', 'External Kometa mode cannot update the runtime. Quickstart can only sync config and optional logs in this mode.')
+      return
+    }
+    if (installMode === 'existing') {
+      $updateKometaBtn.prop('disabled', true).html('<i class="bi bi-arrow-repeat me-1"></i> Checking...')
+      runKometaStatusPass(true)
+        .then((data) => {
+          if (!data) return
+          if (data.kometa_update_available) {
+            showToast('warning', `Kometa update available: ${data.local_version} → ${data.remote_version}. Update this existing install manually outside Quickstart.`)
+            const noteEl = document.getElementById('kometa-update-box-note')
+            if (noteEl) {
+              noteEl.textContent = 'Update this existing Kometa install manually outside Quickstart before running.'
+            }
+          } else if (!data.kometa_update_check_skipped) {
+            showToast('success', 'Existing Kometa install checked. No newer version was detected.')
+          }
+        })
+        .catch(() => {
+          showToast('error', 'Failed to check existing Kometa status.')
+        })
+        .finally(() => {
+          $updateKometaBtn.prop('disabled', false)
+          syncUpdateButtonLabel()
+        })
+      return
+    }
     if (KOMETA_STATUS === 'running') {
       showToast('info', 'Kometa is currently running; update skipped.')
       return
@@ -2148,6 +2369,8 @@ $(document).ready(function () {
     const $runBox = $('#run-command-box')
     const qsBranch = $btn.data('qs-branch') || 'master'
     const branchOverride = getKometaBranchOverride()
+    const configuredRootPosix = getConfiguredKometaRootPosix()
+    const configuredInstallMode = getConfiguredKometaInstallMode()
     const forceUpdate = $forceUpdateToggle.is(':checked')
 
     if (KOMETA_INSTALLED && !forceUpdate && !KOMETA_UPDATE_AVAILABLE) {
@@ -2232,7 +2455,7 @@ $(document).ready(function () {
     fetch('/update-kometa', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ branch: qsBranch, branch_override: branchOverride, force: forceUpdate, background: true })
+      body: JSON.stringify({ branch: qsBranch, branch_override: branchOverride, path: configuredRootPosix, install_mode: configuredInstallMode, force: forceUpdate, background: true })
     })
       .then(async res => {
         const data = await res.json()
@@ -2261,7 +2484,8 @@ $(document).ready(function () {
             $('#kometa-update-box').addClass('d-none')
             syncUpdateButtonLabel()
             const elapsed = formatElapsed(Date.now() - startTs)
-            if (progress.update_success) {
+            const updateSucceeded = progress.update_success ?? progress.success
+            if (updateSucceeded) {
               if (progress.up_to_date) {
                 showToast('info', 'Kometa is already up to date.')
                 postUpdateLabel = '<i class="bi bi-check-circle me-1"></i> Up to date'
@@ -2580,7 +2804,8 @@ $(document).ready(function () {
   const SPARKLINE_MAX_POINTS = 40
   const runSparkState = {
     cpu: { system: [], kometa: [] },
-    mem: { system: [], kometa: [] }
+    mem: { system: [], kometa: [] },
+    io: { read: [], write: [] }
   }
 
   function clampPercent (value) {
@@ -2611,22 +2836,42 @@ $(document).ready(function () {
     }).join(' ')
   }
 
+  function buildSparklinePointsScaled (series, maxValue) {
+    if (!series.length) return ''
+    const safeMax = typeof maxValue === 'number' && Number.isFinite(maxValue) && maxValue > 0 ? maxValue : 1
+    const normalized = series.map(value => {
+      if (typeof value !== 'number' || !Number.isFinite(value)) return 0
+      return Math.max(0, Math.min(100, (value / safeMax) * 100))
+    })
+    return buildSparklinePoints(normalized)
+  }
+
   function renderRunSparklines () {
     if (!$runStatusSparklines.length) return
     const hasData = runSparkState.cpu.system.length || runSparkState.cpu.kometa.length ||
-      runSparkState.mem.system.length || runSparkState.mem.kometa.length
+      runSparkState.mem.system.length || runSparkState.mem.kometa.length ||
+      runSparkState.io.read.length || runSparkState.io.write.length
     $runStatusSparklines.toggleClass('d-none', !hasData)
     if (!hasData) {
       if ($runSparkCpuSystem.length) $runSparkCpuSystem.attr('points', '')
       if ($runSparkCpuKometa.length) $runSparkCpuKometa.attr('points', '')
       if ($runSparkMemSystem.length) $runSparkMemSystem.attr('points', '')
       if ($runSparkMemKometa.length) $runSparkMemKometa.attr('points', '')
+      const $runSparkIoRead = $('#run-spark-io-read')
+      const $runSparkIoWrite = $('#run-spark-io-write')
+      if ($runSparkIoRead.length) $runSparkIoRead.attr('points', '')
+      if ($runSparkIoWrite.length) $runSparkIoWrite.attr('points', '')
       return
     }
     if ($runSparkCpuSystem.length) $runSparkCpuSystem.attr('points', buildSparklinePoints(runSparkState.cpu.system))
     if ($runSparkCpuKometa.length) $runSparkCpuKometa.attr('points', buildSparklinePoints(runSparkState.cpu.kometa))
     if ($runSparkMemSystem.length) $runSparkMemSystem.attr('points', buildSparklinePoints(runSparkState.mem.system))
     if ($runSparkMemKometa.length) $runSparkMemKometa.attr('points', buildSparklinePoints(runSparkState.mem.kometa))
+    const $runSparkIoRead = $('#run-spark-io-read')
+    const $runSparkIoWrite = $('#run-spark-io-write')
+    const ioMax = Math.max(0, ...runSparkState.io.read, ...runSparkState.io.write)
+    if ($runSparkIoRead.length) $runSparkIoRead.attr('points', buildSparklinePointsScaled(runSparkState.io.read, ioMax))
+    if ($runSparkIoWrite.length) $runSparkIoWrite.attr('points', buildSparklinePointsScaled(runSparkState.io.write, ioMax))
   }
 
   function resetRunSparklines () {
@@ -2634,6 +2879,8 @@ $(document).ready(function () {
     runSparkState.cpu.kometa = []
     runSparkState.mem.system = []
     runSparkState.mem.kometa = []
+    runSparkState.io.read = []
+    runSparkState.io.write = []
     renderRunSparklines()
   }
 
@@ -2646,10 +2893,18 @@ $(document).ready(function () {
     const cpuKometa = clampPercent(data.cpu_percent)
     const memSystem = clampPercent(data.system_memory_percent)
     const memKometa = clampPercent(data.memory_percent)
+    const ioRead = (typeof data.disk_read_rate_mb_s === 'number' && Number.isFinite(data.disk_read_rate_mb_s))
+      ? Math.max(0, data.disk_read_rate_mb_s)
+      : null
+    const ioWrite = (typeof data.disk_write_rate_mb_s === 'number' && Number.isFinite(data.disk_write_rate_mb_s))
+      ? Math.max(0, data.disk_write_rate_mb_s)
+      : null
     pushSparkValue(runSparkState.cpu.system, cpuSystem)
     pushSparkValue(runSparkState.cpu.kometa, cpuKometa)
     pushSparkValue(runSparkState.mem.system, memSystem)
     pushSparkValue(runSparkState.mem.kometa, memKometa)
+    pushSparkValue(runSparkState.io.read, ioRead)
+    pushSparkValue(runSparkState.io.write, ioWrite)
     renderRunSparklines()
   }
 
@@ -2684,8 +2939,23 @@ $(document).ready(function () {
       const sysPct = (typeof data.system_memory_percent === 'number' && Number.isFinite(data.system_memory_percent))
         ? `${data.system_memory_percent.toFixed(1)}%`
         : 'n/a'
+      const formatDiskMb = (valueMb) => {
+        if (typeof valueMb !== 'number' || !Number.isFinite(valueMb)) return 'n/a'
+        if (valueMb >= 1024) return `${(valueMb / 1024).toFixed(1)} GB`
+        return `${valueMb.toFixed(1)} MB`
+      }
+      const formatDiskRate = (valueMbS) => {
+        if (typeof valueMbS !== 'number' || !Number.isFinite(valueMbS)) return 'n/a'
+        if (valueMbS >= 1024) return `${(valueMbS / 1024).toFixed(2)} GB/s`
+        return `${valueMbS.toFixed(2)} MB/s`
+      }
+      const hasDiskData = [data.disk_read_mb, data.disk_write_mb, data.disk_read_rate_mb_s, data.disk_write_rate_mb_s]
+        .some(value => typeof value === 'number' && Number.isFinite(value))
+      const diskText = hasDiskData
+        ? ` | Disk: R ${formatDiskRate(data.disk_read_rate_mb_s)} • W ${formatDiskRate(data.disk_write_rate_mb_s)} • ${formatDiskMb(data.disk_read_mb)} read • ${formatDiskMb(data.disk_write_mb)} written`
+        : ''
       $runStatusTimer.text(`Running since: ${startedAt} • Elapsed: ${elapsed || 'n/a'}`)
-      $runStatusMetrics.text(`Kometa: ${cpuText} CPU • ${memRss} (${memPct}) | System: ${sysCpu} CPU • ${sysUsed} / ${sysTotal} (${sysPct})`)
+      $runStatusMetrics.text(`Kometa: ${cpuText} CPU • ${memRss} (${memPct}) | System: ${sysCpu} CPU • ${sysUsed} / ${sysTotal} (${sysPct})${diskText}`)
     } else if (data && data.status === 'done') {
       $runStatusTimer.text('Kometa run complete.')
       $runStatusMetrics.text('')
@@ -2910,7 +3180,18 @@ $(document).ready(function () {
       })
       .catch(() => showToast('error', 'Failed to download log.'))
   })
+  if (!kometaCanReadLogs()) {
+    $downloadLogBtn.prop('disabled', true)
+  }
   updateClearFilterButton()
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) {
+      resumeKometaLiveView()
+    }
+  })
+  window.addEventListener('pageshow', function () {
+    resumeKometaLiveView()
+  })
   // Ensure we check Kometa status once on page load to catch unclean exits.
   // Keep the run area hidden until Kometa validation completes.
   hideRunCommandSectionUntilValidated()
@@ -2919,6 +3200,10 @@ $(document).ready(function () {
     .finally(() => {
       if (!document.getElementById('kometa-validation-log')) return
       if (KOMETA_STATUS === 'running') return
+      if (!kometaCanProbeRuntime()) {
+        appendKometaStatusLine('ℹ️ External Kometa mode active. Runtime validation, launch, and update controls are disabled; generated config still syncs to the configured Kometa path.')
+        return
+      }
       Promise.resolve(runKometaStatusPass(false))
         .finally(() => {
           const stage = getFinalGateState().stage
@@ -2932,6 +3217,7 @@ $(document).ready(function () {
     kometaActionsCollapse.addEventListener('show.bs.collapse', () => {
       const stage = getFinalGateState().stage
       if (stage === 'todo' || stage === 'freshness') return
+      if (!kometaCanProbeRuntime()) return
       if (KOMETA_STATUS === 'running') {
         if (typeof bootstrap !== 'undefined' && bootstrap.Collapse) {
           bootstrap.Collapse.getOrCreateInstance(kometaActionsCollapse, { toggle: false }).hide()
@@ -2945,6 +3231,10 @@ $(document).ready(function () {
 
   if (runCommandCollapse) {
     runCommandCollapse.addEventListener('show.bs.collapse', () => {
+      if (!kometaCanLaunch()) {
+        setRunCommandPlaceholderState()
+        return
+      }
       if (KOMETA_STATUS === 'running') {
         clearRunCommandPlaceholderState()
         return
@@ -3143,6 +3433,7 @@ $(document).ready(function () {
 
     document.addEventListener('qs:bulk-validation-complete', function (event) {
       const data = (event && event.detail) ? event.detail : {}
+      const finalGateState = getFinalGateState()
       const results = data.results || {}
       const gateTargets = {
         '010-plex': { id: 'plex_valid', datasetKey: 'plexValid', attrKey: 'plex-valid' },
@@ -3206,6 +3497,13 @@ $(document).ready(function () {
         }
       }
 
+      if (finalGateState.stage === 'freshness') {
+        resolveFreshnessGateAfterBulkValidation()
+        showToast('info', 'Validation complete. Refreshing Kometa...')
+        setTimeout(() => window.location.reload(), 300)
+        return
+      }
+
       updateValidationGate()
       const anyNewlyValidated = Object.keys(results).some(key => results[key]?.status === 'validated' && !previousStatuses[key])
       if (previouslyBlocked && showYAML) {
@@ -3259,6 +3557,10 @@ $(document).ready(function () {
   }
 
   $('#run-now').on('click', function () {
+    if (!kometaCanLaunch()) {
+      showToast('info', 'External Kometa mode cannot launch Kometa from Quickstart. Quickstart can only sync config and optional logs in this mode.')
+      return
+    }
     startKometaCommand(getCurrentRunCommand(), {
       startMode: 'current',
       requireValidated: true,
@@ -3393,6 +3695,7 @@ $(document).ready(function () {
     return fetch('/kometa-status')
       .then(res => res.json())
       .then(data => {
+        latestKometaStatusPayload = data || null
         KOMETA_STATUS = data.status || null
         KOMETA_PENDING_START = Boolean(data.pending_start && data.status !== 'running')
         const $updateBtn = $updateKometaBtn
@@ -3407,18 +3710,21 @@ $(document).ready(function () {
           const why = KOMETA_UPDATING ? 'Kometa is updating; wait for it to finish.' : 'Kometa is running; stop it before updating.'
           $updateBtn.prop('disabled', true)
             .attr('title', why)
-            .tooltip({ placement: 'top' })
+          initBootstrapTooltips($updateBtn[0], '[title]', { html: false, sanitize: true, placement: 'top', trigger: 'hover' })
           $forceUpdate.prop('disabled', true)
         } else {
           $updateBtn.prop('disabled', false)
             .removeAttr('title')
-            .tooltip('dispose')
+          disposeBootstrapTooltips($updateBtn[0], '[title]')
           $forceUpdate.prop('disabled', false)
         }
 
         updateRunStatus(data)
         if (typeof window.QS_handleMaintenanceStatus === 'function') {
           window.QS_handleMaintenanceStatus(data)
+        }
+        if (lastRunProgressPayload && data.status === 'running') {
+          renderRunProgress(lastRunProgressPayload)
         }
 
         if (data.pending_start && data.status !== 'running') {

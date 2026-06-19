@@ -96,6 +96,50 @@ def test_logscan_trends_empty(client, isolated_config_dir):
     assert payload["archive_storage"]["imagemaid_retention_label"] == "Keep all archived logs"
 
 
+def test_logscan_trends_reports_invalid_archived_log_candidates(client, isolated_config_dir):
+    archive_dir = isolated_config_dir / "cache" / "logscan" / "archive" / "imagemaid"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    invalid_path = archive_dir / "imagemaid-20260506-042838Z-53.log.gz"
+    with gzip.open(invalid_path, "wt", encoding="utf-8") as handle:
+        handle.write("")
+
+    resp = client.get("/logscan/trends")
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["ingest_health"]["invalid_archived_count"] == 1
+    assert payload["ingest_health"]["invalid_archived_sample"] == [invalid_path.name]
+
+
+def test_logscan_invalid_archived_log_delete_route_removes_only_invalid_archives(client, isolated_config_dir):
+    archive_dir = isolated_config_dir / "cache" / "logscan" / "archive" / "imagemaid"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    invalid_path = archive_dir / "imagemaid-20260506-042838Z-53.log.gz"
+    with gzip.open(invalid_path, "wt", encoding="utf-8") as handle:
+        handle.write("")
+
+    valid_path = archive_dir / "imagemaid-20260506-120000Z-200.log.gz"
+    with gzip.open(valid_path, "wt", encoding="utf-8") as handle:
+        handle.write(
+            "\n".join(
+                [
+                    "[Quickstart] Run marker: started=2026-04-28T20:13:55Z config=demo tool=imagemaid mode=report",
+                    "[2026-04-28 20:17:00,274] [imagemaid.py:453]          [INFO]     |======================================== ImageMaid Finished ========================================|",
+                    "[2026-04-28 20:17:00,275] [imagemaid.py:453]          [INFO]     | Total Runtime      | 0:03:05                                                                       |",
+                    "[2026-04-28 20:17:00,275] [imagemaid.py:453]          [INFO]     |====================================================================================================|",
+                ]
+            )
+        )
+
+    resp = client.post("/logscan/trends/log/invalid/delete")
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["deleted"] == 1
+    assert payload["results"][0]["name"] == invalid_path.name
+    assert not invalid_path.exists()
+    assert valid_path.exists()
+
+
 def test_logscan_trends_limit_all_returns_all_saved_runs(client, isolated_config_dir, qs_module):
     for idx in range(3):
         timestamp = f"2026-04-2{idx}T10:00:00Z"
@@ -349,6 +393,10 @@ def test_logscan_trends_uses_cached_incomplete_summary_without_reparse(client, i
                         "analysis_counts": {"playlist_errors": 1},
                     },
                     "recommendations": [{"first_line": "INFO - Run incomplete", "message": "Review the log"}],
+                    "resume_progress_snapshot": {
+                        "columns": [{"key": "collections", "label": "Collections"}],
+                        "rows": [{"name": "Movies", "type": "movie", "status": "Done", "phase_cells": [{"label": "4m 11s", "tone": "primary"}]}],
+                    },
                 }
             },
         },
@@ -364,6 +412,7 @@ def test_logscan_trends_uses_cached_incomplete_summary_without_reparse(client, i
     assert row["warning_count"] == 2
     assert row["error_count"] == 1
     assert row["recommendations_count"] == 1
+    assert row["progress_snapshot"]["rows"][0]["name"] == "Movies"
 
 
 def test_logscan_trends_recommendations_support_incomplete_run(client, isolated_config_dir, monkeypatch, qs_module):
@@ -777,12 +826,29 @@ def test_normalize_logscan_archive_filenames_renames_legacy_files_and_updates_ca
     result = qs_module._normalize_logscan_archive_filenames()
 
     assert result["renamed"] == 1
-    renamed_path = archive_dir / "meta-20251224-170000Z-7.log"
+    renamed_path = archive_dir / "meta-20251224-170000Z-7.log.gz"
     assert renamed_path.exists()
     assert not legacy_path.exists()
     saved_cache = saved["cache"]
     assert str(renamed_path.resolve()) in saved_cache["logs"]
     assert str(legacy_path.resolve()) not in saved_cache["logs"]
+
+
+def test_normalize_logscan_archive_filenames_removes_archived_maintenance_sidecar(isolated_config_dir, monkeypatch, qs_module):
+    archive_dir = isolated_config_dir / "cache" / "logscan" / "archive" / "kometa"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_path = archive_dir / "meta.quickstart-maintenance.log"
+    sidecar_path.write_text("sidecar marker\n", encoding="utf-8")
+    cache = {"version": 1, "logs": {str(sidecar_path.resolve()): {"run_key": "run-sidecar", "run_complete": False}}}
+    saved = {}
+
+    monkeypatch.setattr(qs_module, "_load_logscan_ingest_cache", lambda: cache)
+    monkeypatch.setattr(qs_module, "_save_logscan_ingest_cache", lambda value: saved.setdefault("cache", value))
+
+    result = qs_module._normalize_logscan_archive_filenames()
+
+    assert result["renamed"] == 1
+    assert not sidecar_path.exists()
 
 
 def test_normalize_logscan_archive_filenames_collapses_repeated_kometa_archive_stem(isolated_config_dir, monkeypatch, qs_module):
@@ -963,6 +1029,8 @@ def test_logscan_progress_cached_running_payload_keeps_live_elapsed(client, isol
         {
             "mtime": stats.st_mtime,
             "size": stats.st_size,
+            "sidecar_mtime": None,
+            "sidecar_size": None,
             "data": {
                 "current_library": "Movies",
                 "phase_current": "collections",
@@ -973,7 +1041,7 @@ def test_logscan_progress_cached_running_payload_keeps_live_elapsed(client, isol
                 "playlist_total_seconds": 5,
                 "preparation_seconds": None,
                 "preparation_elapsed_seconds": None,
-                "run_started_at": started_at,
+                "run_started_at": datetime.fromisoformat(started_at),
             },
         }
     )
@@ -1000,6 +1068,118 @@ def test_logscan_progress_cached_running_payload_keeps_live_elapsed(client, isol
     assert payload["preparation_elapsed_seconds"] == 900
     assert payload["current_phase_elapsed_seconds"] == 612
     assert payload["playlist_elapsed_seconds"] == 305
+
+
+def test_logscan_progress_size_all_bypasses_matching_stale_cache(client, isolated_config_dir, monkeypatch, qs_module):
+    kometa_root = Path(qs_module.app.config["KOMETA_ROOT"])
+    log_dir = kometa_root / "config" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "meta.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[2026-04-01 01:13:24,670] [kometa.py:730] [INFO]     |================================== Mapping Movies Library ===================================|",
+                "[2026-04-01 01:13:25,670] [kometa.py:730] [INFO]     |================================== Mapping TV Shows Library ===================================|",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    stats = log_path.stat()
+
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_root_path", lambda: kometa_root)
+    monkeypatch.setattr(qs_module.helpers, "is_kometa_running", lambda: True)
+    monkeypatch.setattr(qs_module, "_load_progress_config", lambda *_args, **_kwargs: {})
+
+    analyzer_calls = {"count": 0}
+
+    class _FakeProgressAnalyzer:
+        def extract_progress(self, content, **kwargs):
+            analyzer_calls["count"] += 1
+            return {
+                "phase_current": "collections",
+                "phases_completed": [],
+                "libraries": [
+                    {"name": "Movies", "type": "movie", "status": "Done", "durations": {}},
+                    {"name": "TV Shows", "type": "show", "status": "In progress", "durations": {}},
+                ],
+                "current_library": "TV Shows",
+                "completed_count": 1,
+                "total_count": 2,
+            }
+
+        def extract_maintenance_summary(self, content):
+            return {"had_pause": False, "pause_count": 0, "pause_seconds": 0, "open_pause": False, "window": None, "events": []}
+
+    monkeypatch.setattr(qs_module.logscan, "LogscanAnalyzer", _FakeProgressAnalyzer)
+    qs_module.LOGSCAN_PROGRESS_CACHE.update(
+        {
+            "mtime": stats.st_mtime,
+            "size": stats.st_size,
+            "sidecar_mtime": None,
+            "sidecar_size": None,
+            "data": {
+                "run_started_at": None,
+                "current_library": "Movies",
+                "phase_current": "operations",
+                "libraries": [
+                    {"name": "Movies", "type": "movie", "status": "In progress", "durations": {}},
+                    {"name": "TV Shows", "type": "show", "status": "Pending", "durations": {}},
+                ],
+                "total_count": 2,
+                "completed_count": 0,
+            },
+        }
+    )
+
+    resp = client.get("/logscan/progress?size=all")
+    assert resp.status_code == 200
+    assert analyzer_calls["count"] == 1
+    payload = resp.get_json()
+    statuses = {entry["name"]: entry["status"] for entry in payload["libraries"]}
+    assert statuses["Movies"] == "Done"
+    assert statuses["TV Shows"] == "In progress"
+
+
+def test_logscan_progress_includes_maintenance_sidecar_and_invalidates_cache(client, isolated_config_dir, monkeypatch, qs_module):
+    kometa_root = Path(qs_module.app.config["KOMETA_ROOT"])
+    log_dir = kometa_root / "config" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "meta.log"
+    sidecar_path = log_dir / "meta.quickstart-maintenance.log"
+    log_path.write_text(
+        "[Quickstart] Run marker: started=2026-04-24T21:00:00Z config=demo quickstart=1.0.0 branch=develop maintenance_markers=1 start_mode=current\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_root_path", lambda: kometa_root)
+    monkeypatch.setattr(qs_module.helpers, "is_kometa_running", lambda: True)
+    monkeypatch.setattr(qs_module.persistence, "retrieve_settings", lambda *_args, **_kwargs: {"libraries": {}})
+
+    qs_module.LOGSCAN_PROGRESS_CACHE.update({"mtime": None, "size": None, "sidecar_mtime": None, "sidecar_size": None, "data": None})
+
+    first = client.get("/logscan/progress")
+    assert first.status_code == 200
+    first_payload = first.get_json()
+    assert first_payload["maintenance_had_pause"] is False
+
+    sidecar_path.write_text(
+        "\n".join(
+            [
+                "[Quickstart] Maintenance marker: event=paused at=2026-04-24T21:10:00Z local_at=2026-04-24_17:10:00 window=03:00-05:00",
+                "[Quickstart] Maintenance marker: event=resumed at=2026-04-24T21:12:00Z local_at=2026-04-24_17:12:00 window=03:00-05:00 paused_seconds=120",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    second = client.get("/logscan/progress")
+    assert second.status_code == 200
+    second_payload = second.get_json()
+    assert second_payload["maintenance_had_pause"] is True
+    assert second_payload["maintenance_summary"]["had_pause"] is True
+    assert second_payload["maintenance_summary"]["pause_count"] == 1
+    assert second_payload["maintenance_summary"]["pause_seconds"] == 120
 
 
 def test_logscan_reingest_ingests_day_runtime_log(client, isolated_config_dir, monkeypatch, qs_module):
@@ -1119,7 +1299,10 @@ def test_logscan_reingest_ingests_imagemaid_log(client, isolated_config_dir, mon
         "\n".join(
             [
                 "[Quickstart] Run marker: started=2026-04-28T20:13:55Z config=demo tool=imagemaid mode=report",
+                "[2026-04-28 20:13:56,001] [imagemaid.py:93]           [DEBUG]    | --photo-transcoder (PHOTO_TRANSCODER): True                                                         |",
                 "| Running in Report Mode with Empty Trash, Clean Bundles, Optimize DB, and PhotoTrancoder set to True |",
+                "[2026-04-28 20:16:58,010] [imagemaid.py:214]          [WARNING]  | Example warning before finish                                                                       |",
+                "[2026-04-28 20:16:59,010] [imagemaid.py:214]          [CRITICAL] | Example critical before finish                                                                      |",
                 "[2026-04-28 20:17:00,274] [imagemaid.py:453]          [INFO]     |======================================== ImageMaid Finished ========================================|",
                 "[2026-04-28 20:17:00,275] [imagemaid.py:453]          [INFO]     | Total Runtime      | 0:03:05                                                                       |",
                 "[2026-04-28 20:17:00,275] [imagemaid.py:453]          [INFO]     |====================================================================================================|",
@@ -1142,6 +1325,10 @@ def test_logscan_reingest_ingests_imagemaid_log(client, isolated_config_dir, mon
     imagemaid_runs = [run for run in runs if run.get("tool_name") == "imagemaid"]
     assert imagemaid_runs
     assert imagemaid_runs[0]["kometa_version"] == qs_module.helpers.get_imagemaid_local_version()
+    assert imagemaid_runs[0]["debug_count"] == 1
+    assert imagemaid_runs[0]["info_count"] == 3
+    assert imagemaid_runs[0]["warning_count"] == 1
+    assert imagemaid_runs[0]["critical_count"] == 1
 
 
 def test_logscan_reingest_archives_completed_imagemaid_live_log(client, isolated_config_dir, monkeypatch, qs_module):
@@ -1245,6 +1432,9 @@ def test_logscan_reingest_ingests_imagemaid_clear_runtime_log_with_restore_stats
                 "[2026-04-29 21:53:15,701] [imagemaid.py:93]           [INFO]     |====================================================================================================|",
                 "[2026-04-29 21:53:16,088] [imagemaid.py:93]           [INFO]     |     Version: 1.1.1-build8 (Python 3.12.1)                                                          |",
                 "[2026-04-29 21:53:16,716] [imagemaid.py:93]           [DEBUG]    | Run Command: C:\\Users\\bullmoose20\\Quickstart\\config\\imagemaid\\imagemaid.py --url (redacted) --token (redacted) --plex P:\\plex --mode clear --photo-transcoder --local --timeout 600 --sleep 60 |",
+                "[2026-04-29 21:53:16,717] [imagemaid.py:93]           [DEBUG]    | --empty-trash (EMPTY_TRASH): False                                                                 |",
+                "[2026-04-29 21:53:16,718] [imagemaid.py:93]           [DEBUG]    | --clean-bundles (CLEAN_BUNDLES): False                                                             |",
+                "[2026-04-29 21:53:16,719] [imagemaid.py:93]           [DEBUG]    | --optimize-db (OPTIMIZE_DB): False                                                                 |",
                 "[2026-04-29 21:53:16,726] [imagemaid.py:118]          [INFO]     | Running in Clear Mode with PhotoTrancoder set to True                                              |",
                 "[2026-04-29 21:53:16,739] [imagemaid.py:385]          [INFO]     | Scanning ImageMaid Restore for Bloat Images to Remove                                              |",
                 "[2026-04-29 22:05:43,127] [imagemaid.py:387]          [INFO]     | Scanning Complete: Found 93440 Bloat Images in the ImageMaid Directory to Remove                   |",
@@ -1294,10 +1484,21 @@ def test_logscan_reingest_ingests_imagemaid_clear_runtime_log_with_restore_stats
     assert run["analysis_counts"]["imagemaid_restore_recovered_bytes"] == 25544317992
     assert run["analysis_counts"]["imagemaid_photo_recovered_bytes"] == 6742343
     assert run["analysis_counts"]["imagemaid_total_recovered_bytes"] == 25551060335
+    assert run["analysis_counts"]["imagemaid_empty_trash_enabled"] == 0
+    assert run["analysis_counts"]["imagemaid_clean_bundles_enabled"] == 0
+    assert run["analysis_counts"]["imagemaid_optimize_db_enabled"] == 0
     assert run["section_runtimes"]["restore_dir_scan"] == 746
     assert run["section_runtimes"]["restore_dir_action"] == 3743
     assert run["section_runtimes"]["photo_transcoder_scan"] == 1
     assert run["section_runtimes"]["photo_transcoder_remove"] == 1
+    assert run["progress_snapshot"]["name_label"] == "Operation"
+    assert run["progress_snapshot"]["type_label"] == "Area"
+    assert run["progress_snapshot"]["total_label"] == "1h 14m 52s"
+    progress_rows = {row["name"]: row for row in run["progress_snapshot"]["rows"]}
+    assert progress_rows["Restore Cache"]["phase_cells"][0]["label"] == "12m 26s"
+    assert progress_rows["Restore Cache"]["phase_cells"][1]["label"] == "1h 2m 23s"
+    assert progress_rows["Restore Cache"]["phase_cells"][2]["label"] == "Removed 93.4K"
+    assert progress_rows["PhotoTranscoder"]["phase_cells"][2]["label"] == "Removed 126"
 
 
 def test_analyze_imagemaid_log_content_uses_first_runtime_timestamp_for_started_at(qs_module):
@@ -1318,6 +1519,179 @@ def test_analyze_imagemaid_log_content_uses_first_runtime_timestamp_for_started_
     assert summary["finished_at"] == "2026-04-29 15:08:35"
     assert summary["run_time_seconds"] == 5
     assert summary["config_name"] == "unknown"
+
+
+def test_analyze_imagemaid_log_content_parses_summary_section_runtimes(qs_module):
+    result = qs_module._analyze_imagemaid_log_content(
+        "\n".join(
+            [
+                "[2026-05-06 07:45:19,459] [imagemaid.py:244]          [INFO]     | Downloading Database via the Plex API. First Plex will make a backup of your database.             |",
+                "[2026-05-06 07:50:48,649] [imagemaid.py:290]          [INFO]     | Runtime: 0:05:29                                                                                   |",
+                "[2026-05-06 07:50:48,779] [imagemaid.py:297]          [INFO]     | Database Opened Querying For In-Use Images                                                         |",
+                "[2026-05-06 07:50:49,327] [imagemaid.py:304]          [INFO]     | Runtime: 0:00:00                                                                                   |",
+                "[2026-05-06 07:50:49,330] [imagemaid.py:311]          [INFO]     | Scanning Metadata Directory For Bloat Images: p:\\Plex\\Metadata                                     |",
+                "[2026-05-06 07:56:08,253] [imagemaid.py:317]          [INFO]     | Runtime: 0:05:18                                                                                   |",
+                "[2026-05-06 07:56:08,253] [imagemaid.py:322]          [INFO]     | Reporting Bloat Images                                                                             |",
+                "[2026-05-06 07:56:08,404] [imagemaid.py:354]          [INFO]     | Runtime: 0:00:00                                                                                   |",
+                "[2026-05-06 07:56:08,407] [imagemaid.py:415]          [INFO]     | Scanning for PhotoTranscoder Images                                                                |",
+                "[2026-05-06 07:56:09,910] [imagemaid.py:418]          [INFO]     | Runtime: 0:00:01                                                                                   |",
+                "[2026-05-06 07:56:09,911] [imagemaid.py:421]          [INFO]     | Removing PhotoTranscoder Images                                                                    |",
+                "[2026-05-06 07:56:09,913] [imagemaid.py:435]          [INFO]     | Runtime: 0:00:00                                                                                   |",
+                "[2026-05-06 07:56:09,914] [imagemaid.py:473]          [INFO]     |============================================= Database =============================================|",
+                "[2026-05-06 07:56:09,916] [imagemaid.py:473]          [INFO]     | Downloaded         | 0:05:29                                                                       |",
+                "[2026-05-06 07:56:09,917] [imagemaid.py:473]          [INFO]     | Query              | 0:00:00                                                                       |",
+                "[2026-05-06 07:56:09,917] [imagemaid.py:473]          [INFO]     |====================================== Reporting Bloat Images ======================================|",
+                "[2026-05-06 07:56:09,918] [imagemaid.py:473]          [INFO]     | Scan Time          | 0:05:18                                                                       |",
+                "[2026-05-06 07:56:09,918] [imagemaid.py:473]          [INFO]     | Report Time        | 0:00:00                                                                       |",
+                "[2026-05-06 07:56:09,919] [imagemaid.py:473]          [INFO]     |================================== Remove PhotoTranscoder Images ===================================|",
+                "[2026-05-06 07:56:09,920] [imagemaid.py:473]          [INFO]     | Scan Time          | 0:00:01                                                                       |",
+                "[2026-05-06 07:56:09,920] [imagemaid.py:473]          [INFO]     | Remove Time        | 0:00:00                                                                       |",
+                "[2026-05-06 07:56:09,922] [imagemaid.py:473]          [INFO]     | Total Runtime      | 0:10:50                                                                       |",
+            ]
+        ),
+        log_path="imagemaid.log",
+    )
+
+    assert result is not None
+    section_runtimes = result["summary"]["section_runtimes"]
+    assert section_runtimes["database_download"] == 329
+    assert section_runtimes["database_query"] == 0
+    assert section_runtimes["report_bloat_scan"] == 318
+    assert section_runtimes["report_bloat_action"] == 0
+    assert section_runtimes["photo_transcoder_scan"] == 1
+    assert section_runtimes["photo_transcoder_remove"] == 0
+    progress_snapshot = result["summary"]["progress_snapshot"]
+    assert progress_snapshot["name_label"] == "Operation"
+    assert progress_snapshot["type_label"] == "Area"
+    assert progress_snapshot["columns"][0]["label"] == "Scan Time"
+    assert progress_snapshot["columns"][2]["label"] == "Observed"
+    row_names = [row["name"] for row in progress_snapshot["rows"]]
+    assert "Database Prep" in row_names
+    assert "Bloat Report" in row_names
+    assert "PhotoTranscoder" in row_names
+
+
+def test_logscan_reingest_preserves_incomplete_imagemaid_progress_snapshot(client, isolated_config_dir, monkeypatch, qs_module):
+    imagemaid_root = isolated_config_dir / "imagemaid"
+    log_dir = imagemaid_root / "config" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    runtime_log = log_dir / "imagemaid.log"
+    runtime_log.write_text(
+        "\n".join(
+            [
+                "[2026-05-06 07:45:19,459] [imagemaid.py:244]          [INFO]     | Downloading Database via the Plex API. First Plex will make a backup of your database.             |",
+                "[2026-05-06 07:50:48,649] [imagemaid.py:290]          [INFO]     | Runtime: 0:05:29                                                                                   |",
+                "[2026-05-06 07:50:48,779] [imagemaid.py:297]          [INFO]     | Database Opened Querying For In-Use Images                                                         |",
+                "[2026-05-06 07:50:49,327] [imagemaid.py:304]          [INFO]     | Runtime: 0:00:00                                                                                   |",
+                "[2026-05-06 07:50:49,330] [imagemaid.py:311]          [INFO]     | Scanning Metadata Directory For Bloat Images: p:\\Plex\\Metadata                                     |",
+                "[2026-05-06 07:56:08,253] [imagemaid.py:317]          [INFO]     | Runtime: 0:05:18                                                                                   |",
+                "[2026-05-06 07:56:08,253] [imagemaid.py:322]          [INFO]     | Reporting Bloat Images                                                                             |",
+                "[2026-05-06 07:56:08,404] [imagemaid.py:354]          [INFO]     | Runtime: 0:00:00                                                                                   |",
+                "[2026-05-06 07:56:08,407] [imagemaid.py:415]          [INFO]     | Scanning for PhotoTranscoder Images                                                                |",
+                "[2026-05-06 07:56:09,910] [imagemaid.py:418]          [INFO]     | Runtime: 0:00:01                                                                                   |",
+                "[2026-05-06 07:56:09,911] [imagemaid.py:421]          [INFO]     | Removing PhotoTranscoder Images                                                                    |",
+                "[2026-05-06 07:56:09,913] [imagemaid.py:435]          [INFO]     | Runtime: 0:00:00                                                                                   |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(qs_module.helpers, "get_imagemaid_root_path", lambda: imagemaid_root)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_root_path", lambda: isolated_config_dir / "kometa")
+    monkeypatch.setattr(qs_module.helpers, "is_imagemaid_running", lambda: False)
+    monkeypatch.setattr(qs_module.logscan.LogscanAnalyzer, "preload_people_index", lambda self, *_args, **_kwargs: None)
+
+    resp = client.post("/logscan/trends/reingest", json={"reset": True})
+    assert resp.status_code == 200
+
+    incomplete_runs = qs_module._get_logscan_incomplete_runs(limit=10)
+    imagemaid_runs = [run for run in incomplete_runs if run.get("tool_name") == "imagemaid"]
+    assert imagemaid_runs
+    snapshot = imagemaid_runs[0]["progress_snapshot"]
+    assert snapshot["name_label"] == "Operation"
+    assert snapshot["type_label"] == "Area"
+    assert snapshot["rows"]
+    row_names = [row["name"] for row in snapshot["rows"]]
+    assert "Database Prep" in row_names
+    assert "Bloat Report" in row_names
+    assert "PhotoTranscoder" in row_names
+
+
+def test_analyze_incomplete_kometa_log_for_resume_uses_first_runtime_timestamp_for_started_at(qs_module, isolated_config_dir, monkeypatch):
+    log_path = isolated_config_dir / "kometa" / "config" / "logs" / "meta.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "\n".join(
+            [
+                "[2026-04-29 15:08:28,897] [kometa.py:93] [INFO] | Starting work |",
+                "[2026-04-29 15:08:35,001] [collections.py:453] [INFO] | Running Demo Collection in Library |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _IncompleteAnalyzer:
+        def analyze_content(self, content, log_path=None, config_name=None, include_people_scan=False):
+            return {
+                "summary": {
+                    "run_key": "run-incomplete-kometa-1",
+                    "tool_name": "kometa",
+                    "run_complete": False,
+                    "started_at": None,
+                    "finished_at": None,
+                    "config_name": config_name or "demo",
+                    "run_command": "python kometa.py --run --config C:\\Quickstart\\config\\demo.yml",
+                    "log_size": len(content or ""),
+                },
+                "recommendations": [],
+            }
+
+        def extract_progress(self, *_args, **_kwargs):
+            return {}
+
+        def _strip_divider_wrappers(self, value):
+            return value
+
+    monkeypatch.setattr(qs_module.logscan, "LogscanAnalyzer", _IncompleteAnalyzer)
+    monkeypatch.setattr(qs_module, "_build_recovery_suggestions", lambda *_args, **_kwargs: [])
+
+    result = qs_module._analyze_incomplete_log_for_resume(log_path, config_name="demo")
+
+    assert result is not None
+    assert result["started_at"] == "2026-04-29 15:08:28"
+
+
+def test_build_incomplete_run_from_cache_entry_uses_first_runtime_timestamp_for_started_at(qs_module, isolated_config_dir):
+    log_path = isolated_config_dir / "cache" / "logscan" / "archive" / "kometa" / "meta-cached.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "\n".join(
+            [
+                "[2026-04-29 15:08:28,897] [kometa.py:93] [INFO] | Starting work |",
+                "[2026-04-29 15:08:35,001] [collections.py:453] [INFO] | Running Demo Collection in Library |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = qs_module._build_incomplete_run_from_cache_entry(
+        log_path,
+        cache_entry={
+            "run_key": "run-incomplete-cached-1",
+            "tool_name": "kometa",
+            "run_complete": False,
+            "summary": {
+                "run_key": "run-incomplete-cached-1",
+                "tool_name": "kometa",
+                "started_at": None,
+                "config_name": "demo",
+                "run_command": "python kometa.py --run",
+            },
+        },
+        config_name="demo",
+    )
+
+    assert result["started_at"] == "2026-04-29 15:08:28"
 
 
 def test_analyze_imagemaid_log_content_infers_saved_config_name(qs_module, isolated_config_dir):

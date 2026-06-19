@@ -79,6 +79,7 @@ document.addEventListener('DOMContentLoaded', function () {
   const configSwitchSelect = document.getElementById('configSwitchSelect')
   const configSelector = document.getElementById('configSelector')
   const activeConfigInput = document.getElementById('qs-active-config-input')
+  const startStepLinks = Array.from(document.querySelectorAll('.qs-start-step-link[href^="/step/"]'))
   const newConfigInput = document.getElementById('newConfigName')
   const saveConfigRow = document.getElementById('saveConfigRow')
   const saveConfigButton = document.getElementById('saveConfigButton')
@@ -118,6 +119,25 @@ document.addEventListener('DOMContentLoaded', function () {
   const importConfigName = document.getElementById('importConfigName')
   const importModeNew = document.getElementById('importModeNew')
   const importModeMerge = document.getElementById('importModeMerge')
+
+  startStepLinks.forEach((link) => {
+    if (link.dataset.qsStartNavBound === '1') return
+    link.dataset.qsStartNavBound = '1'
+    link.addEventListener('click', (event) => {
+      const href = String(link.getAttribute('href') || '').trim()
+      if (!href || !href.startsWith('/step/')) return
+      event.preventDefault()
+      const targetLabel = String(link.dataset.qsTargetLabel || link.textContent || '').trim()
+      if (typeof window.loading === 'function') {
+        window.loading('jump', targetLabel)
+      } else if (typeof window.showNavigationLoadingOverlay === 'function') {
+        window.showNavigationLoadingOverlay('jump', targetLabel)
+      }
+      window.setTimeout(() => {
+        window.location.assign(href)
+      }, 60)
+    })
+  })
   const importMergeBaseSection = document.getElementById('importMergeBaseSection')
   const importMergeBaseConfig = document.getElementById('importMergeBaseConfig')
   const importPlexCredentials = document.getElementById('importPlexCredentials')
@@ -176,6 +196,226 @@ document.addEventListener('DOMContentLoaded', function () {
       importTmdbApiKey.setAttribute('type', isPassword ? 'text' : 'password')
       setIconOnlyButton(importTmdbApiKeyToggle, isPassword ? 'bi bi-eye-slash' : 'bi bi-eye')
     })
+  }
+
+  const kometaInstallSettings = document.getElementById('start-kometa-install-settings')
+  const kometaInstallSaveButton = document.getElementById('start-kometa-install-save')
+  const kometaInstallStatus = document.getElementById('start-kometa-install-status')
+  const kometaInstallMessage = document.getElementById('start-kometa-install-message')
+  const kometaExistingRootWrap = document.getElementById('start-kometa-existing-root-wrap')
+  const kometaExistingRootInput = document.getElementById('start-kometa-existing-root')
+  const kometaExternalConfigWrap = document.getElementById('start-kometa-external-config-wrap')
+  const kometaExternalConfigInput = document.getElementById('start-kometa-external-config-root')
+  const kometaExternalLogWrap = document.getElementById('start-kometa-external-log-wrap')
+  const kometaExternalLogInput = document.getElementById('start-kometa-external-log-root')
+  const kometaExternalDrawbacks = document.getElementById('start-kometa-external-drawbacks')
+  const kometaActiveRoot = document.getElementById('start-kometa-active-root')
+  const kometaActiveConfig = document.getElementById('start-kometa-active-config')
+  const kometaActiveLog = document.getElementById('start-kometa-active-log')
+  const kometaModePill = document.getElementById('qs-kometa-mode-pill')
+  const kometaModePillBadge = document.getElementById('qs-kometa-mode-pill-badge')
+
+  function getStartKometaInstallMode () {
+    const selected = document.querySelector('input[name="start-kometa-install-mode"]:checked')
+    return selected ? String(selected.value || '').trim().toLowerCase() : 'managed'
+  }
+
+  function syncStartKometaModePill () {
+    if (!kometaModePillBadge) return
+    const mode = getStartKometaInstallMode()
+    let label = 'Managed'
+    let title = 'Kometa mode: Quickstart-managed install'
+    kometaModePillBadge.classList.remove('text-bg-success', 'text-bg-info', 'text-bg-warning', 'text-dark')
+
+    if (mode === 'existing') {
+      label = 'Existing'
+      title = 'Kometa mode: Existing direct install'
+      kometaModePillBadge.classList.add('text-bg-info', 'text-dark')
+    } else if (mode === 'external') {
+      label = 'External'
+      title = 'Kometa mode: External/containerized config+logs'
+      kometaModePillBadge.classList.add('text-bg-warning', 'text-dark')
+    } else {
+      kometaModePillBadge.classList.add('text-bg-success')
+    }
+
+    kometaModePillBadge.innerHTML = `<i class="bi bi-diagram-3 me-1"></i> Kometa: ${label}`
+    if (kometaModePill) {
+      kometaModePill.setAttribute('title', title)
+    }
+  }
+
+  function syncStartKometaInstallUi () {
+    if (!kometaInstallSettings) return
+    const mode = getStartKometaInstallMode()
+    const isExisting = mode === 'existing'
+    const isExternal = mode === 'external'
+    if (kometaExistingRootWrap) {
+      kometaExistingRootWrap.classList.toggle('d-none', !isExisting)
+    }
+    if (kometaExternalConfigWrap) {
+      kometaExternalConfigWrap.classList.toggle('d-none', !isExternal)
+    }
+    if (kometaExternalLogWrap) {
+      kometaExternalLogWrap.classList.toggle('d-none', !isExternal)
+    }
+    if (kometaExternalDrawbacks) {
+      kometaExternalDrawbacks.classList.toggle('d-none', !isExternal)
+    }
+    if (kometaInstallMessage) {
+      if (isExisting) {
+        kometaInstallMessage.textContent = 'Quickstart will only use the existing direct Kometa install if that root is visible from this environment.'
+      } else if (isExternal) {
+        kometaInstallMessage.textContent = 'Quickstart will sync generated config and optional logs for an external/containerized Kometa, but it will not launch or update that runtime directly.'
+      } else {
+        kometaInstallMessage.textContent = 'Quickstart will create and manage its own Kometa install inside this workspace.'
+      }
+    }
+    syncStartKometaModePill()
+  }
+
+  function normalizeKometaPathInput (value) {
+    return String(value || '').trim()
+  }
+
+  function getPersistedStartKometaInstallChoice () {
+    if (!kometaInstallSettings) {
+      return {
+        mode: 'managed',
+        existingRoot: '',
+        externalConfigRoot: '',
+        externalLogRoot: ''
+      }
+    }
+    return {
+      mode: String(kometaInstallSettings.dataset.installMode || 'managed').trim().toLowerCase() || 'managed',
+      existingRoot: normalizeKometaPathInput(kometaInstallSettings.dataset.existingRoot),
+      externalConfigRoot: normalizeKometaPathInput(kometaInstallSettings.dataset.externalConfigRoot),
+      externalLogRoot: normalizeKometaPathInput(kometaInstallSettings.dataset.externalLogRoot)
+    }
+  }
+
+  function getCurrentStartKometaInstallChoice () {
+    return {
+      mode: getStartKometaInstallMode(),
+      existingRoot: normalizeKometaPathInput(kometaExistingRootInput ? kometaExistingRootInput.value : ''),
+      externalConfigRoot: normalizeKometaPathInput(kometaExternalConfigInput ? kometaExternalConfigInput.value : ''),
+      externalLogRoot: normalizeKometaPathInput(kometaExternalLogInput ? kometaExternalLogInput.value : '')
+    }
+  }
+
+  function isStartKometaInstallChoiceDirty () {
+    const persisted = getPersistedStartKometaInstallChoice()
+    const current = getCurrentStartKometaInstallChoice()
+    if (current.mode !== persisted.mode) return true
+    if (current.mode === 'existing') return current.existingRoot !== persisted.existingRoot
+    if (current.mode === 'external') {
+      return current.externalConfigRoot !== persisted.externalConfigRoot || current.externalLogRoot !== persisted.externalLogRoot
+    }
+    return false
+  }
+
+  function syncStartKometaInstallSaveState (options = {}) {
+    if (!kometaInstallSaveButton) return
+    const forceDisabled = options.forceDisabled === true
+    const hasUnsavedChanges = isStartKometaInstallChoiceDirty()
+    const disabled = forceDisabled || !hasUnsavedChanges
+    kometaInstallSaveButton.disabled = disabled
+    kometaInstallSaveButton.classList.remove('btn-success', 'btn-secondary')
+    kometaInstallSaveButton.classList.add(disabled ? 'btn-secondary' : 'btn-success')
+    if (kometaInstallStatus && !options.preserveStatusText) {
+      kometaInstallStatus.textContent = options.statusText !== undefined
+        ? options.statusText
+        : (hasUnsavedChanges ? 'Unsaved changes.' : 'Saved.')
+    }
+  }
+
+  async function saveStartKometaInstallChoice () {
+    if (!kometaInstallSettings || !kometaInstallSaveButton) return
+    const mode = getStartKometaInstallMode()
+    const existingRoot = kometaExistingRootInput ? kometaExistingRootInput.value.trim() : ''
+    const externalConfigRoot = kometaExternalConfigInput ? kometaExternalConfigInput.value.trim() : ''
+    const externalLogRoot = kometaExternalLogInput ? kometaExternalLogInput.value.trim() : ''
+    const configName = window.pageInfo && window.pageInfo.config_name ? window.pageInfo.config_name : ''
+
+    kometaInstallSaveButton.disabled = true
+    kometaInstallSaveButton.classList.remove('btn-success')
+    kometaInstallSaveButton.classList.add('btn-secondary')
+    if (kometaInstallStatus) kometaInstallStatus.textContent = 'Saving...'
+
+    try {
+      const res = await fetch('/save-kometa-install-mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          config_name: configName,
+          install_mode: mode,
+          existing_root: existingRoot,
+          external_config_root: externalConfigRoot,
+          external_log_root: externalLogRoot
+        })
+      })
+      const data = await res.json()
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || data.message || 'Unable to save the Kometa choice.')
+      }
+      kometaInstallSettings.dataset.installMode = data.install_mode || mode
+      kometaInstallSettings.dataset.existingRoot = normalizeKometaPathInput(data.existing_root)
+      kometaInstallSettings.dataset.externalConfigRoot = normalizeKometaPathInput(data.external_config_root)
+      kometaInstallSettings.dataset.externalLogRoot = normalizeKometaPathInput(data.external_log_root)
+      kometaInstallSettings.dataset.selectedRoot = data.kometa_primary_path_display || data.kometa_config_dir_display || data.kometa_root_display || data.kometa_root || ''
+      if (window.pageInfo) {
+        window.pageInfo.kometa_install_mode = data.install_mode || mode
+        window.pageInfo.kometa_existing_root = normalizeKometaPathInput(data.existing_root)
+        window.pageInfo.kometa_external_config_root = normalizeKometaPathInput(data.external_config_root)
+        window.pageInfo.kometa_external_log_root = normalizeKometaPathInput(data.external_log_root)
+      }
+      if (kometaActiveRoot) {
+        kometaActiveRoot.textContent = data.kometa_primary_path_display || data.kometa_config_dir_display || data.kometa_root_display || data.kometa_root || ''
+      }
+      if (kometaActiveConfig) {
+        kometaActiveConfig.textContent = data.kometa_config_dir_display || data.kometa_config_dir || ''
+      }
+      if (kometaActiveLog) {
+        kometaActiveLog.textContent = data.kometa_log_dir_display || data.kometa_log_dir || ''
+      }
+      if (kometaInstallMessage) {
+        kometaInstallMessage.textContent = data.message || 'Kometa choice saved.'
+      }
+      syncStartKometaModePill()
+      syncStartKometaInstallSaveState({ statusText: 'Saved.' })
+      if (typeof showToast === 'function') {
+        showToast('success', data.message || 'Kometa choice saved.')
+      }
+    } catch (err) {
+      syncStartKometaInstallSaveState({ statusText: 'Save failed.' })
+      if (typeof showToast === 'function') {
+        showToast('error', err.message || 'Unable to save the Kometa choice.')
+      }
+    }
+  }
+
+  if (kometaInstallSettings) {
+    document.querySelectorAll('input[name="start-kometa-install-mode"]').forEach((radio) => {
+      radio.addEventListener('change', () => {
+        syncStartKometaInstallUi()
+        syncStartKometaInstallSaveState()
+      })
+    })
+    ;[kometaExistingRootInput, kometaExternalConfigInput, kometaExternalLogInput].forEach((input) => {
+      if (!input) return
+      input.addEventListener('input', () => {
+        syncStartKometaInstallSaveState()
+      })
+      input.addEventListener('change', () => {
+        syncStartKometaInstallSaveState()
+      })
+    })
+    if (kometaInstallSaveButton) {
+      kometaInstallSaveButton.addEventListener('click', saveStartKometaInstallChoice)
+    }
+    syncStartKometaInstallUi()
+    syncStartKometaInstallSaveState({ statusText: 'Saved.' })
   }
 
   function updateButtonState () {
@@ -280,6 +520,8 @@ document.addEventListener('DOMContentLoaded', function () {
     updateButtonState()
     refreshWorkspaceStatusNow()
   }
+
+  window.qsApplyActiveConfigUi = applyActiveConfigUi
 
   async function activateConfig (name) {
     const normalized = sanitizeConfigName(name)
@@ -1017,6 +1259,19 @@ document.addEventListener('DOMContentLoaded', function () {
     }
   }
 
+  async function parseImportJsonResponse (response, fallbackMessage) {
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase()
+    if (contentType.includes('application/json')) {
+      return await response.json()
+    }
+    const text = await response.text()
+    const trimmed = String(text || '').trim()
+    if (!trimmed) {
+      throw new Error(fallbackMessage || 'Request failed.')
+    }
+    throw new Error(trimmed.slice(0, 300))
+  }
+
   if (saveConfigButton) {
     saveConfigButton.addEventListener('click', async () => {
       if (!newConfigInput) return
@@ -1092,6 +1347,7 @@ document.addEventListener('DOMContentLoaded', function () {
     notifiarr: 'Notifiarr',
     gotify: 'Gotify',
     ntfy: 'ntfy',
+    apprise: 'Apprise',
     github: 'GitHub',
     radarr: 'Radarr',
     sonarr: 'Sonarr',
@@ -1114,6 +1370,7 @@ document.addEventListener('DOMContentLoaded', function () {
     'notifiarr',
     'gotify',
     'ntfy',
+    'apprise',
     'webhooks',
     'anidb',
     'radarr',
@@ -1251,7 +1508,7 @@ document.addEventListener('DOMContentLoaded', function () {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: importToken, library_mapping: collectLibraryMapping() })
       })
-      const data = await res.json()
+      const data = await parseImportJsonResponse(res, 'Preview refresh failed.')
       if (!res.ok || !data.success) {
         throw new Error(data.message || 'Preview refresh failed.')
       }
@@ -1670,7 +1927,7 @@ document.addEventListener('DOMContentLoaded', function () {
           method: 'POST',
           body: formData
         })
-        const data = await res.json()
+        const data = await parseImportJsonResponse(res, 'Preview failed.')
         if (!res.ok || !data.success) {
           setImportCredentialFlags({
             needsPlex: Boolean(data && data.needs_plex_credentials),
@@ -1867,6 +2124,7 @@ document.addEventListener('DOMContentLoaded', function () {
           '070-notifiarr': 'Notifiarr',
           '080-gotify': 'Gotify',
           '085-ntfy': 'ntfy',
+          '087-apprise': 'Apprise',
           '090-webhooks': 'Webhooks',
           '100-anidb': 'AniDB',
           '110-radarr': 'Radarr',
@@ -1920,7 +2178,7 @@ document.addEventListener('DOMContentLoaded', function () {
             ...mergePayload
           })
         })
-        const data = await res.json()
+        const data = await parseImportJsonResponse(res, 'Import failed.')
         if (!res.ok || !data.success) {
           throw new Error(data.message || 'Import failed.')
         }
@@ -2060,7 +2318,7 @@ document.addEventListener('DOMContentLoaded', function () {
   // Elapsed time shown inside the button label (no DOM rebuilds)
   let elapsedTimer = null
   let startedAt = 0
-  let baseBtnMsg = '' // e.g., "Downloading… 1.2 GB • 20 MB/s"
+  let baseBtnMsg = '' // e.g., "Downloading... 1.2 GB • 20 MB/s"
   function startElapsedTimer (resumeAt) {
     startedAt = Number.isFinite(resumeAt) ? resumeAt : Date.now()
     clearInterval(elapsedTimer)
@@ -2404,23 +2662,23 @@ document.addEventListener('DOMContentLoaded', function () {
             lastDownloaded = prog.downloaded || 0
             lastTs = now
 
-            setPhase('Downloading…')
+            setPhase('Downloading...')
 
             if (pct === null || estimateTooSmall) {
               const speedNote = speedStr ? `• ${speedStr}` : ''
               const sizeNote = estimateTooSmall ? '• estimate too small' : '• size unknown'
-              setProgress(40, `Downloading… ${bytes(prog.downloaded || 0)} ${speedNote} ${sizeNote}`, { indeterminate: true })
+              setProgress(40, `Downloading... ${bytes(prog.downloaded || 0)} ${speedNote} ${sizeNote}`, { indeterminate: true })
             } else {
               const totalStr = hasTotal ? ` / ${bytes(prog.total)}` : ''
               const estimateLabel = ''
-              setProgress(pct, `Downloading… ${bytes(prog.downloaded || 0)}${totalStr} (${pct}%) ${speedStr ? `• ${speedStr}` : ''}${estimateLabel}`)
+              setProgress(pct, `Downloading... ${bytes(prog.downloaded || 0)}${totalStr} (${pct}%) ${speedStr ? `• ${speedStr}` : ''}${estimateLabel}`)
             }
           } else if (phase === 'extract') {
-            setPhase('Extracting…')
-            setProgress(prog.pct || 0, `Extracting… ${prog.files_done || 0}/${prog.files_total || 0} files`)
+            setPhase('Extracting...')
+            setProgress(prog.pct || 0, `Extracting... ${prog.files_done || 0}/${prog.files_total || 0} files`)
           } else if (phase === 'finalize') {
-            setPhase('Finalizing…')
-            setProgress(prog.pct || 95, 'Finalizing…')
+            setPhase('Finalizing...')
+            setProgress(prog.pct || 95, 'Finalizing...')
           } else if (phase === 'done') {
             setPhase('Completed.')
             setProgress(100, 'Completed.')
@@ -2456,12 +2714,12 @@ document.addEventListener('DOMContentLoaded', function () {
       running = true
 
       const isUpdate = updateRow && !updateRow.classList.contains('d-none')
-      baseBtnMsg = isUpdate ? 'Updating…' : 'Downloading…'
+      baseBtnMsg = isUpdate ? 'Updating...' : 'Downloading...'
 
       setButtonBusy(`${baseBtnMsg} (00:00)`)
       if (updateBtn) updateBtn.disabled = true
       resetProgress()
-      setProgress(0, isUpdate ? 'Preparing update…' : 'Preparing download…')
+      setProgress(0, isUpdate ? 'Preparing update...' : 'Preparing download...')
       startElapsedTimer()
 
       // 1) Start job
@@ -2508,11 +2766,11 @@ document.addEventListener('DOMContentLoaded', function () {
     // Resume any in-flight job after refresh/navigation
     function resumeJob (jobId, startedAtMs) {
       running = true
-      baseBtnMsg = 'Resuming…'
+      baseBtnMsg = 'Resuming...'
       setButtonBusy(`${baseBtnMsg} (00:00)`)
       if (updateBtn) updateBtn.disabled = true
       resetProgress()
-      setProgress(40, 'Resuming download…', { indeterminate: true })
+      setProgress(40, 'Resuming download...', { indeterminate: true })
       startElapsedTimer(Number.isFinite(startedAtMs) ? startedAtMs : undefined)
 
       fetch(`/background-jobs/${encodeURIComponent(jobId)}`)

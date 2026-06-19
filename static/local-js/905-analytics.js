@@ -7,6 +7,7 @@ $(document).ready(function () {
   const $tableSortKey = $('#logscan-table-sort-key')
   const $tableSortDir = $('#logscan-table-sort-dir')
   const $tablePageSize = $('#logscan-table-page-size')
+  const $tableFilterCount = $('#logscan-table-filter-count')
   const $tablePageInfo = $('#logscan-table-page-info')
   const $tablePrev = $('#logscan-table-prev')
   const $tableNext = $('#logscan-table-next')
@@ -32,27 +33,34 @@ $(document).ready(function () {
   const $ingest = $('#logscan-trends-ingest')
   const $issues = $('#logscan-trends-issues')
   const $libraries = $('#logscan-trends-libraries')
-  const $libraryFilter = $('#logscan-trends-library-filter')
+  const $libraryFilter = $('#logscan-trends-library-filter, #logscan-trends-library-filter-bottom')
   const $status = $('#logscan-trends-status')
   const $progress = $('#logscan-trends-progress')
   const $progressBar = $('#logscan-trends-progress-bar')
   const $progressText = $('#logscan-trends-progress-text')
-  const $limit = $('#logscan-trends-limit')
-  const $configFilter = $('#logscan-trends-config-filter')
-  const $toolFilter = $('#logscan-trends-tool-filter')
-  const $timeRange = $('#logscan-trends-time-range')
-  const $commandFilter = $('#logscan-trends-command-filter')
-  const $resetFilters = $('#logscan-trends-reset-filters')
-  const $dateStart = $('#logscan-trends-date-start')
-  const $dateEnd = $('#logscan-trends-date-end')
-  const $customDateRow = $('#logscan-trends-custom-date-row')
-  const $dateHint = $('#logscan-trends-date-hint')
-  const $runCount = $('#logscan-trends-count')
+  const $limit = $('#logscan-trends-limit, #logscan-trends-limit-bottom')
+  const $configFilter = $('#logscan-trends-config-filter, #logscan-trends-config-filter-bottom')
+  const $toolFilter = $('#logscan-trends-tool-filter, #logscan-trends-tool-filter-bottom')
+  const $timeRange = $('#logscan-trends-time-range, #logscan-trends-time-range-bottom')
+  const $commandFilter = $('#logscan-trends-command-filter, #logscan-trends-command-filter-bottom')
+  const $resetFilters = $('#logscan-trends-reset-filters, #logscan-trends-reset-filters-bottom')
+  const $dateStart = $('#logscan-trends-date-start, #logscan-trends-date-start-bottom')
+  const $dateEnd = $('#logscan-trends-date-end, #logscan-trends-date-end-bottom')
+  const $customDateRow = $('#logscan-trends-custom-date-row, #logscan-trends-custom-date-row-bottom')
+  const $dateHint = $('#logscan-trends-date-hint, #logscan-trends-date-hint-bottom')
+  const $runCount = $('#logscan-trends-count, #logscan-trends-count-bottom')
   const $reset = $('#logscan-trends-reset')
   const $reingest = $('#logscan-trends-reingest')
+  const $clearInvalidArchived = $('#logscan-trends-clear-invalid')
   const $confirmReset = $('#logscan-confirm-reset')
   const $confirmReingest = $('#logscan-confirm-reingest')
   const $missingDownload = $('#logscan-trends-missing-download')
+  const $invalidLogBody = $('#logscan-invalid-log-body')
+  const $invalidLogStatus = $('#logscan-invalid-log-status')
+  const $invalidLogSuccess = $('#logscan-invalid-log-success')
+  const $invalidLogError = $('#logscan-invalid-log-error')
+  const $confirmInvalidLog = $('#logscan-confirm-invalid-log')
+  const $cancelInvalidLog = $('#logscan-cancel-invalid-log')
   const $confirmMissingDownload = $('#logscan-confirm-missing-download')
   const $deleteLogBody = $('#logscan-delete-log-body')
   const $deleteLogStatus = $('#logscan-delete-log-status')
@@ -74,12 +82,14 @@ $(document).ready(function () {
   const $preferencesInputs = $('.logscan-pref-input')
   const resetModalEl = document.getElementById('logscan-reset-modal')
   const reingestModalEl = document.getElementById('logscan-reingest-modal')
+  const invalidLogModalEl = document.getElementById('logscan-invalid-log-modal')
   const missingDownloadModalEl = document.getElementById('logscan-missing-download-modal')
   const deleteLogModalEl = document.getElementById('logscan-delete-log-modal')
   const compressLogModalEl = document.getElementById('logscan-compress-log-modal')
   const runDetailsModalEl = document.getElementById('logscan-run-details-modal')
   const preferencesModalEl = document.getElementById('logscan-preferences-modal')
   let missingDownloadUrl = ''
+  let pendingInvalidLogCleanup = null
   let pendingDeleteRun = null
   let pendingCompressRun = null
   let reingestPollTimer = null
@@ -89,17 +99,28 @@ $(document).ready(function () {
   let allIncompleteRuns = []
   let allTableRuns = []
   const sectionDetailsByRunKey = new Map()
+  const expandedProgressRunKeys = new Set()
   let currentFilteredRuns = []
   let currentTableRuns = []
   let allRunsTotal = 0
   let allIncompleteRunsTotal = 0
   let latestArchiveStorage = null
   let tablePage = 1
+  let tableStatusFilter = 'all'
   const selectedRunKeys = new Set()
   const sortState = { key: 'finished_at', dir: 'desc' }
   let lastIngestState = null
   let analyticsPrefs = null
   const defaultReingestButtonLabel = $reingest.text().trim() || 'Reingest logs'
+
+  function syncMirroredControlValue ($controls, source) {
+    if (!$controls.length || !source) return
+    const value = $(source).val()
+    $controls.each(function () {
+      if (this === source) return
+      $(this).val(value)
+    })
+  }
 
   function escapeHtml (value) {
     return String(value || '')
@@ -322,6 +343,23 @@ $(document).ready(function () {
     return getRunToolName(run) === 'imagemaid' ? 'ImageMaid' : 'Kometa'
   }
 
+  function getRunToolIconPath (run) {
+    return getRunToolName(run) === 'imagemaid'
+      ? '/static/images/app-icons/imagemaid.png'
+      : '/static/images/app-icons/kometa.png'
+  }
+
+  function renderRunToolIndicator (run) {
+    const label = getRunToolLabel(run)
+    const iconPath = getRunToolIconPath(run)
+    return `
+      <span class="logscan-app-indicator">
+        <img src="${escapeHtml(iconPath)}" alt="" class="logscan-app-indicator__icon" aria-hidden="true">
+        <span>${escapeHtml(label)}</span>
+      </span>
+    `
+  }
+
   function getKometaStartMode (run) {
     if (!run || getRunToolName(run) !== 'kometa') return ''
     const mode = String(run.start_mode || '').trim().toLowerCase()
@@ -462,6 +500,124 @@ $(document).ready(function () {
     return `<span title="${escapeHtml(title)}">${escapeHtml(parts.join(' • '))}</span>`
   }
 
+  function getProgressSnapshot (run) {
+    const snapshot = run && run.progress_snapshot && typeof run.progress_snapshot === 'object'
+      ? run.progress_snapshot
+      : (run && run.resume_progress_snapshot && typeof run.resume_progress_snapshot === 'object'
+          ? run.resume_progress_snapshot
+          : null)
+    if (!snapshot) return null
+    const columns = Array.isArray(snapshot.columns) ? snapshot.columns : []
+    const rows = Array.isArray(snapshot.rows) ? snapshot.rows : []
+    if (!columns.length || !rows.length) return null
+    return snapshot
+  }
+
+  function renderProgressSnapshotCellLabel (cell) {
+    const safeCell = cell && typeof cell === 'object' ? cell : {}
+    if (!safeCell.label) return '<span class="text-muted small">—</span>'
+    const tone = String(safeCell.tone || '').trim().toLowerCase()
+    const toneMap = {
+      primary: 'text-bg-primary',
+      success: 'text-bg-success',
+      warning: 'text-bg-warning',
+      danger: 'text-bg-danger',
+      info: 'text-bg-info',
+      secondary: 'text-bg-secondary'
+    }
+    const badgeClass = toneMap[tone] || 'text-bg-success'
+    return `<span class="badge ${badgeClass}">${escapeHtml(safeCell.label)}</span>`
+  }
+
+  function renderProgressSnapshotPanel (run, snapshot) {
+    const columns = Array.isArray(snapshot.columns) ? snapshot.columns : []
+    const rows = Array.isArray(snapshot.rows) ? snapshot.rows : []
+    const footerCells = Array.isArray(snapshot.footer_cells) ? snapshot.footer_cells : []
+    const preparationLabel = snapshot.preparation_label || ''
+    const totalLabel = snapshot.total_label || ''
+    const nameLabel = snapshot.name_label || 'Library'
+    const typeLabel = snapshot.type_label || 'Type'
+    const maintenance = getMaintenanceSummary(run)
+    const prepRow = preparationLabel
+      ? `<div class="logscan-progress-inline-row"><span class="fw-semibold">Preparation</span><span class="badge text-bg-primary">${escapeHtml(preparationLabel)}</span></div>`
+      : ''
+    let maintenanceRow = ''
+    if (maintenance.hadPause) {
+      const maintText = maintenance.pauseSeconds > 0
+        ? formatSeconds(maintenance.pauseSeconds)
+        : `${maintenance.pauseCount || 1} pause${(maintenance.pauseCount || 1) === 1 ? '' : 's'}`
+      const maintDetails = maintenance.window ? ` <span class="text-muted small">(${escapeHtml(maintenance.window)})</span>` : ''
+      maintenanceRow = `<div class="logscan-progress-inline-row"><span class="fw-semibold">Maintenance</span><span class="badge text-bg-primary">${escapeHtml(maintText)}</span>${maintDetails}</div>`
+    }
+    const headCells = columns.map(column => `<th scope="col" class="text-end">${escapeHtml(column.label || column.key || '')}</th>`).join('')
+    const bodyRows = rows.map(row => {
+      const phaseCells = Array.isArray(row.phase_cells) ? row.phase_cells : []
+      const statusClass = row.status_class ? ` ${escapeHtml(row.status_class)}` : ''
+      const phaseHtml = columns.map((column, index) => `<td class="text-end">${renderProgressSnapshotCellLabel(phaseCells[index])}</td>`).join('')
+      return `
+        <tr>
+          <td>${escapeHtml(row.name || '—')}</td>
+          <td>${escapeHtml(row.type || '—')}</td>
+          <td><span class="badge${statusClass}">${escapeHtml(row.status || 'Pending')}</span></td>
+          ${phaseHtml}
+        </tr>
+      `
+    }).join('')
+    const footerHtml = columns.map((column, index) => {
+      const label = footerCells[index] || ''
+      return `<td class="text-end">${label ? renderProgressSnapshotCellLabel({ label, tone: 'success' }) : '<span class="text-muted small">—</span>'}</td>`
+    }).join('')
+    return `
+      <div class="logscan-progress-panel-inner">
+        ${prepRow}
+        ${maintenanceRow}
+        <div class="table-responsive logscan-progress-table-wrap" data-qs-sticky-first="true">
+          <table class="table table-sm table-striped mb-0 qs-incomplete-progress-table qs-analytics-progress-table">
+            <thead>
+              <tr>
+                <th scope="col">${escapeHtml(nameLabel)}</th>
+                <th scope="col">${escapeHtml(typeLabel)}</th>
+                <th scope="col">Status</th>
+                ${headCells}
+              </tr>
+            </thead>
+            <tbody>
+              ${bodyRows}
+            </tbody>
+            <tfoot>
+              <tr class="table-group-divider">
+                <th scope="row" class="fw-semibold">Total</th>
+                <td><span class="text-muted small">—</span></td>
+                <td>${totalLabel ? renderProgressSnapshotCellLabel({ label: totalLabel, tone: 'success' }) : '<span class="text-muted small">—</span>'}</td>
+                ${footerHtml}
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      </div>
+    `
+  }
+
+  function renderProgressSnapshotCell (run, runKey) {
+    const snapshot = getProgressSnapshot(run)
+    if (!snapshot) return '<span class="text-muted">n/a</span>'
+    const expanded = expandedProgressRunKeys.has(runKey)
+    const buttonLabel = expanded ? 'Hide matrix' : 'View matrix'
+    return `
+      <div class="logscan-progress-head">
+        <button type="button"
+          class="btn nav-button btn-sm logscan-action-btn logscan-progress-toggle"
+          data-run-key="${escapeHtml(runKey)}"
+          aria-expanded="${expanded ? 'true' : 'false'}">
+          ${buttonLabel}
+        </button>
+      </div>
+      <div class="logscan-progress-panel${expanded ? '' : ' d-none'}" data-run-key="${escapeHtml(runKey)}">
+          ${renderProgressSnapshotPanel(run, snapshot)}
+      </div>
+    `
+  }
+
   function getQuietPeriodSummary (run) {
     const summary = run && run.quiet_period_summary && typeof run.quiet_period_summary === 'object'
       ? run.quiet_period_summary
@@ -550,6 +706,20 @@ $(document).ready(function () {
     return getCount(run, 'warning_count') + getCount(run, 'error_count') + getCount(run, 'trace_count')
   }
 
+  function getDisplayedItemsTotal (run) {
+    if (getRunToolName(run) === 'imagemaid') {
+      const cache = getCount(run, 'cache_line_count')
+      const debug = getCount(run, 'debug_count')
+      const info = getCount(run, 'info_count')
+      const warnings = getCount(run, 'warning_count')
+      const errors = getCount(run, 'error_count')
+      const critical = getCount(run, 'critical_count')
+      const traces = getCount(run, 'trace_count')
+      return cache + debug + info + warnings + errors + critical + traces
+    }
+    return getRunLibraryTotals(run).total
+  }
+
   function renderInfoDot (helpText) {
     return `<span class="logscan-info-dot" tabindex="0" title="${escapeHtml(helpText)}" data-help="${escapeHtml(helpText)}" aria-label="${escapeHtml(helpText)}">i</span>`
   }
@@ -581,6 +751,51 @@ $(document).ready(function () {
   function getCount (run, key) {
     const value = run && typeof run[key] === 'number' ? run[key] : 0
     return Number.isFinite(value) ? value : 0
+  }
+
+  function renderRunCountChips (run) {
+    if (getRunToolName(run) === 'imagemaid') {
+      const cache = getCount(run, 'cache_line_count')
+      const debug = getCount(run, 'debug_count')
+      const info = getCount(run, 'info_count')
+      const warnings = getCount(run, 'warning_count')
+      const errors = getCount(run, 'error_count')
+      const critical = getCount(run, 'critical_count')
+      const traces = getCount(run, 'trace_count')
+      const total = cache + debug + info + warnings + errors + critical + traces
+      return [
+        renderCountChip('C', 'Cache lines', cache, 'cache'),
+        renderCountChip('D', 'Debug lines', debug, 'debug'),
+        renderCountChip('I', 'Info lines', info, 'info'),
+        renderCountChip('W', 'Warnings', warnings, 'warning'),
+        renderCountChip('E', 'Errors', errors, 'error'),
+        renderCountChip('Cr', 'Critical lines', critical, 'critical'),
+        renderCountChip('T', 'Tracebacks', traces, 'trace'),
+        renderCountChip('Items', 'Total counted lines', total, 'total')
+      ].join('')
+    }
+
+    const cache = getCount(run, 'cache_line_count')
+    const debug = getCount(run, 'debug_count')
+    const info = getCount(run, 'info_count')
+    const warnings = getCount(run, 'warning_count')
+    const errors = getCount(run, 'error_count')
+    const critical = getCount(run, 'critical_count')
+    const traces = getCount(run, 'trace_count')
+    const libraryTotals = getRunLibraryTotals(run)
+    return [
+      renderCountChip('C', 'Cache lines', cache, 'cache'),
+      renderCountChip('D', 'Debug lines', debug, 'debug'),
+      renderCountChip('I', 'Info lines', info, 'info'),
+      renderCountChip('W', 'Warnings', warnings, 'warning'),
+      renderCountChip('E', 'Errors', errors, 'error'),
+      renderCountChip('Cr', 'Critical lines', critical, 'critical'),
+      renderCountChip('T', 'Tracebacks', traces, 'trace'),
+      renderCountChip('M', 'Movies', libraryTotals.movies, 'movie'),
+      renderCountChip('S', 'Shows', libraryTotals.shows, 'show'),
+      renderCountChip('Ep', 'Episodes', libraryTotals.episodes, 'episode'),
+      renderCountChip('Items', 'Library items total (movies + episodes, or show count when episode totals are unavailable)', libraryTotals.total, 'total')
+    ].join('')
   }
 
   function getIssueCount (run, key, fallbackKey) {
@@ -1651,21 +1866,43 @@ $(document).ready(function () {
     }
     if ($tableSelectComplete.length) {
       $tableSelectComplete.prop('disabled', visibleCompleteSelectable === 0)
+      $tableSelectComplete.toggleClass('is-active', tableStatusFilter === 'complete')
     }
     if ($tableSelectIncomplete.length) {
       $tableSelectIncomplete.prop('disabled', visibleIncompleteSelectable === 0)
+      $tableSelectIncomplete.toggleClass('is-active', tableStatusFilter === 'incomplete')
     }
+  }
+
+  function filterTableRunsByStatus (runs) {
+    if (!Array.isArray(runs) || !runs.length) return []
+    if (tableStatusFilter === 'complete') {
+      return runs.filter(run => !run.is_incomplete)
+    }
+    if (tableStatusFilter === 'incomplete') {
+      return runs.filter(run => Boolean(run.is_incomplete))
+    }
+    return runs
   }
 
   function updateTableSummary (total, pageSize, pageCount) {
     const totalComplete = Number.isFinite(allRunsTotal) ? allRunsTotal : allRuns.length
     const totalIncomplete = Number.isFinite(allIncompleteRunsTotal) ? allIncompleteRunsTotal : allIncompleteRuns.length
+    const loaded = allTableRuns.length
+    const grandTotal = totalComplete + totalIncomplete
     if ($tableSummary.length) {
       if (!total) {
         $tableSummary.text('No runs match the current filters.')
       } else {
         $tableSummary.text(`Ingested: ${totalComplete}. Incomplete: ${totalIncomplete}. Showing: ${total}. Page size: ${pageSize}.`)
       }
+    }
+    if ($tableFilterCount.length) {
+      let filterText = `Filtered: ${total} of ${loaded} loaded`
+      if (grandTotal > loaded) {
+        filterText += ` (${grandTotal} total)`
+      }
+      $tableFilterCount.text(filterText)
     }
     if (!$tablePageInfo.length) return
     if (!total) {
@@ -1702,28 +1939,13 @@ $(document).ready(function () {
       const commandTitle = run.run_command
         ? `Original: ${run.run_command}`
         : (run.command_signature ? `Signature: ${run.command_signature}` : '')
-      const warnings = getCount(run, 'warning_count')
-      const errors = getCount(run, 'error_count')
-      const traces = getCount(run, 'trace_count')
-      const libraryTotals = getRunLibraryTotals(run)
-      const countChips = [
-        renderCountChip('W', 'Warnings', warnings, 'warning'),
-        renderCountChip('E', 'Errors', errors, 'error'),
-        renderCountChip('T', 'Tracebacks', traces, 'trace'),
-        renderCountChip('M', 'Movies', libraryTotals.movies, 'movie'),
-        renderCountChip('S', 'Shows', libraryTotals.shows, 'show'),
-        renderCountChip('Ep', 'Episodes', libraryTotals.episodes, 'episode'),
-        renderCountChip('Tot', 'Total items', libraryTotals.total, 'total')
-      ].join('')
+      const countChips = renderRunCountChips(run)
       const configLineCount = (typeof run.config_line_count === 'number' && Number.isFinite(run.config_line_count))
         ? run.config_line_count
         : 'n/a'
       const runtimeParts = getRunTimeParts(run)
       const sectionLines = buildSectionDetails(run.section_runtimes, runtimeParts.effective)
       const sectionSummary = sectionLines.length ? sectionLines[0] : 'n/a'
-      const cacheLineCount = (typeof run.cache_line_count === 'number' && Number.isFinite(run.cache_line_count))
-        ? run.cache_line_count
-        : 'n/a'
       const sectionDetails = sectionLines.length > 1 ? sectionLines.slice(1) : []
       const rowKey = (run.run_key && String(run.run_key).trim()) || `row-${absoluteIndex + 1}`
       sectionDetailsByRunKey.set(rowKey, {
@@ -1744,12 +1966,17 @@ $(document).ready(function () {
       }
       sectionCell += `<span class="logscan-section-summary">${escapeHtml(sectionSummary)}</span>`
       sectionCell += '</div>'
-      const toolLabel = getRunToolLabel(run)
+      const isImageMaidRun = getRunToolName(run) === 'imagemaid'
+      const progressLabel = getRunToolName(run) === 'imagemaid' ? 'Operation matrix' : 'Progress matrix'
+      const progressHelpText = getRunToolName(run) === 'imagemaid'
+        ? 'Stored ImageMaid operation matrix for this run, including observed scan/action timings, item counts, and outcomes.'
+        : 'Inline final progress snapshot for this run, including preparation, maintenance context, and per-library phase status.'
       let kometaDisplay = run.kometa_version || 'n/a'
       if (run.kometa_version && run.kometa_newest_version && run.kometa_version !== run.kometa_newest_version) {
         kometaDisplay = `${run.kometa_version} -> ${run.kometa_newest_version}`
       }
       const runKey = run.run_key || rowKey
+      const isProgressExpanded = expandedProgressRunKeys.has(runKey)
       const isSelectable = isRunSelectable(run)
       const isSelected = isSelectable && selectedRunKeys.has(runKey)
       const statusDisplay = run.is_incomplete ? 'Incomplete' : 'Complete'
@@ -1795,15 +2022,22 @@ $(document).ready(function () {
       if (run.is_incomplete && run.resume_reason) {
         logActions.push(`<span class="small text-warning">${escapeHtml(run.resume_reason)}</span>`)
       }
+      const rowClasses = [
+        isSelected ? 'logscan-row-selected' : '',
+        isProgressExpanded ? 'logscan-row-progress-expanded' : ''
+      ].filter(Boolean).join(' ')
       return `
-        <tr class="${isSelected ? 'logscan-row-selected' : ''}">
+        <tr class="${rowClasses}">
           ${renderRunCardCell('Select', 'Select this archived log for bulk actions.', `
             <span class="logscan-select-wrap">
-              <input type="checkbox" class="form-check-input logscan-select-checkbox"
-                data-run-key="${escapeHtml(runKey)}"
-                ${isSelected ? 'checked' : ''}
-                ${isSelectable ? '' : 'disabled'}
-                aria-label="Select ${escapeHtml(runLabel)}">
+              <span class="form-check form-switch logscan-select-switch">
+                <input type="checkbox" class="form-check-input logscan-select-toggle-input"
+                  data-run-key="${escapeHtml(runKey)}"
+                  ${isSelected ? 'checked' : ''}
+                  ${isSelectable ? '' : 'disabled'}
+                  aria-label="Select ${escapeHtml(runLabel)}">
+                <label class="form-check-label">${isSelected ? 'Selected' : 'Select'}</label>
+              </span>
             </span>
           `, 'class="logscan-select-cell"')}
           ${renderRunCardCell('Status', 'Complete runs are included in charts. Incomplete logs are shown here for investigation and file management.', `<span class="${run.is_incomplete ? 'text-warning' : 'text-success'} fw-semibold">${escapeHtml(statusDisplay)}</span>${startModeBadge}`, 'class="text-nowrap"')}
@@ -1811,15 +2045,15 @@ $(document).ready(function () {
           ${renderRunCardCell('Finished', 'Timestamp of the run finishing. Incomplete logs are shown here for investigation only and are excluded from charts.', finishedDisplay, 'class="text-nowrap"')}
           ${renderRunCardCell('Runtime', getRuntimeHelpText(run), escapeHtml(formatSeconds(runtimeParts.effective)))}
           ${renderRunCardCell('Config', 'Config name detected for the run.', escapeHtml(run.config_name || 'default'))}
-          ${renderRunCardCell('Tool', 'Tool that produced this run.', escapeHtml(toolLabel))}
-          ${renderRunCardCell('Config lines', 'Non-comment lines captured from the redacted config output.', escapeHtml(String(configLineCount)))}
-          ${renderRunCardCell('Cache lines', 'Number of log lines that include "from Cache".', escapeHtml(String(cacheLineCount)))}
+          ${renderRunCardCell('App', 'App that produced this run.', renderRunToolIndicator(run))}
+          ${isImageMaidRun ? '' : renderRunCardCell('Config lines', 'Non-comment lines captured from the redacted config output.', escapeHtml(String(configLineCount)))}
           ${renderRunCardCell('Command', 'Sanitized command line captured for the run.', `<span class="logscan-command" title="${escapeHtml(commandTitle)}">${escapeHtml(command)}</span>`)}
-          ${renderRunCardCell('Counts', 'W warnings, E errors, T tracebacks, M movies, S shows, Ep episodes, Tot total library items.', `<span class="logscan-count-chip-row">${countChips}</span>`)}
+          ${renderRunCardCell('Counts', 'Kometa: C cache, D debug, I info, W warnings, E errors, Cr critical, T tracebacks, plus M movies, S shows, Ep episodes, and Items total. ImageMaid: C D I W E Cr T plus Items total.', `<span class="logscan-count-chip-row">${countChips}</span>`)}
           ${renderRunCardCell('Version', 'Detected tool version for the run, plus newest version when different.', escapeHtml(kometaDisplay))}
           ${renderRunCardCell('Maintenance', 'Quickstart maintenance pauses recorded in meta.log for this run.', renderMaintenanceSummaryCell(run))}
           ${renderRunCardCell('Quiet periods', 'Emphasizes the longest unexplained delay between timestamped run log lines, with maintenance-related gaps available in the details view.', renderQuietPeriodCell(run))}
-          ${renderRunCardCell('Section runtimes', 'Runtime totals parsed per run section when available.', sectionCell)}
+          ${renderRunCardCell(progressLabel, progressHelpText, renderProgressSnapshotCell(run, runKey), 'class="logscan-progress-cell"')}
+          ${isImageMaidRun ? '' : renderRunCardCell('Section runtimes', 'Runtime totals parsed per run section when available.', sectionCell)}
           ${renderRunCardCell('Log size', 'Current on-disk size of the resolved log file when available, otherwise the ingested size.', escapeHtml(formatBytes(sizeBytes)))}
           ${renderRunCardCell('Log', 'Download the source log for this run. Archived plain logs can also be compressed, and archived logs can be deleted here.', `<div class="logscan-action-stack">${logActions.join('')}</div>`)}
           ${renderRunCardCell('Report', run.is_incomplete ? 'Open recommendations and diagnostics captured for this incomplete log.' : 'Open the recommendations recorded for the run.', `
@@ -2160,6 +2394,28 @@ $(document).ready(function () {
 
   function renderIngestHealth (state) {
     if (!$ingest.length) return
+    const invalidArchivedCount = Number.isFinite(state && state.invalid_archived_count) ? state.invalid_archived_count : 0
+    const invalidArchivedSample = Array.isArray(state && state.invalid_archived_sample) ? state.invalid_archived_sample : []
+
+    if ($clearInvalidArchived.length) {
+      if (invalidArchivedCount > 0) {
+        $clearInvalidArchived
+          .removeClass('d-none')
+          .prop('disabled', false)
+          .text(invalidArchivedCount > 1 ? `Clear invalid archived logs (${invalidArchivedCount})` : 'Clear invalid archived log')
+        pendingInvalidLogCleanup = {
+          count: invalidArchivedCount,
+          sample: invalidArchivedSample
+        }
+      } else {
+        $clearInvalidArchived
+          .addClass('d-none')
+          .prop('disabled', true)
+          .text('Clear invalid archived logs')
+        pendingInvalidLogCleanup = null
+      }
+    }
+
     if (!state) {
       $ingest.text('No ingest history yet.')
       return
@@ -2237,6 +2493,12 @@ $(document).ready(function () {
     if (Array.isArray(state.incomplete_sample) && state.incomplete_sample.length) {
       lines.push(`Incomplete samples: ${state.incomplete_sample.join(', ')}`)
     }
+    if (invalidArchivedCount > 0) {
+      lines.push(`Invalid archived logs: ${invalidArchivedCount}. Use Clear invalid archived logs to remove them.`)
+    }
+    if (invalidArchivedSample.length) {
+      lines.push(`Invalid archived samples: ${invalidArchivedSample.join(', ')}`)
+    }
     const linesHtml = lines.map(line => `<div>${escapeHtml(line)}</div>`).join('')
     $ingest.html(`<div class="logscan-kpi-grid">${tiles.join('')}</div><div class="small text-muted mt-2">${linesHtml}</div>`)
   }
@@ -2264,7 +2526,10 @@ $(document).ready(function () {
       case 'counts':
         return getCountsTotal(run)
       case 'warning_count':
+      case 'debug_count':
+      case 'info_count':
       case 'error_count':
+      case 'critical_count':
       case 'trace_count':
         return getCount(run, key)
       case 'config_line_count':
@@ -2279,6 +2544,8 @@ $(document).ready(function () {
         return getRunLibraryTotals(run).episodes
       case 'library_total':
         return getRunLibraryTotals(run).total
+      case 'items_total':
+        return getDisplayedItemsTotal(run)
       case 'kometa_version':
         return run.kometa_version || ''
       case 'maintenance':
@@ -2532,7 +2799,7 @@ $(document).ready(function () {
       state = getFilterState()
     }
     const filtered = filterRuns(allRuns, state)
-    const filteredTableRuns = filterRuns(allTableRuns, state)
+    const filteredTableRuns = filterTableRunsByStatus(filterRuns(allTableRuns, state))
     currentFilteredRuns = filtered
     updateRunCountDisplay(filtered)
     renderSummary(filtered)
@@ -2618,7 +2885,7 @@ $(document).ready(function () {
     const extMatch = text.match(/(\.log(?:\.gz)?)$/i)
     const ext = extMatch ? extMatch[1] : ''
     const suffixLength = ext ? Math.max(24, ext.length + 20) : 24
-    return `${text.slice(0, 56)}…${text.slice(-suffixLength)}`
+    return `${text.slice(0, 56)}...${text.slice(-suffixLength)}`
   }
 
   function setButtonSpinner ($button, text) {
@@ -2643,6 +2910,14 @@ $(document).ready(function () {
     }
   }
 
+  function setInvalidLogModalBusy (busy) {
+    $confirmInvalidLog.prop('disabled', busy)
+    $cancelInvalidLog.prop('disabled', busy)
+    if (invalidLogModalEl) {
+      $(invalidLogModalEl).find('.btn-close').prop('disabled', busy)
+    }
+  }
+
   function setCompressModalBusy (busy) {
     $confirmCompressLog.prop('disabled', busy)
     $cancelCompressLog.prop('disabled', busy)
@@ -2654,6 +2929,7 @@ $(document).ready(function () {
   function setControlsDisabled (disabled) {
     $reset.prop('disabled', disabled)
     $reingest.prop('disabled', disabled)
+    $clearInvalidArchived.prop('disabled', disabled || $clearInvalidArchived.hasClass('d-none'))
     $limit.prop('disabled', disabled)
     $tableSortKey.prop('disabled', disabled)
     $tableSortDir.prop('disabled', disabled)
@@ -2667,6 +2943,7 @@ $(document).ready(function () {
     $dateEnd.prop('disabled', disabled)
     $confirmReset.prop('disabled', disabled)
     $confirmReingest.prop('disabled', disabled)
+    $confirmInvalidLog.prop('disabled', disabled)
     $confirmMissingDownload.prop('disabled', disabled)
     $tableSelectAll.prop('disabled', disabled || getSelectableRuns(currentTableRuns).length === 0)
     $tableSelectComplete.prop('disabled', disabled || getSelectableRunsByCompletion(currentTableRuns, false).length === 0)
@@ -3272,6 +3549,39 @@ $(document).ready(function () {
     }
   }
 
+  function openInvalidLogModal () {
+    if (!pendingInvalidLogCleanup || !Number.isFinite(pendingInvalidLogCleanup.count) || pendingInvalidLogCleanup.count <= 0) {
+      return
+    }
+    const invalidCount = pendingInvalidLogCleanup.count
+    const sample = Array.isArray(pendingInvalidLogCleanup.sample) ? pendingInvalidLogCleanup.sample : []
+    if ($invalidLogBody.length) {
+      const sampleHtml = sample.length
+        ? `<div class="small text-muted mt-2">Samples: ${escapeHtml(sample.join(', '))}</div>`
+        : ''
+      $invalidLogBody.html(
+        invalidCount === 1
+          ? `Delete <strong>1 invalid archived log</strong> from disk?${sampleHtml}`
+          : `Delete <strong>${invalidCount} invalid archived logs</strong> from disk?${sampleHtml}`
+      )
+    }
+    setModalAlert($invalidLogStatus, '')
+    setModalAlert($invalidLogSuccess, '')
+    setModalAlert($invalidLogError, '')
+    $confirmInvalidLog.text('Delete')
+    setInvalidLogModalBusy(false)
+    if (invalidLogModalEl) {
+      bootstrap.Modal.getOrCreateInstance(invalidLogModalEl).show()
+      return
+    }
+    const confirmText = invalidCount === 1
+      ? 'Delete 1 invalid archived log?'
+      : `Delete ${invalidCount} invalid archived logs?`
+    if (window.confirm(confirmText)) {
+      handleInvalidLogDelete()
+    }
+  }
+
   function handleDeleteLog () {
     if (!pendingDeleteRun || !Array.isArray(pendingDeleteRun.runKeys) || !pendingDeleteRun.runKeys.length) {
       hideModal(deleteLogModalEl)
@@ -3323,6 +3633,54 @@ $(document).ready(function () {
         if (!deleteSucceeded) {
           $confirmDeleteLog.text('Delete')
           setDeleteModalBusy(false)
+        }
+      })
+  }
+
+  function handleInvalidLogDelete () {
+    if (!pendingInvalidLogCleanup || !Number.isFinite(pendingInvalidLogCleanup.count) || pendingInvalidLogCleanup.count <= 0) {
+      hideModal(invalidLogModalEl)
+      return
+    }
+    let deleteSucceeded = false
+    const invalidCount = pendingInvalidLogCleanup.count
+    setModalAlert($invalidLogSuccess, '')
+    setModalAlert($invalidLogError, '')
+    setModalAlert($invalidLogStatus, invalidCount > 1 ? `Deleting ${invalidCount} invalid archived logs...` : 'Deleting invalid archived log...')
+    setInvalidLogModalBusy(true)
+    setButtonSpinner($confirmInvalidLog, 'Deleting...')
+    fetch('/logscan/trends/log/invalid/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    })
+      .then(async res => {
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) {
+          throw new Error((data && data.error) || 'Delete failed')
+        }
+        const deletedCount = Number.isFinite(data && data.deleted) ? data.deleted : invalidCount
+        deleteSucceeded = true
+        pendingInvalidLogCleanup = null
+        setModalAlert($invalidLogStatus, '')
+        setModalAlert($invalidLogSuccess, deletedCount > 1 ? `${deletedCount} invalid archived logs deleted. Updating Analytics...` : 'Invalid archived log deleted. Updating Analytics...')
+        if (Array.isArray(data && data.failures) && data.failures.length) {
+          updateStatus(`${deletedCount} invalid archived logs deleted. ${data.failures.length} failed.`)
+        } else {
+          updateStatus(deletedCount > 1 ? `${deletedCount} invalid archived logs deleted.` : 'Invalid archived log deleted.')
+        }
+        window.setTimeout(() => hideModal(invalidLogModalEl), 650)
+        fetchRuns({ suppressStatus: true })
+      })
+      .catch(err => {
+        console.error(err)
+        setModalAlert($invalidLogStatus, '')
+        setModalAlert($invalidLogError, err && err.message ? err.message : 'Failed to delete invalid archived logs.')
+        updateStatus(err && err.message ? err.message : 'Failed to delete invalid archived logs.', true)
+      })
+      .finally(() => {
+        if (!deleteSucceeded) {
+          $confirmInvalidLog.text('Delete')
+          setInvalidLogModalBusy(false)
         }
       })
   }
@@ -3381,6 +3739,7 @@ $(document).ready(function () {
   }
 
   $limit.on('change', function () {
+    syncMirroredControlValue($limit, this)
     tablePage = 1
     fetchRuns()
   })
@@ -3420,32 +3779,39 @@ $(document).ready(function () {
     })
   }
   $configFilter.on('change', function () {
+    syncMirroredControlValue($configFilter, this)
     tablePage = 1
     loadPreferences().then(() => applyFiltersAndRender())
   })
   $toolFilter.on('change', function () {
+    syncMirroredControlValue($toolFilter, this)
     tablePage = 1
     clearDateFilters()
     applyFiltersAndRender()
   })
   $timeRange.on('change', function () {
+    syncMirroredControlValue($timeRange, this)
     tablePage = 1
     clearDateFilters()
     applyFiltersAndRender()
   })
   $commandFilter.on('change', function () {
+    syncMirroredControlValue($commandFilter, this)
     tablePage = 1
     applyFiltersAndRender()
   })
   $dateStart.on('change', function () {
+    syncMirroredControlValue($dateStart, this)
     tablePage = 1
     applyFiltersAndRender()
   })
   $dateEnd.on('change', function () {
+    syncMirroredControlValue($dateEnd, this)
     tablePage = 1
     applyFiltersAndRender()
   })
   $libraryFilter.on('change', function () {
+    syncMirroredControlValue($libraryFilter, this)
     renderLibraryInventory(currentFilteredRuns)
   })
   $countsSeries.on('click', '.logscan-series-toggle', function () {
@@ -3463,6 +3829,7 @@ $(document).ready(function () {
   $resetFilters.on('click', function () {
     $limit.val('500')
     tablePage = 1
+    tableStatusFilter = 'all'
     $configFilter.val('')
     $toolFilter.val('')
     $timeRange.val('all')
@@ -3511,6 +3878,11 @@ $(document).ready(function () {
   })
   $confirmReset.on('click', handleReset)
   $confirmReingest.on('click', handleReingest)
+  $clearInvalidArchived.on('click', function () {
+    if ($clearInvalidArchived.hasClass('d-none')) return
+    openInvalidLogModal()
+  })
+  $confirmInvalidLog.on('click', handleInvalidLogDelete)
   $confirmDeleteLog.on('click', handleDeleteLog)
   $confirmCompressLog.on('click', handleCompressLog)
   $missingDownload.on('click', function (event) {
@@ -3536,7 +3908,17 @@ $(document).ready(function () {
     const runKey = $(this).data('runKey') || $(this).attr('data-run-key')
     showRunDetails(runKey)
   })
-  $tableBody.on('change', '.logscan-select-checkbox', function () {
+  $tableBody.on('click', '.logscan-progress-toggle', function () {
+    const runKey = $(this).data('runKey') || $(this).attr('data-run-key')
+    if (!runKey) return
+    if (expandedProgressRunKeys.has(runKey)) {
+      expandedProgressRunKeys.delete(runKey)
+    } else {
+      expandedProgressRunKeys.add(runKey)
+    }
+    renderTable(currentTableRuns)
+  })
+  $tableBody.on('change', '.logscan-select-toggle-input', function () {
     const runKey = $(this).data('runKey') || $(this).attr('data-run-key')
     if (!runKey) return
     if ($(this).is(':checked')) {
@@ -3563,12 +3945,14 @@ $(document).ready(function () {
     renderTable(currentTableRuns)
   })
   $tableSelectComplete.on('click', function () {
-    getSelectableRunsByCompletion(currentTableRuns, false).forEach(run => selectedRunKeys.add(run.run_key))
-    renderTable(currentTableRuns)
+    tableStatusFilter = tableStatusFilter === 'complete' ? 'all' : 'complete'
+    tablePage = 1
+    applyFiltersAndRender()
   })
   $tableSelectIncomplete.on('click', function () {
-    getSelectableRunsByCompletion(currentTableRuns, true).forEach(run => selectedRunKeys.add(run.run_key))
-    renderTable(currentTableRuns)
+    tableStatusFilter = tableStatusFilter === 'incomplete' ? 'all' : 'incomplete'
+    tablePage = 1
+    applyFiltersAndRender()
   })
   $tableClearSelection.on('click', function () {
     selectedRunKeys.clear()

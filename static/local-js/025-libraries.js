@@ -1,4 +1,4 @@
-/* global EventHandler, ValidationHandler, OverlayHandler, Sortable, showToast, setupParentChildToggleSync, bootstrap, FontFace, PathValidation, DOMParser, showNavigationLoadingOverlay, hideNavigationLoadingOverlay */
+/* global EventHandler, ValidationHandler, OverlayHandler, Sortable, showToast, setupParentChildToggleSync, bootstrap, FontFace, PathValidation, DOMParser, MutationObserver, jumpTo, showNavigationLoadingOverlay, hideNavigationLoadingOverlay, requestAnimationFrame */
 
 document.addEventListener('DOMContentLoaded', function () {
   console.log('[DEBUG] Initializing Libraries...')
@@ -59,6 +59,7 @@ document.addEventListener('DOMContentLoaded', function () {
     const copyModal = copyModalEl ? new bootstrap.Modal(copyModalEl) : null
     let activeLibraryId = null
     let loadRequestId = 0
+    let allowNextStepNavigation = false
     const dependencyHintConfigs = {
       tautulli: {
         stepKey: '030-tautulli',
@@ -103,6 +104,1414 @@ document.addEventListener('DOMContentLoaded', function () {
     }
     let dependencyHintRefreshTimer = null
     let dependencyHintRequestToken = 0
+    const advancedVisibilityStorageKey = 'qsLibrariesAdvancedVisible'
+
+    function normalizeMetadataFileEntry (entry) {
+      if (!entry || typeof entry !== 'object') return null
+      const type = String(entry.type || '').trim().toLowerCase()
+      const location = String(entry.location || '').trim()
+      const validated = entry.validated === true || String(entry.validated || '').trim().toLowerCase() === 'true'
+      if (!type && !location) return null
+      const normalized = { type, location }
+      if (validated) normalized.validated = true
+      return normalized
+    }
+
+    function parseMetadataFilesValue (rawValue) {
+      if (!rawValue) return []
+      try {
+        const parsed = JSON.parse(String(rawValue))
+        if (!Array.isArray(parsed)) return []
+        return parsed
+          .map(normalizeMetadataFileEntry)
+          .filter(Boolean)
+      } catch (_error) {
+        return []
+      }
+    }
+
+    const metadataCustomRepoRaw = String(window.QS_SETTINGS_CUSTOM_REPO || '').trim()
+    const metadataCustomRepoBase = String(window.QS_SETTINGS_CUSTOM_REPO_BASE || '').trim()
+    const metadataRepoDependencyMessage = 'Metadata file repo entries require Custom Repo to be configured and saved first within the Settings page.'
+    const collectionRepoDependencyMessage = 'Collection file repo entries require Custom Repo to be configured and saved first within the Settings page.'
+    const overlayRepoDependencyMessage = 'Overlay file repo entries require Custom Repo to be configured and saved first within the Settings page.'
+
+    function appendMetadataSettingsLink (target, className = 'link-light fw-semibold text-decoration-underline') {
+      const link = document.createElement('a')
+      link.href = '/step/150-settings#custom_repo'
+      link.textContent = 'Settings'
+      link.className = className
+      target.appendChild(link)
+      return link
+    }
+
+    function appendInlineCodeText (target, text, options = {}) {
+      const value = String(text || '')
+      const wrapPlainInCode = Boolean(options.wrapPlainInCode)
+      const parts = value.split(/(`[^`]+`)/g)
+      const hasInlineCode = parts.some(part => part.startsWith('`') && part.endsWith('`'))
+
+      if (!hasInlineCode && wrapPlainInCode) {
+        const code = document.createElement('code')
+        code.textContent = value
+        target.appendChild(code)
+        return
+      }
+
+      parts.forEach(part => {
+        if (!part) return
+        if (part.startsWith('`') && part.endsWith('`')) {
+          const code = document.createElement('code')
+          code.textContent = part.slice(1, -1)
+          target.appendChild(code)
+        } else {
+          target.appendChild(document.createTextNode(part))
+        }
+      })
+    }
+
+    function getActiveConfigName () {
+      const selected = String(document.querySelector('[name="configSelector"]')?.value || '').trim()
+      if (selected && selected !== 'add_config') return selected
+      return String(document.querySelector('[name="newConfigName"]')?.value || '').trim()
+    }
+
+    function applyNormalizedLibraryFileLocation (row, selector, payload, editor, syncFn) {
+      const normalizedLocation = String(payload?.normalized_location || '').trim()
+      if (!row || !normalizedLocation) return
+      const input = row.querySelector(selector)
+      if (!input) return
+      input.value = normalizedLocation
+      if (typeof syncFn === 'function') {
+        syncFn(editor, false)
+      }
+    }
+
+    function buildMetadataFileRow (entry = {}) {
+      const wrapper = document.createElement('div')
+      wrapper.className = 'card bg-body-tertiary border-secondary'
+      wrapper.setAttribute('data-metadata-file-row', 'true')
+      wrapper.innerHTML = `
+        <div class="card-body">
+          <div class="row g-3 align-items-end">
+            <div class="col-md-2">
+              <label class="form-label small text-muted">Type</label>
+              <select class="form-select form-select-sm" data-metadata-file-type>
+                <option value="file">file</option>
+                <option value="folder">folder</option>
+                <option value="git">git</option>
+                <option value="repo">repo</option>
+                <option value="url">url</option>
+              </select>
+            </div>
+            <div class="col-md-7">
+              <label class="form-label small text-muted">Location</label>
+              <input type="text" class="form-control form-control-sm" data-metadata-file-location placeholder="config/metadata.yml, config/metadata/, user/file.yml, or https://example.com/metadata.yml">
+            </div>
+            <div class="col-md-3 d-flex gap-2 justify-content-md-end">
+              <button type="button" class="btn btn-success btn-sm" data-validate-metadata-file>Validate</button>
+              <button type="button" class="btn btn-danger btn-sm" data-remove-metadata-file>Remove</button>
+            </div>
+          </div>
+          <div class="mt-2 small d-none" data-metadata-file-status></div>
+        </div>
+      `
+      const typeSelect = wrapper.querySelector('[data-metadata-file-type]')
+      const locationInput = wrapper.querySelector('[data-metadata-file-location]')
+      if (typeSelect && ['file', 'folder', 'git', 'repo', 'url'].includes(entry.type)) {
+        typeSelect.value = entry.type
+      }
+      if (locationInput && entry.location) {
+        locationInput.value = entry.location
+      }
+      if (entry.validated) {
+        wrapper.dataset.metadataFileState = 'success'
+        wrapper.dataset.metadataFileButtonState = 'success'
+      }
+      updateMetadataFileValidateButton(wrapper, Boolean(entry.validated))
+      return wrapper
+    }
+
+    function updateMetadataFileValidateButton (row, isValidated) {
+      if (!row) return
+      const button = row.querySelector('[data-validate-metadata-file]')
+      if (!button) return
+      const state = String(row.dataset.metadataFileButtonState || '').trim() || (isValidated ? 'success' : 'idle')
+      button.classList.remove('btn-success', 'btn-secondary')
+      if (state === 'success') {
+        button.disabled = true
+        button.classList.add('btn-secondary')
+        button.textContent = 'Validated'
+        return
+      }
+      if (state === 'blocked') {
+        button.disabled = true
+        button.classList.add('btn-secondary')
+        button.textContent = 'Needs Repo'
+        return
+      }
+      if (state === 'loading') {
+        button.disabled = true
+        button.classList.add('btn-secondary')
+        button.textContent = 'Validating...'
+        return
+      }
+      button.disabled = false
+      button.classList.add('btn-success')
+      button.textContent = 'Validate'
+    }
+
+    function setMetadataFileButtonState (row, state) {
+      if (!row) return
+      row.dataset.metadataFileButtonState = state || 'idle'
+      updateMetadataFileValidateButton(row, state === 'success')
+    }
+
+    function updateMetadataCustomRepoStatus (editor) {
+      if (!editor) return
+      const target = editor.querySelector('[data-metadata-custom-repo-status]')
+      if (!target) return
+
+      target.replaceChildren()
+      target.className = 'alert small mb-3'
+      if (!metadataCustomRepoBase) {
+        target.classList.add('alert-warning')
+        target.append('Custom Repo is not configured. ')
+        target.append('Use ')
+        appendMetadataSettingsLink(target, 'alert-link fw-semibold')
+        target.append(' to configure and save it before using ')
+        const code = document.createElement('code')
+        code.textContent = 'repo'
+        target.appendChild(code)
+        target.append(' metadata files.')
+        return
+      }
+
+      target.classList.add('alert-secondary')
+      const label = document.createElement('div')
+      label.className = 'fw-semibold mb-1'
+      label.textContent = 'Custom Repo base used for repo entries'
+      target.appendChild(label)
+
+      const baseValue = document.createElement('code')
+      baseValue.textContent = metadataCustomRepoBase
+      target.appendChild(baseValue)
+
+      if (metadataCustomRepoRaw && metadataCustomRepoRaw !== metadataCustomRepoBase) {
+        const savedValue = document.createElement('div')
+        savedValue.className = 'mt-2'
+        savedValue.append('Saved Custom Repo value: ')
+        const savedCode = document.createElement('code')
+        savedCode.textContent = metadataCustomRepoRaw
+        savedValue.appendChild(savedCode)
+        target.appendChild(savedValue)
+      }
+
+      const hint = document.createElement('div')
+      hint.className = 'mt-2'
+      hint.append('Change it in ')
+      appendMetadataSettingsLink(hint, 'alert-link fw-semibold')
+      hint.append('.')
+      target.appendChild(hint)
+    }
+
+    function applyMetadataFileDependencyState (row, opts = {}) {
+      if (!row) return false
+      const skipStatus = Boolean(opts.skipStatus)
+      const type = row.querySelector('[data-metadata-file-type]')?.value || ''
+      if (type !== 'repo') {
+        if (row.dataset.metadataFileDependency === 'repo-missing') {
+          row.dataset.metadataFileDependency = ''
+        }
+        return false
+      }
+
+      if (metadataCustomRepoBase) {
+        if (row.dataset.metadataFileDependency === 'repo-missing') {
+          row.dataset.metadataFileDependency = ''
+        }
+        return false
+      }
+
+      row.dataset.metadataFileDependency = 'repo-missing'
+      setMetadataFileButtonState(row, 'blocked')
+      if (!skipStatus) {
+        setMetadataFileStatus(row, 'error', metadataRepoDependencyMessage)
+      }
+      return true
+    }
+
+    function renderMetadataFileStatusMessage (target, message) {
+      target.replaceChildren()
+      if (!message) return
+
+      if (typeof message === 'object' && message !== null) {
+        const text = String(message.text || message.message || '').trim()
+        const files = Array.isArray(message.files) ? message.files.filter(Boolean) : []
+        if (text) {
+          const summary = document.createElement('div')
+          appendInlineCodeText(summary, text)
+          target.appendChild(summary)
+        }
+        if (files.length) {
+          if (files.length <= 5) {
+            const list = document.createElement('ul')
+            list.className = 'mb-0 mt-1 ps-3'
+            files.forEach(file => {
+              const item = document.createElement('li')
+              appendInlineCodeText(item, file, { wrapPlainInCode: true })
+              list.appendChild(item)
+            })
+            target.appendChild(list)
+          } else {
+            const details = document.createElement('details')
+            details.className = 'mt-1'
+            const summary = document.createElement('summary')
+            summary.className = 'cursor-pointer'
+            summary.textContent = 'Show files'
+            details.appendChild(summary)
+            const list = document.createElement('ul')
+            list.className = 'mb-0 mt-1 ps-3'
+            files.forEach(file => {
+              const item = document.createElement('li')
+              appendInlineCodeText(item, file, { wrapPlainInCode: true })
+              list.appendChild(item)
+            })
+            details.appendChild(list)
+            target.appendChild(details)
+          }
+        }
+        return
+      }
+
+      const text = String(message || '').trim()
+      if (!text) return
+
+      if (text === metadataRepoDependencyMessage) {
+        target.append('Metadata file repo entries require Custom Repo to be configured and saved first within the ')
+        appendMetadataSettingsLink(target)
+        target.append(' page.')
+        return
+      }
+
+      appendInlineCodeText(target, text)
+    }
+
+    function setMetadataFileStatus (row, kind, message) {
+      if (!row) return
+      const target = row.querySelector('[data-metadata-file-status]')
+      if (!target) return
+      row.dataset.metadataFileState = kind || ''
+      target.className = 'mt-2 small'
+      if (!message) {
+        target.classList.add('d-none')
+        target.textContent = ''
+        if (applyMetadataFileDependencyState(row, { skipStatus: true })) {
+          setMetadataFileButtonState(row, 'blocked')
+        } else {
+          setMetadataFileButtonState(row, 'idle')
+        }
+        const editor = row.closest('[data-metadata-files-editor]')
+        if (editor) updateMetadataFilesAccordionState(editor)
+        return
+      }
+      target.classList.remove('d-none')
+      if (kind === 'success') {
+        target.classList.add('text-success')
+      } else if (kind === 'error') {
+        target.classList.add('text-danger')
+      } else {
+        target.classList.add('text-warning')
+      }
+      renderMetadataFileStatusMessage(target, message)
+      if (kind === 'success') {
+        setMetadataFileButtonState(row, 'success')
+      } else if (row.dataset.metadataFileDependency === 'repo-missing') {
+        setMetadataFileButtonState(row, 'blocked')
+      } else {
+        setMetadataFileButtonState(row, 'idle')
+      }
+      const editor = row.closest('[data-metadata-files-editor]')
+      if (editor) updateMetadataFilesAccordionState(editor)
+    }
+
+    function updateMetadataFilesAccordionState (editor) {
+      if (!editor) return
+      const accordionItem = editor.closest('.accordion-item')
+      const accordionHeader = accordionItem?.querySelector(':scope > .accordion-header')
+      if (!accordionHeader) return
+
+      const rows = Array.from(editor.querySelectorAll('[data-metadata-file-row]'))
+      const hasEntries = rows.some(row => {
+        const type = row.querySelector('[data-metadata-file-type]')?.value || ''
+        const location = row.querySelector('[data-metadata-file-location]')?.value || ''
+        return Boolean(normalizeMetadataFileEntry({ type, location }))
+      })
+      const hasInvalid = rows.some(row => {
+        const state = String(row.dataset.metadataFileState || '').trim().toLowerCase()
+        return state === 'error' || state === 'warning'
+      })
+
+      accordionHeader.classList.remove('invalid')
+      if (hasInvalid) {
+        accordionHeader.classList.add('invalid')
+        return
+      }
+
+      accordionHeader.classList.remove('warning')
+      if (hasEntries) {
+        accordionHeader.classList.add('selected')
+      } else {
+        accordionHeader.classList.remove('selected')
+      }
+    }
+
+    function applyMetadataFileServerErrors (editor, errors) {
+      if (!editor || !Array.isArray(errors) || !errors.length) return false
+      const rows = Array.from(editor.querySelectorAll('[data-metadata-file-row]'))
+      rows.forEach(row => setMetadataFileStatus(row, '', ''))
+      let applied = false
+      errors.forEach(error => {
+        const text = String(error || '').trim()
+        const match = text.match(/metadata_files\[(\d+)\]:\s*(.+)$/i)
+        if (!match) return
+        const index = Number(match[1]) - 1
+        const message = match[2] || 'Validation failed.'
+        if (!Number.isInteger(index) || index < 0 || index >= rows.length) return
+        setMetadataFileStatus(rows[index], 'error', message)
+        applied = true
+      })
+      return applied
+    }
+
+    function syncMetadataFilesEditor (editor, emitEvents = true) {
+      if (!editor) return []
+      const hidden = editor.querySelector('input[type="hidden"][name$="-metadata_files"]')
+      if (!hidden) return []
+      const rows = Array.from(editor.querySelectorAll('[data-metadata-file-row]'))
+      const entries = rows.map(row => {
+        const type = row.querySelector('[data-metadata-file-type]')?.value
+        const location = row.querySelector('[data-metadata-file-location]')?.value
+        const validated = String(row.dataset.metadataFileState || '').trim().toLowerCase() === 'success'
+        return normalizeMetadataFileEntry({ type, location, validated })
+      }).filter(Boolean)
+      hidden.value = JSON.stringify(entries)
+      if (emitEvents) {
+        hidden.dispatchEvent(new Event('input', { bubbles: true }))
+        hidden.dispatchEvent(new Event('change', { bubbles: true }))
+      }
+      updateMetadataFilesAccordionState(editor)
+      return entries
+    }
+
+    function renderMetadataFilesEditor (editor) {
+      if (!editor) return
+      const hidden = editor.querySelector('input[type="hidden"][name$="-metadata_files"]')
+      const list = editor.querySelector('[data-metadata-files-list]')
+      if (!hidden || !list) return
+      updateMetadataCustomRepoStatus(editor)
+      const entries = parseMetadataFilesValue(hidden.value)
+      list.replaceChildren()
+      entries.forEach(entry => list.appendChild(buildMetadataFileRow(entry)))
+      list.querySelectorAll('[data-metadata-file-row]').forEach(row => {
+        if (applyMetadataFileDependencyState(row)) return
+        if (String(row.dataset.metadataFileState || '').trim().toLowerCase() === 'success') {
+          setMetadataFileButtonState(row, 'success')
+        } else {
+          setMetadataFileButtonState(row, 'idle')
+        }
+      })
+      syncMetadataFilesEditor(editor, false)
+      updateMetadataFilesAccordionState(editor)
+    }
+
+    function initMetadataFilesEditors (scope) {
+      const root = scope || document
+      root.querySelectorAll('[data-metadata-files-editor]').forEach(editor => {
+        if (editor.dataset.metadataFilesReady === 'true') return
+        renderMetadataFilesEditor(editor)
+        editor.dataset.metadataFilesReady = 'true'
+      })
+    }
+
+    function buildCollectionFileRow (entry = {}) {
+      const wrapper = document.createElement('div')
+      wrapper.className = 'card bg-body-tertiary border-secondary'
+      wrapper.setAttribute('data-collection-file-row', 'true')
+      wrapper.innerHTML = `
+        <div class="card-body">
+          <div class="row g-3 align-items-end">
+            <div class="col-md-2">
+              <label class="form-label small text-muted">Type</label>
+              <select class="form-select form-select-sm" data-collection-file-type>
+                <option value="file">file</option>
+                <option value="folder">folder</option>
+                <option value="git">git</option>
+                <option value="repo">repo</option>
+                <option value="url">url</option>
+              </select>
+            </div>
+            <div class="col-md-7">
+              <label class="form-label small text-muted">Location</label>
+              <input type="text" class="form-control form-control-sm" data-collection-file-location placeholder="config/collections.yml, config/collections/, user/file.yml, or https://example.com/collections.yml">
+            </div>
+            <div class="col-md-3 d-flex gap-2 justify-content-md-end">
+              <button type="button" class="btn btn-success btn-sm" data-validate-collection-file>Validate</button>
+              <button type="button" class="btn btn-danger btn-sm" data-remove-collection-file>Remove</button>
+            </div>
+          </div>
+          <div class="mt-2 small d-none" data-collection-file-status></div>
+        </div>
+      `
+      const typeSelect = wrapper.querySelector('[data-collection-file-type]')
+      const locationInput = wrapper.querySelector('[data-collection-file-location]')
+      if (typeSelect && ['file', 'folder', 'git', 'repo', 'url'].includes(entry.type)) {
+        typeSelect.value = entry.type
+      }
+      if (locationInput && entry.location) {
+        locationInput.value = entry.location
+      }
+      if (entry.validated) {
+        wrapper.dataset.collectionFileState = 'success'
+        wrapper.dataset.collectionFileButtonState = 'success'
+      }
+      updateCollectionFileValidateButton(wrapper, Boolean(entry.validated))
+      return wrapper
+    }
+
+    function updateCollectionFileValidateButton (row, isValidated) {
+      if (!row) return
+      const button = row.querySelector('[data-validate-collection-file]')
+      if (!button) return
+      const state = String(row.dataset.collectionFileButtonState || '').trim() || (isValidated ? 'success' : 'idle')
+      button.classList.remove('btn-success', 'btn-secondary')
+      if (state === 'success') {
+        button.disabled = true
+        button.classList.add('btn-secondary')
+        button.textContent = 'Validated'
+        return
+      }
+      if (state === 'blocked') {
+        button.disabled = true
+        button.classList.add('btn-secondary')
+        button.textContent = 'Needs Repo'
+        return
+      }
+      if (state === 'loading') {
+        button.disabled = true
+        button.classList.add('btn-secondary')
+        button.textContent = 'Validating...'
+        return
+      }
+      button.disabled = false
+      button.classList.add('btn-success')
+      button.textContent = 'Validate'
+    }
+
+    function setCollectionFileButtonState (row, state) {
+      if (!row) return
+      row.dataset.collectionFileButtonState = state || 'idle'
+      updateCollectionFileValidateButton(row, state === 'success')
+    }
+
+    function updateCollectionCustomRepoStatus (editor) {
+      if (!editor) return
+      const target = editor.querySelector('[data-collection-custom-repo-status]')
+      if (!target) return
+
+      target.replaceChildren()
+      target.className = 'alert small mb-3'
+      if (!metadataCustomRepoBase) {
+        target.classList.add('alert-warning')
+        target.append('Custom Repo is not configured. ')
+        target.append('Use ')
+        appendMetadataSettingsLink(target, 'alert-link fw-semibold')
+        target.append(' to configure and save it before using ')
+        const code = document.createElement('code')
+        code.textContent = 'repo'
+        target.appendChild(code)
+        target.append(' collection files.')
+        return
+      }
+
+      target.classList.add('alert-secondary')
+      const label = document.createElement('div')
+      label.className = 'fw-semibold mb-1'
+      label.textContent = 'Custom Repo base used for repo entries'
+      target.appendChild(label)
+
+      const baseValue = document.createElement('code')
+      baseValue.textContent = metadataCustomRepoBase
+      target.appendChild(baseValue)
+
+      if (metadataCustomRepoRaw && metadataCustomRepoRaw !== metadataCustomRepoBase) {
+        const savedValue = document.createElement('div')
+        savedValue.className = 'mt-2'
+        savedValue.append('Saved Custom Repo value: ')
+        const savedCode = document.createElement('code')
+        savedCode.textContent = metadataCustomRepoRaw
+        savedValue.appendChild(savedCode)
+        target.appendChild(savedValue)
+      }
+
+      const hint = document.createElement('div')
+      hint.className = 'mt-2'
+      hint.append('Change it in ')
+      appendMetadataSettingsLink(hint, 'alert-link fw-semibold')
+      hint.append('.')
+      target.appendChild(hint)
+    }
+
+    function applyCollectionFileDependencyState (row, opts = {}) {
+      if (!row) return false
+      const skipStatus = Boolean(opts.skipStatus)
+      const type = row.querySelector('[data-collection-file-type]')?.value || ''
+      if (type !== 'repo') {
+        if (row.dataset.collectionFileDependency === 'repo-missing') {
+          row.dataset.collectionFileDependency = ''
+        }
+        return false
+      }
+
+      if (metadataCustomRepoBase) {
+        if (row.dataset.collectionFileDependency === 'repo-missing') {
+          row.dataset.collectionFileDependency = ''
+        }
+        return false
+      }
+
+      row.dataset.collectionFileDependency = 'repo-missing'
+      setCollectionFileButtonState(row, 'blocked')
+      if (!skipStatus) {
+        setCollectionFileStatus(row, 'error', collectionRepoDependencyMessage)
+      }
+      return true
+    }
+
+    function renderCollectionFileStatusMessage (target, message) {
+      target.replaceChildren()
+      if (!message) return
+
+      if (typeof message === 'object' && message !== null) {
+        const text = String(message.text || message.message || '').trim()
+        const files = Array.isArray(message.files) ? message.files.filter(Boolean) : []
+        if (text) {
+          const summary = document.createElement('div')
+          appendInlineCodeText(summary, text)
+          target.appendChild(summary)
+        }
+        if (files.length) {
+          if (files.length <= 5) {
+            const list = document.createElement('ul')
+            list.className = 'mb-0 mt-1 ps-3'
+            files.forEach(file => {
+              const item = document.createElement('li')
+              appendInlineCodeText(item, file, { wrapPlainInCode: true })
+              list.appendChild(item)
+            })
+            target.appendChild(list)
+          } else {
+            const details = document.createElement('details')
+            details.className = 'mt-1'
+            const summary = document.createElement('summary')
+            summary.className = 'cursor-pointer'
+            summary.textContent = 'Show files'
+            details.appendChild(summary)
+            const list = document.createElement('ul')
+            list.className = 'mb-0 mt-1 ps-3'
+            files.forEach(file => {
+              const item = document.createElement('li')
+              appendInlineCodeText(item, file, { wrapPlainInCode: true })
+              list.appendChild(item)
+            })
+            details.appendChild(list)
+            target.appendChild(details)
+          }
+        }
+        return
+      }
+
+      const text = String(message || '').trim()
+      if (!text) return
+
+      if (text === collectionRepoDependencyMessage) {
+        target.append('Collection file repo entries require Custom Repo to be configured and saved first within the ')
+        appendMetadataSettingsLink(target)
+        target.append(' page.')
+        return
+      }
+
+      appendInlineCodeText(target, text)
+    }
+
+    function setCollectionFileStatus (row, kind, message) {
+      if (!row) return
+      const target = row.querySelector('[data-collection-file-status]')
+      if (!target) return
+      row.dataset.collectionFileState = kind || ''
+      target.className = 'mt-2 small'
+      if (!message) {
+        target.classList.add('d-none')
+        target.textContent = ''
+        if (applyCollectionFileDependencyState(row, { skipStatus: true })) {
+          setCollectionFileButtonState(row, 'blocked')
+        } else {
+          setCollectionFileButtonState(row, 'idle')
+        }
+        const editor = row.closest('[data-collection-files-editor]')
+        if (editor) updateCollectionFilesAccordionState(editor)
+        return
+      }
+      target.classList.remove('d-none')
+      if (kind === 'success') {
+        target.classList.add('text-success')
+      } else if (kind === 'error') {
+        target.classList.add('text-danger')
+      } else {
+        target.classList.add('text-warning')
+      }
+      renderCollectionFileStatusMessage(target, message)
+      if (kind === 'success') {
+        setCollectionFileButtonState(row, 'success')
+      } else if (row.dataset.collectionFileDependency === 'repo-missing') {
+        setCollectionFileButtonState(row, 'blocked')
+      } else {
+        setCollectionFileButtonState(row, 'idle')
+      }
+      const editor = row.closest('[data-collection-files-editor]')
+      if (editor) updateCollectionFilesAccordionState(editor)
+    }
+
+    function updateCollectionFilesAccordionState (editor) {
+      if (!editor) return
+      const accordionItem = editor.closest('.accordion-item')
+      const accordionHeader = accordionItem?.querySelector(':scope > .accordion-header')
+      if (!accordionHeader) return
+
+      const rows = Array.from(editor.querySelectorAll('[data-collection-file-row]'))
+      const hasEntries = rows.some(row => normalizeMetadataFileEntry({
+        type: row.querySelector('[data-collection-file-type]')?.value || '',
+        location: row.querySelector('[data-collection-file-location]')?.value || ''
+      }))
+      const hasInvalid = rows.some(row => {
+        const state = String(row.dataset.collectionFileState || '').trim().toLowerCase()
+        return state === 'error' || state === 'warning'
+      })
+
+      accordionHeader.classList.remove('warning')
+      accordionHeader.classList.toggle('invalid', hasInvalid)
+      if (!hasInvalid && hasEntries) {
+        accordionHeader.classList.add('selected')
+      } else {
+        accordionHeader.classList.remove('selected')
+        if (!hasEntries && !hasInvalid && typeof EventHandler !== 'undefined' && typeof EventHandler.updateAccordionHighlights === 'function') {
+          EventHandler.updateAccordionHighlights()
+        }
+      }
+    }
+
+    function applyCollectionFileServerErrors (editor, errors) {
+      if (!editor || !Array.isArray(errors) || !errors.length) return false
+      const rows = Array.from(editor.querySelectorAll('[data-collection-file-row]'))
+      rows.forEach(row => setCollectionFileStatus(row, '', ''))
+      let applied = false
+      errors.forEach(error => {
+        const text = String(error || '').trim()
+        const match = text.match(/collection_files\[(\d+)\]:\s*(.+)$/i)
+        if (!match) return
+        const index = Number(match[1]) - 1
+        const message = match[2] || 'Validation failed.'
+        if (!Number.isInteger(index) || index < 0 || index >= rows.length) return
+        setCollectionFileStatus(rows[index], 'error', message)
+        applied = true
+      })
+      return applied
+    }
+
+    function syncCollectionFilesEditor (editor, emitEvents = true) {
+      if (!editor) return []
+      const hidden = editor.querySelector('input[type="hidden"][name$="-collection_files"]')
+      if (!hidden) return []
+      const rows = Array.from(editor.querySelectorAll('[data-collection-file-row]'))
+      const entries = rows.map(row => {
+        const type = row.querySelector('[data-collection-file-type]')?.value
+        const location = row.querySelector('[data-collection-file-location]')?.value
+        const validated = String(row.dataset.collectionFileState || '').trim().toLowerCase() === 'success'
+        return normalizeMetadataFileEntry({ type, location, validated })
+      }).filter(Boolean)
+      hidden.value = JSON.stringify(entries)
+      if (emitEvents) {
+        hidden.dispatchEvent(new Event('input', { bubbles: true }))
+        hidden.dispatchEvent(new Event('change', { bubbles: true }))
+      }
+      updateCollectionFilesAccordionState(editor)
+      return entries
+    }
+
+    function renderCollectionFilesEditor (editor) {
+      if (!editor) return
+      const hidden = editor.querySelector('input[type="hidden"][name$="-collection_files"]')
+      const list = editor.querySelector('[data-collection-files-list]')
+      if (!hidden || !list) return
+      updateCollectionCustomRepoStatus(editor)
+      const entries = parseMetadataFilesValue(hidden.value)
+      list.replaceChildren()
+      entries.forEach(entry => list.appendChild(buildCollectionFileRow(entry)))
+      list.querySelectorAll('[data-collection-file-row]').forEach(row => {
+        if (applyCollectionFileDependencyState(row)) return
+        if (String(row.dataset.collectionFileState || '').trim().toLowerCase() === 'success') {
+          setCollectionFileButtonState(row, 'success')
+        } else {
+          setCollectionFileButtonState(row, 'idle')
+        }
+      })
+      syncCollectionFilesEditor(editor, false)
+      updateCollectionFilesAccordionState(editor)
+    }
+
+    function initCollectionFilesEditors (scope) {
+      const root = scope || document
+      root.querySelectorAll('[data-collection-files-editor]').forEach(editor => {
+        if (editor.dataset.collectionFilesReady === 'true') return
+        renderCollectionFilesEditor(editor)
+        editor.dataset.collectionFilesReady = 'true'
+      })
+    }
+
+    document.addEventListener('click', async function (event) {
+      const addButton = event.target.closest('[data-add-metadata-file]')
+      if (addButton) {
+        const editor = addButton.closest('[data-metadata-files-editor]')
+        const list = editor?.querySelector('[data-metadata-files-list]')
+        if (!editor || !list) return
+        list.appendChild(buildMetadataFileRow({ type: 'file', location: '' }))
+        syncMetadataFilesEditor(editor)
+        return
+      }
+
+      const removeButton = event.target.closest('[data-remove-metadata-file]')
+      if (removeButton) {
+        const row = removeButton.closest('[data-metadata-file-row]')
+        const editor = removeButton.closest('[data-metadata-files-editor]')
+        if (!row || !editor) return
+        row.remove()
+        syncMetadataFilesEditor(editor)
+        return
+      }
+
+      const validateButton = event.target.closest('[data-validate-metadata-file]')
+      if (validateButton) {
+        const row = validateButton.closest('[data-metadata-file-row]')
+        const editor = validateButton.closest('[data-metadata-files-editor]')
+        if (!row || !editor) return
+        if (applyMetadataFileDependencyState(row)) return
+        const type = row.querySelector('[data-metadata-file-type]')?.value || ''
+        const location = row.querySelector('[data-metadata-file-location]')?.value || ''
+        const libraryId = String(editor.dataset.libraryId || '').trim()
+        syncMetadataFilesEditor(editor, false)
+        setMetadataFileStatus(row, '', 'Validating...')
+        setMetadataFileButtonState(row, 'loading')
+        try {
+          const response = await fetch('/validate_metadata_file', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              metadata_file_type: type,
+              metadata_file_location: location,
+              library_id: libraryId,
+              config_name: getActiveConfigName()
+            })
+          })
+          const payload = await response.json().catch(() => ({}))
+          if (!response.ok || !payload.valid) {
+            setMetadataFileStatus(row, 'error', payload.error_details || {
+              text: payload.error || 'Validation failed.',
+              files: Array.isArray(payload.files) ? payload.files : []
+            })
+          } else {
+            applyNormalizedLibraryFileLocation(row, '[data-metadata-file-location]', payload, editor, syncMetadataFilesEditor)
+            setMetadataFileStatus(row, 'success', {
+              text: payload.message || 'Metadata source looks valid.',
+              files: Array.isArray(payload.files) ? payload.files : []
+            })
+            syncMetadataFilesEditor(editor, false)
+          }
+        } catch (_error) {
+          setMetadataFileStatus(row, 'error', 'Validation request failed.')
+        } finally {
+          if (row.dataset.metadataFileState !== 'success' && row.dataset.metadataFileDependency !== 'repo-missing') {
+            setMetadataFileButtonState(row, 'idle')
+          }
+        }
+      }
+    })
+
+    document.addEventListener('input', function (event) {
+      const target = event.target
+      if (!target || !target.closest('[data-metadata-files-editor]')) return
+      if (!target.matches('[data-metadata-file-type], [data-metadata-file-location]')) return
+      const row = target.closest('[data-metadata-file-row]')
+      const editor = target.closest('[data-metadata-files-editor]')
+      setMetadataFileStatus(row, '', '')
+      applyMetadataFileDependencyState(row)
+      syncMetadataFilesEditor(editor)
+    })
+
+    document.addEventListener('change', function (event) {
+      const target = event.target
+      if (!target || !target.closest('[data-metadata-files-editor]')) return
+      if (!target.matches('[data-metadata-file-type], [data-metadata-file-location]')) return
+      const row = target.closest('[data-metadata-file-row]')
+      const editor = target.closest('[data-metadata-files-editor]')
+      setMetadataFileStatus(row, '', '')
+      applyMetadataFileDependencyState(row)
+      syncMetadataFilesEditor(editor)
+    })
+
+    initMetadataFilesEditors(document)
+    if (libraryContainer && typeof MutationObserver !== 'undefined') {
+      const metadataObserver = new MutationObserver(() => initMetadataFilesEditors(libraryContainer))
+      metadataObserver.observe(libraryContainer, { childList: true, subtree: true })
+    }
+
+    document.addEventListener('click', async function (event) {
+      const addButton = event.target.closest('[data-add-collection-file]')
+      if (addButton) {
+        const editor = addButton.closest('[data-collection-files-editor]')
+        const list = editor?.querySelector('[data-collection-files-list]')
+        if (!editor || !list) return
+        list.appendChild(buildCollectionFileRow({ type: 'file', location: '' }))
+        syncCollectionFilesEditor(editor)
+        return
+      }
+
+      const removeButton = event.target.closest('[data-remove-collection-file]')
+      if (removeButton) {
+        const row = removeButton.closest('[data-collection-file-row]')
+        const editor = removeButton.closest('[data-collection-files-editor]')
+        if (!row || !editor) return
+        row.remove()
+        syncCollectionFilesEditor(editor)
+        return
+      }
+
+      const validateButton = event.target.closest('[data-validate-collection-file]')
+      if (validateButton) {
+        const row = validateButton.closest('[data-collection-file-row]')
+        const editor = validateButton.closest('[data-collection-files-editor]')
+        if (!row || !editor) return
+        if (applyCollectionFileDependencyState(row)) return
+        const type = row.querySelector('[data-collection-file-type]')?.value || ''
+        const location = row.querySelector('[data-collection-file-location]')?.value || ''
+        const libraryId = String(editor.dataset.libraryId || '').trim()
+        syncCollectionFilesEditor(editor, false)
+        setCollectionFileStatus(row, '', 'Validating...')
+        setCollectionFileButtonState(row, 'loading')
+        try {
+          const response = await fetch('/validate_collection_file', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              collection_file_type: type,
+              collection_file_location: location,
+              library_id: libraryId,
+              config_name: getActiveConfigName()
+            })
+          })
+          const payload = await response.json().catch(() => ({}))
+          if (!response.ok || !payload.valid) {
+            setCollectionFileStatus(row, 'error', payload.error_details || {
+              text: payload.error || 'Validation failed.',
+              files: Array.isArray(payload.files) ? payload.files : []
+            })
+          } else {
+            applyNormalizedLibraryFileLocation(row, '[data-collection-file-location]', payload, editor, syncCollectionFilesEditor)
+            setCollectionFileStatus(row, 'success', {
+              text: payload.message || 'Collection source looks valid.',
+              files: Array.isArray(payload.files) ? payload.files : []
+            })
+            syncCollectionFilesEditor(editor, false)
+          }
+        } catch (_error) {
+          setCollectionFileStatus(row, 'error', 'Validation request failed.')
+        } finally {
+          if (row.dataset.collectionFileState !== 'success' && row.dataset.collectionFileDependency !== 'repo-missing') {
+            setCollectionFileButtonState(row, 'idle')
+          }
+        }
+      }
+    })
+
+    document.addEventListener('input', function (event) {
+      const target = event.target
+      if (!target || !target.closest('[data-collection-files-editor]')) return
+      if (!target.matches('[data-collection-file-type], [data-collection-file-location]')) return
+      const row = target.closest('[data-collection-file-row]')
+      const editor = target.closest('[data-collection-files-editor]')
+      setCollectionFileStatus(row, '', '')
+      applyCollectionFileDependencyState(row)
+      syncCollectionFilesEditor(editor)
+    })
+
+    document.addEventListener('change', function (event) {
+      const target = event.target
+      if (!target || !target.closest('[data-collection-files-editor]')) return
+      if (!target.matches('[data-collection-file-type], [data-collection-file-location]')) return
+      const row = target.closest('[data-collection-file-row]')
+      const editor = target.closest('[data-collection-files-editor]')
+      setCollectionFileStatus(row, '', '')
+      applyCollectionFileDependencyState(row)
+      syncCollectionFilesEditor(editor)
+    })
+
+    initCollectionFilesEditors(document)
+    if (libraryContainer && typeof MutationObserver !== 'undefined') {
+      const collectionObserver = new MutationObserver(() => initCollectionFilesEditors(libraryContainer))
+      collectionObserver.observe(libraryContainer, { childList: true, subtree: true })
+    }
+
+    function buildOverlayFileRow (entry = {}) {
+      const wrapper = document.createElement('div')
+      wrapper.className = 'card bg-body-tertiary border-secondary'
+      wrapper.setAttribute('data-overlay-file-row', 'true')
+      wrapper.innerHTML = `
+        <div class="card-body">
+          <div class="row g-3 align-items-end">
+            <div class="col-md-2">
+              <label class="form-label small text-muted">Type</label>
+              <select class="form-select form-select-sm" data-overlay-file-type>
+                <option value="file">file</option>
+                <option value="folder">folder</option>
+                <option value="git">git</option>
+                <option value="repo">repo</option>
+                <option value="url">url</option>
+              </select>
+            </div>
+            <div class="col-md-7">
+              <label class="form-label small text-muted">Location</label>
+              <input type="text" class="form-control form-control-sm" data-overlay-file-location placeholder="config/overlays.yml, config/overlays/, user/file.yml, or https://example.com/overlays.yml">
+            </div>
+            <div class="col-md-3 d-flex gap-2 justify-content-md-end">
+              <button type="button" class="btn btn-success btn-sm" data-validate-overlay-file>Validate</button>
+              <button type="button" class="btn btn-danger btn-sm" data-remove-overlay-file>Remove</button>
+            </div>
+          </div>
+          <div class="mt-2 small d-none" data-overlay-file-status></div>
+        </div>
+      `
+      const typeSelect = wrapper.querySelector('[data-overlay-file-type]')
+      const locationInput = wrapper.querySelector('[data-overlay-file-location]')
+      if (typeSelect && ['file', 'folder', 'git', 'repo', 'url'].includes(entry.type)) {
+        typeSelect.value = entry.type
+      }
+      if (locationInput && entry.location) {
+        locationInput.value = entry.location
+      }
+      if (entry.validated) {
+        wrapper.dataset.overlayFileState = 'success'
+        wrapper.dataset.overlayFileButtonState = 'success'
+      }
+      updateOverlayFileValidateButton(wrapper, Boolean(entry.validated))
+      return wrapper
+    }
+
+    function updateOverlayFileValidateButton (row, isValidated) {
+      if (!row) return
+      const button = row.querySelector('[data-validate-overlay-file]')
+      if (!button) return
+      const state = String(row.dataset.overlayFileButtonState || '').trim() || (isValidated ? 'success' : 'idle')
+      button.classList.remove('btn-success', 'btn-secondary')
+      if (state === 'success') {
+        button.disabled = true
+        button.classList.add('btn-secondary')
+        button.textContent = 'Validated'
+        return
+      }
+      if (state === 'blocked') {
+        button.disabled = true
+        button.classList.add('btn-secondary')
+        button.textContent = 'Needs Repo'
+        return
+      }
+      if (state === 'loading') {
+        button.disabled = true
+        button.classList.add('btn-secondary')
+        button.textContent = 'Validating...'
+        return
+      }
+      button.disabled = false
+      button.classList.add('btn-success')
+      button.textContent = 'Validate'
+    }
+
+    function setOverlayFileButtonState (row, state) {
+      if (!row) return
+      row.dataset.overlayFileButtonState = state || 'idle'
+      updateOverlayFileValidateButton(row, state === 'success')
+    }
+
+    function updateOverlayCustomRepoStatus (editor) {
+      if (!editor) return
+      const target = editor.querySelector('[data-overlay-custom-repo-status]')
+      if (!target) return
+
+      target.replaceChildren()
+      target.className = 'alert small mb-3'
+      if (!metadataCustomRepoBase) {
+        target.classList.add('alert-warning')
+        target.append('Custom Repo is not configured. ')
+        target.append('Use ')
+        appendMetadataSettingsLink(target, 'alert-link fw-semibold')
+        target.append(' to configure and save it before using ')
+        const code = document.createElement('code')
+        code.textContent = 'repo'
+        target.appendChild(code)
+        target.append(' overlay files.')
+        return
+      }
+
+      target.classList.add('alert-secondary')
+      const label = document.createElement('div')
+      label.className = 'fw-semibold mb-1'
+      label.textContent = 'Custom Repo base used for repo entries'
+      target.appendChild(label)
+
+      const baseValue = document.createElement('code')
+      baseValue.textContent = metadataCustomRepoBase
+      target.appendChild(baseValue)
+
+      if (metadataCustomRepoRaw && metadataCustomRepoRaw !== metadataCustomRepoBase) {
+        const savedValue = document.createElement('div')
+        savedValue.className = 'mt-2'
+        savedValue.append('Saved Custom Repo value: ')
+        const savedCode = document.createElement('code')
+        savedCode.textContent = metadataCustomRepoRaw
+        savedValue.appendChild(savedCode)
+        target.appendChild(savedValue)
+      }
+
+      const hint = document.createElement('div')
+      hint.className = 'mt-2'
+      hint.append('Change it in ')
+      appendMetadataSettingsLink(hint, 'alert-link fw-semibold')
+      hint.append('.')
+      target.appendChild(hint)
+    }
+
+    function applyOverlayFileDependencyState (row, opts = {}) {
+      if (!row) return false
+      const skipStatus = Boolean(opts.skipStatus)
+      const type = row.querySelector('[data-overlay-file-type]')?.value || ''
+      if (type !== 'repo') {
+        if (row.dataset.overlayFileDependency === 'repo-missing') {
+          row.dataset.overlayFileDependency = ''
+        }
+        return false
+      }
+
+      if (metadataCustomRepoBase) {
+        if (row.dataset.overlayFileDependency === 'repo-missing') {
+          row.dataset.overlayFileDependency = ''
+        }
+        return false
+      }
+
+      row.dataset.overlayFileDependency = 'repo-missing'
+      setOverlayFileButtonState(row, 'blocked')
+      if (!skipStatus) {
+        setOverlayFileStatus(row, 'error', overlayRepoDependencyMessage)
+      }
+      return true
+    }
+
+    function renderOverlayFileStatusMessage (target, message) {
+      target.replaceChildren()
+      if (!message) return
+
+      if (typeof message === 'object' && message !== null) {
+        const text = String(message.text || message.message || '').trim()
+        const files = Array.isArray(message.files) ? message.files.filter(Boolean) : []
+        if (text) {
+          const summary = document.createElement('div')
+          appendInlineCodeText(summary, text)
+          target.appendChild(summary)
+        }
+        if (files.length) {
+          if (files.length <= 5) {
+            const list = document.createElement('ul')
+            list.className = 'mb-0 mt-1 ps-3'
+            files.forEach(file => {
+              const item = document.createElement('li')
+              appendInlineCodeText(item, file, { wrapPlainInCode: true })
+              list.appendChild(item)
+            })
+            target.appendChild(list)
+          } else {
+            const details = document.createElement('details')
+            details.className = 'mt-1'
+            const summary = document.createElement('summary')
+            summary.className = 'cursor-pointer'
+            summary.textContent = 'Show files'
+            details.appendChild(summary)
+            const list = document.createElement('ul')
+            list.className = 'mb-0 mt-1 ps-3'
+            files.forEach(file => {
+              const item = document.createElement('li')
+              appendInlineCodeText(item, file, { wrapPlainInCode: true })
+              list.appendChild(item)
+            })
+            details.appendChild(list)
+            target.appendChild(details)
+          }
+        }
+        return
+      }
+
+      const text = String(message || '').trim()
+      if (!text) return
+
+      if (text === overlayRepoDependencyMessage) {
+        target.append('Overlay file repo entries require Custom Repo to be configured and saved first within the ')
+        appendMetadataSettingsLink(target)
+        target.append(' page.')
+        return
+      }
+
+      appendInlineCodeText(target, text)
+    }
+
+    function setOverlayFileStatus (row, kind, message) {
+      if (!row) return
+      const target = row.querySelector('[data-overlay-file-status]')
+      if (!target) return
+      row.dataset.overlayFileState = kind || ''
+      target.className = 'mt-2 small'
+      if (!message) {
+        target.classList.add('d-none')
+        target.textContent = ''
+        if (applyOverlayFileDependencyState(row, { skipStatus: true })) {
+          setOverlayFileButtonState(row, 'blocked')
+        } else {
+          setOverlayFileButtonState(row, 'idle')
+        }
+        const editor = row.closest('[data-overlay-files-editor]')
+        if (editor) updateOverlayFilesAccordionState(editor)
+        return
+      }
+      target.classList.remove('d-none')
+      if (kind === 'success') {
+        target.classList.add('text-success')
+      } else if (kind === 'error') {
+        target.classList.add('text-danger')
+      } else {
+        target.classList.add('text-warning')
+      }
+      renderOverlayFileStatusMessage(target, message)
+      if (kind === 'success') {
+        setOverlayFileButtonState(row, 'success')
+      } else if (row.dataset.overlayFileDependency === 'repo-missing') {
+        setOverlayFileButtonState(row, 'blocked')
+      } else {
+        setOverlayFileButtonState(row, 'idle')
+      }
+      const editor = row.closest('[data-overlay-files-editor]')
+      if (editor) updateOverlayFilesAccordionState(editor)
+    }
+
+    function updateOverlayFilesAccordionState (editor) {
+      if (!editor) return
+      const accordionItem = editor.closest('.accordion-item')
+      const accordionHeader = accordionItem?.querySelector(':scope > .accordion-header')
+      if (!accordionHeader) return
+
+      const rows = Array.from(editor.querySelectorAll('[data-overlay-file-row]'))
+      const hasEntries = rows.some(row => normalizeMetadataFileEntry({
+        type: row.querySelector('[data-overlay-file-type]')?.value || '',
+        location: row.querySelector('[data-overlay-file-location]')?.value || ''
+      }))
+      const hasInvalid = rows.some(row => {
+        const state = String(row.dataset.overlayFileState || '').trim().toLowerCase()
+        return state === 'error' || state === 'warning'
+      })
+
+      accordionHeader.classList.remove('warning')
+      accordionHeader.classList.toggle('invalid', hasInvalid)
+      if (!hasInvalid && hasEntries) {
+        accordionHeader.classList.add('selected')
+      } else {
+        accordionHeader.classList.remove('selected')
+        if (!hasEntries && !hasInvalid && typeof EventHandler !== 'undefined' && typeof EventHandler.updateAccordionHighlights === 'function') {
+          EventHandler.updateAccordionHighlights()
+        }
+      }
+    }
+
+    function applyOverlayFileServerErrors (editor, errors) {
+      if (!editor || !Array.isArray(errors) || !errors.length) return false
+      const rows = Array.from(editor.querySelectorAll('[data-overlay-file-row]'))
+      rows.forEach(row => setOverlayFileStatus(row, '', ''))
+      let applied = false
+      errors.forEach(error => {
+        const text = String(error || '').trim()
+        const match = text.match(/overlay_files\[(\d+)\]:\s*(.+)$/i)
+        if (!match) return
+        const index = Number(match[1]) - 1
+        const message = match[2] || 'Validation failed.'
+        if (!Number.isInteger(index) || index < 0 || index >= rows.length) return
+        setOverlayFileStatus(rows[index], 'error', message)
+        applied = true
+      })
+      return applied
+    }
+
+    function syncOverlayFilesEditor (editor, emitEvents = true) {
+      if (!editor) return []
+      const hidden = editor.querySelector('input[type="hidden"][name$="-overlay_files"]')
+      if (!hidden) return []
+      const rows = Array.from(editor.querySelectorAll('[data-overlay-file-row]'))
+      const entries = rows.map(row => {
+        const type = row.querySelector('[data-overlay-file-type]')?.value
+        const location = row.querySelector('[data-overlay-file-location]')?.value
+        const validated = String(row.dataset.overlayFileState || '').trim().toLowerCase() === 'success'
+        return normalizeMetadataFileEntry({ type, location, validated })
+      }).filter(Boolean)
+      hidden.value = JSON.stringify(entries)
+      if (emitEvents) {
+        hidden.dispatchEvent(new Event('input', { bubbles: true }))
+        hidden.dispatchEvent(new Event('change', { bubbles: true }))
+      }
+      updateOverlayFilesAccordionState(editor)
+      return entries
+    }
+
+    function renderOverlayFilesEditor (editor) {
+      if (!editor) return
+      const hidden = editor.querySelector('input[type="hidden"][name$="-overlay_files"]')
+      const list = editor.querySelector('[data-overlay-files-list]')
+      if (!hidden || !list) return
+      updateOverlayCustomRepoStatus(editor)
+      const entries = parseMetadataFilesValue(hidden.value)
+      list.replaceChildren()
+      entries.forEach(entry => list.appendChild(buildOverlayFileRow(entry)))
+      list.querySelectorAll('[data-overlay-file-row]').forEach(row => {
+        if (applyOverlayFileDependencyState(row)) return
+        if (String(row.dataset.overlayFileState || '').trim().toLowerCase() === 'success') {
+          setOverlayFileButtonState(row, 'success')
+        } else {
+          setOverlayFileButtonState(row, 'idle')
+        }
+      })
+      syncOverlayFilesEditor(editor, false)
+      updateOverlayFilesAccordionState(editor)
+    }
+
+    function initOverlayFilesEditors (scope) {
+      const root = scope || document
+      root.querySelectorAll('[data-overlay-files-editor]').forEach(editor => {
+        if (editor.dataset.overlayFilesReady === 'true') return
+        renderOverlayFilesEditor(editor)
+        editor.dataset.overlayFilesReady = 'true'
+      })
+    }
+
+    document.addEventListener('click', async function (event) {
+      const addButton = event.target.closest('[data-add-overlay-file]')
+      if (addButton) {
+        const editor = addButton.closest('[data-overlay-files-editor]')
+        const list = editor?.querySelector('[data-overlay-files-list]')
+        if (!editor || !list) return
+        list.appendChild(buildOverlayFileRow({ type: 'file', location: '' }))
+        syncOverlayFilesEditor(editor)
+        return
+      }
+
+      const removeButton = event.target.closest('[data-remove-overlay-file]')
+      if (removeButton) {
+        const row = removeButton.closest('[data-overlay-file-row]')
+        const editor = removeButton.closest('[data-overlay-files-editor]')
+        if (!row || !editor) return
+        row.remove()
+        syncOverlayFilesEditor(editor)
+        return
+      }
+
+      const validateButton = event.target.closest('[data-validate-overlay-file]')
+      if (validateButton) {
+        const row = validateButton.closest('[data-overlay-file-row]')
+        const editor = validateButton.closest('[data-overlay-files-editor]')
+        if (!row || !editor) return
+        if (applyOverlayFileDependencyState(row)) return
+        const type = row.querySelector('[data-overlay-file-type]')?.value || ''
+        const location = row.querySelector('[data-overlay-file-location]')?.value || ''
+        const libraryId = String(editor.dataset.libraryId || '').trim()
+        syncOverlayFilesEditor(editor, false)
+        setOverlayFileStatus(row, '', 'Validating...')
+        setOverlayFileButtonState(row, 'loading')
+        try {
+          const response = await fetch('/validate_overlay_file', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              overlay_file_type: type,
+              overlay_file_location: location,
+              library_id: libraryId,
+              config_name: getActiveConfigName()
+            })
+          })
+          const payload = await response.json().catch(() => ({}))
+          if (!response.ok || !payload.valid) {
+            setOverlayFileStatus(row, 'error', payload.error_details || {
+              text: payload.error || 'Validation failed.',
+              files: Array.isArray(payload.files) ? payload.files : []
+            })
+          } else {
+            applyNormalizedLibraryFileLocation(row, '[data-overlay-file-location]', payload, editor, syncOverlayFilesEditor)
+            setOverlayFileStatus(row, 'success', {
+              text: payload.message || 'Overlay source looks valid.',
+              files: Array.isArray(payload.files) ? payload.files : []
+            })
+            syncOverlayFilesEditor(editor, false)
+          }
+        } catch (_error) {
+          setOverlayFileStatus(row, 'error', 'Validation request failed.')
+        } finally {
+          if (row.dataset.overlayFileState !== 'success' && row.dataset.overlayFileDependency !== 'repo-missing') {
+            setOverlayFileButtonState(row, 'idle')
+          }
+        }
+      }
+    })
+
+    document.addEventListener('input', function (event) {
+      const target = event.target
+      if (!target || !target.closest('[data-overlay-files-editor]')) return
+      if (!target.matches('[data-overlay-file-type], [data-overlay-file-location]')) return
+      const row = target.closest('[data-overlay-file-row]')
+      const editor = target.closest('[data-overlay-files-editor]')
+      setOverlayFileStatus(row, '', '')
+      applyOverlayFileDependencyState(row)
+      syncOverlayFilesEditor(editor)
+    })
+
+    document.addEventListener('change', function (event) {
+      const target = event.target
+      if (!target || !target.closest('[data-overlay-files-editor]')) return
+      if (!target.matches('[data-overlay-file-type], [data-overlay-file-location]')) return
+      const row = target.closest('[data-overlay-file-row]')
+      const editor = target.closest('[data-overlay-files-editor]')
+      setOverlayFileStatus(row, '', '')
+      applyOverlayFileDependencyState(row)
+      syncOverlayFilesEditor(editor)
+    })
+
+    initOverlayFilesEditors(document)
+    if (libraryContainer && typeof MutationObserver !== 'undefined') {
+      const overlayObserver = new MutationObserver(() => initOverlayFilesEditors(libraryContainer))
+      overlayObserver.observe(libraryContainer, { childList: true, subtree: true })
+    }
 
     // Ensure hidden "false" inputs don't submit alongside checked checkboxes with the same name
     function syncHiddenCheckboxPairs (scope) {
@@ -199,6 +1608,332 @@ document.addEventListener('DOMContentLoaded', function () {
       })
     }
 
+    const overlayLanguageWeightDefaults = {
+      en: 610,
+      de: 600,
+      fr: 590,
+      es: 580,
+      pt: 570,
+      ja: 560,
+      ko: 550,
+      zh: 540,
+      da: 530,
+      ru: 520,
+      it: 510,
+      hi: 500,
+      te: 490,
+      fa: 480,
+      th: 470,
+      nl: 460,
+      no: 450,
+      is: 440,
+      sv: 430,
+      tr: 420,
+      pl: 410,
+      cs: 400,
+      uk: 390,
+      hu: 380,
+      ar: 370,
+      bg: 360,
+      bn: 350,
+      bs: 340,
+      ca: 330,
+      cy: 320,
+      el: 310,
+      et: 300,
+      eu: 290,
+      fi: 280,
+      tl: 270,
+      fil: 265,
+      gl: 260,
+      he: 250,
+      hr: 240,
+      id: 230,
+      ka: 220,
+      kk: 210,
+      kn: 200,
+      la: 190,
+      lt: 180,
+      lv: 170,
+      mk: 160,
+      ml: 150,
+      mr: 140,
+      ms: 130,
+      nb: 120,
+      nn: 110,
+      pa: 100,
+      ro: 90,
+      sk: 80,
+      sl: 70,
+      sq: 60,
+      sr: 50,
+      so: 45,
+      sw: 40,
+      ta: 30,
+      ur: 20,
+      ay: 19,
+      ga: 18,
+      li: 17,
+      kh: 16,
+      vi: 15,
+      mn: 14,
+      af: 13,
+      bm: 12,
+      ln: 11,
+      wo: 10,
+      lo: 9,
+      myn: 8,
+      iu: 7,
+      rom: 6,
+      am: 5,
+      su: 4,
+      zu: 3,
+      lb: 2,
+      mos: 1
+    }
+
+    function setupOverlayLanguageWeightBuilders (scope) {
+      const root = scope || document
+      root.querySelectorAll('[data-overlay-language-weight-builder]').forEach(wrapper => {
+        if (wrapper.dataset.listenerAdded === 'true') return
+
+        const templateName = String(wrapper.dataset.templateName || '').trim()
+        const languageInputId = String(wrapper.dataset.languageInputId || '').trim()
+        const rowsContainer = wrapper.querySelector('[data-overlay-language-weight-rows]')
+        const addButton = wrapper.querySelector('[data-overlay-language-weight-add]')
+        const hiddenContainer = wrapper.querySelector('[data-overlay-language-weight-hidden]')
+        if (!templateName || !rowsContainer || !addButton || !hiddenContainer) return
+
+        let options = []
+        try {
+          const parsed = JSON.parse(wrapper.dataset.options || '[]')
+          if (Array.isArray(parsed)) {
+            const seen = new Set()
+            options = parsed
+              .map(option => {
+                if (typeof option === 'string') {
+                  return { value: option, label: option }
+                }
+                if (option && typeof option === 'object' && option.value) {
+                  return { value: String(option.value), label: String(option.label || option.value) }
+                }
+                return null
+              })
+              .filter(Boolean)
+              .filter(option => {
+                if (seen.has(option.value)) return false
+                seen.add(option.value)
+                return true
+              })
+          }
+        } catch (_error) {
+          options = []
+        }
+
+        let state = []
+        try {
+          const parsed = JSON.parse(wrapper.dataset.existing || '{}')
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            state = Object.entries(parsed).map(([key, weight], index) => ({
+              id: `weight-${index + 1}`,
+              key: String(key || '').trim(),
+              weight: String(weight ?? '').trim()
+            })).filter(row => row.key)
+          }
+        } catch (_error) {
+          state = []
+        }
+
+        let rowCounter = state.length
+
+        function getLanguageSelect () {
+          return languageInputId ? document.getElementById(languageInputId) : null
+        }
+
+        function getSelectedLanguages () {
+          const select = getLanguageSelect()
+          if (!select || !select.multiple) return []
+          return Array.from(select.selectedOptions)
+            .map(option => String(option.value || '').trim())
+            .filter(Boolean)
+        }
+
+        function getDefaultWeight (key) {
+          return Object.prototype.hasOwnProperty.call(overlayLanguageWeightDefaults, key)
+            ? overlayLanguageWeightDefaults[key]
+            : null
+        }
+
+        function rowStatusText (row) {
+          const defaultWeight = getDefaultWeight(row.key)
+          const weightText = String(row.weight || '').trim()
+          if (!weightText) return 'Using Kometa default weight'
+          if (!/^-?\d+$/.test(weightText)) return 'Enter a whole number'
+          if (defaultWeight !== null && Number(weightText) === defaultWeight) return 'Matches default weight, so it will not be emitted'
+          return 'Custom override will be emitted'
+        }
+
+        function currentOptionsForRow (row) {
+          const selectedLanguages = new Set(getSelectedLanguages())
+          const selectedKeys = new Set(state.map(entry => entry.key).filter(Boolean))
+          const weightedOptions = options.map(option => {
+            const defaultWeight = getDefaultWeight(option.value)
+            return {
+              value: option.value,
+              label: option.label,
+              defaultWeight,
+              preferred: selectedLanguages.has(option.value) || option.value === row.key,
+              usedElsewhere: selectedKeys.has(option.value) && option.value !== row.key
+            }
+          })
+          weightedOptions.sort((left, right) => {
+            if (left.preferred !== right.preferred) return left.preferred ? -1 : 1
+            return left.label.localeCompare(right.label)
+          })
+          return weightedOptions
+        }
+
+        function nextRowId () {
+          rowCounter += 1
+          return `weight-${rowCounter}`
+        }
+
+        function nextAvailableKey () {
+          const usedKeys = new Set(state.map(row => row.key).filter(Boolean))
+          const selectedLanguages = getSelectedLanguages()
+          for (const key of selectedLanguages) {
+            if (!usedKeys.has(key)) return key
+          }
+          for (const option of options) {
+            if (!usedKeys.has(option.value)) return option.value
+          }
+          return options[0]?.value || ''
+        }
+
+        function syncHiddenInputs () {
+          hiddenContainer.replaceChildren()
+          state.forEach(row => {
+            const key = String(row.key || '').trim()
+            const weightText = String(row.weight || '').trim()
+            if (!key || !weightText || !/^-?\d+$/.test(weightText)) return
+            const numericWeight = Number.parseInt(weightText, 10)
+            const defaultWeight = getDefaultWeight(key)
+            if (defaultWeight !== null && numericWeight === defaultWeight) return
+            const hidden = document.createElement('input')
+            hidden.type = 'hidden'
+            hidden.name = `${templateName}[weight_${key}]`
+            hidden.value = String(numericWeight)
+            hiddenContainer.appendChild(hidden)
+          })
+        }
+
+        function renderRows () {
+          rowsContainer.replaceChildren()
+
+          state.forEach(row => {
+            const rowWrap = document.createElement('div')
+            rowWrap.className = 'border rounded p-2'
+
+            const controls = document.createElement('div')
+            controls.className = 'row g-2 align-items-end'
+
+            const keyCol = document.createElement('div')
+            keyCol.className = 'col-md-5'
+            const keyLabel = document.createElement('label')
+            keyLabel.className = 'form-label mb-1'
+            keyLabel.textContent = 'Language'
+            const keySelect = document.createElement('select')
+            keySelect.className = 'form-select form-select-sm'
+            currentOptionsForRow(row).forEach(option => {
+              const el = document.createElement('option')
+              el.value = option.value
+              const suffix = option.defaultWeight !== null ? ` (${option.value}, default ${option.defaultWeight})` : ` (${option.value})`
+              el.textContent = `${option.label}${suffix}`
+              if (option.value === row.key) el.selected = true
+              if (option.usedElsewhere) el.disabled = true
+              keySelect.appendChild(el)
+            })
+            keyCol.append(keyLabel, keySelect)
+
+            const defaultCol = document.createElement('div')
+            defaultCol.className = 'col-md-3'
+            const defaultLabel = document.createElement('label')
+            defaultLabel.className = 'form-label mb-1'
+            defaultLabel.textContent = 'Default Weight'
+            const defaultBadge = document.createElement('div')
+            defaultBadge.className = 'form-control form-control-sm bg-body-tertiary'
+            const defaultWeight = getDefaultWeight(row.key)
+            defaultBadge.textContent = defaultWeight !== null ? String(defaultWeight) : 'Unknown'
+            defaultCol.append(defaultLabel, defaultBadge)
+
+            const customCol = document.createElement('div')
+            customCol.className = 'col-md-3'
+            const customLabel = document.createElement('label')
+            customLabel.className = 'form-label mb-1'
+            customLabel.textContent = 'Custom Weight'
+            const customInput = document.createElement('input')
+            customInput.type = 'number'
+            customInput.className = 'form-control form-control-sm'
+            customInput.step = '1'
+            customInput.value = row.weight
+            customInput.placeholder = defaultWeight !== null ? String(defaultWeight) : 'Weight'
+            customCol.append(customLabel, customInput)
+
+            const removeCol = document.createElement('div')
+            removeCol.className = 'col-md-1 d-grid'
+            const removeButton = document.createElement('button')
+            removeButton.type = 'button'
+            removeButton.className = 'btn btn-outline-danger btn-sm'
+            removeButton.textContent = 'Remove'
+            removeCol.appendChild(removeButton)
+
+            const status = document.createElement('div')
+            status.className = 'form-text mt-2'
+            status.textContent = rowStatusText(row)
+
+            controls.append(keyCol, defaultCol, customCol, removeCol)
+            rowWrap.append(controls, status)
+            rowsContainer.appendChild(rowWrap)
+
+            keySelect.addEventListener('change', () => {
+              row.key = String(keySelect.value || '').trim()
+              renderRows()
+            })
+            customInput.addEventListener('input', () => {
+              row.weight = String(customInput.value || '').trim()
+              syncHiddenInputs()
+              status.textContent = rowStatusText(row)
+            })
+            removeButton.addEventListener('click', () => {
+              state = state.filter(entry => entry.id !== row.id)
+              renderRows()
+            })
+          })
+
+          syncHiddenInputs()
+          const disableAdd = options.length === 0 || state.length >= options.length
+          addButton.disabled = disableAdd
+        }
+
+        addButton.addEventListener('click', () => {
+          const key = nextAvailableKey()
+          if (!key) return
+          state.push({ id: nextRowId(), key, weight: '' })
+          renderRows()
+        })
+
+        const languageSelect = getLanguageSelect()
+        if (languageSelect) {
+          languageSelect.addEventListener('change', () => {
+            renderRows()
+          })
+        }
+
+        renderRows()
+        wrapper.dataset.listenerAdded = 'true'
+      })
+    }
+
     function initNumericOnlyInputs (scope) {
       const root = scope || document
       root.querySelectorAll('input[data-numeric-only="true"]').forEach(input => {
@@ -220,6 +1955,123 @@ document.addEventListener('DOMContentLoaded', function () {
           }
         })
         input.dataset.numericOnlyBound = 'true'
+      })
+    }
+
+    function setupCollectionTemplateFieldRules (scope) {
+      const root = scope || document
+
+      function normalizeFieldValue (input) {
+        if (!input) return
+        const preset = String(input.dataset.validationPreset || '').trim()
+        if (preset === 'iso_3166_1_code' && input.type !== 'checkbox') {
+          const raw = String(input.value || '')
+          const cleaned = raw.replace(/[^a-z]/gi, '').slice(0, 2).toUpperCase()
+          if (raw !== cleaned) input.value = cleaned
+        }
+      }
+
+      function isActiveField (input) {
+        if (!input) return false
+        if (input.type === 'checkbox') return !!input.checked
+        return String(input.value || '').trim().length > 0
+      }
+
+      function setFieldDisabledState (input, disabled) {
+        if (!input) return
+        input.disabled = !!disabled
+      }
+
+      function syncMutualState (group) {
+        if (!group) return
+        const fields = Array.from(group.querySelectorAll('[data-template-variable-key][data-mutually-exclusive-with]'))
+        if (!fields.length) return
+
+        const fieldByKey = new Map()
+        fields.forEach(field => {
+          const key = String(field.dataset.templateVariableKey || '').trim()
+          if (key && !fieldByKey.has(key)) fieldByKey.set(key, field)
+        })
+
+        let hasConflict = false
+        fields.forEach(field => {
+          const key = String(field.dataset.templateVariableKey || '').trim()
+          const counterpartKey = String(field.dataset.mutuallyExclusiveWith || '').trim()
+          if (!key || !counterpartKey) return
+
+          const counterpart = fieldByKey.get(counterpartKey)
+          if (!counterpart) return
+
+          const fieldActive = isActiveField(field)
+          const counterpartActive = isActiveField(counterpart)
+          if (fieldActive && counterpartActive) hasConflict = true
+
+          if (fieldActive && !counterpartActive) {
+            setFieldDisabledState(counterpart, true)
+          } else if (!counterpartActive) {
+            setFieldDisabledState(counterpart, false)
+          }
+        })
+
+        let warning = group.querySelector('[data-collection-mutual-warning]')
+        if (!warning) {
+          warning = document.createElement('div')
+          warning.className = 'alert alert-warning py-2 px-3 mb-2 small d-none'
+          warning.dataset.collectionMutualWarning = 'true'
+          warning.textContent = 'Originals Only and Region cannot both be set at the same time.'
+          const anchor = group.querySelector('.child-toggle-wrapper')
+          if (anchor) {
+            anchor.insertAdjacentElement('afterbegin', warning)
+          } else {
+            group.appendChild(warning)
+          }
+        }
+        warning.classList.toggle('d-none', !hasConflict)
+      }
+
+      root.querySelectorAll('[data-collection-config="true"]').forEach(group => {
+        if (group.dataset.templateFieldRulesBound === 'true') return
+
+        const fields = Array.from(group.querySelectorAll('[data-template-variable-key]'))
+        fields.forEach(input => {
+          const preset = String(input.dataset.validationPreset || '').trim()
+          if (preset === 'iso_3166_1_code' && input.type !== 'checkbox') {
+            const feedbackId = `${input.id}_feedback`
+            let feedback = document.getElementById(feedbackId)
+            if (!feedback) {
+              feedback = document.createElement('div')
+              feedback.id = feedbackId
+              feedback.className = 'invalid-feedback'
+              feedback.textContent = 'Enter a 2-letter ISO 3166-1 region code.'
+              input.insertAdjacentElement('afterend', feedback)
+            }
+
+            const validateRegion = () => {
+              normalizeFieldValue(input)
+              const value = String(input.value || '').trim()
+              const valid = !value || /^[A-Z]{2}$/.test(value)
+              input.classList.toggle('is-invalid', !valid)
+              input.setCustomValidity(valid ? '' : 'Enter a 2-letter ISO 3166-1 region code.')
+            }
+
+            input.addEventListener('input', validateRegion)
+            input.addEventListener('change', validateRegion)
+            input.addEventListener('blur', validateRegion)
+            validateRegion()
+          }
+
+          input.addEventListener('input', () => {
+            normalizeFieldValue(input)
+            syncMutualState(group)
+          })
+          input.addEventListener('change', () => {
+            normalizeFieldValue(input)
+            syncMutualState(group)
+          })
+        })
+
+        syncMutualState(group)
+        group.dataset.templateFieldRulesBound = 'true'
       })
     }
 
@@ -588,6 +2440,12 @@ document.addEventListener('DOMContentLoaded', function () {
         modeSelect.addEventListener('change', () => updateHidden())
         valueInput.addEventListener('input', () => updateHidden())
         valueInput.addEventListener('blur', () => updateHidden())
+        hidden.addEventListener('change', () => {
+          const next = resolveInitial()
+          modeSelect.value = next.mode
+          valueInput.value = next.number
+          updateHidden()
+        })
 
         wrapper.dataset.listenerAdded = 'true'
       })
@@ -815,11 +2673,260 @@ document.addEventListener('DOMContentLoaded', function () {
           })
         }
 
+        hidden.addEventListener('change', () => {
+          const nextRaw = String(hidden.value || defaultValue || '').trim()
+          const nextParsed = parseSchedule(nextRaw)
+          applyParsed(nextParsed)
+          updateFromBuilder()
+        })
+
         builder.dataset.listenerAdded = 'true'
       })
     }
 
+    const templateStringListPresetConfigs = {
+      generic_text: {
+        duplicateInsensitive: false,
+        normalize: value => value,
+        validate: value => {
+          if (!value) return { valid: false, message: 'Enter a value before adding it.' }
+          return { valid: true }
+        }
+      },
+      name_like: {
+        duplicateInsensitive: true,
+        normalize: value => value.replace(/\s+/g, ' '),
+        validate: value => {
+          const normalized = String(value || '').trim()
+          if (!normalized) return { valid: false, message: 'Enter a text value before adding it.' }
+          try {
+            if (!/[\p{L}\p{N}]/u.test(normalized)) {
+              return { valid: false, message: 'Enter a text value with letters or numbers.' }
+            }
+            if (!/^[\p{L}\p{N} .,&'’:+\-/()!]+$/u.test(normalized)) {
+              return { valid: false, message: 'Use letters, numbers, spaces, or common punctuation only.' }
+            }
+          } catch (_error) {
+            if (!/[A-Za-z0-9]/.test(normalized)) {
+              return { valid: false, message: 'Enter a text value with letters or numbers.' }
+            }
+            if (!/^[A-Za-z0-9 .,&':+\-/()!]+$/.test(normalized)) {
+              return { valid: false, message: 'Use letters, numbers, spaces, or common punctuation only.' }
+            }
+          }
+          return { valid: true }
+        }
+      },
+      tmdb_collection_id: {
+        duplicateInsensitive: true,
+        normalize: value => value,
+        lookupService: 'tmdb',
+        validate: value => /^\d+$/.test(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter a numeric TMDb collection ID like 131292.' }
+      },
+      numeric_id: {
+        duplicateInsensitive: true,
+        normalize: value => value,
+        lookupService: 'tmdb',
+        validate: value => /^\d+$/.test(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter a numeric ID like 603 or 1399.' }
+      },
+      imdb_id_plex: {
+        duplicateInsensitive: true,
+        normalize: value => value.toLowerCase(),
+        lookupService: 'plex',
+        validate: value => /^tt\d{7,8}$/i.test(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter an IMDb ID like tt1234567 or tt12345678.' }
+      },
+      year: {
+        duplicateInsensitive: true,
+        normalize: value => value,
+        validate: value => /^\d{4}$/.test(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter a 4-digit year like 2022.' }
+      },
+      decade: {
+        duplicateInsensitive: true,
+        normalize: value => value,
+        validate: value => /^\d{3,4}0$/.test(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter a decade key ending in 0 like 2020.' }
+      },
+      language_code: {
+        duplicateInsensitive: true,
+        normalize: value => value.toLowerCase(),
+        suggestions: [
+          'en', 'fr', 'es', 'de', 'it', 'pt', 'ja', 'ko', 'zh', 'ru', 'ar', 'hi',
+          'fil', 'myn', 'rom', 'tai'
+        ],
+        validate: value => /^[a-z]{2,3}$/.test(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter a 2 or 3 letter language code like fr or fil.' }
+      },
+      aspect_key: {
+        duplicateInsensitive: true,
+        normalize: value => value,
+        suggestions: ['1.33', '1.65', '1.66', '1.78', '1.85', '2.2', '2.35', '2.77'],
+        allowedValues: new Set(['1.33', '1.65', '1.66', '1.78', '1.85', '2.2', '2.35', '2.77']),
+        validate: value => templateStringListPresetConfigs.aspect_key.allowedValues.has(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter a supported aspect ratio key like 1.78 or 2.35.' }
+      },
+      resolution_key: {
+        duplicateInsensitive: true,
+        normalize: value => value.toLowerCase(),
+        suggestions: ['4k', '1080', '720', '480', '8k', '2k', '576', 'sd'],
+        allowedValues: new Set(['4k', '1080', '720', '480', '8k', '2k', '144', '240', '360', '576', 'sd']),
+        validate: value => templateStringListPresetConfigs.resolution_key.allowedValues.has(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter a supported resolution key like 4k, 1080, 720, 480, or sd.' }
+      },
+      streaming_key: {
+        duplicateInsensitive: true,
+        normalize: value => value.toLowerCase(),
+        suggestions: ['netflix', 'disney', 'amazon', 'hulu', 'hbomax', 'paramount', 'peacock'],
+        allowedValues: new Set(['channel4', 'appletv', 'bet', 'crave', 'crunchyroll', 'discovery', 'disney', 'itvx', 'hbomax', 'hayu', 'hulu', 'movistar', 'atresplayer', 'netflix', 'now', 'paramount', 'peacock', 'amazon', 'amc', 'filmin', 'youtube', 'tubi']),
+        validate: value => templateStringListPresetConfigs.streaming_key.allowedValues.has(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter a supported streaming service key like netflix, disney, or amazon.' }
+      },
+      universe_key: {
+        duplicateInsensitive: true,
+        normalize: value => value.toLowerCase(),
+        suggestions: ['mcu', 'star', 'trek', 'wizard', 'fast'],
+        allowedValues: new Set(['avp', 'arrow', 'askew', 'conjuring', 'dca', 'dcu', 'fast', 'marvel', 'mcu', 'middle', 'rocky', 'trek', 'star', 'mummy', 'wizard', 'xmen']),
+        validate: value => templateStringListPresetConfigs.universe_key.allowedValues.has(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter a supported universe key like mcu, star, trek, or wizard.' }
+      },
+      based_key: {
+        duplicateInsensitive: true,
+        normalize: value => value.toLowerCase(),
+        suggestions: ['books', 'comics', 'true_story', 'video_games'],
+        allowedValues: new Set(['books', 'comics', 'true_story', 'video_games']),
+        validate: value => templateStringListPresetConfigs.based_key.allowedValues.has(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter a supported media outlet key like books or video_games.' }
+      },
+      seasonal_key: {
+        duplicateInsensitive: true,
+        normalize: value => value.toLowerCase(),
+        suggestions: ['christmas', 'halloween', 'valentine', 'years', 'women'],
+        allowedValues: new Set(['years', 'valentine', 'patrick', 'easter', 'mother', 'memorial', 'father', 'independence', 'labor', 'halloween', 'veteran', 'thanksgiving', 'christmas', 'aapi', 'disabilities', 'black_history', 'lgbtq', 'latinx', 'women']),
+        validate: value => templateStringListPresetConfigs.seasonal_key.allowedValues.has(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter a supported seasonal key like halloween, christmas, or women.' }
+      },
+      content_rating: {
+        duplicateInsensitive: true,
+        normalize: value => value.replace(/\s+/g, ' '),
+        validate: value => /^[A-Za-z0-9][A-Za-z0-9 +\-./()]*$/.test(value)
+          ? { valid: true }
+          : { valid: false, message: 'Enter a content rating like PG-13, TV-14, 15, or M.' }
+      }
+    }
+
+    function inferTemplateStringListPreset (wrapper, input) {
+      const explicitPreset = String(wrapper.dataset.validationPreset || input.dataset.validationPreset || '').trim()
+      if (explicitPreset && templateStringListPresetConfigs[explicitPreset]) return explicitPreset
+
+      const placeholder = String(input.getAttribute('placeholder') || '').trim().toLowerCase()
+      if (placeholder.includes('tmdb collection id')) return 'tmdb_collection_id'
+      if (placeholder.includes('year (e.g. 2022)')) return 'year'
+      if (placeholder.includes('decade key')) return 'decade'
+      if (placeholder.includes('language code')) return 'language_code'
+      if (placeholder.includes('aspect ratio key')) return 'aspect_key'
+      if (placeholder.includes('resolution key')) return 'resolution_key'
+      if (placeholder.includes('service key')) return 'streaming_key'
+      if (placeholder.includes('universe key')) return 'universe_key'
+      if (placeholder.includes('media outlet key')) return 'based_key'
+      if (placeholder.includes('seasonal key')) return 'seasonal_key'
+      if (placeholder.includes('content rating')) return 'content_rating'
+      if (
+        placeholder.includes('genre name') ||
+        placeholder.includes('person name') ||
+        placeholder.includes('studio name') ||
+        placeholder.includes('network name') ||
+        placeholder.includes('country name') ||
+        placeholder.includes('region name') ||
+        placeholder.includes('continent name')
+      ) {
+        return 'name_like'
+      }
+      return 'generic_text'
+    }
+
+    function ensureTemplateStringListDatalist (wrapper, input, presetConfig, presetName) {
+      if (!wrapper || !input || !presetConfig || !Array.isArray(presetConfig.suggestions) || !presetConfig.suggestions.length) return
+      if (presetConfig.suggestions.length > 50) return
+      const existingListId = input.getAttribute('list')
+      if (existingListId && document.getElementById(existingListId)) return
+      const hiddenId = String(wrapper.dataset.hiddenInput || input.id || 'template-string-list').replace(/[^A-Za-z0-9_-]+/g, '_')
+      const datalistId = `${hiddenId}_${presetName}_options`
+      let datalist = document.getElementById(datalistId)
+      if (!datalist) {
+        datalist = document.createElement('datalist')
+        datalist.id = datalistId
+        presetConfig.suggestions.forEach(value => {
+          const option = document.createElement('option')
+          option.value = value
+          datalist.appendChild(option)
+        })
+        wrapper.appendChild(datalist)
+      }
+      input.setAttribute('list', datalistId)
+    }
+
     function setupTemplateStringListHandlers (scope) {
+      const templateStringLookupCache = window.__qsTemplateStringLookupCache || new Map()
+      window.__qsTemplateStringLookupCache = templateStringLookupCache
+
+      function getServiceValidationState (serviceName) {
+        const el = document.getElementById(`qs-validate-${serviceName}`)
+        return String(el?.value || '').trim().toLowerCase() === 'true'
+      }
+
+      async function lookupTemplateStringValue (presetName, value, context = {}) {
+        const libraryName = String(context.libraryName || '').trim()
+        const mediaType = String(context.mediaType || '').trim()
+        const cacheKey = `${presetName}:${libraryName}:${mediaType}:${value}`
+        if (templateStringLookupCache.has(cacheKey)) {
+          return templateStringLookupCache.get(cacheKey)
+        }
+        const request = fetch('/lookup_template_string_value', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            preset: presetName,
+            value,
+            library_name: libraryName,
+            media_type: mediaType
+          })
+        })
+          .then(async (response) => {
+            const data = await response.json().catch(() => ({}))
+            if (!response.ok) {
+              return {
+                valid: false,
+                verified: false,
+                message: data.error || data.message || `Lookup failed (${response.status})`
+              }
+            }
+            return data
+          })
+          .catch(() => ({
+            valid: false,
+            verified: false,
+            message: 'Lookup unavailable right now.'
+          }))
+        templateStringLookupCache.set(cacheKey, request)
+        return request
+      }
+
       const root = scope || document
       root.querySelectorAll('[data-template-string-list]').forEach(wrapper => {
         if (wrapper.dataset.listenerAdded) return
@@ -828,11 +2935,20 @@ document.addEventListener('DOMContentLoaded', function () {
         const input = wrapper.querySelector('input[type="text"]')
         const addBtn = wrapper.querySelector('[data-template-string-add]')
         const list = wrapper.querySelector('[data-template-string-items]')
+        const feedback = wrapper.querySelector('[data-template-string-feedback]')
+        const templateVariableKey = String(wrapper.dataset.templateVariableKey || '').trim()
+        const mutuallyExclusiveWith = String(wrapper.dataset.mutuallyExclusiveWith || '').trim()
 
         if (!hidden || !input || !addBtn || !list) return
 
-        function parseValues () {
-          const raw = String(hidden.value || '').trim()
+        const presetName = inferTemplateStringListPreset(wrapper, input)
+        const presetConfig = templateStringListPresetConfigs[presetName] || templateStringListPresetConfigs.generic_text
+        const libraryName = String(wrapper.dataset.libraryName || '').trim()
+        const mediaType = String(wrapper.dataset.mediaType || '').trim()
+        ensureTemplateStringListDatalist(wrapper, input, presetConfig, presetName)
+
+        function parseStoredStringList (rawValue) {
+          const raw = String(rawValue || '').trim()
           if (!raw) return []
           try {
             const parsed = JSON.parse(raw)
@@ -845,13 +2961,132 @@ document.addEventListener('DOMContentLoaded', function () {
           return [raw]
         }
 
-        function renderList (values) {
+        function getCounterpartHiddenId () {
+          if (!hiddenId || !templateVariableKey || !mutuallyExclusiveWith) return ''
+          const suffix = `_${templateVariableKey}`
+          if (!hiddenId.endsWith(suffix)) return ''
+          return `${hiddenId.slice(0, -suffix.length)}_${mutuallyExclusiveWith}`
+        }
+
+        function getCounterpartWrapper () {
+          const counterpartHiddenId = getCounterpartHiddenId()
+          if (!counterpartHiddenId) return null
+          return document.querySelector(`[data-template-string-list][data-hidden-input="${counterpartHiddenId}"]`)
+        }
+
+        function getCounterpartValues () {
+          const counterpartWrapper = getCounterpartWrapper()
+          if (counterpartWrapper && typeof counterpartWrapper.__qsTemplateStringListGetValues === 'function') {
+            return counterpartWrapper.__qsTemplateStringListGetValues()
+          }
+          const counterpartHiddenId = getCounterpartHiddenId()
+          const counterpartHidden = counterpartHiddenId ? document.getElementById(counterpartHiddenId) : null
+          return parseStoredStringList(counterpartHidden?.value)
+        }
+
+        function setLookupState (target, state) {
+          if (!target) return
+          target.textContent = state?.message || ''
+          target.className = 'small mt-1'
+          if (!state?.message) {
+            target.classList.add('d-none')
+            return
+          }
+          target.classList.remove('d-none')
+          if (state.level === 'warning') {
+            target.classList.add('text-warning')
+          } else if (state.valid && state.verified) {
+            target.classList.add('text-success')
+          } else if (state.verified) {
+            target.classList.add('text-danger')
+          } else {
+            target.classList.add('text-warning')
+          }
+        }
+
+        function setFeedback (message, persistent = false, level = 'error') {
+          const isError = Boolean(message) && level === 'error'
+          if (feedback) {
+            feedback.textContent = message || ''
+            feedback.classList.toggle('d-none', !message)
+            feedback.classList.toggle('d-block', Boolean(message))
+            feedback.classList.toggle('invalid-feedback', isError)
+            feedback.classList.toggle('text-warning', Boolean(message) && level === 'warning')
+            feedback.classList.toggle('small', Boolean(message) && level === 'warning')
+          }
+          input.classList.toggle('is-invalid', isError)
+          input.setCustomValidity(persistent && isError && message ? message : '')
+        }
+
+        function clearTransientFeedback () {
+          if (input.validationMessage) return
+          setFeedback('')
+        }
+
+        function parseValues () {
+          return parseStoredStringList(hidden.value)
+        }
+
+        function validateValue (rawValue) {
+          const normalizedRaw = String(rawValue || '').trim()
+          const normalized = presetConfig.normalize ? presetConfig.normalize(normalizedRaw) : normalizedRaw
+          const result = presetConfig.validate ? presetConfig.validate(normalized) : { valid: Boolean(normalized) }
+          return {
+            value: normalized,
+            valid: Boolean(result.valid),
+            message: result.message || 'Enter a valid value.'
+          }
+        }
+
+        function duplicateKeyForValue (value) {
+          return presetConfig.duplicateInsensitive ? String(value || '').toLowerCase() : String(value || '')
+        }
+
+        function analyzeValues (values) {
+          const seen = new Set()
+          const analyzed = []
+          values.forEach(rawValue => {
+            const checked = validateValue(rawValue)
+            if (!checked.value) return
+            const duplicateKey = duplicateKeyForValue(checked.value)
+            if (seen.has(duplicateKey)) return
+            seen.add(duplicateKey)
+            analyzed.push(checked)
+          })
+          return analyzed
+        }
+
+        function renderList (items) {
           list.replaceChildren()
-          values.forEach(value => {
+          items.forEach((item, index) => {
             const li = document.createElement('li')
             li.className = 'list-group-item d-flex justify-content-between align-items-center'
+            if (!item.valid) li.classList.add('list-group-item-danger')
+
+            const textWrap = document.createElement('div')
+            textWrap.className = 'd-flex flex-column'
+
+            const titleRow = document.createElement('div')
+            titleRow.className = 'd-flex align-items-center gap-2'
+
             const textSpan = document.createElement('span')
-            textSpan.textContent = value
+            textSpan.textContent = item.value
+            titleRow.appendChild(textSpan)
+
+            if (!item.valid) {
+              const badge = document.createElement('span')
+              badge.className = 'badge text-bg-danger'
+              badge.textContent = 'Invalid'
+              badge.title = item.message
+              titleRow.appendChild(badge)
+            }
+
+            textWrap.appendChild(titleRow)
+
+            const lookupMeta = document.createElement('div')
+            lookupMeta.className = 'small mt-1 d-none'
+            textWrap.appendChild(lookupMeta)
+
             const button = document.createElement('button')
             button.type = 'button'
             button.className = 'btn btn-sm btn-danger'
@@ -859,37 +3094,307 @@ document.addEventListener('DOMContentLoaded', function () {
             const icon = document.createElement('i')
             icon.className = 'bi bi-x-lg'
             button.appendChild(icon)
-            li.append(textSpan, button)
+            li.append(textWrap, button)
             list.appendChild(li)
 
             button.addEventListener('click', () => {
-              const updated = values.filter(item => item !== value)
-              hidden.value = JSON.stringify(updated)
-              renderList(updated)
+              const updated = items
+                .filter((_, itemIndex) => itemIndex !== index)
+                .map(entry => entry.value)
+              syncState(updated)
             })
+
+            if (item.valid && presetConfig.lookupService === 'tmdb') {
+              if (!getServiceValidationState('tmdb')) {
+                setLookupState(lookupMeta, {
+                  valid: false,
+                  verified: false,
+                  message: 'TMDb not validated, so the collection title could not be checked.'
+                })
+              } else {
+                setLookupState(lookupMeta, {
+                  valid: false,
+                  verified: false,
+                  message: 'Checking TMDb collection title...'
+                })
+                lookupTemplateStringValue(presetName, item.value, { libraryName, mediaType }).then(result => {
+                  if (!lookupMeta.isConnected) return
+                  if (result.valid && result.verified && result.label) {
+                    const successMessage = result.message || `TMDb: ${result.label}`
+                    setLookupState(lookupMeta, {
+                      valid: true,
+                      verified: true,
+                      level: result.level,
+                      message: successMessage
+                    })
+                    return
+                  }
+                  setLookupState(lookupMeta, {
+                    valid: Boolean(result.valid),
+                    verified: Boolean(result.verified),
+                    message: result.message || 'TMDb lookup failed.'
+                  })
+                })
+              }
+            } else if (item.valid && presetConfig.lookupService === 'plex') {
+              if (!getServiceValidationState('plex')) {
+                setLookupState(lookupMeta, {
+                  valid: false,
+                  verified: false,
+                  message: 'Plex not validated, so the IMDb ID could not be checked against the active library.'
+                })
+              } else if (!libraryName) {
+                setLookupState(lookupMeta, {
+                  valid: false,
+                  verified: false,
+                  message: 'Library context is unavailable for Plex lookup.'
+                })
+              } else {
+                setLookupState(lookupMeta, {
+                  valid: false,
+                  verified: false,
+                  message: 'Checking Plex library for this IMDb ID...'
+                })
+                lookupTemplateStringValue(presetName, item.value, { libraryName, mediaType }).then(result => {
+                  if (!lookupMeta.isConnected) return
+                  if (result.valid && result.verified && result.label) {
+                    const successMessage = result.message || `Plex: ${result.label}`
+                    setLookupState(lookupMeta, {
+                      valid: true,
+                      verified: true,
+                      level: result.level,
+                      message: successMessage
+                    })
+                    return
+                  }
+                  setLookupState(lookupMeta, {
+                    valid: Boolean(result.valid),
+                    verified: Boolean(result.verified),
+                    message: result.message || 'Plex lookup failed.'
+                  })
+                })
+              }
+            }
           })
         }
 
-        function addValue () {
-          const value = input.value.trim()
-          if (!value) return
-          const current = parseValues()
-          if (current.includes(value)) return
-          current.push(value)
-          hidden.value = JSON.stringify(current)
-          renderList(current)
-          input.value = ''
+        function syncState (values, transientMessage = '', options = {}) {
+          const analyzed = analyzeValues(values)
+          const normalizedValues = analyzed.map(item => item.value)
+          let feedbackMessage = transientMessage || ''
+          let feedbackLevel = 'error'
+
+          if (!options.skipMutualExclusion && mutuallyExclusiveWith && normalizedValues.length) {
+            const counterpartValues = getCounterpartValues()
+            if (counterpartValues.length) {
+              if (!feedbackMessage) {
+                feedbackMessage = 'Include and Exclude are both set. Kometa code allows this, but the wiki says not to combine them.'
+                feedbackLevel = 'warning'
+              }
+            }
+          }
+
+          hidden.value = JSON.stringify(normalizedValues)
+          renderList(analyzed)
+
+          const invalidItems = analyzed.filter(item => !item.valid)
+          if (invalidItems.length) {
+            const message = invalidItems.length === 1
+              ? `${invalidItems[0].message} Remove or fix the invalid entry.`
+              : `${invalidItems[0].message} Remove or fix the invalid entries.`
+            setFeedback(message, true)
+            return analyzed
+          }
+
+          setFeedback(feedbackMessage || '', false, feedbackLevel)
+          return analyzed
         }
 
-        const initial = parseValues()
-        hidden.value = JSON.stringify(initial)
-        renderList(initial)
+        function addValue () {
+          const checked = validateValue(input.value)
+          if (!checked.value) {
+            setFeedback('Enter a value before adding it.', false)
+            return
+          }
+          if (!checked.valid) {
+            setFeedback(checked.message, false)
+            return
+          }
+          const current = analyzeValues(parseValues())
+          if (current.some(item => duplicateKeyForValue(item.value) === duplicateKeyForValue(checked.value))) {
+            setFeedback('That value is already in the list.', false)
+            return
+          }
+          current.push(checked)
+          syncState(current.map(item => item.value))
+          input.value = ''
+          clearTransientFeedback()
+        }
+
+        wrapper.__qsTemplateStringListGetValues = () => parseValues()
+        wrapper.__qsTemplateStringListSync = syncState
+        syncState(parseValues())
 
         addBtn.addEventListener('click', addValue)
+        hidden.addEventListener('change', () => {
+          syncState(parseValues())
+        })
+        input.addEventListener('input', clearTransientFeedback)
         input.addEventListener('keydown', (event) => {
           if (event.key === 'Enter') {
             event.preventDefault()
             addValue()
+          }
+        })
+
+        wrapper.dataset.listenerAdded = 'true'
+      })
+    }
+
+    function setupTemplateMappingListHandlers (scope) {
+      const root = scope || document
+      root.querySelectorAll('[data-template-mapping-list]').forEach(wrapper => {
+        if (wrapper.dataset.listenerAdded) return
+
+        const hiddenId = wrapper.dataset.hiddenInput
+        const hidden = hiddenId ? document.getElementById(hiddenId) : wrapper.querySelector('input[type="hidden"]')
+        const keyInput = wrapper.querySelector('[data-template-mapping-key]')
+        const valueInput = wrapper.querySelector('[data-template-mapping-value]')
+        const addBtn = wrapper.querySelector('[data-template-mapping-add]')
+        const list = wrapper.querySelector('[data-template-mapping-items]')
+        const feedback = wrapper.querySelector('[data-template-mapping-feedback]')
+
+        if (!hidden || !keyInput || !valueInput || !addBtn || !list) return
+
+        function parseValuesList (rawValue) {
+          if (Array.isArray(rawValue)) {
+            return rawValue.map(item => String(item).trim()).filter(Boolean)
+          }
+          const text = String(rawValue || '').trim()
+          if (!text) return []
+          return text.split(',').map(item => item.trim()).filter(Boolean)
+        }
+
+        function parseStoredMapping (rawValue) {
+          const raw = String(rawValue || '').trim()
+          if (!raw) return {}
+          try {
+            const parsed = JSON.parse(raw)
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              return parsed
+            }
+          } catch (e) {
+            // fall through to empty mapping
+          }
+          return {}
+        }
+
+        function setFeedback (message = '') {
+          if (!feedback) return
+          feedback.textContent = message
+          feedback.classList.toggle('d-none', !message)
+          feedback.classList.toggle('d-block', Boolean(message))
+        }
+
+        function normalizeMapping (mapping) {
+          const normalized = {}
+          Object.entries(mapping || {}).forEach(([rawKey, rawValues]) => {
+            const key = String(rawKey || '').trim()
+            if (!key) return
+            const values = parseValuesList(rawValues)
+            if (!values.length) return
+            normalized[key] = values
+          })
+          return normalized
+        }
+
+        function renderList (mapping) {
+          list.replaceChildren()
+          Object.entries(mapping).forEach(([key, values]) => {
+            const li = document.createElement('li')
+            li.className = 'list-group-item d-flex justify-content-between align-items-center'
+
+            const textWrap = document.createElement('div')
+            textWrap.className = 'd-flex flex-column'
+
+            const title = document.createElement('span')
+            title.textContent = key
+            textWrap.appendChild(title)
+
+            const details = document.createElement('div')
+            details.className = 'small text-muted'
+            details.textContent = values.join(', ')
+            textWrap.appendChild(details)
+
+            const button = document.createElement('button')
+            button.type = 'button'
+            button.className = 'btn btn-sm btn-danger'
+            button.setAttribute('aria-label', 'Remove')
+            const icon = document.createElement('i')
+            icon.className = 'bi bi-x-lg'
+            button.appendChild(icon)
+
+            li.append(textWrap, button)
+            list.appendChild(li)
+
+            button.addEventListener('click', () => {
+              const current = normalizeMapping(parseStoredMapping(hidden.value))
+              delete current[key]
+              hidden.value = JSON.stringify(current)
+              renderList(current)
+              setFeedback('')
+            })
+          })
+        }
+
+        function syncState (mapping, message = '') {
+          const normalized = normalizeMapping(mapping)
+          hidden.value = JSON.stringify(normalized)
+          renderList(normalized)
+          setFeedback(message)
+          return normalized
+        }
+
+        function addEntry () {
+          const key = String(keyInput.value || '').trim()
+          if (!key) {
+            setFeedback('Enter a key before adding it.')
+            return
+          }
+          const values = parseValuesList(valueInput.value)
+          if (!values.length) {
+            setFeedback('Enter at least one value before adding it.')
+            return
+          }
+          const current = normalizeMapping(parseStoredMapping(hidden.value))
+          current[key] = values
+          syncState(current)
+          keyInput.value = ''
+          valueInput.value = ''
+        }
+
+        syncState(parseStoredMapping(hidden.value))
+
+        addBtn.addEventListener('click', addEntry)
+        hidden.addEventListener('change', () => {
+          syncState(parseStoredMapping(hidden.value))
+        })
+        keyInput.addEventListener('input', () => {
+          setFeedback('')
+        })
+        valueInput.addEventListener('input', () => {
+          setFeedback('')
+        })
+        keyInput.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            addEntry()
+          }
+        })
+        valueInput.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            addEntry()
           }
         })
 
@@ -1244,6 +3749,260 @@ document.addEventListener('DOMContentLoaded', function () {
       toggle.dataset.listenerAdded = 'true'
     }
 
+    function hasConfiguredAdvancedValues (card) {
+      if (!card) return false
+      const fields = card.querySelectorAll('.library-advanced-section [name]')
+      return Array.from(fields).some((field) => {
+        if (!field || field.disabled) return false
+        if (field.type === 'checkbox' || field.type === 'radio') return field.checked
+        const value = String(field.value ?? '').trim()
+        if (!value) return false
+        if (field.name.endsWith('-metadata_files') || field.name.endsWith('-collection_files') || field.name.endsWith('-overlay_files')) {
+          return value !== '[]'
+        }
+        return true
+      })
+    }
+
+    function setAdvancedVisibility (card, visible) {
+      if (!card) return
+      card.querySelectorAll('.library-advanced-section').forEach(section => {
+        section.classList.toggle('d-none', !visible)
+      })
+      const toggle = card.querySelector('.library-advanced-toggle')
+      if (toggle) {
+        toggle.textContent = visible ? 'Hide Advanced' : 'Show Advanced'
+        toggle.setAttribute('aria-expanded', visible ? 'true' : 'false')
+      }
+      card.dataset.advancedVisible = visible ? 'true' : 'false'
+    }
+
+    function wireAdvancedToggle (card) {
+      if (!card || card.dataset.advancedToggleBound === 'true') return
+      const toggle = card.querySelector('.library-advanced-toggle')
+      if (!toggle) return
+
+      let persisted = null
+      try {
+        persisted = window.localStorage ? window.localStorage.getItem(advancedVisibilityStorageKey) : null
+      } catch (_error) {}
+      const initialVisible = persisted === 'true' || (persisted !== 'false' && hasConfiguredAdvancedValues(card))
+      setAdvancedVisibility(card, initialVisible)
+
+      toggle.addEventListener('click', () => {
+        const nextVisible = card.dataset.advancedVisible !== 'true'
+        setAdvancedVisibility(card, nextVisible)
+        try {
+          if (window.localStorage) window.localStorage.setItem(advancedVisibilityStorageKey, nextVisible ? 'true' : 'false')
+        } catch (_error) {}
+      })
+
+      card.dataset.advancedToggleBound = 'true'
+    }
+
+    function setLibraryServiceStatus (card, serviceName, kind, message) {
+      const statusEl = card ? card.querySelector(`[data-library-service-status="${serviceName}"]`) : null
+      if (!statusEl) return
+      const text = String(message || '').trim()
+      if (!text) {
+        statusEl.classList.add('d-none')
+        statusEl.textContent = ''
+        statusEl.classList.remove('alert-success', 'alert-danger', 'alert-info')
+        return
+      }
+      statusEl.textContent = text
+      statusEl.classList.remove('d-none', 'alert-success', 'alert-danger', 'alert-info')
+      statusEl.classList.add(kind === 'success' ? 'alert-success' : kind === 'error' ? 'alert-danger' : 'alert-info')
+    }
+
+    function getLibraryServiceValidationFields (card, serviceName) {
+      if (!card || !serviceName) return {}
+      return {
+        validatedInput: card.querySelector(`[data-library-service-validated="${serviceName}"]`),
+        validatedAtInput: card.querySelector(`[data-library-service-validated-at="${serviceName}"]`),
+        button: card.querySelector(`[data-validate-library-service="${serviceName}"]`)
+      }
+    }
+
+    function isLibraryServiceValidated (card, serviceName) {
+      const { validatedInput } = getLibraryServiceValidationFields(card, serviceName)
+      return String(validatedInput?.value || '').trim().toLowerCase() === 'true'
+    }
+
+    function updateLibraryServiceValidateButton (card, serviceName, state = null) {
+      const { button } = getLibraryServiceValidationFields(card, serviceName)
+      if (!button) return
+      const effectiveState = String(state || button.dataset.validationState || '').trim() || (isLibraryServiceValidated(card, serviceName) ? 'success' : 'idle')
+      button.dataset.validationState = effectiveState
+      button.classList.remove('btn-success', 'btn-secondary')
+
+      if (effectiveState === 'loading') {
+        button.disabled = true
+        button.classList.add('btn-secondary')
+        button.textContent = `Validating ${serviceName === 'radarr' ? 'Radarr' : 'Sonarr'} Overrides...`
+        return
+      }
+
+      if (effectiveState === 'success') {
+        button.disabled = true
+        button.classList.add('btn-secondary')
+        button.textContent = 'Validated'
+        return
+      }
+
+      button.disabled = false
+      button.classList.add('btn-success')
+      button.textContent = `Validate ${serviceName === 'radarr' ? 'Radarr' : 'Sonarr'} Overrides`
+    }
+
+    function setLibraryServiceValidatedState (card, serviceName, isValidated) {
+      const { validatedInput, validatedAtInput, button } = getLibraryServiceValidationFields(card, serviceName)
+      if (validatedInput) validatedInput.value = isValidated ? 'true' : 'false'
+      if (validatedAtInput) validatedAtInput.value = isValidated ? new Date().toISOString() : ''
+      if (button) {
+        button.dataset.validationState = isValidated ? 'success' : 'idle'
+      }
+      updateLibraryServiceValidateButton(card, serviceName, isValidated ? 'success' : 'idle')
+    }
+
+    function resetLibraryServiceValidatedState (card, serviceName, opts = {}) {
+      const clearStatus = opts.clearStatus !== false
+      setLibraryServiceValidatedState(card, serviceName, false)
+      if (clearStatus) {
+        setLibraryServiceStatus(card, serviceName, '', '')
+      }
+    }
+
+    function libraryServiceOverrideFieldSelector (serviceName) {
+      return `[name*="-attribute_${serviceName}_"]`
+    }
+
+    function setSecretToggleButtonIcon (button, showPlainText) {
+      if (!button) return
+      const icon = document.createElement('i')
+      icon.className = showPlainText ? 'fas fa-eye-slash' : 'fas fa-eye'
+      button.replaceChildren(icon)
+    }
+
+    function initSecretVisibilityToggles (scope) {
+      const root = scope || document
+      root.querySelectorAll('[data-toggle-secret-visibility]').forEach(button => {
+        if (button.dataset.secretToggleBound === 'true') return
+        const targetId = button.dataset.targetInput
+        const input = targetId ? root.querySelector(`#${targetId}`) : null
+        if (!input) return
+
+        const syncState = () => {
+          const hasValue = String(input.value || '').trim() !== ''
+          const forceVisible = button.dataset.secretVisible === 'true'
+          const showPlainText = !hasValue || forceVisible
+          input.setAttribute('type', showPlainText ? 'text' : 'password')
+          setSecretToggleButtonIcon(button, showPlainText)
+        }
+
+        button.dataset.secretVisible = 'false'
+        syncState()
+
+        button.addEventListener('click', () => {
+          const currentType = input.getAttribute('type')
+          const nextVisible = currentType === 'password'
+          button.dataset.secretVisible = nextVisible ? 'true' : 'false'
+          syncState()
+        })
+
+        input.addEventListener('input', () => {
+          if (String(input.value || '').trim() === '') {
+            button.dataset.secretVisible = 'false'
+          }
+          syncState()
+        })
+
+        button.dataset.secretToggleBound = 'true'
+      })
+    }
+
+    function populateOverrideDatalist (card, listId, items, valueField) {
+      const list = card ? card.querySelector(`#${listId}`) : null
+      if (!list) return
+      list.replaceChildren()
+      const normalizedItems = Array.isArray(items) ? items : []
+      normalizedItems.forEach(item => {
+        const value = item && typeof item === 'object' ? item[valueField] : ''
+        if (!value) return
+        const option = document.createElement('option')
+        option.value = value
+        list.appendChild(option)
+      })
+    }
+
+    function validateLibraryServiceOverrides (button) {
+      const serviceName = button?.dataset?.validateLibraryService
+      const libraryId = button?.dataset?.libraryId || activeLibraryId
+      const card = libraryContainer?.firstElementChild
+      if (!button || !serviceName || !libraryId || !card) return
+
+      const payload = buildPayloadFromCard(card)
+      updateLibraryServiceValidateButton(card, serviceName, 'loading')
+      setLibraryServiceStatus(card, serviceName, 'info', `Validating ${serviceName} overrides...`)
+
+      fetch(`/validate_library_service_overrides/${encodeURIComponent(libraryId)}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+        .then(async (res) => {
+          const data = await res.json().catch(() => ({}))
+          if (!res.ok) {
+            const errors = Array.isArray(data.errors) ? data.errors : [data.error || `Validation failed (${res.status})`]
+            throw new Error(errors.filter(Boolean).join(' '))
+          }
+          return data
+        })
+        .then((data) => {
+          if (serviceName === 'radarr') {
+            populateOverrideDatalist(card, `${libraryId}-radarr-root-folders`, data.root_folders, 'path')
+            populateOverrideDatalist(card, `${libraryId}-radarr-quality-profiles`, data.quality_profiles, 'name')
+          } else {
+            populateOverrideDatalist(card, `${libraryId}-sonarr-root-folders`, data.root_folders, 'path')
+            populateOverrideDatalist(card, `${libraryId}-sonarr-quality-profiles`, data.quality_profiles, 'name')
+            populateOverrideDatalist(card, `${libraryId}-sonarr-language-profiles`, data.language_profiles, 'name')
+          }
+          setAdvancedVisibility(card, true)
+          setLibraryServiceValidatedState(card, serviceName, true)
+          setLibraryServiceStatus(card, serviceName, 'success', `${serviceName === 'radarr' ? 'Radarr' : 'Sonarr'} overrides validated.`)
+        })
+        .catch((error) => {
+          setAdvancedVisibility(card, true)
+          resetLibraryServiceValidatedState(card, serviceName, { clearStatus: false })
+          setLibraryServiceStatus(card, serviceName, 'error', error.message || 'Validation failed.')
+        })
+        .finally(() => {
+          if (!isLibraryServiceValidated(card, serviceName)) {
+            updateLibraryServiceValidateButton(card, serviceName, 'idle')
+          }
+        })
+    }
+
+    function wireLibraryServiceValidationButtons (card) {
+      if (!card || card.dataset.libraryServiceValidationBound === 'true') return
+      card.querySelectorAll('[data-validate-library-service]').forEach(button => {
+        const serviceName = button.dataset.validateLibraryService
+        updateLibraryServiceValidateButton(card, serviceName)
+        button.addEventListener('click', () => validateLibraryServiceOverrides(button))
+      })
+      card.querySelectorAll(`${libraryServiceOverrideFieldSelector('radarr')}, ${libraryServiceOverrideFieldSelector('sonarr')}`).forEach(field => {
+        const fieldName = String(field.name || '')
+        const serviceName = fieldName.includes('-attribute_sonarr_') ? 'sonarr' : fieldName.includes('-attribute_radarr_') ? 'radarr' : ''
+        if (!serviceName || field.dataset.libraryServiceWatcherBound === 'true') return
+        const onChange = () => resetLibraryServiceValidatedState(card, serviceName)
+        field.addEventListener('input', onChange)
+        field.addEventListener('change', onChange)
+        field.dataset.libraryServiceWatcherBound = 'true'
+      })
+      card.dataset.libraryServiceValidationBound = 'true'
+    }
+
     function moveCurrentToCache () {
       const current = libraryContainer.firstElementChild
       if (current) {
@@ -1257,12 +4016,17 @@ document.addEventListener('DOMContentLoaded', function () {
       card.style.display = ''
       libraryContainer.appendChild(card)
       activeLibraryId = libraryId
+      initSecretVisibilityToggles(card)
       syncHiddenCheckboxPairs(card)
       wireIncludeToggle(card, libraryId)
+      wireAdvancedToggle(card)
+      wireLibraryServiceValidationButtons(card)
       refreshPickerLabels()
       initTooltips(card)
       sortLanguageSelects(card)
+      setupOverlayLanguageWeightBuilders(card)
       initNumericOnlyInputs(card)
+      setupCollectionTemplateFieldRules(card)
       initStylePreviewGrids(card)
       initRelativeYearInputs(card)
       initScheduleBuilders(card)
@@ -1277,6 +4041,7 @@ document.addEventListener('DOMContentLoaded', function () {
       setupCustomStringListHandlers('mass_content_rating_update', card)
       setupCustomStringListHandlers('mass_genre_mapper', card)
       setupTemplateStringListHandlers(card)
+      setupTemplateMappingListHandlers(card)
       setupMappingListHandlers('genre_mapper', card)
       setupMappingListHandlers('content_rating_mapper', card)
       wireOverlayDetailToggles(card)
@@ -1315,6 +4080,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function buildPayloadFromCard (card) {
       const payload = {}
+      const libraryId = activeLibraryId || String(card?.querySelector('[name]')?.name || '').split('-')[0]
       const checkboxNames = new Set(
         Array.from(card.querySelectorAll('input[type="checkbox"][name]'))
           .map(el => String(el.name || '').trim())
@@ -1354,6 +4120,14 @@ document.addEventListener('DOMContentLoaded', function () {
 
         payload[el.name] = el.value ?? ''
       })
+      if (libraryId) {
+        document.querySelectorAll(`input[type="hidden"][name^="${libraryId}-"]`).forEach(el => {
+          if (!el.name || el.disabled) return
+          if (card.contains(el)) return
+          if (checkboxNames.has(String(el.name || '').trim())) return
+          payload[el.name] = el.value ?? ''
+        })
+      }
       card.querySelectorAll('input.playlist-library-toggle[type="checkbox"][name]:disabled').forEach(el => {
         payload[el.name] = 'false'
       })
@@ -1434,6 +4208,9 @@ document.addEventListener('DOMContentLoaded', function () {
       }
 
       const payload = buildPayloadFromCard(card)
+      const collectionEditor = card.querySelector('[data-collection-files-editor]')
+      const metadataEditor = card.querySelector('[data-metadata-files-editor]')
+      const overlayEditor = card.querySelector('[data-overlay-files-editor]')
       const option = libraryPicker?.querySelector(`option[value="${activeLibraryId}"]`)
       const friendlyName = option?.dataset.label || option?.textContent?.trim() || activeLibraryId
 
@@ -1444,7 +4221,21 @@ document.addEventListener('DOMContentLoaded', function () {
         body: JSON.stringify(payload)
       })
         .then(res => {
-          if (!res.ok) throw new Error(`Autosave failed: ${res.status}`)
+          if (!res.ok) {
+            return res.json().catch(() => ({})).then(body => {
+              if (collectionEditor) {
+                applyCollectionFileServerErrors(collectionEditor, body && body.errors)
+              }
+              if (metadataEditor) {
+                applyMetadataFileServerErrors(metadataEditor, body && body.errors)
+              }
+              if (overlayEditor) {
+                applyOverlayFileServerErrors(overlayEditor, body && body.errors)
+              }
+              const message = body && body.error ? body.error : `Autosave failed: ${res.status}`
+              throw new Error(message)
+            })
+          }
           return res.json().catch(() => ({}))
         })
         .then(data => {
@@ -1460,7 +4251,7 @@ document.addEventListener('DOMContentLoaded', function () {
         .catch(err => {
           console.error('[Autosave] Failed to save library', activeLibraryId, err)
           if (typeof showToast === 'function') {
-            showToast('error', `Autosave failed for ${friendlyName}.`)
+            showToast('error', err.message || `Autosave failed for ${friendlyName}.`)
           }
           throw err
         })
@@ -1610,6 +4401,7 @@ document.addEventListener('DOMContentLoaded', function () {
     function loadLibrary (libraryId, context = 'switch') {
       if (libraryId === activeLibraryId) return
       const requestId = ++loadRequestId
+      const previousLibraryId = activeLibraryId
       const setLoading = (flag) => {
         if (libraryLoading) {
           libraryLoading.classList.toggle('d-none', !flag)
@@ -1628,7 +4420,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
       setLoading(true)
       autosaveActiveLibrary()
-        .finally(() => {
+        .then(() => {
           if (requestId !== loadRequestId) return
 
           if (!libraryId) {
@@ -1669,6 +4461,13 @@ document.addEventListener('DOMContentLoaded', function () {
               setLoading(false)
             })
         })
+        .catch(() => {
+          if (requestId !== loadRequestId) return
+          if (libraryPicker && previousLibraryId) {
+            libraryPicker.value = previousLibraryId
+          }
+          setLoading(false)
+        })
     }
 
     if (libraryPicker) {
@@ -1691,6 +4490,27 @@ document.addEventListener('DOMContentLoaded', function () {
       }
     }
 
+    document.addEventListener('qs:before-step-navigation', (event) => {
+      const detail = (event && event.detail) || {}
+      if (allowNextStepNavigation) {
+        allowNextStepNavigation = false
+        return
+      }
+      if (!activeLibraryId || !libraryContainer || !libraryContainer.firstElementChild) return
+      if (!detail.targetPage || detail.targetPage === '025-libraries') return
+
+      event.preventDefault()
+
+      autosaveActiveLibrary()
+        .then(() => {
+          allowNextStepNavigation = true
+          jumpTo(detail.targetPage, detail.targetLabel)
+        })
+        .catch(() => {
+          allowNextStepNavigation = false
+        })
+    })
+
     if (typeof setupParentChildToggleSync === 'function') {
       setupParentChildToggleSync()
     }
@@ -1704,12 +4524,15 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     setupParentChildToggleVisibility()
+    setupCollectionTemplateFieldRules()
     setupCustomStringListHandlers('mass_genre_update')
     setupCustomStringListHandlers('radarr_remove_by_tag')
     setupCustomStringListHandlers('sonarr_remove_by_tag')
     setupCustomStringListHandlers('metadata_backup')
     setupCustomStringListHandlers('mass_content_rating_update')
     setupCustomStringListHandlers('mass_genre_mapper')
+    setupTemplateStringListHandlers()
+    setupTemplateMappingListHandlers()
     setupMappingListHandlers('genre_mapper')
     setupMappingListHandlers('content_rating_mapper')
 
@@ -1728,6 +4551,243 @@ document.addEventListener('DOMContentLoaded', function () {
       const sourceName = btn.dataset.libraryName
       const sourceType = btn.dataset.libraryType
       openCopyModal(sourceId, sourceName, sourceType)
+    })
+
+    function compareCollectionSectionValues (a, b) {
+      const aTrimmed = String(a || '').trim()
+      const bTrimmed = String(b || '').trim()
+      const aNumeric = /^\d+$/.test(aTrimmed)
+      const bNumeric = /^\d+$/.test(bTrimmed)
+      if (aNumeric && bNumeric) return Number(aTrimmed) - Number(bTrimmed)
+      if (aNumeric) return -1
+      if (bNumeric) return 1
+      if (aTrimmed && bTrimmed) return aTrimmed.localeCompare(bTrimmed)
+      if (aTrimmed) return -1
+      if (bTrimmed) return 1
+      return 0
+    }
+
+    function getCollectionSectionEntries (libraryId) {
+      const container = document.getElementById(`${libraryId}-container`)
+      if (!container) return []
+      const groups = Array.from(container.querySelectorAll('[data-collection-config="true"]'))
+      const entries = []
+      groups.forEach((group, index) => {
+        const collectionId = group.dataset.collectionId || ''
+        const label = group.dataset.collectionLabel || collectionId
+        const toggle = collectionId ? group.querySelector(`input[type="checkbox"]#${libraryId}-${collectionId}`) : null
+        if (!toggle || !toggle.checked) return
+        const input = group.querySelector('input[name$="_collection_section"]')
+        if (!input) return
+        entries.push({
+          collectionId,
+          label,
+          inputId: input.id,
+          currentValue: String(input.value || '').trim(),
+          domIndex: index
+        })
+      })
+      entries.sort((left, right) => {
+        const byValue = compareCollectionSectionValues(left.currentValue, right.currentValue)
+        if (byValue !== 0) return byValue
+        return left.domIndex - right.domIndex
+      })
+      return entries
+    }
+
+    function buildCollectionSectionListItem (entry, position) {
+      const li = document.createElement('li')
+      li.className = 'list-group-item sortable-item d-flex justify-content-between align-items-center gap-3'
+      li.dataset.inputId = entry.inputId
+      li.dataset.collectionId = entry.collectionId
+      li.innerHTML = `
+        <div class="d-flex align-items-center gap-2 flex-grow-1">
+          <i class="bi bi-grip-vertical drag-handle text-muted" role="button" aria-label="Drag to reorder"></i>
+          <div class="d-flex flex-column">
+            <span class="fw-semibold">${entry.label}</span>
+            <span class="small text-muted"><code>${entry.collectionId.replace(/^collection_/, '')}</code></span>
+          </div>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+          <div class="btn-group btn-group-sm" role="group" aria-label="Move collection section">
+            <button type="button" class="btn btn-outline-secondary" data-collection-section-move="up" aria-label="Move up">
+              <i class="bi bi-chevron-up"></i>
+            </button>
+            <button type="button" class="btn btn-outline-secondary" data-collection-section-move="down" aria-label="Move down">
+              <i class="bi bi-chevron-down"></i>
+            </button>
+          </div>
+        </div>
+        <div class="text-end">
+          <div class="small text-muted">Current</div>
+          <span class="badge bg-secondary" data-collection-section-current>${entry.currentValue || 'blank'}</span>
+          <div class="small text-muted mt-1">New: <span data-collection-section-next>${String(position * 10).padStart(3, '0')}</span></div>
+        </div>
+      `
+      return li
+    }
+
+    function refreshCollectionSectionPreviewNumbers (list) {
+      if (!list) return
+      Array.from(list.children).forEach((item, index) => {
+        const next = item.querySelector('[data-collection-section-next]')
+        if (next) next.textContent = String((index + 1) * 10).padStart(3, '0')
+      })
+    }
+
+    function ensureCollectionSectionModalRoot (modalEl) {
+      if (!modalEl || !document.body) return modalEl
+      const modalId = modalEl.id
+      if (modalId) {
+        const bodyModal = Array.from(document.body.querySelectorAll('[data-collection-section-modal]'))
+          .find(el => el.id === modalId && el !== modalEl)
+        if (bodyModal) {
+          if (modalEl.parentElement) modalEl.remove()
+          return bodyModal
+        }
+      }
+      if (modalEl.parentElement !== document.body) {
+        document.body.appendChild(modalEl)
+      }
+      return modalEl
+    }
+
+    function syncCollectionSectionModalBackdrop (modalEl) {
+      if (!modalEl) return
+      modalEl.style.zIndex = '2000'
+      modalEl.style.pointerEvents = 'auto'
+      modalEl.removeAttribute('inert')
+
+      const dialog = modalEl.querySelector('.modal-dialog')
+      if (dialog) dialog.style.pointerEvents = 'auto'
+
+      const content = modalEl.querySelector('.modal-content')
+      if (content) content.style.pointerEvents = 'auto'
+
+      const backdrops = Array.from(document.querySelectorAll('.modal-backdrop'))
+      const latestBackdrop = backdrops.at(-1)
+      if (latestBackdrop) latestBackdrop.style.zIndex = '1990'
+    }
+
+    function cleanupCollectionSectionModalBackdrops () {
+      if (document.querySelector('.modal.show')) return
+      document.querySelectorAll('.modal-backdrop').forEach(backdrop => backdrop.remove())
+    }
+
+    function prepareCollectionSectionModal (modalEl) {
+      if (!modalEl) return modalEl
+      modalEl = ensureCollectionSectionModalRoot(modalEl)
+      if (modalEl.dataset.collectionSectionPrepared === 'true') return modalEl
+      modalEl.dataset.collectionSectionPrepared = 'true'
+      modalEl.addEventListener('show.bs.modal', () => {
+        syncCollectionSectionModalBackdrop(modalEl)
+        requestAnimationFrame(() => syncCollectionSectionModalBackdrop(modalEl))
+      })
+      modalEl.addEventListener('shown.bs.modal', () => {
+        syncCollectionSectionModalBackdrop(modalEl)
+      })
+      modalEl.addEventListener('hidden.bs.modal', () => {
+        cleanupCollectionSectionModalBackdrops()
+      })
+      return modalEl
+    }
+
+    function renderCollectionSectionModalList (modalEl) {
+      if (!modalEl) return []
+      const libraryId = modalEl.dataset.libraryId
+      const list = modalEl.querySelector('[data-collection-section-sortable]')
+      const status = modalEl.querySelector('[data-collection-section-modal-status]')
+      const saveButton = modalEl.querySelector('[data-collection-section-save]')
+      const entries = getCollectionSectionEntries(libraryId)
+      list.replaceChildren()
+      if (!entries.length) {
+        if (status) status.textContent = 'No enabled collections with a collection_section field are available to reorder in this library.'
+        if (saveButton) saveButton.disabled = true
+        return entries
+      }
+      entries.forEach((entry, index) => list.appendChild(buildCollectionSectionListItem(entry, index + 1)))
+      if (status) status.textContent = `${entries.length} enabled collection default${entries.length === 1 ? '' : 's'} ready to reorder.`
+      if (saveButton) saveButton.disabled = false
+      refreshCollectionSectionPreviewNumbers(list)
+      if (modalEl._collectionSectionSortable && typeof modalEl._collectionSectionSortable.destroy === 'function') {
+        modalEl._collectionSectionSortable.destroy()
+      }
+      modalEl._collectionSectionSortable = Sortable.create(list, {
+        handle: '.drag-handle',
+        animation: 150,
+        delayOnTouchOnly: true,
+        delay: 180,
+        touchStartThreshold: 6,
+        onSort: function () {
+          refreshCollectionSectionPreviewNumbers(list)
+        }
+      })
+      return entries
+    }
+
+    function saveCollectionSectionModalOrder (modalEl) {
+      if (!modalEl) return
+      const list = modalEl.querySelector('[data-collection-section-sortable]')
+      const items = Array.from(list ? list.children : [])
+      if (!items.length) return
+      items.forEach((item, index) => {
+        const inputId = item.dataset.inputId
+        const input = inputId ? document.getElementById(inputId) : null
+        if (!input) return
+        const nextValue = String((index + 1) * 10).padStart(3, '0')
+        input.value = nextValue
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        input.dispatchEvent(new Event('change', { bubbles: true }))
+        const current = item.querySelector('[data-collection-section-current]')
+        if (current) current.textContent = nextValue
+      })
+      if (typeof showToast === 'function') {
+        showToast('success', 'Collection section order updated.')
+      }
+      refreshCollectionSectionPreviewNumbers(list)
+      const modal = bootstrap && bootstrap.Modal ? bootstrap.Modal.getInstance(modalEl) : null
+      if (modal) modal.hide()
+    }
+
+    document.addEventListener('click', (event) => {
+      const trigger = event.target.closest('[data-collection-section-modal-trigger]')
+      if (trigger) {
+        const libraryId = trigger.dataset.libraryId
+        let modalEl = libraryId ? document.getElementById(`${libraryId}-collection-section-modal`) : null
+        if (!modalEl || !bootstrap || !bootstrap.Modal) return
+        modalEl = prepareCollectionSectionModal(modalEl)
+        renderCollectionSectionModalList(modalEl)
+        bootstrap.Modal.getOrCreateInstance(modalEl).show()
+        return
+      }
+
+      const resetButton = event.target.closest('[data-collection-section-reset]')
+      if (resetButton) {
+        const modalEl = resetButton.closest('[data-collection-section-modal]')
+        renderCollectionSectionModalList(modalEl)
+        return
+      }
+
+      const saveButton = event.target.closest('[data-collection-section-save]')
+      if (saveButton) {
+        const modalEl = saveButton.closest('[data-collection-section-modal]')
+        saveCollectionSectionModalOrder(modalEl)
+        return
+      }
+
+      const moveButton = event.target.closest('[data-collection-section-move]')
+      if (moveButton) {
+        const direction = moveButton.dataset.collectionSectionMove
+        const item = moveButton.closest('li')
+        const list = item?.parentElement
+        if (!item || !list) return
+        if (direction === 'up' && item.previousElementSibling) {
+          list.insertBefore(item, item.previousElementSibling)
+        } else if (direction === 'down' && item.nextElementSibling) {
+          list.insertBefore(item.nextElementSibling, item)
+        }
+        refreshCollectionSectionPreviewNumbers(list)
+      }
     })
 
     function initializeSortableList (libraryId, prefix) {
@@ -2024,12 +5084,183 @@ function setupMappingListHandlers (prefix, scope) {
   })
 }
 
+async function runCollectionGroupReset (btn, group) {
+  if (!btn || !group || btn.dataset.resetBusy === 'true') return
+
+  const idleLabel = btn.dataset.resetIdleLabel || btn.textContent.trim() || 'Reset to Defaults'
+  btn.dataset.resetIdleLabel = idleLabel
+  btn.dataset.resetBusy = 'true'
+  btn.disabled = true
+  btn.setAttribute('aria-busy', 'true')
+  btn.textContent = 'Resetting...'
+
+  const pauseForPaint = async () => {
+    await new Promise(resolve => requestAnimationFrame(() => resolve()))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+  }
+  const escapeHtml = (value) => String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+  const getInputLabel = (input) => {
+    if (!input) return 'Field'
+    const describedBy = input.getAttribute('aria-describedby')
+    if (describedBy) {
+      const firstId = describedBy.split(' ')[0]
+      const el = document.getElementById(firstId)
+      if (el && el.textContent) return el.textContent.trim()
+    }
+    if (input.id) {
+      const label = document.querySelector(`label[for="${input.id}"]`)
+      if (label && label.textContent) return label.textContent.trim()
+    }
+    return input.name || input.id || 'Field'
+  }
+  const getDisplayValue = (input) => {
+    if (!input) return ''
+    if (input.tagName === 'SELECT') {
+      return input.selectedOptions?.[0]?.textContent?.trim() || input.value || ''
+    }
+    if (input.type === 'checkbox') return input.checked ? 'On' : 'Off'
+    if (input.type === 'radio') return input.checked ? 'Selected' : 'Not selected'
+    return input.value ?? ''
+  }
+  const getDefaultDisplayValue = (input, defaultValue) => {
+    if (!input) return ''
+    if (input.type === 'checkbox' || input.type === 'radio') {
+      const normalizedDefault = (defaultValue || '').toString().toLowerCase()
+      const normalizedValue = (input.value || '').toString().toLowerCase()
+      const checked = normalizedDefault === 'true' || normalizedDefault === normalizedValue
+      return checked ? (input.type === 'radio' ? 'Selected' : 'On') : (input.type === 'radio' ? 'Not selected' : 'Off')
+    }
+    if (input.tagName === 'SELECT') {
+      const option = Array.from(input.options).find(o => String(o.value) === String(defaultValue))
+      return option ? (option.textContent || '').trim() : (defaultValue ?? '')
+    }
+    return defaultValue ?? ''
+  }
+  const shouldDispatchCollectionChange = (input) => {
+    if (!input) return false
+    if (input.type === 'hidden') return true
+    if (input.type === 'checkbox' || input.type === 'radio') return true
+    return input.tagName === 'SELECT'
+  }
+  const flushQueuedChanges = async (inputs) => {
+    let index = 0
+    for (const input of inputs) {
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+      index += 1
+      if (index % 20 === 0) {
+        await new Promise(resolve => window.setTimeout(resolve, 0))
+      }
+    }
+  }
+  const finalizeToast = (changes) => {
+    if (typeof showToast !== 'function') return
+    if (!changes.length) {
+      showToast('info', 'Already at defaults (no changes).')
+      return
+    }
+    const preview = changes.slice(0, 12)
+      .map(change => `${escapeHtml(change.label)}: ${escapeHtml(change.from)} → ${escapeHtml(change.to)}`)
+      .join('<br>')
+    const extraCount = changes.length - 12
+    const suffix = extraCount > 0 ? `<br>...and ${extraCount} more field${extraCount === 1 ? '' : 's'}.` : ''
+    showToast('info', `Reset to defaults (${changes.length} field${changes.length === 1 ? '' : 's'}):<br>${preview}${suffix}`)
+  }
+
+  try {
+    await pauseForPaint()
+
+    const changes = []
+    const touched = new Set()
+    const pendingChangeInputs = new Set()
+    group.dataset.resetting = 'true'
+
+    const recordReset = (input, defaultValue) => {
+      if (!input || touched.has(input)) return false
+      touched.add(input)
+      const from = getDisplayValue(input)
+      const to = getDefaultDisplayValue(input, defaultValue)
+      if (from !== to) {
+        changes.push({ label: getInputLabel(input), from, to })
+        return true
+      }
+      return false
+    }
+
+    const inputs = Array.from(group.querySelectorAll('input[data-default], select[data-default], textarea[data-default]'))
+    for (let index = 0; index < inputs.length; index += 1) {
+      const input = inputs[index]
+      if (input.disabled) continue
+      const defaultValue = input.dataset.default
+      if (defaultValue === undefined) continue
+
+      let changed = false
+      if (input.type === 'checkbox' || input.type === 'radio') {
+        const normalizedDefault = (defaultValue || '').toString().toLowerCase()
+        const normalizedValue = (input.value || '').toString().toLowerCase()
+        const nextChecked = normalizedDefault === 'true' || normalizedDefault === normalizedValue
+        changed = recordReset(input, defaultValue)
+        if (changed) input.checked = nextChecked
+      } else {
+        changed = recordReset(input, defaultValue)
+        if (changed) input.value = defaultValue
+      }
+
+      if (changed && shouldDispatchCollectionChange(input)) {
+        pendingChangeInputs.add(input)
+      }
+
+      if (index > 0 && index % 30 === 0) {
+        await new Promise(resolve => window.setTimeout(resolve, 0))
+      }
+    }
+
+    delete group.dataset.resetting
+
+    if (pendingChangeInputs.size) {
+      await flushQueuedChanges(pendingChangeInputs)
+    }
+
+    const trigger = group.querySelector('input:not([disabled]), select:not([disabled]), textarea:not([disabled])')
+    if (trigger && changes.length) {
+      trigger.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+
+    if (typeof EventHandler !== 'undefined' && typeof EventHandler.updateAccordionHighlights === 'function') {
+      EventHandler.updateAccordionHighlights()
+    }
+    if (typeof ValidationHandler !== 'undefined' && typeof ValidationHandler.updateValidationState === 'function') {
+      ValidationHandler.updateValidationState()
+    }
+    finalizeToast(changes)
+  } finally {
+    delete group.dataset.resetting
+    btn.disabled = false
+    btn.removeAttribute('aria-busy')
+    btn.dataset.resetBusy = 'false'
+    btn.textContent = idleLabel
+  }
+}
+
 function wireOffsetReset (scope) {
   const root = scope || document
   root.querySelectorAll('.reset-offset-btn').forEach(btn => {
     if (btn.dataset.listenerAdded) return
     btn.addEventListener('click', () => {
       const group = btn.closest('.template-toggle-group')
+      if (group?.dataset?.collectionId) {
+        runCollectionGroupReset(btn, group).catch(error => {
+          console.error('[collection reset failed]', error)
+          if (typeof showToast === 'function') {
+            showToast('error', 'Reset to defaults failed.')
+          }
+        })
+        return
+      }
       if (group) {
         group.dataset.resetting = 'true'
       }
@@ -2308,10 +5539,14 @@ function setupParentChildToggleVisibility (scope) {
         const id = child.id || ''
         return id.includes('_visible_')
       }
+      const isCollectionBehaviorToggle = (child) => {
+        const id = child.id || ''
+        return id.endsWith('_use_separator') || id.endsWith('_use_other')
+      }
       const isRequiredChild = (child) => {
         const id = child.id || ''
         if (!id.includes('-template_collection_')) return false
-        if (isAddMissingToggle(child) || isVisibleToggle(child)) return false
+        if (isAddMissingToggle(child) || isVisibleToggle(child) || isCollectionBehaviorToggle(child)) return false
         return id.includes('_use_')
       }
       const requiredChildren = Array.from(childrenToggles).filter(isRequiredChild)

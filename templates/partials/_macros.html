@@ -826,7 +826,7 @@ select_input.key if yml_location == "top_level" else
 {% endmacro %}
 
 {% macro text_input_section(library, data, prefix, title, description, wiki, placeholder="", tooltip_variant="info",
-container_class="border rounded p-3 mb-2", yml_location="attribute", multiline=false, rows=3) %}
+container_class="border rounded p-3 mb-2", yml_location="attribute", multiline=false, rows=3, input_mode="") %}
 {% set field_prefix = "template_variables" if yml_location == "template_variables" else "" if yml_location ==
 "top_level" else "attribute" %}
 {% set full_id = library.id ~ "-" ~ (field_prefix ~ "_" if field_prefix) ~ prefix %}
@@ -834,6 +834,102 @@ container_class="border rounded p-3 mb-2", yml_location="attribute", multiline=f
 field_prefix ~ "_" ~ prefix if field_prefix else prefix) %}
 {% set legacy_name = library.id ~ "-" ~ prefix %}
 {% set field_value = data.libraries.get(full_name, data.libraries.get(legacy_name, '')) %}
+{% if input_mode == "schedule" %}
+<div class="{{ container_class }}">
+    <div class="schedule-builder mb-2" data-schedule-builder data-hidden-input="{{ full_name }}"
+        data-default-value="{{ field_value | default('', true) }}">
+        <div class="input-group mb-2 schedule-builder-header">
+            <span class="input-group-text" id="{{ full_id }}_text">
+                <a href="{{ wiki }}" target="_blank" rel="noopener noreferrer">{{ title }}</a>
+                <span class="text-{{ tooltip_variant }} ms-3" data-bs-toggle="tooltip" data-bs-html="true"
+                    title="{{ description }}">
+                    <i
+                        class="bi {% if tooltip_variant == 'danger' %}bi-exclamation-circle-fill{% else %}bi-info-circle-fill{% endif %}"></i>
+                </span>
+            </span>
+            <select class="form-select" id="{{ full_id }}_schedule_mode" data-schedule-mode-select>
+                <option value="range">Range</option>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+                <option value="yearly">Yearly</option>
+                <option value="date">Date</option>
+                <option value="hourly">Hourly</option>
+                <option value="daily">Daily</option>
+                <option value="never">Never</option>
+                <option value="non_existing">Only If Missing</option>
+                <option value="custom">Custom (Advanced)</option>
+            </select>
+        </div>
+        <div class="schedule-builder-body">
+            <div class="schedule-mode" data-schedule-mode="range">
+                <div class="schedule-grid">
+                    <input type="date" class="form-control" id="{{ full_id }}_schedule_range_start"
+                        data-schedule-range-start aria-label="Range start">
+                    <span class="schedule-range-sep">to</span>
+                    <input type="date" class="form-control" id="{{ full_id }}_schedule_range_end"
+                        data-schedule-range-end aria-label="Range end">
+                </div>
+                <div class="form-text">Month/day are used; year is ignored.</div>
+            </div>
+            <div class="schedule-mode" data-schedule-mode="weekly">
+                <div class="schedule-weekly">
+                    {% for day in ['sun','mon','tue','wed','thu','fri','sat'] %}
+                    <label class="schedule-day">
+                        <input type="checkbox" id="{{ full_id }}_schedule_week_{{ day }}" value="{{ day }}"
+                            data-schedule-week-day>
+                        <span>{{ day|capitalize }}</span>
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
+            <div class="schedule-mode" data-schedule-mode="monthly">
+                <input type="number" class="form-control" id="{{ full_id }}_schedule_month_day" min="1" max="31"
+                    step="1" data-schedule-month-day placeholder="Day of month">
+            </div>
+            <div class="schedule-mode" data-schedule-mode="yearly">
+                <input type="date" class="form-control" id="{{ full_id }}_schedule_yearly" data-schedule-yearly
+                    aria-label="Yearly date">
+                <div class="form-text">Month/day are used; year is ignored.</div>
+            </div>
+            <div class="schedule-mode" data-schedule-mode="date">
+                <input type="date" class="form-control" id="{{ full_id }}_schedule_date" data-schedule-date
+                    aria-label="Exact date">
+            </div>
+            <div class="schedule-mode" data-schedule-mode="hourly">
+                <div class="schedule-grid">
+                    <input type="number" class="form-control" id="{{ full_id }}_schedule_hour_start" min="0" max="23"
+                        step="1" data-schedule-hour-start placeholder="Start hour">
+                    <span class="schedule-range-sep">to</span>
+                    <input type="number" class="form-control" id="{{ full_id }}_schedule_hour_end" min="0" max="23"
+                        step="1" data-schedule-hour-end placeholder="End hour (optional)">
+                </div>
+            </div>
+            <div class="schedule-mode" data-schedule-mode="daily">
+                <div class="form-text">Runs once per day.</div>
+            </div>
+            <div class="schedule-mode" data-schedule-mode="never">
+                <div class="form-text">Skips overlay processing for this library.</div>
+            </div>
+            <div class="schedule-mode" data-schedule-mode="non_existing">
+                <div class="form-text">Runs only when the target does not already exist.</div>
+            </div>
+            <div class="schedule-mode" data-schedule-mode="custom">
+                <div class="form-text">Use Advanced to enter a raw schedule string.</div>
+            </div>
+        </div>
+        <div class="schedule-preview small text-muted mt-2">
+            Preview: <code data-schedule-preview></code>
+        </div>
+        <details class="schedule-advanced mt-2">
+            <summary>Advanced (use with caution)</summary>
+            <div class="form-text mb-2">Only use this if you know Kometa schedule syntax.</div>
+            <input type="text" class="form-control" id="{{ full_id }}_schedule_raw" data-schedule-raw
+                placeholder="{{ placeholder }}" value="{{ field_value }}">
+        </details>
+        <input type="hidden" id="{{ full_id }}" name="{{ full_name }}" value="{{ field_value }}">
+    </div>
+</div>
+{% else %}
 <div class="{{ container_class }}">
     <div class="input-group mb-2">
         <span class="input-group-text" id="{{ full_id }}_text">
@@ -853,6 +949,7 @@ field_prefix ~ "_" ~ prefix if field_prefix else prefix) %}
         {% endif %}
     </div>
 </div>
+{% endif %}
 {% endmacro %}
 
 {% macro asset_directory_list_section(library, data, prefix, title, description, wiki, placeholder="Add Asset Directory",
@@ -925,7 +1022,11 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                 {% set disable_toggle = needs_tv_metadata and not valid_tv_metadata %}
 
                 <!-- Rendering Collection: {{ collection.id }} -->
-                <div class="template-toggle-group ms-3 mb-2">
+                <div class="template-toggle-group ms-3 mb-2"
+                    data-collection-config="true"
+                    data-library-id="{{ library.id }}"
+                    data-collection-id="{{ collection.id }}"
+                    data-collection-label="{{ collection.label }}">
 
                     {% if needs_tv_metadata %}
                     {% if disable_toggle %}
@@ -983,10 +1084,66 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
 
                     {% if collection.template_variables %}
                     {% set is_seasonal = collection.id == 'collection_seasonal' %}
+                    {% set priority_use_key_collection_ids = [
+                        'collection_oscars',
+                        'collection_berlinale',
+                        'collection_bafta',
+                        'collection_cannes',
+                        'collection_cesar',
+                        'collection_choice',
+                        'collection_emmy',
+                        'collection_golden',
+                        'collection_spirit',
+                        'collection_pca',
+                        'collection_razzie',
+                        'collection_sag',
+                        'collection_sundance',
+                        'collection_tiff',
+                        'collection_venice',
+                        'collection_basic',
+                        'collection_anilist',
+                        'collection_imdb',
+                        'collection_letterboxd',
+                        'collection_myanimelist',
+                        'collection_simkl',
+                        'collection_tautulli',
+                        'collection_tmdb',
+                        'collection_trakt',
+                        'collection_other_chart'
+                    ] %}
+                    {% set ordered_collection_items = collection.template_variables %}
+                    {% if collection.id in priority_use_key_collection_ids %}
+                    {% set prioritized_collection_items = namespace(priority=[], remaining=[], used_keys=[]) %}
+                    {% for raw_item in collection.template_variables %}
+                    {% if raw_item.key is defined and raw_item.key.startswith('use_') %}
+                    {% set _ = prioritized_collection_items.priority.append(raw_item) %}
+                    {% set _ = prioritized_collection_items.used_keys.append(raw_item.key) %}
+                    {% set use_suffix = raw_item.key[4:] %}
+                    {% for sibling_item in collection.template_variables %}
+                    {% if sibling_item.key is defined and sibling_item.key in ['radarr_add_missing_' ~ use_suffix, 'sonarr_add_missing_' ~ use_suffix] %}
+                    {% if sibling_item.key not in prioritized_collection_items.used_keys %}
+                    {% set _ = prioritized_collection_items.priority.append(sibling_item) %}
+                    {% set _ = prioritized_collection_items.used_keys.append(sibling_item.key) %}
+                    {% endif %}
+                    {% endif %}
+                    {% endfor %}
+                    {% else %}
+                    {% if raw_item.key is not defined or raw_item.key not in prioritized_collection_items.used_keys %}
+                    {% set _ = prioritized_collection_items.remaining.append(raw_item) %}
+                    {% endif %}
+                    {% endif %}
+                    {% endfor %}
+                    {% set ordered_collection_items = prioritized_collection_items.priority + prioritized_collection_items.remaining %}
+                    {% endif %}
                     {% set season = namespace(open=false) %}
                     <div class="child-toggle-wrapper ms-4 mt-2"
                         data-toggle-parent="{{ library.id }}-{{ collection.id }}" style="display: none;">
-                        {% for item in collection.template_variables
+                        <div class="d-flex align-items-center gap-2 flex-wrap mb-2">
+                            <button type="button" class="btn btn-sm btn-outline-secondary btn-overlay reset-offset-btn">
+                                Reset to Defaults
+                            </button>
+                        </div>
+                        {% for item in ordered_collection_items
                         if (not item.media_types or library.type in item.media_types)
                         and (not item.key.startswith('visible_') or telemetry.plex_pass) %}
                         {% set clean_id = collection.id.replace('collection_', '') %}
@@ -1008,7 +1165,11 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                         <div class="form-check form-switch d-flex align-items-center mb-1">
                             <input class="form-check-input template-child-toggle me-2" type="checkbox"
                                 id="{{ input_name }}" name="{{ input_name }}" value="true"
-                                data-parent-toggle="{{ library.id }}-{{ collection.id }}" {% if disable_toggle
+                                data-parent-toggle="{{ library.id }}-{{ collection.id }}"
+                                data-default="{{ item.default | default('false', true) }}"
+                                {% if item.key is defined %}data-template-variable-key="{{ item.key }}"{% endif %}
+                                {% if item.mutually_exclusive_with %}data-mutually-exclusive-with="{{ item.mutually_exclusive_with }}"{% endif %}
+                                {% if disable_toggle
                                 %}disabled{% endif %} {% if not disable_toggle and
                                 (stored_true or (not has_stored and default_true)) %}checked{% endif %}>
                             <input type="hidden" name="{{ input_name }}" value="false">
@@ -1019,6 +1180,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                             {% endif %}
                         </div>
                         {% elif item.type == 'select' %}
+                        {% set stored_select_val = data['libraries'].get(input_name, item.default) | default('', true) %}
                         <div class="input-group mb-2">
                             <span class="input-group-text" id="{{ input_name }}_text" style="width: 170px;">
                                 {{ item.label }}
@@ -1031,7 +1193,27 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                 {% endif %}
                             </span>
                             <select class="form-select" id="{{ input_name }}" name="{{ input_name }}"
-                                aria-describedby="{{ input_name }}_text" {% if disable_toggle %}disabled{% endif %}>
+                                aria-describedby="{{ input_name }}_text"
+                                data-default="{{ item.default | default('', true) }}"
+                                {% if item.key is defined %}data-template-variable-key="{{ item.key }}"{% endif %}
+                                {% if item.mutually_exclusive_with %}data-mutually-exclusive-with="{{ item.mutually_exclusive_with }}"{% endif %}
+                                {% if item.validation_preset %}data-validation-preset="{{ item.validation_preset }}"{% endif %}
+                                {% if disable_toggle %}disabled{% endif %}>
+                                {% if item.include_blank_option %}
+                                <option value="" {% if not stored_select_val %}selected{% endif %}>
+                                    {{ item.blank_option_label | default('Default') }}
+                                </option>
+                                {% endif %}
+                                {% if item.options_source == 'iso_3166_1_regions' %}
+                                <option value="US" {% if stored_select_val == 'US' %}selected{% endif %}>United States</option>
+                                {% for code, region in data['iso_3166_1_regions'] | sort(attribute='1') %}
+                                {% if code != "US" %}
+                                <option value="{{ code }}" {% if stored_select_val == code %}selected{% endif %}>
+                                    {{ region }}
+                                </option>
+                                {% endif %}
+                                {% endfor %}
+                                {% else %}
                                 {% for val in item.options %}
                                 {% if val is string %}
                                 {% set option_value = val %}
@@ -1044,16 +1226,16 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                 val.media_types) %}
                                 {% endif %}
                                 {% if show_option %}
-                                <option value="{{ option_value }}" {% if data['libraries'][input_name]==option_value or
-                                    (not data['libraries'][input_name] and item.default==option_value) %} selected {%
-                                    endif %}>
+                                <option value="{{ option_value }}" {% if stored_select_val == option_value %}selected{% endif %}>
                                     {{ option_label }}
                                 </option>
                                 {% endif %}
                                 {% endfor %}
+                                {% endif %}
                             </select>
                         </div>
                         {% set preview_options = [] %}
+                        {% if item.options is defined %}
                         {% for val in item.options %}
                         {% if val is mapping and val.image_url %}
                         {% set show_preview = (val.media_types is not defined) or (library.type in val.media_types) %}
@@ -1062,6 +1244,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                         {% endif %}
                         {% endif %}
                         {% endfor %}
+                        {% endif %}
                         {% if preview_options %}
                         <div class="style-preview-grid mb-2" data-style-preview-grid data-style-select="{{ input_name }}">
                             {% for val in preview_options %}
@@ -1086,7 +1269,21 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                         {% else %}
                         {% set list_json = '[]' %}
                         {% endif %}
-                        <div class="mb-2" data-template-string-list data-hidden-input="{{ input_name }}">
+                        {% if item.default is defined and item.default is sequence and item.default is not string %}
+                        {% set list_default_json = item.default | tojson %}
+                        {% elif item.default is defined and item.default is string and item.default|trim %}
+                        {% set list_default_json = item.default %}
+                        {% else %}
+                        {% set list_default_json = '[]' %}
+                        {% endif %}
+                        <div class="mb-2" data-template-string-list data-hidden-input="{{ input_name }}"
+                            data-library-name="{{ library.name }}"
+                            data-media-type="{{ library.type }}"
+                            {% if item.key is defined %}data-template-variable-key="{{ item.key }}"{% endif %}
+                            {% if item.mutually_exclusive_with %}data-mutually-exclusive-with="{{ item.mutually_exclusive_with }}"{% endif %}
+                            {% if item.validation_preset %}data-validation-preset="{{ item.validation_preset }}"{% endif %}
+                            {% if item.validation_mode %}data-validation-mode="{{ item.validation_mode }}"{% endif %}
+                            {% if item.validation_normalize %}data-validation-normalize="{{ item.validation_normalize }}"{% endif %}>
                             <div class="input-group">
                                 <span class="input-group-text" id="{{ input_name }}_text" style="width: 170px;">
                                     {{ item.label }}
@@ -1101,12 +1298,59 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                 <input type="text" class="form-control" id="{{ input_name }}_input"
                                     aria-describedby="{{ input_name }}_text"
                                     placeholder="{{ item.placeholder | default('Add value') }}"
+                                    {% if item.validation_preset %}data-validation-preset="{{ item.validation_preset }}"{% endif %}
                                     {% if disable_toggle %}disabled{% endif %}>
                                 <button class="btn nav-button" type="button" data-template-string-add
                                     {% if disable_toggle %}disabled{% endif %}>Add</button>
                             </div>
-                            <ul class="list-group mt-2" data-template-string-items></ul>
-                            <input type="hidden" id="{{ input_name }}" name="{{ input_name }}" value="{{ list_json }}">
+                        <div class="invalid-feedback d-none" data-template-string-feedback></div>
+                        <ul class="list-group mt-2" data-template-string-items></ul>
+                        <input type="hidden" id="{{ input_name }}" name="{{ input_name }}" value="{{ list_json }}"
+                            data-default='{{ list_default_json }}'>
+                        </div>
+                        {% elif item.type == 'mapping_list' %}
+                        {% set stored_map = data['libraries'].get(input_name) %}
+                        {% if stored_map is string %}
+                        {% set map_json = stored_map %}
+                        {% elif stored_map is mapping %}
+                        {% set map_json = stored_map | tojson %}
+                        {% else %}
+                        {% set map_json = '{}' %}
+                        {% endif %}
+                        {% if item.default is defined and item.default is mapping %}
+                        {% set map_default_json = item.default | tojson %}
+                        {% elif item.default is defined and item.default is string and item.default|trim %}
+                        {% set map_default_json = item.default %}
+                        {% else %}
+                        {% set map_default_json = '{}' %}
+                        {% endif %}
+                        <div class="mb-2" data-template-mapping-list data-hidden-input="{{ input_name }}">
+                            <div class="input-group">
+                                <span class="input-group-text" id="{{ input_name }}_text" style="width: 170px;">
+                                    {{ item.label }}
+                                    {% if item.tooltip %}
+                                    <span class="text-{{ item.tooltip_variant or 'info' }} ms-2" data-bs-toggle="tooltip"
+                                        data-bs-html="true" title="{{ item.tooltip }}">
+                                        <i
+                                            class="bi {% if item.tooltip_variant == 'danger' %}bi-exclamation-circle-fill{% else %}bi-info-circle-fill{% endif %}"></i>
+                                    </span>
+                                    {% endif %}
+                                </span>
+                                <input type="text" class="form-control" data-template-mapping-key
+                                    aria-describedby="{{ input_name }}_text"
+                                    placeholder="{{ item.key_placeholder | default('Add key') }}"
+                                    {% if disable_toggle %}disabled{% endif %}>
+                                <input type="text" class="form-control" data-template-mapping-value
+                                    aria-describedby="{{ input_name }}_text"
+                                    placeholder="{{ item.value_placeholder | default('Add comma-separated values') }}"
+                                    {% if disable_toggle %}disabled{% endif %}>
+                                <button class="btn nav-button" type="button" data-template-mapping-add
+                                    {% if disable_toggle %}disabled{% endif %}>Add</button>
+                            </div>
+                            <div class="invalid-feedback d-none" data-template-mapping-feedback></div>
+                            <ul class="list-group mt-2" data-template-mapping-items></ul>
+                            <input type="hidden" id="{{ input_name }}" name="{{ input_name }}" value="{{ map_json }}"
+                                data-default='{{ map_default_json }}'>
                         </div>
                         {% elif item.type == 'relative_year' %}
                         {% set stored_val = data['libraries'].get(input_name, item.default) | default('', true) %}
@@ -1117,11 +1361,11 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                             {'value': 'relative_latest', 'label': 'Relative Latest (latest-#)', 'kind': 'relative', 'prefix': 'latest-'},
                             {'value': 'year', 'label': 'Specific Year', 'kind': 'year'}
                         ] %}
-                        {% set label_width = item.label_width if item.label_width is defined else 170 %}
+                        {% set label_width = item.label_width if item.label_width is defined else ((320 if item.label|length > 24 else 240) if item.key is defined and (item.key.startswith('limit_') or item.key.startswith('list_days_') or item.key.startswith('list_size_')) else 170) %}
                         <div class="input-group mb-2" data-relative-year data-hidden-input="{{ input_name }}"
                             data-default-value="{{ item.default | default('', true) }}"
                             data-min-year="{{ item.min | default(1) }}">
-                            <span class="input-group-text" id="{{ input_name }}_text" style="width: {{ label_width }}px;">
+                            <span class="input-group-text qs-template-variable-label" id="{{ input_name }}_text" style="width: {{ label_width }}px;">
                                 {% if item.url %}
                                 <a href="{{ item.url }}" target="_blank">
                                     {{ item.label }}
@@ -1155,7 +1399,8 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                 data-relative-year-value inputmode="numeric"
                                 min="1" step="1" data-numeric-only="true" placeholder="Year or Offset"
                                 aria-label="Year or offset" {% if disable_toggle %}disabled{% endif %}>
-                            <input type="hidden" id="{{ input_name }}" name="{{ input_name }}" value="{{ stored_val }}">
+                            <input type="hidden" id="{{ input_name }}" name="{{ input_name }}" value="{{ stored_val }}"
+                                data-default="{{ item.default | default('', true) }}">
                         </div>
                         {% elif item.key is defined and item.key.startswith('schedule_') %}
                         {% set schedule_label = 'Schedule' %}
@@ -1272,13 +1517,14 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                     data-schedule-raw
                                     value="{{ stored_val }}" {% if disable_toggle %}disabled{% endif %}>
                             </details>
-                            <input type="hidden" id="{{ input_name }}" name="{{ input_name }}" value="{{ stored_val }}">
+                            <input type="hidden" id="{{ input_name }}" name="{{ input_name }}" value="{{ stored_val }}"
+                                data-default="{{ item.default | default('', true) }}">
                         </div>
                         {% elif item.type == 'text_input' %}
                         {% set is_number_input = item.input_type is defined and item.input_type == 'number' %}
-                        {% set label_width = item.label_width if item.label_width is defined else 170 %}
+                        {% set label_width = item.label_width if item.label_width is defined else ((320 if item.label|length > 24 else 240) if item.key is defined and (item.key.startswith('limit_') or item.key.startswith('list_days_') or item.key.startswith('list_size_')) else 170) %}
                         <div class="input-group mb-2">
-                            <span class="input-group-text" id="{{ input_name }}_text" style="width: {{ label_width }}px;">
+                            <span class="input-group-text qs-template-variable-label" id="{{ input_name }}_text" style="width: {{ label_width }}px;">
                                 {% if item.url %}
                                 <a href="{{ item.url }}" target="_blank">
                                     {{ item.label }}
@@ -1296,13 +1542,21 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                             </span>
                             <input type="{{ 'number' if is_number_input else 'text' }}" class="form-control" id="{{ input_name }}" name="{{ input_name }}"
                                 value="{{ data['libraries'].get(input_name, item.default) | default('', true) }}"
+                                data-default="{{ item.default | default('', true) }}"
+                                {% if item.key is defined %}data-template-variable-key="{{ item.key }}"{% endif %}
+                                {% if item.mutually_exclusive_with %}data-mutually-exclusive-with="{{ item.mutually_exclusive_with }}"{% endif %}
+                                {% if item.validation_preset %}data-validation-preset="{{ item.validation_preset }}"{% endif %}
                                 {% if is_number_input %}
                                 min="{{ item.min | default(1) }}" step="{{ item.step | default(1) }}" inputmode="numeric"
                                 data-numeric-only="true"
                                 data-default-value="{{ item.default | default('', true) }}"
                                 {% else %}
-                                minlength="1" pattern="[\x20-\x7E]+"
-                                title="Only ASCII characters allowed (no accents or emojis)"
+                                {% if item.minlength is defined %}minlength="{{ item.minlength }}"{% else %}minlength="1"{% endif %}
+                                pattern="{{ item.text_pattern | default('[\\x20-\\x7E]+') }}"
+                                title="{{ item.text_title | default('Only ASCII characters allowed (no accents or emojis)') }}"
+                                {% if item.maxlength is defined %}maxlength="{{ item.maxlength }}"{% endif %}
+                                {% if item.inputmode is defined %}inputmode="{{ item.inputmode }}"{% endif %}
+                                {% if item.autocapitalize is defined %}autocapitalize="{{ item.autocapitalize }}"{% endif %}
                                 {% endif %}
                                 {% if disable_toggle %}disabled{% endif %}>
                         </div>
@@ -1541,7 +1795,22 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                 <div class="overlay-template-section mt-2" id="{{ details_id }}"
                                                     style="display: none;">
                                                 {% set is_mapping = overlay.template_variables is mapping %}
-                                                {% set tv_items = overlay.template_variables.items() if is_mapping else overlay.template_variables %}
+                                                {% set raw_tv_items = overlay.template_variables.items() if is_mapping else overlay.template_variables %}
+                                                {% if is_mapping and overlay.id in ['overlay_languages', 'overlay_languages_subtitles'] %}
+                                                {% set priority_tv_items = [] %}
+                                                {% set remaining_tv_items = [] %}
+                                                {% for tv_item in raw_tv_items %}
+                                                {% set tv_item_name = tv_item[0] %}
+                                                {% if tv_item_name.startswith('use_') and tv_item_name not in ['use_lowercase', 'use_subtitles'] %}
+                                                {% set _ = priority_tv_items.append(tv_item) %}
+                                                {% else %}
+                                                {% set _ = remaining_tv_items.append(tv_item) %}
+                                                {% endif %}
+                                                {% endfor %}
+                                                {% set tv_items = priority_tv_items + remaining_tv_items %}
+                                                {% else %}
+                                                {% set tv_items = raw_tv_items %}
+                                                {% endif %}
                                                 {% set seen_vars = [] %}
                                                 {% for item in tv_items %}
                                                 {% if is_mapping %}
@@ -1762,6 +2031,86 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                             {% if var_name == 'text' and overlay.id in ['overlay_aspect', 'overlay_video_format'] %}data-skip-yaml="true"{% endif %}>
                                                     </div>
                                                         {% endif %}
+                                                    {% elif var_details.input_type == "multiselect" %}
+                                                    {% set display_label = var_details.label or var_name.replace('_', ' ') %}
+                                                    {% set input_id = template_name ~ '-' ~ var_name %}
+                                                    {% if selected_value is sequence and selected_value is not string %}
+                                                        {% set selected_values = selected_value %}
+                                                    {% elif selected_value is string and selected_value not in ['', 'None', 'none'] %}
+                                                        {% set selected_values = [selected_value] %}
+                                                    {% elif var_details.default is sequence and var_details.default is not string %}
+                                                        {% set selected_values = var_details.default %}
+                                                    {% else %}
+                                                        {% set selected_values = [] %}
+                                                    {% endif %}
+                                                    <div class="mb-2">
+                                                        <label class="form-label fw-semibold mb-1"
+                                                            for="{{ input_id }}">
+                                                            {{ display_label }}
+                                                            {% if var_details.tooltip %}
+                                                            <span
+                                                                class="text-{{ var_details.tooltip_variant or 'info' }} ms-2"
+                                                                data-bs-toggle="tooltip" data-bs-html="true"
+                                                                title="{{ var_details.tooltip }}">
+                                                                <i
+                                                                    class="bi {% if var_details.tooltip_variant == 'danger' %}bi-exclamation-circle-fill{% else %}bi-info-circle-fill{% endif %}"></i>
+                                                            </span>
+                                                            {% endif %}
+                                                        </label>
+                                                        <select class="form-select template-variable-multiselect"
+                                                            id="{{ input_id }}"
+                                                            name="{{ template_name }}[{{ var_name }}]"
+                                                            multiple
+                                                            size="{{ var_details.size or 12 }}"
+                                                            data-default='{{ var_details.default | tojson }}'>
+                                                            {% for option in var_details.options %}
+                                                            {% if option is string %}
+                                                            {% set opt_value = option %}
+                                                            {% set opt_label = option %}
+                                                            {% else %}
+                                                            {% set opt_value = option.value %}
+                                                            {% set opt_label = option.label %}
+                                                            {% endif %}
+                                                            <option value="{{ opt_value }}"
+                                                                {% if opt_value in selected_values %}selected{% endif %}>
+                                                                {{ opt_label }}
+                                                            </option>
+                                                            {% endfor %}
+                                                        </select>
+                                                        <div class="form-text">
+                                                            {{ var_details.help_text or 'Select one or more supported values. Ctrl/Cmd+click toggles individual selections.' }}
+                                                        </div>
+                                                    </div>
+                                                    {% if overlay.id in ['overlay_languages', 'overlay_languages_subtitles'] and var_name == 'languages' %}
+                                                    {% set weight_ns = namespace(values={}) %}
+                                                    {% for raw_key, raw_val in data.libraries.items() %}
+                                                        {% if raw_key.startswith(template_name ~ '[weight_') and raw_key.endswith(']') %}
+                                                            {% set weight_key = raw_key | replace(template_name ~ '[weight_', '') | replace(']', '') %}
+                                                            {% if raw_val not in [none, '', 'None', 'none'] %}
+                                                                {% set _ = weight_ns.values.update({weight_key: raw_val}) %}
+                                                            {% endif %}
+                                                        {% endif %}
+                                                    {% endfor %}
+                                                    <div class="overlay-language-weight-builder mb-3"
+                                                        data-overlay-language-weight-builder
+                                                        data-template-name="{{ template_name }}"
+                                                        data-language-input-id="{{ input_id }}"
+                                                        data-options='{{ var_details.options | tojson }}'
+                                                        data-existing='{{ weight_ns.values | tojson }}'>
+                                                        <label class="form-label fw-semibold mb-1">Weight Overrides</label>
+                                                        <div class="form-text mb-2">
+                                                            Override priority for specific language flags. Default weights are omitted from YAML.
+                                                        </div>
+                                                        <div class="d-flex flex-column gap-2" data-overlay-language-weight-rows></div>
+                                                        <div class="mt-2">
+                                                            <button type="button" class="btn btn-outline-secondary btn-sm"
+                                                                data-overlay-language-weight-add>
+                                                                Add Weight Override
+                                                            </button>
+                                                        </div>
+                                                        <div data-overlay-language-weight-hidden></div>
+                                                    </div>
+                                                    {% endif %}
                                                     {% elif var_details.type == "toggle" or var_details.input_type == "toggle" %}
                                                     {% set toggle_id = template_name ~ '-' ~ var_name ~ '-' ~ (var_details.value or 'true') %}
                                                     {% set display_label = var_details.label or var_name.replace('_', ' ') %}
@@ -1773,6 +2122,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                             value="{{ var_details.value or 'true' }}"
                                                             {% if var_details.default is defined %}data-default="{{ var_details.default }}"{% endif %}
                                                             {% if is_checked %}checked{% endif %}>
+                                                        <input type="hidden" name="{{ template_name }}[{{ var_name }}]" value="false">
                                                         <label class="form-check-label ms-2 mb-0" for="{{ toggle_id }}">{{ display_label }}</label>
                                                         {% if var_details.tooltip %}
                                                         <i class="bi {% if var_details.tooltip_variant == 'danger' %}bi-exclamation-circle-fill{% else %}bi-info-circle-fill{% endif %} text-{{ var_details.tooltip_variant or 'info' }} ms-2"
