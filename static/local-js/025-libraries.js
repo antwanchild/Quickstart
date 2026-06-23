@@ -1,4 +1,4 @@
-/* global EventHandler, ValidationHandler, OverlayHandler, Sortable, showToast, setupParentChildToggleSync, bootstrap, FontFace, PathValidation, DOMParser, MutationObserver, jumpTo, showNavigationLoadingOverlay, hideNavigationLoadingOverlay, requestAnimationFrame */
+/* global EventHandler, ValidationHandler, OverlayHandler, Sortable, showToast, setupParentChildToggleSync, bootstrap, FontFace, PathValidation, URLValidation, DOMParser, MutationObserver, jumpTo, showNavigationLoadingOverlay, hideNavigationLoadingOverlay, requestAnimationFrame */
 
 document.addEventListener('DOMContentLoaded', function () {
   console.log('[DEBUG] Initializing Libraries...')
@@ -1982,6 +1982,58 @@ document.addEventListener('DOMContentLoaded', function () {
         input.disabled = !!disabled
       }
 
+      function syncTemplateRequirementState (group) {
+        if (!group) return
+
+        const fieldByKey = new Map()
+        Array.from(group.querySelectorAll('[data-template-variable-key]')).forEach(field => {
+          const key = String(field.dataset.templateVariableKey || '').trim()
+          if (key && !fieldByKey.has(key)) fieldByKey.set(key, field)
+        })
+
+        const dependentFields = Array.from(group.querySelectorAll('[data-template-variable-key][data-requires-any-of-template-keys]'))
+        dependentFields.forEach(field => {
+          if (field.dataset.requirementBaseDisabled === undefined) {
+            field.dataset.requirementBaseDisabled = field.disabled ? 'true' : 'false'
+          }
+
+          const baseDisabled = field.dataset.requirementBaseDisabled === 'true'
+          const requiresPlexPass = field.dataset.requiresPlexPass === 'true'
+          const plexPassAvailable = field.dataset.plexPassAvailable !== 'false'
+          const wrapper = field.closest('[data-collection-field-wrapper="true"]')
+          const requiredKeys = String(field.dataset.requiresAnyOfTemplateKeys || '')
+            .split(',')
+            .map(key => key.trim())
+            .filter(Boolean)
+          const anyActive = requiredKeys.some(key => isActiveField(fieldByKey.get(key)))
+          const shouldDisableForDependency = !anyActive
+          const shouldDisable = baseDisabled || (requiresPlexPass && !plexPassAvailable) || shouldDisableForDependency
+
+          field.disabled = shouldDisable
+
+          if (!wrapper || (requiresPlexPass && !plexPassAvailable)) return
+
+          const hintId = field.id ? `${field.id}_requirement_hint` : ''
+          let hint = hintId ? group.querySelector(`[data-requirement-hint-for="${field.id}"]`) : null
+          if (!hint && hintId) {
+            hint = document.createElement('div')
+            hint.className = 'form-text text-warning mb-2 d-none'
+            hint.id = hintId
+            hint.dataset.requirementHintFor = field.id
+            wrapper.insertAdjacentElement('afterend', hint)
+          }
+          if (!hint) return
+
+          if (shouldDisableForDependency) {
+            hint.textContent = String(field.dataset.requirementHint || 'Requires one of Visible Home, Visible Library, or Visible Shared to be enabled first.').trim()
+            hint.classList.remove('d-none')
+          } else {
+            hint.classList.add('d-none')
+            hint.textContent = ''
+          }
+        })
+      }
+
       function syncMutualState (group) {
         if (!group) return
         const fields = Array.from(group.querySelectorAll('[data-template-variable-key][data-mutually-exclusive-with]'))
@@ -2063,14 +2115,17 @@ document.addEventListener('DOMContentLoaded', function () {
           input.addEventListener('input', () => {
             normalizeFieldValue(input)
             syncMutualState(group)
+            syncTemplateRequirementState(group)
           })
           input.addEventListener('change', () => {
             normalizeFieldValue(input)
             syncMutualState(group)
+            syncTemplateRequirementState(group)
           })
         })
 
         syncMutualState(group)
+        syncTemplateRequirementState(group)
         group.dataset.templateFieldRulesBound = 'true'
       })
     }
@@ -2271,15 +2326,25 @@ document.addEventListener('DOMContentLoaded', function () {
     function bindDependencyRequirementHintLiveRefresh (card) {
       if (!card || card.dataset.dependencyHintWatcherBound === 'true') return
 
-      const shouldTrack = (name) => {
-        const fieldName = String(name || '')
+      const shouldTrack = (target) => {
+        if (!target || target.nodeType !== 1) return false
+        if (
+          target.dataset.skipLibraryInputBubble === 'true' ||
+          target.closest('[data-overlay-source-editor="true"]') ||
+          target.closest('[data-overlay-source-hidden]') ||
+          (target.matches('input') && target.type === 'hidden')
+        ) {
+          return false
+        }
+
+        const fieldName = String(target.name || '')
         if (!fieldName) return false
         return /-library$|-collection_|-template_collection_|-attribute_|-overlay_|-template_overlay_/i.test(fieldName)
       }
 
       const onFieldInteraction = (event) => {
         const target = event && event.target
-        if (!target || !shouldTrack(target.name)) return
+        if (!shouldTrack(target)) return
         scheduleDependencyRequirementHintRefresh(160)
       }
 
@@ -3263,6 +3328,8 @@ document.addEventListener('DOMContentLoaded', function () {
         const addBtn = wrapper.querySelector('[data-template-mapping-add]')
         const list = wrapper.querySelector('[data-template-mapping-items]')
         const feedback = wrapper.querySelector('[data-template-mapping-feedback]')
+        const validationPreset = String(wrapper.dataset.validationPreset || '').trim().toLowerCase()
+        const valueKind = String(wrapper.dataset.mappingValueKind || 'string_list').trim().toLowerCase()
 
         if (!hidden || !keyInput || !valueInput || !addBtn || !list) return
 
@@ -3273,6 +3340,13 @@ document.addEventListener('DOMContentLoaded', function () {
           const text = String(rawValue || '').trim()
           if (!text) return []
           return text.split(',').map(item => item.trim()).filter(Boolean)
+        }
+
+        function parseScalarValue (rawValue) {
+          if (Array.isArray(rawValue)) {
+            return String(rawValue[0] || '').trim()
+          }
+          return String(rawValue || '').trim()
         }
 
         function parseStoredMapping (rawValue) {
@@ -3296,21 +3370,39 @@ document.addEventListener('DOMContentLoaded', function () {
           feedback.classList.toggle('d-block', Boolean(message))
         }
 
+        function setValueInputValidity (result) {
+          if (!valueInput) return
+          if (!result || result.valid) {
+            valueInput.classList.remove('is-invalid')
+            return
+          }
+          valueInput.classList.add('is-invalid')
+        }
+
+        function normalizeMappingValue (rawValue) {
+          if (valueKind === 'string_list') {
+            const values = parseValuesList(rawValue)
+            return values.length ? values : null
+          }
+          const value = parseScalarValue(rawValue)
+          return value || null
+        }
+
         function normalizeMapping (mapping) {
           const normalized = {}
           Object.entries(mapping || {}).forEach(([rawKey, rawValues]) => {
             const key = String(rawKey || '').trim()
             if (!key) return
-            const values = parseValuesList(rawValues)
-            if (!values.length) return
-            normalized[key] = values
+            const value = normalizeMappingValue(rawValues)
+            if (value == null) return
+            normalized[key] = value
           })
           return normalized
         }
 
         function renderList (mapping) {
           list.replaceChildren()
-          Object.entries(mapping).forEach(([key, values]) => {
+          Object.entries(mapping).forEach(([key, value]) => {
             const li = document.createElement('li')
             li.className = 'list-group-item d-flex justify-content-between align-items-center'
 
@@ -3323,7 +3415,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
             const details = document.createElement('div')
             details.className = 'small text-muted'
-            details.textContent = values.join(', ')
+            details.textContent = Array.isArray(value) ? value.join(', ') : String(value || '')
             textWrap.appendChild(details)
 
             const button = document.createElement('button')
@@ -3352,6 +3444,7 @@ document.addEventListener('DOMContentLoaded', function () {
           hidden.value = JSON.stringify(normalized)
           renderList(normalized)
           setFeedback(message)
+          setValueInputValidity({ valid: true })
           return normalized
         }
 
@@ -3361,13 +3454,21 @@ document.addEventListener('DOMContentLoaded', function () {
             setFeedback('Enter a key before adding it.')
             return
           }
-          const values = parseValuesList(valueInput.value)
-          if (!values.length) {
+          const normalizedValue = normalizeMappingValue(valueInput.value)
+          if (normalizedValue == null) {
             setFeedback('Enter at least one value before adding it.')
             return
           }
+          if (validationPreset === 'url' && typeof URLValidation !== 'undefined' && typeof URLValidation.validateValue === 'function') {
+            const validationResult = URLValidation.validateValue(normalizedValue)
+            if (!validationResult.valid) {
+              setValueInputValidity(validationResult)
+              setFeedback(validationResult.message || 'Enter a valid URL before adding it.')
+              return
+            }
+          }
           const current = normalizeMapping(parseStoredMapping(hidden.value))
-          current[key] = values
+          current[key] = normalizedValue
           syncState(current)
           keyInput.value = ''
           valueInput.value = ''
@@ -3384,6 +3485,7 @@ document.addEventListener('DOMContentLoaded', function () {
         })
         valueInput.addEventListener('input', () => {
           setFeedback('')
+          setValueInputValidity({ valid: true })
         })
         keyInput.addEventListener('keydown', (event) => {
           if (event.key === 'Enter') {
@@ -4066,6 +4168,9 @@ document.addEventListener('DOMContentLoaded', function () {
       if (typeof PathValidation !== 'undefined' && PathValidation.attach) {
         PathValidation.attach(card)
       }
+      if (typeof URLValidation !== 'undefined' && URLValidation.attach) {
+        URLValidation.attach(card)
+      }
       if (typeof ValidationHandler !== 'undefined' && ValidationHandler.updateValidationState) {
         ValidationHandler.updateValidationState()
       }
@@ -4200,10 +4305,26 @@ document.addEventListener('DOMContentLoaded', function () {
       if (typeof PathValidation !== 'undefined' && PathValidation.validateAll) {
         const pathValid = PathValidation.validateAll(card)
         if (!pathValid) {
+          if (typeof ValidationHandler !== 'undefined' && typeof ValidationHandler.focusFirstInvalidField === 'function') {
+            ValidationHandler.focusFirstInvalidField(card)
+          }
           if (typeof showToast === 'function') {
             showToast('error', 'Please fix invalid path fields before saving.')
           }
           return Promise.reject(new Error('Invalid path fields'))
+        }
+      }
+
+      if (typeof URLValidation !== 'undefined' && URLValidation.validateAll) {
+        const urlValid = URLValidation.validateAll(card)
+        if (!urlValid) {
+          if (typeof ValidationHandler !== 'undefined' && typeof ValidationHandler.focusFirstInvalidField === 'function') {
+            ValidationHandler.focusFirstInvalidField(card)
+          }
+          if (typeof showToast === 'function') {
+            showToast('error', 'Please fix invalid URL fields before saving.')
+          }
+          return Promise.reject(new Error('Invalid URL fields'))
         }
       }
 

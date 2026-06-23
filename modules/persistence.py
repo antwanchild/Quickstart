@@ -6,7 +6,7 @@ import datetime
 import copy
 
 from flask import current_app as app
-from flask import session
+from flask import has_request_context, session
 from ruamel.yaml import YAML
 from ruamel.yaml.constructor import DuplicateKeyError  # noqa
 from urllib.parse import urlparse
@@ -72,6 +72,46 @@ def ensure_session_config_name():
     if app.config["QS_DEBUG"]:
         helpers.ts_log(f"Initialized missing session config_name: {session['config_name']}", level="DEBUG")
     return session["config_name"]
+
+
+def resolve_request_config_name(payload=None):
+    raw_config_name = str((payload or {}).get("config_name") or "").strip() if isinstance(payload, dict) else ""
+    normalized = helpers.normalize_config_name_for_storage(raw_config_name) if raw_config_name else ""
+    if normalized:
+        if has_request_context():
+            session["config_name"] = normalized
+        return normalized
+    resolved = session.get("config_name") or ensure_session_config_name()
+    if has_request_context() and resolved:
+        session["config_name"] = resolved
+    return resolved
+
+
+def retrieve_settings_for_config(config_name, target):
+    source, source_name = extract_names(target)
+    stored_validated, stored_user_entered, stored_payload = database.retrieve_section_data(config_name, source_name)
+    payload = stored_payload if isinstance(stored_payload, dict) else {}
+    section = payload.get(source_name, {}) if isinstance(payload.get(source_name), dict) else {}
+    if not section:
+        section = get_dummy_data(source_name)
+    return {
+        "validated": helpers.booler(stored_validated),
+        "user_entered": helpers.booler(stored_user_entered),
+        "validated_at": payload.get("validated_at") if isinstance(payload, dict) else None,
+        source_name: section,
+    }
+
+
+def apply_validation_metadata(stored_data, status, reason=None, details=None, updated_at=None):
+    if not isinstance(stored_data, dict):
+        stored_data = {}
+    stored_data["validation_status"] = status
+    if reason is not None:
+        stored_data["validation_reason"] = reason
+    if details is not None:
+        stored_data["validation_details"] = details
+    stored_data["validation_updated_at"] = updated_at or helpers.utc_now_iso()
+    return stored_data
 
 
 def clean_form_data(form_data):
@@ -308,7 +348,7 @@ def save_settings(raw_source, form_data):
     )
 
     if app.config["QS_DEBUG"]:
-        helpers.ts_log(f"Data saved successfully.", level="DEBUG")
+        helpers.ts_log("Data saved successfully.", level="DEBUG")
 
 
 def get_stored_plex_credentials(name):
@@ -327,7 +367,7 @@ def get_stored_plex_credentials(name):
         if plex_url and plex_token:
             return plex_url, plex_token
         if app.config["QS_DEBUG"]:
-            helpers.ts_log(f"Plex URL or Token is missing in stored settings", level="ERROR")
+            helpers.ts_log("Plex URL or Token is missing in stored settings", level="ERROR")
     except Exception as e:
         if app.config["QS_DEBUG"]:
             helpers.ts_log(f"Failed to retrieve Plex credentials: {e}", level="ERROR")
@@ -340,7 +380,7 @@ def update_stored_plex_libraries(name, movie_libraries, show_libraries, music_li
         # Fetch existing settings from DB before updating
         settings_before = retrieve_settings(name)
         if app.config["QS_DEBUG"]:
-            helpers.ts_log(f"Settings before update:", settings_before, level="DEBUG")
+            helpers.ts_log("Settings before update:", settings_before, level="DEBUG")
 
         if "plex" not in settings_before:
             settings_before["plex"] = {}
@@ -374,7 +414,7 @@ def update_stored_plex_libraries(name, movie_libraries, show_libraries, music_li
         # Fetch updated settings from DB after updating
         settings_after = retrieve_settings(name)
         if app.config["QS_DEBUG"]:
-            helpers.ts_log(f"Settings after update:", settings_after, level="DEBUG")
+            helpers.ts_log("Settings after update:", settings_after, level="DEBUG")
 
     except Exception as e:
         helpers.ts_log(f"Failed to update Plex libraries in DB: {e}", level="ERROR")

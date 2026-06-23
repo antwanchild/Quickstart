@@ -1,4 +1,5 @@
 import datetime
+import gzip
 import hashlib
 import io
 import platform
@@ -17,7 +18,6 @@ import copy
 
 from pathlib import Path
 from plexapi.server import PlexServer
-from plexapi.exceptions import BadRequest, NotFound, Unauthorized
 from modules import persistence
 
 import requests
@@ -106,6 +106,103 @@ JSON_SCHEMA_SYNC_FILES = (
     ("builders/tvdb.yml", "json-schema/builders/tvdb.yml"),
     ("config.yml.template", "config/config.yml.template"),
 )
+
+
+def utc_now_iso():
+    return datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+
+
+def safe_rel_path(raw_path: str | None, allow_subdirs: bool = False) -> str | None:
+    if not isinstance(raw_path, str):
+        return None
+    raw_path = raw_path.strip()
+    if not raw_path:
+        return None
+    if "\x00" in raw_path:
+        return None
+
+    drive, _ = os.path.splitdrive(raw_path)
+    if drive:
+        return None
+    if os.path.isabs(raw_path):
+        return None
+
+    normalized = os.path.normpath(raw_path)
+    if normalized in (".", ""):
+        return None
+    if normalized.startswith("..") or normalized.startswith("../") or normalized.startswith("..\\"):
+        return None
+    if not allow_subdirs and ("/" in normalized or "\\" in normalized):
+        return None
+
+    return normalized
+
+
+def safe_join(base_dir: str | Path, raw_path: str | None, allow_subdirs: bool = False) -> Path | None:
+    rel = safe_rel_path(raw_path, allow_subdirs=allow_subdirs)
+    if not rel:
+        return None
+    try:
+        base = Path(base_dir).resolve()
+        candidate = (base / rel).resolve()
+        candidate.relative_to(base)
+        return candidate
+    except Exception:
+        return None
+
+
+def resolve_user_dir(raw_path: str | None) -> Path | None:
+    if not isinstance(raw_path, str):
+        return None
+    raw_path = raw_path.strip()
+    if not raw_path:
+        return None
+    if "\x00" in raw_path:
+        return None
+    try:
+        path = Path(raw_path)
+    except Exception:
+        return None
+    if not path.is_absolute():
+        return None
+    if any(part == ".." for part in path.parts):
+        return None
+    try:
+        return path.resolve()
+    except Exception:
+        return None
+
+
+def is_logscan_gzip_path(path):
+    try:
+        suffixes = [suffix.lower() for suffix in Path(path).suffixes]
+    except Exception:
+        return False
+    return bool(suffixes and suffixes[-1] == ".gz")
+
+
+def read_logscan_text(path, encoding="utf-8", errors="replace"):
+    path = Path(path)
+    if is_logscan_gzip_path(path):
+        with gzip.open(path, "rt", encoding=encoding, errors=errors) as handle:
+            return handle.read()
+    content = path.read_text(encoding=encoding, errors=errors)
+    try:
+        if path.name.lower() == "meta.log":
+            sidecar_path = path.parent / "meta.quickstart-maintenance.log"
+            if sidecar_path.exists() and sidecar_path.is_file():
+                sidecar_content = sidecar_path.read_text(encoding=encoding, errors=errors).strip()
+                if sidecar_content:
+                    content = f"{content.rstrip()}\n{sidecar_content}\n"
+        elif path.suffix.lower() == ".log":
+            sidecar_path = path.parent / "imagemaid.quickstart-maintenance.log"
+            if sidecar_path.exists() and sidecar_path.is_file():
+                sidecar_content = sidecar_path.read_text(encoding=encoding, errors=errors).strip()
+                if sidecar_content:
+                    content = f"{content.rstrip()}\n{sidecar_content}\n"
+    except Exception:
+        pass
+    return content
 
 
 def detect_git_branch(repo_root=None, default="develop"):
@@ -633,7 +730,7 @@ def check_for_update():
 
 def get_running_os():
     # Preserve build for backward compatibility, even if unused
-    build = os.getenv("BUILD_OS", "local").lower()
+    build = os.getenv("BUILD_OS", "local").lower()  # noqa: F841
 
     # 1. Docker check via env
     if os.getenv("QUICKSTART_DOCKER", "False").lower() in ["true", "1"]:
@@ -1042,8 +1139,258 @@ def load_quickstart_config(filename: str):
         return json.load(f)
 
 
+def _overlay_origin_alignment_defaults(origin):
+    origin_str = str(origin or "").strip().lower()
+    tokens = [token for token in re.split(r"[^a-z]+", origin_str) if token]
+    has_center = "center" in tokens
+
+    horizontal = "right" if "right" in tokens else "left"
+    if "left" not in tokens and has_center and "right" not in tokens:
+        horizontal = "center"
+
+    vertical = "bottom" if "bottom" in tokens else "top"
+    if "top" not in tokens and has_center and "bottom" not in tokens:
+        vertical = "center"
+
+    return horizontal, vertical
+
+
+def _overlay_template_var_keys(template_variables):
+    keys = set()
+    if isinstance(template_variables, dict):
+        keys.update(str(key) for key in template_variables.keys())
+    elif isinstance(template_variables, list):
+        for item in template_variables:
+            if isinstance(item, dict) and item.get("key"):
+                keys.add(str(item.get("key")))
+    return keys
+
+
+def _insert_overlay_mapping_fields(template_variables, inserted_fields, *, before_keys=None):
+    if not isinstance(template_variables, dict) or not inserted_fields:
+        return template_variables
+
+    before_keys = set(before_keys or ())
+    next_template_variables = {}
+    inserted = False
+
+    for key, value in template_variables.items():
+        if not inserted and key in before_keys:
+            for inserted_key, inserted_value in inserted_fields.items():
+                if inserted_key not in template_variables:
+                    next_template_variables[inserted_key] = inserted_value
+            inserted = True
+        next_template_variables[key] = value
+
+    if not inserted:
+        for inserted_key, inserted_value in inserted_fields.items():
+            if inserted_key not in next_template_variables:
+                next_template_variables[inserted_key] = inserted_value
+
+    template_variables.clear()
+    template_variables.update(next_template_variables)
+    return template_variables
+
+
+def _insert_overlay_list_fields(template_variables, inserted_fields, *, before_keys=None):
+    if not isinstance(template_variables, list) or not inserted_fields:
+        return template_variables
+
+    before_keys = set(before_keys or ())
+    existing_keys = _overlay_template_var_keys(template_variables)
+    next_template_variables = []
+    inserted = False
+
+    for item in template_variables:
+        item_key = item.get("key") if isinstance(item, dict) else None
+        if not inserted and item_key in before_keys:
+            for inserted_field in inserted_fields:
+                inserted_key = inserted_field.get("key")
+                if inserted_key and inserted_key not in existing_keys:
+                    next_template_variables.append(copy.deepcopy(inserted_field))
+            inserted = True
+        next_template_variables.append(item)
+
+    if not inserted:
+        for inserted_field in inserted_fields:
+            inserted_key = inserted_field.get("key")
+            if inserted_key and inserted_key not in existing_keys:
+                next_template_variables.append(copy.deepcopy(inserted_field))
+
+    template_variables[:] = next_template_variables
+    return template_variables
+
+
+def enrich_quickstart_overlay_config(config):
+    enriched = copy.deepcopy(config or [])
+
+    for group in enriched:
+        if not isinstance(group, dict):
+            continue
+        overlays = group.get("overlays", [])
+        if not isinstance(overlays, list):
+            continue
+        for overlay in overlays:
+            if not isinstance(overlay, dict):
+                continue
+            template_variables = overlay.get("template_variables")
+            if template_variables is None:
+                template_variables = {}
+                overlay["template_variables"] = template_variables
+            if not isinstance(template_variables, (dict, list)):
+                continue
+
+            existing_keys = _overlay_template_var_keys(template_variables)
+            default_offsets = overlay.get("default_offsets")
+            offsets_by_type = overlay.get("default_offsets_by_type")
+
+            supports_runtime_offsets = (
+                isinstance(default_offsets, dict)
+                or (isinstance(offsets_by_type, dict) and any(isinstance(value, dict) for value in offsets_by_type.values()))
+                or "initial_horizontal_offset" in existing_keys
+                or "initial_vertical_offset" in existing_keys
+            )
+
+            offset_defaults = default_offsets if isinstance(default_offsets, dict) else {}
+            if not offset_defaults and isinstance(offsets_by_type, dict):
+                for candidate in offsets_by_type.values():
+                    if isinstance(candidate, dict):
+                        offset_defaults = candidate
+                        break
+
+            if supports_runtime_offsets:
+                horizontal_default = 0
+                vertical_default = 0
+                if "initial_horizontal_offset" in existing_keys:
+                    if isinstance(template_variables, dict):
+                        horizontal_default = template_variables.get("initial_horizontal_offset", {}).get(
+                            "default",
+                            offset_defaults.get("horizontal", 0),
+                        )
+                    else:
+                        for item in template_variables:
+                            if isinstance(item, dict) and item.get("key") == "initial_horizontal_offset":
+                                horizontal_default = item.get("default", offset_defaults.get("horizontal", 0))
+                                break
+                else:
+                    horizontal_default = offset_defaults.get("horizontal", 0)
+
+                if "initial_vertical_offset" in existing_keys:
+                    if isinstance(template_variables, dict):
+                        vertical_default = template_variables.get("initial_vertical_offset", {}).get(
+                            "default",
+                            offset_defaults.get("vertical", 0),
+                        )
+                    else:
+                        for item in template_variables:
+                            if isinstance(item, dict) and item.get("key") == "initial_vertical_offset":
+                                vertical_default = item.get("default", offset_defaults.get("vertical", 0))
+                                break
+                else:
+                    vertical_default = offset_defaults.get("vertical", 0)
+
+                offset_fields_mapping = {
+                    "horizontal_offset": {
+                        "input_type": "number",
+                        "default": horizontal_default,
+                        "label": "Horizontal Offset",
+                    },
+                    "vertical_offset": {
+                        "input_type": "number",
+                        "default": vertical_default,
+                        "label": "Vertical Offset",
+                    },
+                }
+                offset_fields_list = [
+                    {
+                        "input_type": "number",
+                        "key": "horizontal_offset",
+                        "default": horizontal_default,
+                        "label": "Horizontal Offset",
+                    },
+                    {
+                        "input_type": "number",
+                        "key": "vertical_offset",
+                        "default": vertical_default,
+                        "label": "Vertical Offset",
+                    },
+                ]
+
+                if isinstance(template_variables, dict):
+                    _insert_overlay_mapping_fields(
+                        template_variables,
+                        offset_fields_mapping,
+                        before_keys={"horizontal_offset", "vertical_offset", "builder_level"},
+                    )
+                else:
+                    _insert_overlay_list_fields(
+                        template_variables,
+                        offset_fields_list,
+                        before_keys={"horizontal_offset", "vertical_offset", "builder_level"},
+                    )
+
+            supports_origin_alignment = (
+                isinstance(offset_defaults, dict)
+                and bool(offset_defaults.get("origin"))
+                and "horizontal_position" not in existing_keys
+                and "vertical_position" not in existing_keys
+            )
+
+            if supports_origin_alignment:
+                horizontal_align_default, vertical_align_default = _overlay_origin_alignment_defaults(offset_defaults.get("origin"))
+                align_fields_mapping = {
+                    "horizontal_align": {
+                        "input_type": "select",
+                        "default": horizontal_align_default,
+                        "label": "Horizontal Alignment",
+                        "options": ["left", "center", "right"],
+                    },
+                    "vertical_align": {
+                        "input_type": "select",
+                        "default": vertical_align_default,
+                        "label": "Vertical Alignment",
+                        "options": ["top", "center", "bottom"],
+                    },
+                }
+                align_fields_list = [
+                    {
+                        "input_type": "select",
+                        "key": "horizontal_align",
+                        "default": horizontal_align_default,
+                        "label": "Horizontal Alignment",
+                        "options": ["left", "center", "right"],
+                    },
+                    {
+                        "input_type": "select",
+                        "key": "vertical_align",
+                        "default": vertical_align_default,
+                        "label": "Vertical Alignment",
+                        "options": ["top", "center", "bottom"],
+                    },
+                ]
+
+                if isinstance(template_variables, dict):
+                    _insert_overlay_mapping_fields(
+                        template_variables,
+                        align_fields_mapping,
+                        before_keys={"horizontal_offset", "vertical_offset", "builder_level"},
+                    )
+                else:
+                    _insert_overlay_list_fields(
+                        template_variables,
+                        align_fields_list,
+                        before_keys={"horizontal_offset", "vertical_offset", "builder_level"},
+                    )
+
+    return enriched
+
+
+def load_quickstart_overlay_config():
+    return enrich_quickstart_overlay_config(load_quickstart_config("quickstart_overlays.json"))
+
+
 def get_top_imdb_items(library_id, media_type, placeholder_id=None):
-    ts_log(f"Fetching Plex credentials for '010-plex'", level="DEBUG")
+    ts_log("Fetching Plex credentials for '010-plex'", level="DEBUG")
     plex_url, plex_token = persistence.get_stored_plex_credentials("010-plex")
 
     ts_log(f"Connecting to Plex with URL: {plex_url}", level="DEBUG")
@@ -1878,8 +2225,9 @@ def rotate_logs():
 def initialize_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
     rotate_logs()
-    with open(LOG_FILE, "w", encoding="utf-8") as f:
-        ts_log(f"New log started at {datetime.datetime.now()}", level="INFO")
+    with open(LOG_FILE, "w", encoding="utf-8"):
+        pass
+    ts_log(f"New log started at {datetime.datetime.now()}", level="INFO")
 
 
 def redact_string(text):
@@ -2291,7 +2639,8 @@ def _ensure_venv(kometa_dir: Path, logs: list[str], venv_name: str = "kometa-ven
     Create (if missing) and validate a venv at <kometa_dir>/kometa-venv.
     Returns (python_bin, pip_bin) or None on failure.
     """
-    import shutil, time
+    import shutil
+    import time
 
     is_windows = os.name == "nt"
     venv_dir = kometa_dir / venv_name
@@ -3014,7 +3363,7 @@ def normalize_config_name_for_storage(config_name: str | None) -> str:
     if not raw:
         return "default"
 
-    name = Path(raw).name.strip().lower()
+    name = Path(raw.replace("\\", "/")).name.strip().lower()
     if name.endswith("_config.yml"):
         name = name[:-11]
     elif name.endswith("_config.yaml"):

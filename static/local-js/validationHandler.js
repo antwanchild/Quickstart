@@ -1,4 +1,4 @@
-/* global $, PathValidation */
+/* global $, PathValidation, URLValidation */
 
 const librariesValidatedAtInput = document.getElementById('libraries_validated_at')
 let librariesTouched = false
@@ -67,6 +67,35 @@ const ValidationHandler = {
     }
 
     return true
+  },
+
+  showAccordionForField: function (field) {
+    if (!field) return
+    let collapse = field.closest('.accordion-collapse')
+    while (collapse) {
+      if (!collapse.classList.contains('show')) {
+        const button = collapse.previousElementSibling?.querySelector('button.accordion-button')
+        if (button) {
+          button.click()
+        } else {
+          collapse.classList.add('show')
+        }
+      }
+      collapse = collapse.parentElement?.closest('.accordion-collapse')
+    }
+  },
+
+  focusFirstInvalidField: function (scope = document) {
+    if (!scope) return
+    const first = scope.querySelector('.is-invalid')
+    if (!first) return
+    ValidationHandler.showAccordionForField(first)
+    window.setTimeout(() => {
+      first.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      if (typeof first.focus === 'function') {
+        first.focus({ preventScroll: true })
+      }
+    }, 180)
   },
 
   validateForm: function () {
@@ -150,23 +179,28 @@ const ValidationHandler = {
     const validatePlaceholderSelection = () => {
       let allPlaceholdersValid = true
 
-      document.querySelectorAll('.placeholder-imdb-dropdown').forEach(dropdown => {
-        dropdown.classList.remove('is-invalid')
+      document.querySelectorAll('[data-separator-placeholder-wrapper="true"]').forEach(wrapper => {
+        const sourceSelect = wrapper.querySelector('.separator-placeholder-source')
+        const activeField = wrapper.querySelector('.separator-placeholder-field:not(.d-none) [data-separator-placeholder-input]')
+        if (!sourceSelect) return
 
-        const libraryId = dropdown.dataset.libraryId
-        const libraryType = dropdown.dataset.libraryType
-        const libraryPrefix = libraryType === 'movie' ? 'mov' : 'sho'
+        sourceSelect.classList.remove('is-invalid')
+        wrapper.querySelectorAll('[data-separator-placeholder-input]').forEach(input => input.classList.remove('is-invalid'))
 
-        const separatorDropdown = document.querySelector(`[name="${libraryPrefix}-library_${libraryId.replace(/\s+/g, '').toLowerCase()}-template_variables[use_separator]"]`)
+        const libraryPrefix = String(wrapper.dataset.libraryPrefix || '').trim()
+        const separatorDropdown = libraryPrefix
+          ? document.querySelector(`[name="${libraryPrefix}-template_variables[use_separator]"]`)
+          : null
 
         if (separatorDropdown && separatorDropdown.value !== 'none') {
-          if (!dropdown.value) {
-            console.log(`[DEBUG] Placeholder missing for library: ${libraryId}`)
+          const activeValue = String(activeField?.value || '').trim()
+          if (!activeField || !activeValue) {
+            console.log(`[DEBUG] Separator placeholder missing for library prefix: ${libraryPrefix}`)
             allPlaceholdersValid = false
-            dropdown.classList.add('is-invalid')
+            sourceSelect.classList.add('is-invalid')
+            if (activeField) activeField.classList.add('is-invalid')
 
-            // Bubble up red invalid highlight properly
-            let parent = dropdown.closest('.accordion-item')
+            let parent = wrapper.closest('.accordion-item')
             while (parent) {
               const header = parent.querySelector(':scope > .accordion-header')
               if (header) {
@@ -176,10 +210,9 @@ const ValidationHandler = {
               parent = parent.parentElement?.closest('.accordion-item')
             }
           } else {
-            console.log(`[DEBUG] Valid placeholder selected for: ${libraryId}`)
+            console.log(`[DEBUG] Valid separator placeholder selected for: ${libraryPrefix}`)
 
-            // Valid and relevant placeholder, bubble up green
-            let parent = dropdown.closest('.accordion-item')
+            let parent = wrapper.closest('.accordion-item')
             while (parent) {
               const header = parent.querySelector(':scope > .accordion-header')
               if (header) {
@@ -200,12 +233,16 @@ const ValidationHandler = {
     const pathValid = (typeof PathValidation !== 'undefined' && PathValidation.validateAll)
       ? PathValidation.validateAll()
       : true
+    const urlValid = (typeof URLValidation !== 'undefined' && URLValidation.validateAll)
+      ? URLValidation.validateAll()
+      : true
 
     console.log(`[DEBUG] Libraries Valid: ${allLibrariesValid}`)
     console.log(`[DEBUG] Placeholders Valid: ${allPlaceholdersValid}`)
     console.log(`[DEBUG] Paths Valid: ${pathValid}`)
+    console.log(`[DEBUG] URLs Valid: ${urlValid}`)
 
-    if (allLibrariesValid && allPlaceholdersValid && pathValid) {
+    if (allLibrariesValid && allPlaceholdersValid && pathValid && urlValid) {
       console.log('[DEBUG] Validation Passed! Enabling navigation.')
       ValidationHandler.showValidationMessage('Validation successful! You may proceed.', 'success')
       ValidationHandler.enableNavigation()
@@ -213,7 +250,7 @@ const ValidationHandler = {
     } else {
       console.log('[DEBUG] Some validations failed! Disabling navigation.')
       ValidationHandler.showValidationMessage(
-        'Each selected library must have at least one highlighted item, a valid Placeholder IMDb must be selected if a Separator is enabled, and any path fields must be valid.',
+        'Each selected library must have at least one highlighted item, a valid separator placeholder must be selected if a separator is enabled, and any path or URL fields must be valid.',
         'danger'
       )
       ValidationHandler.disableNavigation(false)

@@ -17,9 +17,9 @@ from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import PlainScalarString
 from ruamel.yaml.comments import CommentedSeq
 
-_EMPTY_OUTPUT = object()
-
 from modules import helpers, persistence, database
+
+_EMPTY_OUTPUT = object()
 
 LIBRARY_RADARR_FIELDS = {
     "url": "string",
@@ -37,6 +37,25 @@ LIBRARY_RADARR_FIELDS = {
     "ignore_cache": "bool",
     "radarr_path": "string",
     "plex_path": "string",
+}
+
+FRANCHISE_DYNAMIC_CHILD_FIELD_SPECS = {
+    "child_name_overrides": ("name_", "string"),
+    "child_summary_overrides": ("summary_", "string"),
+    "child_sort_title_overrides": ("sort_title_", "string"),
+    "child_sync_mode_overrides": ("sync_mode_", "select"),
+    "child_collection_order_overrides": ("collection_order_", "select"),
+    "child_url_poster_overrides": ("url_poster_", "string"),
+    "child_radarr_add_missing_overrides": ("radarr_add_missing_", "boolean"),
+    "child_radarr_folder_overrides": ("radarr_folder_", "string"),
+    "child_radarr_tag_overrides": ("radarr_tag_", "string_list"),
+    "child_item_radarr_tag_overrides": ("item_radarr_tag_", "string_list"),
+    "child_radarr_monitor_overrides": ("radarr_monitor_", "boolean"),
+    "child_sonarr_add_missing_overrides": ("sonarr_add_missing_", "boolean"),
+    "child_sonarr_folder_overrides": ("sonarr_folder_", "string"),
+    "child_sonarr_tag_overrides": ("sonarr_tag_", "string_list"),
+    "child_item_sonarr_tag_overrides": ("item_sonarr_tag_", "string_list"),
+    "child_sonarr_monitor_overrides": ("sonarr_monitor_", "select"),
 }
 LIBRARY_SONARR_FIELDS = {
     "url": "string",
@@ -354,6 +373,75 @@ def _parse_string_list_mapping(value):
     return normalized
 
 
+def _parse_tmdb_person_window(value):
+    if value is None:
+        return None
+
+    raw_text = None
+    parsed = value
+    if isinstance(value, str):
+        raw_text = value.strip()
+        if not raw_text:
+            return None
+        try:
+            parsed = json.loads(raw_text)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(raw_text)
+            except Exception:
+                candidate = {}
+                valid_candidate = True
+                for part in re.split(r"[\n;,]+", raw_text):
+                    piece = str(part or "").strip()
+                    if not piece:
+                        continue
+                    if "=" in piece:
+                        key_text, raw_val = piece.split("=", 1)
+                    elif ":" in piece:
+                        key_text, raw_val = piece.split(":", 1)
+                    else:
+                        valid_candidate = False
+                        break
+                    key_text = key_text.strip()
+                    raw_val = raw_val.strip()
+                    if not key_text:
+                        valid_candidate = False
+                        break
+                    candidate[key_text] = raw_val
+                parsed = candidate if valid_candidate and candidate else raw_text
+
+    if not isinstance(parsed, dict):
+        return raw_text if raw_text is not None else value
+
+    normalized = {}
+    raw_this_month = parsed.get("this_month")
+    if raw_this_month not in (None, ""):
+        bool_value = _coerce_bool(raw_this_month)
+        normalized["this_month"] = bool_value if bool_value is not None else raw_this_month
+
+    for key in ("before", "after"):
+        raw_number = parsed.get(key)
+        if raw_number in (None, ""):
+            continue
+        number = _to_number(raw_number)
+        if number is None:
+            normalized[key] = raw_number
+        elif float(number).is_integer():
+            normalized[key] = int(number)
+        else:
+            normalized[key] = number
+
+    for raw_key, raw_value in parsed.items():
+        key_text = str(raw_key or "").strip()
+        if not key_text or key_text in normalized or key_text in {"this_month", "before", "after"}:
+            continue
+        if raw_value in (None, ""):
+            continue
+        normalized[key_text] = raw_value
+
+    return normalized or (raw_text if raw_text is not None else value)
+
+
 def _normalize_collection_template_var_value(key, value):
     if key in {"ignore_ids", "ignore_imdb_ids"}:
         list_values = _parse_string_list(value)
@@ -364,13 +452,73 @@ def _normalize_collection_template_var_value(key, value):
     if key in {"addons", "append_addons"}:
         mapping_values = _parse_string_list_mapping(value)
         return mapping_values if mapping_values else None
+    if key in {"tmdb_birthday", "tmdb_deathday"}:
+        return _parse_tmdb_person_window(value)
     if key == "remove_suffix":
         list_values = _parse_comma_string_list(value)
         return ",".join(list_values) if list_values else None
-    if key in {"radarr_tag", "sonarr_tag", "item_radarr_tag", "item_sonarr_tag"}:
+    if key in {"radarr_tag", "sonarr_tag", "item_radarr_tag", "item_sonarr_tag"} or key.startswith(("radarr_tag_", "sonarr_tag_", "item_radarr_tag_", "item_sonarr_tag_")):
         list_values = _parse_string_list(value)
         return list_values if list_values else None
     return value
+
+
+def _parse_template_mapping_dict(value):
+    if isinstance(value, dict):
+        return value
+    if value in (None, ""):
+        return {}
+
+    raw_text = str(value).strip()
+    if not raw_text:
+        return {}
+
+    try:
+        parsed = json.loads(raw_text)
+    except Exception:
+        try:
+            parsed = ast.literal_eval(raw_text)
+        except Exception:
+            return {}
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _normalize_dynamic_child_override_value(value_kind, raw_value):
+    if raw_value in (None, ""):
+        return None
+
+    kind = str(value_kind or "string").strip().lower()
+    if kind == "string_list":
+        list_values = _parse_comma_string_list(raw_value)
+        return list_values if list_values else None
+    if kind == "boolean":
+        bool_value = _coerce_bool(raw_value)
+        return bool_value if bool_value is not None else raw_value
+    return raw_value
+
+
+def _expand_franchise_dynamic_child_overrides(template_vars):
+    if not isinstance(template_vars, dict):
+        return
+
+    for field_key, (child_prefix, value_kind) in FRANCHISE_DYNAMIC_CHILD_FIELD_SPECS.items():
+        if field_key not in template_vars:
+            continue
+
+        raw_mapping = template_vars.pop(field_key, None)
+        mapping = _parse_template_mapping_dict(raw_mapping)
+        if not mapping:
+            continue
+
+        for raw_suffix, raw_value in mapping.items():
+            suffix = str(raw_suffix or "").strip()
+            if not suffix:
+                continue
+            normalized_value = _normalize_dynamic_child_override_value(value_kind, raw_value)
+            if normalized_value is None:
+                continue
+            template_vars[f"{child_prefix}{suffix}"] = normalized_value
 
 
 def _normalize_settings_section_value(key, value):
@@ -553,7 +701,7 @@ def _extract_offset_defaults(overlay):
 def _build_overlay_defaults():
     defaults = {}
     try:
-        data = helpers.load_quickstart_config("quickstart_overlays.json")
+        data = helpers.load_quickstart_overlay_config()
     except Exception as e:
         helpers.ts_log(f"Failed to load quickstart_overlays.json: {e}", level="ERROR")
         return defaults
@@ -1287,24 +1435,6 @@ def build_libraries_section(
         operations = {}
         attr_group = attributes.get(lib_id, {})
         # Begin: Mass Genre Update Section
-        mass_genre_update_keys = [
-            "tmdb",
-            "tvdb",
-            "imdb",
-            "omdb",
-            "anidb",
-            "anidb_3_0",
-            "anidb_2_5",
-            "anidb_2_0",
-            "anidb_1_5",
-            "anidb_1_0",
-            "anidb_0_5",
-            "mal",
-            "lock",
-            "unlock",
-            "remove",
-            "reset",
-        ]
         mass_genre_update = []
 
         # Grab the full reordered list from hidden input
@@ -1580,6 +1710,8 @@ def build_libraries_section(
                         k: (True if isinstance(v, (bool, str)) and str(v).lower() == "true" else False if isinstance(v, (bool, str)) and str(v).lower() == "false" else v)
                         for k, v in all_children.items()
                     }
+                    if raw_id == "franchise":
+                        _expand_franchise_dynamic_child_overrides(template_vars)
                     # Normalize legacy Region key spelling so final YAML always uses
                     # the current Kometa key with a hyphen.
                     legacy_region_keys = {
@@ -2322,7 +2454,9 @@ def build_libraries_section(
         template_data = templates.get(template_key, {})
 
         sep_color_key = None
-        placeholder_key = None
+        placeholder_imdb_key = None
+        placeholder_tmdb_movie_key = None
+        placeholder_tvdb_show_key = None
         language_key = None
         collection_mode_key = None
 
@@ -2330,14 +2464,20 @@ def build_libraries_section(
             if key.endswith("-template_variables[use_separator]") and key.startswith(f"{library_type}-library_{template_key}"):
                 sep_color_key = key
             if key.endswith("-attribute_template_variables[placeholder_imdb_id]") and key.startswith(f"{library_type}-library_{template_key}"):
-                placeholder_key = key
+                placeholder_imdb_key = key
+            if key.endswith("-attribute_template_variables[placeholder_tmdb_movie]") and key.startswith(f"{library_type}-library_{template_key}"):
+                placeholder_tmdb_movie_key = key
+            if key.endswith("-attribute_template_variables[placeholder_tvdb_show]") and key.startswith(f"{library_type}-library_{template_key}"):
+                placeholder_tvdb_show_key = key
             if key.endswith("-template_variables[language]") and key.startswith(f"{library_type}-library_{template_key}"):
                 language_key = key
             if key.endswith("-template_variables[collection_mode]") and key.startswith(f"{library_type}-library_{template_key}"):
                 collection_mode_key = key
 
         sep_color = template_data.get(sep_color_key)
-        placeholder_id = template_data.get(placeholder_key)
+        placeholder_imdb_id = template_data.get(placeholder_imdb_key)
+        placeholder_tmdb_movie = template_data.get(placeholder_tmdb_movie_key)
+        placeholder_tvdb_show = template_data.get(placeholder_tvdb_show_key)
         language_value = template_data.get(language_key)
         collection_mode_value = template_data.get(collection_mode_key)
 
@@ -2346,8 +2486,16 @@ def build_libraries_section(
         if sep_color:
             template_vars["sep_style"] = sep_color
 
-        if placeholder_id:
-            template_vars["placeholder_imdb_id"] = placeholder_id
+        if library_type == "mov":
+            if placeholder_tmdb_movie:
+                template_vars["placeholder_tmdb_movie"] = placeholder_tmdb_movie
+            elif placeholder_imdb_id:
+                template_vars["placeholder_imdb_id"] = placeholder_imdb_id
+        else:
+            if placeholder_tvdb_show:
+                template_vars["placeholder_tvdb_show"] = placeholder_tvdb_show
+            elif placeholder_imdb_id:
+                template_vars["placeholder_imdb_id"] = placeholder_imdb_id
 
         if language_value:
             template_vars["language"] = language_value
@@ -2518,12 +2666,14 @@ def build_libraries_section(
         remove_key = f"{library_type}-library_{lib_id}-top_level_remove_overlays"
         reset_key = f"{library_type}-library_{lib_id}-top_level_reset_overlays"
         schedule_key = f"{library_type}-library_{lib_id}-top_level_schedule"
+        auto_sort_hubs_key = f"{library_type}-library_{lib_id}-top_level_auto_sort_hubs"
         schedule_overlays_key = f"{library_type}-library_{lib_id}-top_level_schedule_overlays"
         report_path_key = f"{library_type}-library_{lib_id}-top_level_report_path"
 
         remove_overlays = top_group.get(remove_key)
         reset_overlays = top_group.get(reset_key)
         schedule = top_group.get(schedule_key)
+        auto_sort_hubs = top_group.get(auto_sort_hubs_key)
         schedule_overlays = top_group.get(schedule_overlays_key)
         report_path = top_group.get(report_path_key)
 
@@ -2531,6 +2681,8 @@ def build_libraries_section(
             entry["report_path"] = report_path
         if schedule not in [None, ""]:
             entry["schedule"] = schedule
+        if auto_sort_hubs not in [None, ""]:
+            entry["auto_sort_hubs"] = auto_sort_hubs
         if remove_overlays:
             entry["remove_overlays"] = True
         if reset_overlays not in [None, "None", ""]:
@@ -2542,6 +2694,7 @@ def build_libraries_section(
             helpers.ts_log(f"Top Level for {lib_id}: {top_group}", level="DEBUG")
             helpers.ts_log(f"{report_path_key} = {report_path}", level="DEBUG")
             helpers.ts_log(f"{schedule_key} = {schedule}", level="DEBUG")
+            helpers.ts_log(f"{auto_sort_hubs_key} = {auto_sort_hubs}", level="DEBUG")
             helpers.ts_log(f"{remove_key} = {remove_overlays}", level="DEBUG")
             helpers.ts_log(f"{reset_key} = {reset_overlays}", level="DEBUG")
             helpers.ts_log(f"{schedule_overlays_key} = {schedule_overlays}", level="DEBUG")
@@ -2583,7 +2736,7 @@ def build_libraries_section(
         )
 
     if app.config["QS_DEBUG"]:
-        helpers.ts_log(f"Generated YAML Output:\n", level="DEBUG")
+        helpers.ts_log("Generated YAML Output:\n", level="DEBUG")
         buf = io.BytesIO()
         YAML().dump({"libraries": libraries_section}, buf)
         helpers.ts_log(buf.getvalue().decode("utf-8"))
@@ -2596,6 +2749,7 @@ def reorder_library_section(library_data):
     Reorders library data so that:
     - `report_path` appears first.
     - `schedule` comes next.
+    - `auto_sort_hubs` comes after `schedule`.
     - `remove_overlays`, `reset_overlays`, and `schedule_overlays` come after that.
     - `template_variables` next.
     - `settings` appears before `radarr` / `sonarr` / `operations`.
@@ -2615,7 +2769,11 @@ def reorder_library_section(library_data):
     if "schedule" in library_data:
         reordered_data["schedule"] = library_data["schedule"]
 
-    # 3. Then remove/reset overlays
+    # 3. Then library-level hub sorting
+    if "auto_sort_hubs" in library_data:
+        reordered_data["auto_sort_hubs"] = library_data["auto_sort_hubs"]
+
+    # 4. Then remove/reset overlays
     if "remove_overlays" in library_data:
         reordered_data["remove_overlays"] = library_data["remove_overlays"]
     if "reset_overlays" in library_data:
@@ -2623,21 +2781,21 @@ def reorder_library_section(library_data):
     if "schedule_overlays" in library_data:
         reordered_data["schedule_overlays"] = library_data["schedule_overlays"]
 
-    # 4. Then template_variables
+    # 5. Then template_variables
     if "template_variables" in library_data:
         reordered_data["template_variables"] = library_data["template_variables"]
 
-    # 5. Then library settings
+    # 6. Then library settings
     if "settings" in library_data:
         reordered_data["settings"] = library_data["settings"]
 
-    # 6. Then per-library Arr overrides
+    # 7. Then per-library Arr overrides
     if "radarr" in library_data:
         reordered_data["radarr"] = library_data["radarr"]
     if "sonarr" in library_data:
         reordered_data["sonarr"] = library_data["sonarr"]
 
-    # 7. Reorder operations
+    # 8. Reorder operations
     operations_order = [
         "assets_for_all",
         "assets_for_all_collections",
@@ -2777,7 +2935,7 @@ def build_config(header_style="standard", config_name=None):
         # Format playlist_files data
         formatted_playlist_files = _format_playlist_files(libraries_list)
         if app.config["QS_DEBUG"]:
-            helpers.ts_log(f"Formatted playlist_files data:", formatted_playlist_files, level="DEBUG")
+            helpers.ts_log("Formatted playlist_files data:", formatted_playlist_files, level="DEBUG")
 
         # Replace in config_data
         config_data["playlist_files"] = formatted_playlist_files
@@ -2802,7 +2960,7 @@ def build_config(header_style="standard", config_name=None):
         if app.config["QS_DEBUG"]:
             helpers.ts_log(f"Cleaned Webhooks Data AFTER Removing Empty Values: {cleaned_webhooks}", level="DEBUG")
             if "webhooks" not in config_data:
-                helpers.ts_log(f"Webhooks section completely removed.", level="DEBUG")
+                helpers.ts_log("Webhooks section completely removed.", level="DEBUG")
 
     if "apprise" in config_data:
         apprise_data = config_data["apprise"]
@@ -2836,7 +2994,7 @@ def build_config(header_style="standard", config_name=None):
 
         # Debugging
         if app.config["QS_DEBUG"]:
-            helpers.ts_log(f"Raw nested libraries data:", nested_libraries_data, level="DEBUG")
+            helpers.ts_log("Raw nested libraries data:", nested_libraries_data, level="DEBUG")
 
         # Extract selected libraries
         movie_libraries = {
@@ -2858,8 +3016,8 @@ def build_config(header_style="standard", config_name=None):
 
         # Debugging
         if app.config["QS_DEBUG"]:
-            helpers.ts_log(f"Movie Library Names:", movie_library_names, level="DEBUG")
-            helpers.ts_log(f"Show Library Names:", show_library_names, level="DEBUG")
+            helpers.ts_log("Movie Library Names:", movie_library_names, level="DEBUG")
+            helpers.ts_log("Show Library Names:", show_library_names, level="DEBUG")
 
         def group_by_library(prefix, names, normalize_overlays=False):
             """

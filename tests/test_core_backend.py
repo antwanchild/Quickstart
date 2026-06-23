@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 
@@ -66,6 +68,124 @@ def test_step_rejects_invalid_path_payload(client, isolated_config_dir):
     assert data is None
     assert validated is False
     assert user_entered is False
+
+
+def test_step_rejects_invalid_auto_sort_hubs_payload(client, isolated_config_dir):
+    from modules import database
+
+    config_name = "pytest_invalid_auto_sort_hubs"
+    step_name = "150-settings"
+
+    resp = client.post(
+        f"/step/{step_name}",
+        data={"configSelector": config_name, "auto_sort_hubs": "bogus"},
+        headers={"Referer": f"http://localhost/step/{step_name}"},
+    )
+    assert resp.status_code == 200
+    assert b"auto_sort_hubs must be one of" in resp.data
+
+    validated, user_entered, data = database.retrieve_section_data(config_name, "settings")
+    assert data is None
+    assert validated is False
+    assert user_entered is False
+
+
+def test_settings_page_disables_auto_sort_hubs_without_plex_pass(client, monkeypatch, qs_module):
+    original_retrieve_settings = qs_module.persistence.retrieve_settings
+
+    def fake_retrieve_settings(target):
+        data = original_retrieve_settings(target)
+        if target == "150-settings":
+            data.setdefault("settings", {})["auto_sort_hubs"] = "alpha"
+        elif target == "010-plex":
+            data.setdefault("plex", {})["telemetry"] = {"plex_pass": False}
+        elif target == "plex_telemetry":
+            data["plex_telemetry"] = {"plex_pass": False}
+        return data
+
+    monkeypatch.setattr(qs_module.persistence, "retrieve_settings", fake_retrieve_settings)
+
+    resp = client.get("/step/150-settings")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+
+    match = re.search(r'<select class="form-select" id="auto_sort_hubs"([^>]*)>', html)
+    assert match is not None
+    attrs = match.group(1)
+    assert 'disabled aria-disabled="true"' in attrs
+    assert 'name="auto_sort_hubs"' not in attrs
+    assert 'name="auto_sort_hubs" value="alpha"' in html
+    assert "Requires Plex Pass. Validate Plex first if this should be available." in html
+
+
+def test_settings_page_enables_auto_sort_hubs_with_plex_pass(client, monkeypatch, qs_module):
+    original_retrieve_settings = qs_module.persistence.retrieve_settings
+
+    def fake_retrieve_settings(target):
+        data = original_retrieve_settings(target)
+        if target == "150-settings":
+            data.setdefault("settings", {})["auto_sort_hubs"] = "configured.desc"
+        elif target == "010-plex":
+            data.setdefault("plex", {})["telemetry"] = {"plex_pass": True}
+        elif target == "plex_telemetry":
+            data["plex_telemetry"] = {"plex_pass": True}
+        return data
+
+    monkeypatch.setattr(qs_module.persistence, "retrieve_settings", fake_retrieve_settings)
+
+    resp = client.get("/step/150-settings")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+
+    match = re.search(r'<select class="form-select" id="auto_sort_hubs"([^>]*)>', html)
+    assert match is not None
+    attrs = match.group(1)
+    assert 'name="auto_sort_hubs"' in attrs
+    assert "disabled" not in attrs
+    assert 'value="configured.desc" selected' in html
+
+
+def test_validate_library_auto_sort_hubs_rejects_invalid_value(qs_module):
+    errors = qs_module._validate_library_auto_sort_hubs(
+        {
+            "mov-library_movies-library": "Movies",
+            "mov-library_movies-top_level_auto_sort_hubs": "bogus",
+        },
+        ["mov-library_movies"],
+    )
+
+    assert errors == ["Movies: auto_sort_hubs must be one of: alpha, alpha.desc, configured, configured.desc, random, sort_title, sort_title.desc"]
+
+
+def test_library_fragment_disables_auto_sort_hubs_without_plex_pass(client, monkeypatch, qs_module):
+    monkeypatch.setattr(
+        qs_module,
+        "_build_library_lists",
+        lambda: ([{"id": "mov-library_movies", "name": "Movies", "type": "movie"}], [], {"plex_pass": False}),
+    )
+    monkeypatch.setattr(qs_module, "_migrate_legacy_playlist_libraries_to_library_toggles", lambda *_args: set())
+    monkeypatch.setattr(qs_module, "_build_preview_image_data", lambda: {"movie": {}, "show": {}})
+
+    original_retrieve_settings = qs_module.persistence.retrieve_settings
+
+    def fake_retrieve_settings(target):
+        if target == "025-libraries":
+            return {"libraries": {"mov-library_movies-top_level_auto_sort_hubs": "alpha"}}
+        return original_retrieve_settings(target)
+
+    monkeypatch.setattr(qs_module.persistence, "retrieve_settings", fake_retrieve_settings)
+
+    resp = client.get("/library_fragment/mov-library_movies")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+
+    match = re.search(r'<select class="form-select" id="mov-library_movies-top_level_auto_sort_hubs"([^>]*)>', html)
+    assert match is not None
+    attrs = match.group(1)
+    assert 'disabled aria-disabled="true"' in attrs
+    assert 'name="mov-library_movies-top_level_auto_sort_hubs"' not in attrs
+    assert 'name="mov-library_movies-top_level_auto_sort_hubs" value="alpha"' in html
+    assert "Requires Plex Pass. Validate Plex first if this should be available." in html
 
 
 def test_validate_apprise_rejects_bad_url(client):
@@ -1218,6 +1338,109 @@ def test_build_libraries_section_normalizes_collection_arr_tag_lists(app):
     assert show_entry["template_variables"]["item_sonarr_tag"] == ["watched", "tracked"]
 
 
+def test_build_libraries_section_emits_collection_hub_priority(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            {"mov-library_movies-library": "Movies"},
+            {},
+            {
+                "movies": {
+                    "mov-library_movies-collection_content_rating_uk": True,
+                    "mov-library_movies-template_collection_content_rating_uk_visible_home": "true",
+                    "mov-library_movies-template_collection_content_rating_uk_hub_priority": "2",
+                    "mov-library_movies-template_collection_content_rating_uk_visible_home_12A": "true",
+                    "mov-library_movies-template_collection_content_rating_uk_hub_priority_12A": "1",
+                }
+            },
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+        )
+
+    movie_entry = next(
+        (entry for entry in libraries_section["libraries"]["Movies"]["collection_files"] if entry.get("default") == "content_rating_uk"),
+        None,
+    )
+
+    assert movie_entry is not None
+    assert movie_entry["template_variables"]["visible_home"] is True
+    assert movie_entry["template_variables"]["hub_priority"] == "2"
+    assert movie_entry["template_variables"]["visible_home_12A"] is True
+    assert movie_entry["template_variables"]["hub_priority_12A"] == "1"
+
+
+def test_build_libraries_section_expands_franchise_dynamic_child_override_maps(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            {"mov-library_movies-library": "Movies"},
+            {"sho-library_shows-library": "Shows"},
+            {
+                "movies": {
+                    "mov-library_movies-collection_franchise": True,
+                    "mov-library_movies-template_collection_franchise_child_name_overrides": '{"10": "Skywalker Saga"}',
+                    "mov-library_movies-template_collection_franchise_child_sync_mode_overrides": '{"10": "append"}',
+                    "mov-library_movies-template_collection_franchise_child_radarr_tag_overrides": '{"10": "4k,franchise"}',
+                    "mov-library_movies-template_collection_franchise_child_radarr_add_missing_overrides": '{"10": "true"}',
+                }
+            },
+            {
+                "shows": {
+                    "sho-library_shows-collection_franchise": True,
+                    "sho-library_shows-template_collection_franchise_child_summary_overrides": '{"1399": "Dragons and dynasties"}',
+                    "sho-library_shows-template_collection_franchise_child_collection_order_overrides": '{"1399": "custom"}',
+                    "sho-library_shows-template_collection_franchise_child_sonarr_monitor_overrides": '{"1399": "future"}',
+                    "sho-library_shows-template_collection_franchise_child_item_sonarr_tag_overrides": '{"1399": "tracked,priority"}',
+                }
+            },
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+        )
+
+    movie_entry = next(
+        (entry for entry in libraries_section["libraries"]["Movies"]["collection_files"] if entry.get("default") == "franchise"),
+        None,
+    )
+    show_entry = next(
+        (entry for entry in libraries_section["libraries"]["Shows"]["collection_files"] if entry.get("default") == "franchise"),
+        None,
+    )
+
+    assert movie_entry is not None
+    assert show_entry is not None
+    assert movie_entry["template_variables"]["name_10"] == "Skywalker Saga"
+    assert movie_entry["template_variables"]["sync_mode_10"] == "append"
+    assert movie_entry["template_variables"]["radarr_tag_10"] == ["4k", "franchise"]
+    assert movie_entry["template_variables"]["radarr_add_missing_10"] is True
+    assert show_entry["template_variables"]["summary_1399"] == "Dragons and dynasties"
+    assert show_entry["template_variables"]["collection_order_1399"] == "custom"
+    assert show_entry["template_variables"]["sonarr_monitor_1399"] == "future"
+    assert show_entry["template_variables"]["item_sonarr_tag_1399"] == ["tracked", "priority"]
+
+
 def test_build_libraries_section_emits_library_arr_overrides(app):
     from modules import output
 
@@ -1464,6 +1687,14 @@ def test_normalize_collection_template_var_value_handles_dynamic_family_controls
         "append_addons",
         '{"Top 250": ["IMDb Top 250"]}',
     ) == {"Top 250": ["IMDb Top 250"]}
+    assert output._normalize_collection_template_var_value(
+        "tmdb_birthday",
+        '{"this_month": true, "before": 7, "after": "2"}',
+    ) == {"this_month": True, "before": 7, "after": 2}
+    assert output._normalize_collection_template_var_value(
+        "tmdb_birthday",
+        "before=14, after=3",
+    ) == {"before": 14, "after": 3}
 
 
 def test_dynamic_family_template_var_normalization_matches_collection_export_shapes():
@@ -3446,6 +3677,34 @@ def test_build_libraries_section_emits_schedule_overlays(app):
     assert list(movies.keys())[:2] == ["schedule_overlays", "template_variables"]
 
 
+def test_build_libraries_section_emits_auto_sort_hubs(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            {"mov-library_movies-library": "Movies"},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {"movies": {"mov-library_movies-top_level_auto_sort_hubs": "configured.desc"}},
+            {},
+        )
+
+    movies = libraries_section["libraries"]["Movies"]
+    assert movies["auto_sort_hubs"] == "configured.desc"
+    assert list(movies.keys())[:2] == ["auto_sort_hubs", "template_variables"]
+
+
 def test_build_libraries_section_keeps_default_ratings_overlay_when_overlay_files_exist(app):
     from modules import output
 
@@ -3697,6 +3956,76 @@ def test_build_libraries_section_includes_separator_placeholder_imdb_id(app):
     assert template_variables["collection_mode"] == "hide"
 
 
+def test_build_libraries_section_includes_separator_placeholder_tmdb_movie(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            {"mov-library_movies-library": "Movies"},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {
+                "movies": {
+                    "mov-library_movies-template_variables[use_separator]": "gray",
+                    "mov-library_movies-attribute_template_variables[placeholder_tmdb_movie]": "603",
+                    "mov-library_movies-template_variables[language]": "en",
+                }
+            },
+            {},
+            {},
+            {},
+        )
+
+    template_variables = libraries_section["libraries"]["Movies"]["template_variables"]
+    assert template_variables["sep_style"] == "gray"
+    assert template_variables["placeholder_tmdb_movie"] == "603"
+    assert "placeholder_imdb_id" not in template_variables
+
+
+def test_build_libraries_section_includes_separator_placeholder_tvdb_show(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            {},
+            {"sho-library_shows-library": "Shows"},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {
+                "shows": {
+                    "sho-library_shows-template_variables[use_separator]": "gray",
+                    "sho-library_shows-attribute_template_variables[placeholder_tvdb_show]": "121361",
+                    "sho-library_shows-template_variables[language]": "en",
+                }
+            },
+            {},
+            {},
+        )
+
+    template_variables = libraries_section["libraries"]["Shows"]["template_variables"]
+    assert template_variables["sep_style"] == "gray"
+    assert template_variables["placeholder_tvdb_show"] == "121361"
+    assert "placeholder_imdb_id" not in template_variables
+
+
 def test_reorder_library_section_keeps_settings_and_operations_before_library_files():
     from modules import output
 
@@ -3704,6 +4033,7 @@ def test_reorder_library_section_keeps_settings_and_operations_before_library_fi
         {
             "report_path": "config/Movies_Report.yml",
             "schedule": "weekly(mon)",
+            "auto_sort_hubs": "configured.desc",
             "schedule_overlays": "weekly(wed)",
             "template_variables": {"sep_style": "gray"},
             "metadata_files": [{"folder": "config/example/metadata"}],
@@ -3718,6 +4048,7 @@ def test_reorder_library_section_keeps_settings_and_operations_before_library_fi
     assert list(reordered.keys()) == [
         "report_path",
         "schedule",
+        "auto_sort_hubs",
         "schedule_overlays",
         "template_variables",
         "settings",

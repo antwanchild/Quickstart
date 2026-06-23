@@ -1,3 +1,6 @@
+import time
+
+
 def test_start_kometa_queues_during_maintenance(client, monkeypatch, qs_module):
     monkeypatch.setattr(qs_module.helpers, "is_kometa_running", lambda: False)
     monkeypatch.setattr(qs_module.helpers, "get_kometa_pid", lambda: None)
@@ -295,13 +298,14 @@ def test_start_imagemaid_surfaces_immediate_exit(client, monkeypatch, qs_module)
 
 
 def test_launch_imagemaid_command_resets_runtime_env_before_start(tmp_path, monkeypatch, qs_module):
+    is_win = qs_module.sys.platform.startswith("win")
     imagemaid_root = tmp_path / "imagemaid"
     config_dir = imagemaid_root / "config"
-    venv_dir = imagemaid_root / "imagemaid-venv" / "Scripts"
+    venv_dir = imagemaid_root / "imagemaid-venv" / ("Scripts" if is_win else "bin")
     config_dir.mkdir(parents=True, exist_ok=True)
     venv_dir.mkdir(parents=True, exist_ok=True)
     (imagemaid_root / "imagemaid.py").write_text("print('imagemaid')\n", encoding="utf-8")
-    (venv_dir / "python.exe").write_text("", encoding="utf-8")
+    (venv_dir / ("python.exe" if is_win else "python3")).write_text("", encoding="utf-8")
     env_path = config_dir / ".env"
     env_path.write_text("EMPTY_TRASH=True\nOPTIMIZE_DB=True\n", encoding="utf-8")
     pid_file = tmp_path / "imagemaid.pid"
@@ -340,11 +344,12 @@ def test_launch_imagemaid_command_resets_runtime_env_before_start(tmp_path, monk
 
 
 def test_launch_imagemaid_command_aborts_when_runtime_env_reset_fails(tmp_path, monkeypatch, qs_module):
+    is_win = qs_module.sys.platform.startswith("win")
     imagemaid_root = tmp_path / "imagemaid"
-    venv_dir = imagemaid_root / "imagemaid-venv" / "Scripts"
+    venv_dir = imagemaid_root / "imagemaid-venv" / ("Scripts" if is_win else "bin")
     venv_dir.mkdir(parents=True, exist_ok=True)
     (imagemaid_root / "imagemaid.py").write_text("print('imagemaid')\n", encoding="utf-8")
-    (venv_dir / "python.exe").write_text("", encoding="utf-8")
+    (venv_dir / ("python.exe" if is_win else "python3")).write_text("", encoding="utf-8")
 
     monkeypatch.setattr(qs_module.helpers, "get_imagemaid_root_path", lambda: imagemaid_root)
     monkeypatch.setattr(
@@ -1238,7 +1243,3 @@ def test_build_imagemaid_command_parts_only_adds_supported_optional_flags(tmp_pa
 
     assert "--no-verify-ssl" in parts
     assert "--overlays-only" in parts
-
-
-import os
-import time
