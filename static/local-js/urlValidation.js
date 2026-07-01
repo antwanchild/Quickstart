@@ -1,5 +1,3 @@
-/* global */
-
 const URLValidation = (() => {
   const urlKeyPattern = /(^|[_-])url([_-]|$)/i
   const placeholderValues = new Set(['http://', 'https://'])
@@ -32,7 +30,7 @@ const URLValidation = (() => {
     let parsed
     try {
       parsed = new URL(text)
-    } catch (err) {
+    } catch {
       return { valid: false, message: 'Please enter a valid URL.' }
     }
     if (!parsed.protocol || !['http:', 'https:'].includes(parsed.protocol)) {

@@ -1,8 +1,12 @@
-/* global showToast, bootstrap, localStorage, $, PathValidation */
-
 /* ============================== */
 /* Helpers for the config UI      */
 /* ============================== */
+
+// `loading` is the navigation-spinner helper defined in 000-base.js.
+// 000-base.js is loaded as an ES module on every page (templates/000-base.html),
+// so we import it directly here instead of relying on `window.loading`,
+// which was retired in PR #1383 (chore/retire-jumpto-loading-shims).
+import { loading } from './000-base.js'
 
 function toggleConfigInput (selectElement) {
   const box = document.getElementById('newConfigInput')
@@ -16,9 +20,6 @@ function toggleConfigInput (selectElement) {
     if (input) removeValidationMessages(input)
   }
 }
-
-// expose for inline HTML usage: onchange="toggleConfigInput(this)"
-window.toggleConfigInput = toggleConfigInput
 
 function applyValidationStyles (inputElement, type, message) {
   removeValidationMessages(inputElement)
@@ -128,11 +129,13 @@ document.addEventListener('DOMContentLoaded', function () {
       if (!href || !href.startsWith('/step/')) return
       event.preventDefault()
       const targetLabel = String(link.dataset.qsTargetLabel || link.textContent || '').trim()
-      if (typeof window.loading === 'function') {
-        window.loading('jump', targetLabel)
-      } else if (typeof window.showNavigationLoadingOverlay === 'function') {
-        window.showNavigationLoadingOverlay('jump', targetLabel)
-      }
+      // `loading` is imported from 000-base.js at the top of this file.
+      // The previous `window.showNavigationLoadingOverlay` fallback is
+      // still reachable via the window shim (kept in 000-base.js); we
+      // route through `loading()` first because it composes both the
+      // overlay AND the per-button spinner-state plumbing, while the
+      // overlay fallback is overlay-only.
+      loading('jump', targetLabel)
       window.setTimeout(() => {
         window.location.assign(href)
       }, 60)
@@ -543,6 +546,7 @@ document.addEventListener('DOMContentLoaded', function () {
   updateButtonState()
   if (configSelector) {
     configSelector.addEventListener('change', () => {
+      toggleConfigInput(configSelector)
       updateButtonState()
     })
   }
@@ -796,10 +800,12 @@ document.addEventListener('DOMContentLoaded', function () {
     const title = document.getElementById('orphanedArtifactsRestoreModalLabel')
     if (title) title.innerHTML = `<i class="bi bi-arrow-counterclockwise me-2"></i>Restore ${orphanedRestoreTarget}`
 
-    const loading = document.createElement('div')
-    loading.className = 'small text-muted'
-    loading.textContent = 'Loading saved versions...'
-    orphanedArtifactsRestoreList.appendChild(loading)
+    // Local element name `loadingMsg` (not `loading`) to avoid shadowing
+    // the `loading` spinner function imported from 000-base.js.
+    const loadingMsg = document.createElement('div')
+    loadingMsg.className = 'small text-muted'
+    loadingMsg.textContent = 'Loading saved versions...'
+    orphanedArtifactsRestoreList.appendChild(loadingMsg)
 
     const modal = bootstrap.Modal.getOrCreateInstance(orphanedArtifactsRestoreModalEl)
     modal.show()
@@ -843,10 +849,12 @@ document.addEventListener('DOMContentLoaded', function () {
       orphanedArtifactsModalEl.querySelectorAll('.btn-close').forEach(el => { el.disabled = false })
     }
 
-    const loading = document.createElement('div')
-    loading.className = 'small text-muted'
-    loading.textContent = 'Scanning config storage...'
-    orphanedArtifactsList.appendChild(loading)
+    // Local element name `loadingMsg` (not `loading`) to avoid shadowing
+    // the `loading` spinner function imported from 000-base.js.
+    const loadingMsg = document.createElement('div')
+    loadingMsg.className = 'small text-muted'
+    loadingMsg.textContent = 'Scanning config storage...'
+    orphanedArtifactsList.appendChild(loadingMsg)
 
     try {
       const res = await fetch('/orphaned-config-artifacts')
@@ -2334,12 +2342,12 @@ document.addEventListener('DOMContentLoaded', function () {
     elapsedTimer = null
   }
 
-  function storeJob (jobId, startedAt) {
+  function storeJob (jobId, startedAtMs) {
     try {
       localStorage.setItem(jobStorageKey, jobId)
-      const ts = Number.isFinite(startedAt) ? startedAt : Date.now()
+      const ts = Number.isFinite(startedAtMs) ? startedAtMs : Date.now()
       localStorage.setItem(jobStartedKey, String(ts))
-    } catch (e) {
+    } catch {
       // ignore storage errors
     }
   }
@@ -2350,7 +2358,7 @@ document.addEventListener('DOMContentLoaded', function () {
         jobId: localStorage.getItem(jobStorageKey),
         startedAt: Number(localStorage.getItem(jobStartedKey))
       }
-    } catch (e) {
+    } catch {
       return { jobId: null, startedAt: NaN }
     }
   }
@@ -2359,7 +2367,7 @@ document.addEventListener('DOMContentLoaded', function () {
     try {
       localStorage.removeItem(jobStorageKey)
       localStorage.removeItem(jobStartedKey)
-    } catch (e) {
+    } catch {
       // ignore storage errors
     }
   }
@@ -2735,8 +2743,8 @@ document.addEventListener('DOMContentLoaded', function () {
         }).then(r => r.json())
         if (!startRes.success) throw new Error(startRes.message || 'Failed to start')
         jobId = startRes.job_id
-        const startedAt = Number(startRes.started_at)
-        storeJob(jobId, Number.isFinite(startedAt) ? startedAt * 1000 : undefined)
+        const jobStartedAt = Number(startRes.started_at)
+        storeJob(jobId, Number.isFinite(jobStartedAt) ? jobStartedAt * 1000 : undefined)
       } catch (err) {
         running = false
         stopElapsedTimer()

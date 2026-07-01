@@ -1,5 +1,3 @@
-/* global $, PathValidation, URLValidation */
-
 const librariesValidatedAtInput = document.getElementById('libraries_validated_at')
 let librariesTouched = false
 
@@ -46,7 +44,8 @@ const ValidationHandler = {
       console.log('[DEBUG] Validation Failed! Disabling navigation.')
       ValidationHandler.showValidationMessage(
         'Please review your selections: ensure you have picked at least one library, selected an item inside each chosen library, and if using Separators, selected a valid <strong>Placeholder IMDb ID</strong>. Items needing attention are highlighted in red below.',
-        'danger'
+        'danger',
+        { html: true }
       )
       ValidationHandler.disableNavigation(false)
     }
@@ -59,8 +58,9 @@ const ValidationHandler = {
     if (!plexValid) {
       console.log('[DEBUG] Plex validation failed! Disabling navigation.')
       ValidationHandler.showValidationMessage(
-        'Plex settings have not been validated successfully. Please <a href="javascript:void(0);" onclick="jumpTo(\'010-plex\');">return to the Plex page</a> and hit the validate button and ensure success before returning here.<br>',
-        'danger'
+        'Plex settings have not been validated successfully. Please <a href="javascript:void(0);" data-jumpto-page="010-plex">return to the Plex page</a> and hit the validate button and ensure success before returning here.<br>',
+        'danger',
+        { html: true }
       )
       ValidationHandler.disableNavigation()
       return false
@@ -299,13 +299,21 @@ const ValidationHandler = {
     })
   },
 
-  showValidationMessage: function (message, type) {
+  showValidationMessage: function (message, type, options) {
     const validationBox = document.getElementById('validation-messages')
     if (!validationBox) return
 
     console.log(`[DEBUG] Showing validation message: "${message}" (${type})`)
 
-    validationBox.textContent = message
+    // Default to textContent (safe against XSS). Callers that need to
+    // render HTML (e.g. embedded links or <strong>) must pass
+    // { html: true } explicitly so the choice is auditable.
+    const useHtml = !!(options && options.html)
+    if (useHtml) {
+      validationBox.innerHTML = message
+    } else {
+      validationBox.textContent = message
+    }
     validationBox.classList.remove('alert-danger', 'alert-success')
     validationBox.classList.add(`alert-${type}`)
     validationBox.style.display = 'block'
@@ -313,12 +321,12 @@ const ValidationHandler = {
 
   disableNavigation: function (lockAccordions = true) {
     console.log('[DEBUG] Disabling navigation.')
-    document.querySelectorAll("#configForm .dropdown-toggle, #configForm button[onclick*='next']").forEach(button => {
+    document.querySelectorAll("#configForm .dropdown-toggle, #configForm button[data-nav-action='next']").forEach(button => {
       button.disabled = true
     })
 
     // Keep the Previous button enabled
-    document.querySelector("#configForm button[onclick*='prev']").disabled = false
+    document.querySelector("#configForm button[data-nav-action='prev']").disabled = false
 
     // Handle accordions based on the lockAccordions flag
     if (!lockAccordions) {
@@ -337,31 +345,31 @@ const ValidationHandler = {
   }
 }
 
+window.ValidationHandler = ValidationHandler
+
 // Restore previously selected libraries
 ValidationHandler.restoreSelectedLibraries()
 
 // Attach validation update on input change
-document.addEventListener('DOMContentLoaded', () => {
-  console.log('[DEBUG] Adding change event listeners to library checkboxes & accordions.')
+console.log('[DEBUG] Adding change event listeners to library checkboxes & accordions.')
 
-  const onLibraryChange = (event) => {
-    if (!event || !event.target || !event.target.closest) return
-    if (event.target.id === 'libraryPicker') {
-      librariesTouched = true
-      console.log('[DEBUG] Change detected on libraryPicker')
-      ValidationHandler.updateValidationState()
-      return
-    }
-    if (!event.target.closest('#library-form-container')) return
+const onLibraryChange = (event) => {
+  if (!event || !event.target || !event.target.closest) return
+  if (event.target.id === 'libraryPicker') {
     librariesTouched = true
-    console.log(`[DEBUG] Change detected on: ${event.target.id || '(unknown input)'}`)
+    console.log('[DEBUG] Change detected on libraryPicker')
     ValidationHandler.updateValidationState()
+    return
   }
-
-  document.addEventListener('change', onLibraryChange)
-  document.addEventListener('input', onLibraryChange)
-
-  // Initial validation check on page load
-  console.log('[DEBUG] Running initial validation check on page load.')
+  if (!event.target.closest('#library-form-container')) return
+  librariesTouched = true
+  console.log(`[DEBUG] Change detected on: ${event.target.id || '(unknown input)'}`)
   ValidationHandler.updateValidationState()
-})
+}
+
+document.addEventListener('change', onLibraryChange)
+document.addEventListener('input', onLibraryChange)
+
+// Initial validation check on page load
+console.log('[DEBUG] Running initial validation check on page load.')
+ValidationHandler.updateValidationState()

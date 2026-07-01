@@ -1,14 +1,20 @@
 import hashlib
-import json
 import logging
-import os
 import re
-import shlex
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import unquote
 
-import requests
+from modules import logscan_command, logscan_people
+
+# Re-exported for back-compat with tests / quickstart imports.
+from modules.logscan_people import (  # noqa: F401
+    PEOPLE_MISSING_WARNING_RE,
+    PEOPLE_MISSING_WARNING_REGEX,
+    PEOPLE_README_URLS,
+    PEOPLE_SECTION_END_PATTERNS,
+    PEOPLE_SECTION_START_STRONG,
+    PEOPLE_SECTION_START_WEAK,
+)
 
 # Create logger
 mylogger = logging.getLogger("logscan")
@@ -39,28 +45,6 @@ def _version_in_inclusive_range(ver: str, low: tuple, high: tuple) -> bool:
 # Vulnerable range you want to flag (adjust as needed)
 _PMS_VULN_LOW = (1, 41, 7, 0)  # 1.41.7.x
 _PMS_VULN_HIGH = (1, 42, 0, 99999)  # through 1.42.0.x
-
-PEOPLE_README_URLS = [
-    "https://raw.githubusercontent.com/Kometa-Team/People-Images/refs/heads/master/README.md",
-]
-PEOPLE_MISSING_WARNING_REGEX = (
-    r"Collection Warning: No Poster Found at "
-    r"(https://raw\.githubusercontent\.com/"
-    r"(?:Kometa-Team/People-Images(?:-[^/]+)?|meisnate12/Plex-Meta-Manager-People(?:-[^/]+)?)"
-    r"/[^\s\]]+)"
-)
-PEOPLE_MISSING_WARNING_RE = re.compile(PEOPLE_MISSING_WARNING_REGEX, re.IGNORECASE)
-PEOPLE_SECTION_START_STRONG = [
-    r"^(.+?) Collection in .+$",
-    r"^Running .+ Collection$",
-]
-PEOPLE_SECTION_START_WEAK = [
-    r"^Updating Details of .+ Collection$",
-    r"^Validating .+ Attributes$",
-]
-PEOPLE_SECTION_END_PATTERNS = [
-    r"^Finished .+ Collection$",
-]
 
 
 class LogscanAnalyzer:
@@ -402,91 +386,27 @@ class LogscanAnalyzer:
         return cleaned_content
 
     def extract_filename_from_url(self, url):
-        return unquote(os.path.splitext(os.path.basename(url))[0])
+        return logscan_people.extract_filename_from_url(url)
 
     def _get_people_cache_path(self, log_path):
-        cache_dir = Path(__file__).resolve().parent.parent / "config" / "cache" / "logscan"
-        try:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            return cache_dir / "logscan_people_readme.json"
-        except Exception:
-            pass
-        if log_path:
-            try:
-                log_path = Path(log_path)
-                if log_path.is_file():
-                    return log_path.parent / ".logscan_people_cache.json"
-            except Exception:
-                pass
-        return Path.cwd() / ".logscan_people_cache.json"
+        return logscan_people.get_people_cache_path(log_path)
 
     def _load_people_cache(self, cache_path):
-        try:
-            if not cache_path or not Path(cache_path).exists():
-                return {}
-            with open(cache_path, "r", encoding="utf-8") as handle:
-                return json.load(handle) or {}
-        except Exception:
-            return {}
+        return logscan_people.load_people_cache(cache_path)
 
     def _save_people_cache(self, cache_path, payload):
-        try:
-            if not cache_path:
-                return
-            with open(cache_path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=True, indent=2)
-        except Exception:
-            return
+        return logscan_people.save_people_cache(cache_path, payload)
 
     def _fetch_people_readme(self, cache_path):
-        cache = self._load_people_cache(cache_path)
-        cached_content = cache.get("content")
-
-        for url in PEOPLE_README_URLS:
-            headers = {"User-Agent": "Quickstart-Logscan"}
-            if cache.get("url") == url:
-                if cache.get("etag"):
-                    headers["If-None-Match"] = cache["etag"]
-                if cache.get("last_modified"):
-                    headers["If-Modified-Since"] = cache["last_modified"]
-            try:
-                response = requests.get(url, headers=headers, timeout=5)
-            except Exception as exc:
-                mylogger.debug(f"People-Images README fetch failed for {url}: {exc}")
-                continue
-
-            if response.status_code == 304 and cached_content:
-                return cached_content, True
-            if response.status_code == 200 and response.text:
-                payload = {
-                    "url": url,
-                    "etag": response.headers.get("ETag"),
-                    "last_modified": response.headers.get("Last-Modified"),
-                    "fetched_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                    "content": response.text,
-                }
-                self._save_people_cache(cache_path, payload)
-                return response.text, False
-            if response.status_code in (404, 410):
-                continue
-
-        return cached_content, True if cached_content else False
+        return logscan_people.fetch_people_readme(cache_path)
 
     def _build_people_index(self, readme_text):
-        if not readme_text:
-            return set()
-        filenames = re.findall(r"([A-Za-z0-9_./%\-]+\.(?:jpg|jpeg|png|webp))", readme_text, flags=re.IGNORECASE)
-        names = set()
-        for name in filenames:
-            cleaned = self.extract_filename_from_url(name)
-            if cleaned:
-                names.add(cleaned.lower())
-        return names
+        return logscan_people.build_people_index(readme_text)
 
     def preload_people_index(self, log_path=None):
-        cache_path = self._get_people_cache_path(log_path)
-        readme_text, _used_cache = self._fetch_people_readme(cache_path)
-        self._people_index = self._build_people_index(readme_text)
+        cache_path = logscan_people.get_people_cache_path(log_path)
+        readme_text, _used_cache = logscan_people.fetch_people_readme(cache_path)
+        self._people_index = logscan_people.build_people_index(readme_text)
         self.people_index_available = bool(self._people_index)
         return self._people_index
 
@@ -497,189 +417,44 @@ class LogscanAnalyzer:
         if self._people_index is not None:
             self.people_index_available = bool(self._people_index)
             return self._people_index
-        cache_path = self._get_people_cache_path(log_path)
-        readme_text, _used_cache = self._fetch_people_readme(cache_path)
-        self._people_index = self._build_people_index(readme_text)
-        self.people_index_available = bool(self._people_index)
-        return self._people_index
+        return self.preload_people_index(log_path=log_path)
 
     def _is_blank_log_line(self, line):
-        return not line.strip()
+        return logscan_people.is_blank_log_line(line)
 
     def _is_divider_log_line(self, line):
-        stripped = line.strip()
-        if not stripped:
-            return False
-        compact = stripped.replace(" ", "")
-        if len(compact) < 8:
-            return False
-        return len(set(compact)) == 1
+        return logscan_people.is_divider_log_line(line)
 
     def _is_section_break(self, line):
-        return self._is_blank_log_line(line) or self._is_divider_log_line(line)
+        return logscan_people.is_section_break(line)
 
     def _matches_any_pattern(self, normalized, patterns):
-        for pattern in patterns:
-            if re.match(pattern, normalized):
-                return True
-        return False
+        return logscan_people.matches_any_pattern(normalized, patterns)
 
     def _find_log_section_bounds(self, cleaned_lines, index, max_span=300):
-        start = None
-        end = None
-
-        min_index = max(0, index - max_span)
-        for idx in range(index, min_index - 1, -1):
-            normalized = self._normalize_name_line(cleaned_lines[idx])
-            if not normalized:
-                continue
-            if self._matches_any_pattern(normalized, PEOPLE_SECTION_START_STRONG):
-                start = idx
-                break
-
-        if start is None:
-            for idx in range(index, min_index - 1, -1):
-                normalized = self._normalize_name_line(cleaned_lines[idx])
-                if not normalized:
-                    continue
-                if self._matches_any_pattern(normalized, PEOPLE_SECTION_START_WEAK):
-                    start = idx
-                    break
-
-        if start is not None:
-            while start > 0 and self._is_divider_log_line(cleaned_lines[start - 1]):
-                start -= 1
-
-        max_index = len(cleaned_lines) - 1
-        max_end = min(max_index, index + max_span)
-        for idx in range(index, max_end + 1):
-            normalized = self._normalize_name_line(cleaned_lines[idx])
-            if not normalized:
-                continue
-            if self._matches_any_pattern(normalized, PEOPLE_SECTION_END_PATTERNS):
-                end = idx
-                break
-
-        if end is not None:
-            while end < max_index and self._is_divider_log_line(cleaned_lines[end + 1]):
-                end += 1
-
-        if start is None or end is None:
-            fallback_start = index
-            while fallback_start > 0 and (index - fallback_start) < max_span:
-                if self._is_section_break(cleaned_lines[fallback_start - 1]):
-                    if self._is_divider_log_line(cleaned_lines[fallback_start - 1]):
-                        fallback_start -= 1
-                    break
-                fallback_start -= 1
-
-            fallback_end = index
-            while fallback_end < max_index and (fallback_end - index) < max_span:
-                if self._is_section_break(cleaned_lines[fallback_end + 1]):
-                    if self._is_divider_log_line(cleaned_lines[fallback_end + 1]):
-                        fallback_end += 1
-                    break
-                fallback_end += 1
-
-            start = fallback_start if start is None else start
-            end = fallback_end if end is None else end
-
-        return start, end
+        return logscan_people.find_log_section_bounds(cleaned_lines, index, max_span=max_span)
 
     def _normalize_name_line(self, line):
-        if not line:
-            return ""
-        return line.strip().strip("= ").strip()
+        return logscan_people.normalize_name_line(line)
 
     def _extract_key_name_from_block(self, cleaned_lines, start, end):
-        block = cleaned_lines[start : end + 1]
-        for idx, line in enumerate(block):
-            if "Validating Method: key_name" in line:
-                for offset in range(1, 6):
-                    if idx + offset >= len(block):
-                        break
-                    candidate = block[idx + offset].strip()
-                    if not candidate:
-                        continue
-                    if "Value:" in candidate:
-                        value = candidate.split("Value:", 1)[1].strip()
-                        if value:
-                            return value
-                break
-
-        patterns = [
-            r"^Validating\s+(.+?)\s+Attributes$",
-            r"^Running\s+(.+?)\s+Collection$",
-            r"^Finished\s+(.+?)\s+Collection$",
-            r"^(.+?)\s+Collection\s+in\s+.+$",
-        ]
-        for line in block:
-            normalized = self._normalize_name_line(line)
-            if not normalized:
-                continue
-            for pattern in patterns:
-                match = re.match(pattern, normalized)
-                if match:
-                    return match.group(1).strip()
-        return None
+        return logscan_people.extract_key_name_from_block(cleaned_lines, start, end)
 
     def _extract_missing_people_names(self, lines, available, name_hint=None):
-        names = set()
-        for line in lines:
-            match = PEOPLE_MISSING_WARNING_RE.search(line)
-            if not match:
-                continue
-            name = name_hint
-            if not name:
-                url = match.group(1)
-                name = self.extract_filename_from_url(url)
-            if not name:
-                continue
-            key = name.lower()
-            if available and key in available:
-                continue
-            names.add(key)
-        return names
+        return logscan_people.extract_missing_people_names(lines, available, name_hint=name_hint)
 
     def collect_missing_people_lines(self, content, available_index=None, max_block_lines=300, log_path=None):
+        """Resolve the people index (caching it on ``self``) then delegate to
+        :func:`modules.logscan_people.collect_missing_people_lines`."""
         if not content:
             return []
         available = self._ensure_people_index(log_path=log_path, available_index=available_index)
-        raw_lines = content.splitlines()
-        cleaned_lines = self.cleanup_content(content).splitlines()
-        items = []
-        seen_blocks = set()
-
-        for idx, line in enumerate(raw_lines):
-            if not PEOPLE_MISSING_WARNING_RE.search(line):
-                continue
-
-            if idx < len(cleaned_lines):
-                start, end = self._find_log_section_bounds(cleaned_lines, idx, max_span=max_block_lines)
-            else:
-                start = max(0, idx - 2)
-                end = min(len(raw_lines) - 1, idx + 2)
-
-            block_lines = raw_lines[start : end + 1]
-            name_hint = None
-            if idx < len(cleaned_lines):
-                name_hint = self._extract_key_name_from_block(cleaned_lines, start, end)
-            names = self._extract_missing_people_names(block_lines, available, name_hint=name_hint)
-            if not names:
-                continue
-
-            block_text = "\n".join(block_lines)
-            if block_text in seen_blocks:
-                continue
-            seen_blocks.add(block_text)
-            items.append(
-                {
-                    "names": names,
-                    "block": block_text,
-                }
-            )
-
-        return items
+        return logscan_people.collect_missing_people_lines(
+            content,
+            available_index=available,
+            max_block_lines=max_block_lines,
+            cleanup_fn=self.cleanup_content,
+        )
 
     def scan_file_for_people_posters(self, content, log_path=None):
         if not content:
@@ -1966,227 +1741,51 @@ class LogscanAnalyzer:
         return sorted_recommendations
 
     def extract_plex_config(self, content):
+        """Extract Plex configuration sections from ``content``.
+
+        Delegates to :mod:`modules.logscan_command` and folds any flagged
+        server versions onto ``self.server_versions`` so the legacy
+        ``make_recommendations`` lookup keeps working.
         """
-        Extract Plex configuration sections from the content.
-        """
-        lines = content.splitlines()
-        plex_config_content = []
-
-        start_marker = "Plex Configuration"
-        # end_markers = [" Scanning Metadata and", "Library Connection Failed"]
-        end_markers = [" Scanning ", "Library Connection Failed"]
-        mylogger.debug("extract_plex_config")
-
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if start_marker in line:
-                config_section = self.extract_plex_config_section(lines, i + 1, end_markers)
-                if config_section:
-                    # Call parse_server_info
-                    server_info, all_lines = self.parse_server_info(config_section)
-                    plex_config_content.append(config_section)
-
-                    # Store the extracted server info in a variable
-                    if server_info:
-                        my_server_name = server_info["server_name"]
-                        my_server_version = server_info["version"]
-
-                        stable_version = "1.40.0.7998-c29d4c0c8"
-                        good_version = "1.40.3.8555-fef15d30c"
-
-                        if stable_version < my_server_version < good_version:
-                            mylogger.debug(
-                                f"Server Name: {my_server_name} has Version: {my_server_version}. Potential Rounding Issue because > {stable_version} and < {good_version}"
-                            )
-                            # Store the server version globally in a list
-                            self.server_versions.append((my_server_name, my_server_version))
-                        elif my_server_version >= good_version:
-                            mylogger.debug(f"Server Name: {my_server_name} has Version: {my_server_version}. ALL GOOD")
-                        else:
-                            mylogger.debug(f"Server Name: {my_server_name} has Version: {my_server_version}. ALL GOOD")
-
-            i += 1
-
-        if plex_config_content:
-            return plex_config_content  # Return the list of extracted server info
-        else:
-            return None
+        result = logscan_command.extract_plex_config(content)
+        self.server_versions.extend(result["server_versions"])
+        return result["plex_config_content"]
 
     def extract_plex_config_section(self, lines, start_index, end_markers):
-        """
-        Extract a Plex configuration section starting from a specific index.
-        """
-        config_section = []
-
-        for i in range(start_index, len(lines)):
-            line = lines[i].strip()
-            if any(marker in line for marker in end_markers):
-                break
-            if line:
-                config_section.append(line)
-
-        # Find the index of "Traceback (most recent call last):"
-        traceback_marker = "Traceback (most recent call last):"
-        traceback_line_number = -1
-        for i, line in enumerate(config_section):
-            if traceback_marker in line:
-                traceback_line_number = i
-                break
-
-        # Remove lines after traceback_marker + 1 and before (total_lines - 2)
-        if traceback_line_number >= 0:
-            total_lines = len(config_section)
-            start_remove = traceback_line_number + 1
-            end_remove = total_lines - 2
-            config_section = config_section[:start_remove] + config_section[end_remove + 1 :]
-
-        return "\n".join(config_section) if config_section else None
+        return logscan_command.extract_plex_config_section(lines, start_index, end_markers)
 
     def parse_server_info(self, config_section):
-        """
-        Parse the server name and version from the Plex configuration section.
-        """
-        server_info = {}
-
-        # Initialize a list to keep all lines, including the ones not matched
-        all_lines = []
-
-        # Iterate through each line in the config_section
-        for line in config_section.splitlines():
-            # Add each line to the all_lines list
-            all_lines.append(line)
-
-            # Attempt to match the regex pattern in the current line
-            match = re.search(r"Connected to server\s+([\w\s]+)\s+version\s+(\d+\.\d+\.\d+\.\d+-[\w\d]+)", line)
-            if match:
-                # Extract server name and version from the regex match
-                server_name = match.group(1).strip()
-                version = match.group(2).strip()
-
-                # Store server name and version in dictionary
-                server_info["server_name"] = server_name
-                server_info["version"] = version
-
-        # Log if server info extraction failed for all lines
-        if not server_info:
-            mylogger.debug("Failed to extract server info from config_section")
-
-        return server_info, all_lines
+        return logscan_command.parse_server_info(config_section)
 
     def extract_header_lines(self, content):
-        start_marker_current = "Version: "
-        start_marker_newest = "Newest Version: "
-        end_marker = "Run Command: "
-
-        lines = content.splitlines()
-        header_lines = []
-
-        for i, line in enumerate(lines):
-            if start_marker_current in line:
-                version_value = line.split(start_marker_current)[1].strip()  # Extract version value
-                self.current_kometa_version = version_value  # Store the version as a class variable
-                while line and end_marker not in line:
-                    header_lines.append(line.strip())  # Trim leading and trailing spaces
-                    i += 1
-                    line = lines[i] if i < len(lines) else ""
-                    if start_marker_newest in line:
-                        newest_version_value = line.split(start_marker_newest)[1].strip()  # Extract newest version value
-                        self.kometa_newest_version = newest_version_value  # Store the newest version as a class variable
-                header_lines.append(line.strip())  # Append the "Run Command" line
-                # mylogger.info(f"header_lines bef replacement: {header_lines}")
-                break  # Stop after the first occurrence
-
-        # Perform the replacement after all lines have been added to header_lines
-        header_lines = [line.replace("(redacted)", "") for line in header_lines]
-        header_lines = [line.replace("(redacted)", "") for line in header_lines]
-        # mylogger.info(f"header_lines aft replacement: {header_lines}")
-
-        return "\n".join(header_lines)
+        """Capture the header block and stash the Kometa versions on ``self``."""
+        header_text, current_version, newest_version = logscan_command.extract_header_lines(content)
+        if current_version is not None:
+            self.current_kometa_version = current_version
+        if newest_version is not None:
+            self.kometa_newest_version = newest_version
+        return header_text
 
     def extract_run_command(self, content):
-        if not content:
-            return None
-        for line in content.splitlines():
-            match = re.search(r"Run Command:\s*(.+)$", line)
-            if match:
-                return match.group(1).strip()
-        return None
+        return logscan_command.extract_run_command(content)
 
     def _split_command(self, command):
-        if not command:
-            return []
-        try:
-            return shlex.split(command, posix=False)
-        except Exception:
-            return command.split()
+        return logscan_command.split_command(command)
 
     def compute_command_signature(self, run_command):
-        if not run_command:
-            return None
-        tokens = self._split_command(run_command)
-        flags = []
-        for token in tokens:
-            if token.startswith("-"):
-                flag = token.split("=", 1)[0]
-                flags.append(flag)
-        return " ".join(flags)
+        return logscan_command.compute_command_signature(run_command)
 
     def _extract_config_path_from_command(self, run_command):
-        if not run_command:
-            return None
-        tokens = self._split_command(run_command)
-        for idx, token in enumerate(tokens):
-            if token.startswith("--config="):
-                return token.split("=", 1)[1].strip('"')
-            if token == "--config" and idx + 1 < len(tokens):
-                return tokens[idx + 1].strip('"')
-        return None
+        return logscan_command.extract_config_path_from_command(run_command)
 
     def _derive_config_name_from_path(self, config_path):
-        try:
-            config_path = Path(config_path)
-        except Exception:
-            return None
-        stem = config_path.stem
-        if stem.endswith("_config"):
-            stem = stem[: -len("_config")]
-        return stem or None
+        return logscan_command.derive_config_name_from_path(config_path)
 
     def sanitize_run_command(self, run_command, config_path=None):
-        if not run_command:
-            return None
-        cleaned = run_command
-        if config_path:
-            config_path = str(config_path)
-            cleaned = cleaned.replace(config_path, "<config>")
-            cleaned = cleaned.replace(config_path.replace("\\", "/"), "<config>")
-            cleaned = cleaned.replace(config_path.replace("/", "\\"), "<config>")
-        cleaned = re.sub(
-            r"(?i)(--?[\w-]*(token|apikey|api-key|api_key|secret)\w*)(=|\s+)(\S+)",
-            r"\1\3<redacted>",
-            cleaned,
-        )
-        return cleaned
+        return logscan_command.sanitize_run_command(run_command, config_path=config_path)
 
     def _hash_file(self, path):
-        if not path:
-            return None
-        try:
-            path = Path(path)
-        except Exception:
-            return None
-        if not path.exists():
-            return None
-        hasher = hashlib.sha256()
-        try:
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(8192), b""):
-                    hasher.update(chunk)
-            return hasher.hexdigest()
-        except Exception as exc:
-            mylogger.warning(f"Failed to hash config file {path}: {exc}")
-            return None
+        return logscan_command.hash_file(path)
 
     def _parse_finished_datetime(self, value):
         if not value:

@@ -100,6 +100,8 @@ This reduces the chance of Plex background maintenance colliding with long Komet
 ### Live Previews & Assets
 - **Overlay Preview Generator:** Combines overlays and template variables into real-time preview images
 - **Custom Artwork Uploads:** Drag-and-drop or fetch library images from a URL so you can see what the overlays look like on your favorite poster.
+- **Overlay Image Source Overrides:** Supported overlay families can override built-in badge images per key using `file`, `url`, `git`, or `repo` sources, validate those images before save, preview the result live on the canvas, and optionally convert remote sources into managed local files with `Make Local`.
+- **Managed Overlay Cleanup:** When a managed override image is replaced or removed, Quickstart cleans up the old managed file and can sweep unreferenced managed override images to avoid config bloat.
 
 ![Overlay Preview Canvas](static/images/readme/overlay-preview.png)
 
@@ -476,47 +478,117 @@ Quickstart uses pytest for unit/integration tests and Playwright for E2E tests.
 
 ### Developer Testing
 
-Set up or refresh the local test environment, including runtime requirements, developer requirements, and Playwright browsers:
+The Python test runner is cross-platform:
 
-```
-.\scripts\setup-dev.ps1
+- `scripts/run_tests.py` is the source-of-truth runner for Windows, macOS, and Linux.
+- `scripts/run-tests.ps1` is only a Windows PowerShell wrapper around `scripts/run_tests.py`.
+- `scripts/run_tests.py --setup` installs Python requirements, Node dependencies, and Playwright browsers.
+
+#### Windows (PowerShell)
+
+First-time setup:
+
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+python scripts/run_tests.py --setup
 ```
 
-You can also run setup through the test runner:
+Normal test and lint flow:
 
-```
-.\scripts\run-tests.ps1 -Setup
-.\scripts\run-tests.ps1 -Setup -All
+```powershell
+python scripts/run_tests.py --lint
+python scripts/run_tests.py --repochecks
+python scripts/run_tests.py
+python scripts/run_tests.py --e2e
+python scripts/run_tests.py --all
 ```
 
-Run tests (PowerShell):
+If you prefer the Windows wrapper:
 
+```powershell
+.\scripts\run-tests.ps1 -Lint
+.\scripts\run-tests.ps1 -RepoChecks
+.\scripts\run-tests.ps1
+.\scripts\run-tests.ps1 -E2E
+.\scripts\run-tests.ps1 -All
 ```
-.\scripts\run-tests.ps1          # Unit/integration (non-E2E)
-.\scripts\run-tests.ps1 -E2E     # End-to-end tests (Playwright)
-.\scripts\run-tests.ps1 -All     # Everything
+
+#### macOS and Linux
+
+These steps are identical on macOS and Linux:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+python scripts/run_tests.py --setup
+```
+
+Normal test and lint flow:
+
+```bash
+python scripts/run_tests.py --lint
+python scripts/run_tests.py --repochecks
+python scripts/run_tests.py
+python scripts/run_tests.py --e2e
+python scripts/run_tests.py --all
+```
+
+#### Direct commands
+
+Use these when you want to run individual layers yourself instead of the wrapper:
+
+```bash
+npm run lint:eslint
+python -m pre_commit run --all-files
+python -m pytest -p pytest_progress_plugin tests -m "not e2e and not ratings_matrix" -vv -o console_output_style=count
+python -m pytest -p pytest_progress_plugin tests -m e2e -vv -o console_output_style=count
 ```
 
 Fast focused paths:
 
-```
+```powershell
 .\venv\Scripts\python.exe -m pytest tests\test_importer_edge_cases.py
 .\venv\Scripts\python.exe -m pytest tests\test_workspace_dependency_logic.py
 .\venv\Scripts\python.exe -m pytest tests\test_core_backend.py -k final
-.\scripts\run-tests.ps1 -E2E
 ```
 
-If you prefer raw commands:
+Unix/macOS equivalents:
 
-```
-python -m pytest -m "not e2e" -vv
-python -m pytest -m e2e -vv
+```bash
+venv/bin/python -m pytest tests/test_importer_edge_cases.py
+venv/bin/python -m pytest tests/test_workspace_dependency_logic.py
+venv/bin/python -m pytest tests/test_core_backend.py -k final
 ```
 
 Notes for Playwright on Windows:
 
 - Playwright requires named pipes. If you see `Access is denied`, re-run PowerShell as Administrator or adjust security policy to allow Playwright browser processes.
 - E2E tests load Bootstrap and jQuery from CDNs (`cdn.jsdelivr.net`, `code.jquery.com`). If you’re behind a strict firewall, allowlist those hosts or the tests may fail to render the UI correctly.
+
+## Frontend Tooling
+
+Quickstart serves its JavaScript directly from `static/local-js/` via Flask in production and is gradually being migrated to ES modules (see roadmap issue #1334). [Vite](https://vitejs.dev/) is now wired up as the future build pipeline for the modular files.
+
+**Today, the Vite build tooling is dormant** — nothing in production references its output. Flask still loads JS from `static/local-js/` exactly as before. The scaffolding is in place so that future PRs (validation widget consolidation, Alpine, etc.) can plug into it.
+
+Vitest, by contrast, is **active**: `npm test` is enforced in CI via the `Vitest` job in `.github/workflows/lint.yml`. New JS unit tests should land alongside the modules they cover.
+
+Use cases for developers:
+
+```
+npm install            # one-time, installs dev tooling
+npm run dev            # Vite dev server on http://localhost:5173 (HMR for ESM files)
+npm run build          # emits production bundles into static/dist/ (gitignored)
+npm run preview        # serves the built bundles for a quick smoke test
+npm test               # Vitest, one-shot run (used by CI)
+npm run test:watch     # Vitest in watch mode
+npm run lint:eslint    # existing ESLint job (unchanged)
+```
+
+Which files Vite knows about: every file in `static/local-js/*.js` that already starts with an `import` or `export` statement is auto-discovered as a Vite entry point. This stays in sync with `MODULE_PAGE_SCRIPTS` in `quickstart.py` without manual updates.
+
+JS tests live under `tests/js/` (mirroring the existing `tests/` convention for Python tests) and use the jsdom environment so DOM-touching code can be exercised without a real browser.
 
 ## Appendix: Dependency Map
 

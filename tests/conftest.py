@@ -44,10 +44,29 @@ def _load_app(config_dir, kometa_root):
     import modules.helpers as helpers
 
     _seed_schema_files(config_dir)
-    helpers.CONFIG_DIR = str(config_dir)
-    helpers.JSON_SCHEMA_DIR = os.path.join(str(config_dir), ".schema")
-    helpers.HASH_FILE = os.path.join(str(config_dir), ".schema", "file_hashes.txt")
-    helpers.RESTART_NOTICE_FILE = os.path.join(str(config_dir), "restart_needed.flag")
+    # NOTE: After helpers.py was decomposed into a package, path constants
+    # like ``CONFIG_DIR`` live as module-level globals inside ``_legacy.py``.
+    # Extracted submodules (``_fonts`` etc.) import these at load time, so
+    # their bindings drift independently from the package. Patch every loaded
+    # submodule that carries the constant.
+    config_dir = str(config_dir)
+    schema_dir = os.path.join(config_dir, ".schema")
+    hash_file = os.path.join(schema_dir, "file_hashes.txt")
+    restart_notice = os.path.join(config_dir, "restart_needed.flag")
+    mods = {helpers}
+    for attr_name in dir(helpers):
+        obj = getattr(helpers, attr_name)
+        if isinstance(obj, type(helpers)) and hasattr(obj, "CONFIG_DIR"):
+            mods.add(obj)
+    for mod in mods:
+        if hasattr(mod, "CONFIG_DIR"):
+            mod.CONFIG_DIR = config_dir
+        if hasattr(mod, "JSON_SCHEMA_DIR"):
+            mod.JSON_SCHEMA_DIR = schema_dir
+        if hasattr(mod, "HASH_FILE"):
+            mod.HASH_FILE = hash_file
+        if hasattr(mod, "RESTART_NOTICE_FILE"):
+            mod.RESTART_NOTICE_FILE = restart_notice
     helpers.check_for_update = lambda: {
         "local_version": "0.0.0",
         "remote_version": "0.0.0",
@@ -79,25 +98,118 @@ def qs_module(app):
     return sys.modules.get("quickstart") or _LOADED.get("module")
 
 
+@pytest.fixture(scope="session")
+def workspace_status_module(qs_module):
+    """Direct handle to ``modules.workspace_status``.
+
+    Tests must patch *this* module (not ``qs_module``) for symbols whose
+    runtime call site lives inside ``modules/workspace_status.py`` --
+    e.g. ``_build_kometa_install_context``, ``_build_final_gate``,
+    ``_get_imagemaid_settings_section``. ``qs_module`` re-exports these
+    names but the functions inside ``workspace_status`` resolve them in
+    their own module namespace.
+    """
+    import modules.workspace_status as ws
+
+    return ws
+
+
+@pytest.fixture(scope="session")
+def library_routes_module(qs_module):
+    """Direct handle to ``blueprints.library_routes``.
+
+    Same rationale as ``workspace_status_module`` -- when a test needs to
+    monkeypatch a helper (e.g. ``_build_library_lists``,
+    ``_migrate_legacy_playlist_libraries_to_library_toggles``,
+    ``_build_preview_image_data``) that is called from *inside* a route in
+    ``blueprints/library_routes.py``, patching ``qs_module`` will only
+    update the re-export; the actual call resolves through the blueprint
+    module's own namespace.
+    """
+    import blueprints.library_routes as lr
+
+    return lr
+
+
+@pytest.fixture(scope="session")
+def import_config_routes_module(qs_module):
+    """Direct handle to ``blueprints.import_config_routes``.
+
+    Same rationale as ``workspace_status_module`` and
+    ``library_routes_module`` -- patches on ``qs_module._foo`` only update
+    the re-export.  Use this fixture to monkeypatch helpers that route
+    callers inside the import-config blueprint resolve through their own
+    module namespace (e.g. ``_coerce_validation_response_payload``,
+    ``_map_playlist_libraries``, ``count_annotated_lines``).
+    """
+    import blueprints.import_config_routes as ic
+
+    return ic
+
+
+@pytest.fixture(scope="session")
+def imagemaid_routes_module(qs_module):
+    """Direct handle to ``blueprints.imagemaid_routes``.
+
+    Same rationale as the other ``*_routes_module`` fixtures -- patches on
+    ``qs_module._foo`` only update the re-export.  Use this fixture to
+    monkeypatch helpers that route callers inside the imagemaid-runtime
+    blueprint resolve through their own module namespace.
+    """
+    import blueprints.imagemaid_routes as ir
+
+    return ir
+
+
 @pytest.fixture()
 def client(app):
     return app.test_client()
 
 
-@pytest.fixture()
-def isolated_config_dir(tmp_path, monkeypatch, app):
+def _patch_helpers_paths(monkeypatch, config_dir):
+    """Re-bind CONFIG_DIR + friends across all helpers namespaces.
+
+    After ``modules/helpers.py`` was split into a package, path constants
+    like ``CONFIG_DIR`` are imported at module load time by extracted
+    submodules (``_fonts``, ``_paths``, etc.) from ``_legacy``.  Those
+    import-time bindings then drift independently from the package-level
+    ``helpers.CONFIG_DIR``.  Functions inside any submodule resolve the
+    constant from *their own* module globals, so we must patch every
+    submodule that uses these constants.
+    """
     import modules.helpers as helpers
 
+    config_dir = str(config_dir)
+    schema_dir = os.path.join(config_dir, ".schema")
+    hash_file = os.path.join(schema_dir, "file_hashes.txt")
+    restart_notice = os.path.join(config_dir, "restart_needed.flag")
+
+    # Patch the package and every loaded submodule that carries path constants.
+    mods = {helpers}
+    for attr_name in dir(helpers):
+        obj = getattr(helpers, attr_name)
+        if isinstance(obj, type(helpers)) and hasattr(obj, "CONFIG_DIR"):
+            mods.add(obj)
+    for mod in mods:
+        if hasattr(mod, "CONFIG_DIR"):
+            monkeypatch.setattr(mod, "CONFIG_DIR", config_dir)
+        if hasattr(mod, "JSON_SCHEMA_DIR"):
+            monkeypatch.setattr(mod, "JSON_SCHEMA_DIR", schema_dir)
+        if hasattr(mod, "HASH_FILE"):
+            monkeypatch.setattr(mod, "HASH_FILE", hash_file)
+        if hasattr(mod, "RESTART_NOTICE_FILE"):
+            monkeypatch.setattr(mod, "RESTART_NOTICE_FILE", restart_notice)
+
+
+@pytest.fixture()
+def isolated_config_dir(tmp_path, monkeypatch, app):
     config_dir = tmp_path / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     _seed_schema_files(config_dir)
     kometa_root = tmp_path / "_qs_test_kometa_root"
     kometa_root.mkdir(parents=True, exist_ok=True)
 
-    monkeypatch.setattr(helpers, "CONFIG_DIR", str(config_dir))
-    monkeypatch.setattr(helpers, "JSON_SCHEMA_DIR", str(config_dir / ".schema"))
-    monkeypatch.setattr(helpers, "HASH_FILE", str(config_dir / ".schema" / "file_hashes.txt"))
-    monkeypatch.setattr(helpers, "RESTART_NOTICE_FILE", str(config_dir / "restart_needed.flag"))
+    _patch_helpers_paths(monkeypatch, config_dir)
     app.config["KOMETA_ROOT"] = str(kometa_root)
 
     return config_dir
@@ -105,18 +217,13 @@ def isolated_config_dir(tmp_path, monkeypatch, app):
 
 @pytest.fixture()
 def _runtime_isolation(tmp_path, monkeypatch, app):
-    import modules.helpers as helpers
-
     config_dir = tmp_path / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     _seed_schema_files(config_dir)
     kometa_root = tmp_path / "_qs_test_kometa_root"
     kometa_root.mkdir(parents=True, exist_ok=True)
 
-    monkeypatch.setattr(helpers, "CONFIG_DIR", str(config_dir))
-    monkeypatch.setattr(helpers, "JSON_SCHEMA_DIR", str(config_dir / ".schema"))
-    monkeypatch.setattr(helpers, "HASH_FILE", str(config_dir / ".schema" / "file_hashes.txt"))
-    monkeypatch.setattr(helpers, "RESTART_NOTICE_FILE", str(config_dir / "restart_needed.flag"))
+    _patch_helpers_paths(monkeypatch, config_dir)
     app.config["KOMETA_ROOT"] = str(kometa_root)
 
     return {"config_dir": config_dir, "kometa_root": kometa_root}

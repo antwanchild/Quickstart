@@ -157,14 +157,14 @@ def test_validate_library_auto_sort_hubs_rejects_invalid_value(qs_module):
     assert errors == ["Movies: auto_sort_hubs must be one of: alpha, alpha.desc, configured, configured.desc, random, sort_title, sort_title.desc"]
 
 
-def test_library_fragment_disables_auto_sort_hubs_without_plex_pass(client, monkeypatch, qs_module):
+def test_library_fragment_disables_auto_sort_hubs_without_plex_pass(client, monkeypatch, qs_module, library_routes_module):
     monkeypatch.setattr(
-        qs_module,
+        library_routes_module,
         "_build_library_lists",
         lambda: ([{"id": "mov-library_movies", "name": "Movies", "type": "movie"}], [], {"plex_pass": False}),
     )
-    monkeypatch.setattr(qs_module, "_migrate_legacy_playlist_libraries_to_library_toggles", lambda *_args: set())
-    monkeypatch.setattr(qs_module, "_build_preview_image_data", lambda: {"movie": {}, "show": {}})
+    monkeypatch.setattr(library_routes_module, "_migrate_legacy_playlist_libraries_to_library_toggles", lambda *_args: set())
+    monkeypatch.setattr(library_routes_module, "_build_preview_image_data", lambda: {"movie": {}, "show": {}})
 
     original_retrieve_settings = qs_module.persistence.retrieve_settings
 
@@ -377,6 +377,930 @@ def test_validate_metadata_file_organizes_local_file_into_managed_store(client, 
     managed_file = isolated_config_dir.parent / Path(normalized_location)
     assert managed_file.exists()
     assert managed_file.read_text(encoding="utf-8") == metadata_file.read_text(encoding="utf-8")
+
+
+def test_validate_overlay_source_override_organizes_local_file_into_managed_store(client, isolated_config_dir, tmp_path):
+    from pathlib import Path
+
+    from PIL import Image
+
+    config_name = "pytest_validate_overlay_source"
+    image_path = tmp_path / "4k.png"
+    Image.new("RGBA", (4, 4), (255, 0, 0, 0)).save(image_path)
+
+    resp = client.post(
+        "/validate_overlay_source_override",
+        json={
+            "config_name": config_name,
+            "library_id": "mov-library_movies",
+            "overlay_id": "overlay_resolution",
+            "template_key": "file_4k",
+            "source_type": "file",
+            "source_value": str(image_path),
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["valid"] is True
+    assert payload["organized"] is True
+    normalized_location = str(payload["normalized_location"]).replace("\\", "/")
+    assert normalized_location.startswith(f"config/{config_name}/overlay_images/mov-library_movies/overlay_resolution/")
+    managed_file = isolated_config_dir.parent / Path(normalized_location)
+    assert managed_file.exists()
+    assert managed_file.read_bytes() == image_path.read_bytes()
+
+
+def test_validate_overlay_source_override_rejects_opaque_png_file(client, tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "opaque.png"
+    Image.new("RGBA", (4, 4), (255, 0, 0, 255)).save(image_path)
+
+    resp = client.post(
+        "/validate_overlay_source_override",
+        json={
+            "source_type": "file",
+            "source_value": str(image_path),
+        },
+    )
+
+    assert resp.status_code == 400
+    payload = resp.get_json()
+    assert payload["valid"] is False
+    assert "must include transparency" in payload["error"]
+
+
+def test_validate_overlay_source_override_rejects_file_suffix_mismatch(client, tmp_path):
+    import io
+
+    from PIL import Image
+
+    image_path = tmp_path / "badge.webp"
+    image_bytes = io.BytesIO()
+    Image.new("RGBA", (4, 4), (255, 0, 0, 0)).save(image_bytes, format="PNG")
+    image_path.write_bytes(image_bytes.getvalue())
+
+    resp = client.post(
+        "/validate_overlay_source_override",
+        json={
+            "source_type": "file",
+            "source_value": str(image_path),
+        },
+    )
+
+    assert resp.status_code == 400
+    payload = resp.get_json()
+    assert payload["valid"] is False
+    assert "path suffix must match the detected PNG format" in payload["error"]
+
+
+def test_validate_overlay_source_override_rejects_jpg_url(client, monkeypatch):
+    import io
+
+    from PIL import Image
+
+    image_bytes = io.BytesIO()
+    Image.new("RGB", (4, 4), (255, 0, 0)).save(image_bytes, format="JPEG")
+
+    class _Response:
+        status_code = 200
+        reason = "OK"
+        content = image_bytes.getvalue()
+        headers = {"Content-Type": "image/jpeg"}
+
+    monkeypatch.setattr("modules.validations.requests.get", lambda *_args, **_kwargs: _Response())
+
+    resp = client.post(
+        "/validate_overlay_source_override",
+        json={
+            "source_type": "url",
+            "source_value": "https://example.com/badge.jpg",
+        },
+    )
+
+    assert resp.status_code == 400
+    payload = resp.get_json()
+    assert payload["valid"] is False
+    assert "must be PNG or WEBP images" in payload["error"]
+
+
+def test_validate_overlay_source_override_rejects_url_content_type_mismatch(client, monkeypatch):
+    import io
+
+    from PIL import Image
+
+    image_bytes = io.BytesIO()
+    Image.new("RGBA", (4, 4), (255, 0, 0, 0)).save(image_bytes, format="PNG")
+
+    class _Response:
+        status_code = 200
+        reason = "OK"
+        content = image_bytes.getvalue()
+        headers = {"Content-Type": "image/webp"}
+
+    monkeypatch.setattr("modules.validations.requests.get", lambda *_args, **_kwargs: _Response())
+
+    resp = client.post(
+        "/validate_overlay_source_override",
+        json={
+            "source_type": "url",
+            "source_value": "https://example.com/badge.png",
+        },
+    )
+
+    assert resp.status_code == 400
+    payload = resp.get_json()
+    assert payload["valid"] is False
+    assert "Content-Type must match the detected PNG format" in payload["error"]
+
+
+def test_validate_overlay_source_override_warns_for_poster_sized_image(client, tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "posterish.png"
+    Image.new("RGBA", (1000, 1500), (255, 0, 0, 0)).save(image_path)
+
+    resp = client.post(
+        "/validate_overlay_source_override",
+        json={
+            "source_type": "file",
+            "source_value": str(image_path),
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["valid"] is True
+    assert "warning" in payload
+    assert "unusually large for a badge overlay" in payload["warning"]
+    assert "close to a full poster/canvas size" in payload["warning"]
+
+
+def test_validate_overlay_source_override_warns_for_tiny_extreme_aspect_image(client, tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "tiny-wide.png"
+    Image.new("RGBA", (100, 10), (255, 0, 0, 0)).save(image_path)
+
+    resp = client.post(
+        "/validate_overlay_source_override",
+        json={
+            "source_type": "file",
+            "source_value": str(image_path),
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["valid"] is True
+    assert "warning" in payload
+    assert "extremely small" in payload["warning"]
+
+
+def test_validate_overlay_source_override_does_not_warn_for_resolution_badge_aspect(client, tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "4k.png"
+    Image.new("RGBA", (292, 60), (255, 0, 0, 0)).save(image_path)
+
+    resp = client.post(
+        "/validate_overlay_source_override",
+        json={
+            "source_type": "file",
+            "source_value": str(image_path),
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["valid"] is True
+    assert "warning" not in payload
+
+
+def test_validate_overlay_source_override_rejects_oversized_file(client, tmp_path):
+    image_path = tmp_path / "too-big.png"
+    image_path.write_bytes(b"x" * (1024 * 1024))
+
+    resp = client.post(
+        "/validate_overlay_source_override",
+        json={
+            "source_type": "file",
+            "source_value": str(image_path),
+        },
+    )
+
+    assert resp.status_code == 400
+    payload = resp.get_json()
+    assert payload["valid"] is False
+    assert "must be 1 MB or smaller" in payload["error"]
+
+
+def test_validate_overlay_source_override_rejects_oversized_url(client, monkeypatch):
+    class _Response:
+        status_code = 200
+        reason = "OK"
+        content = b"x" * (1024 * 1024)
+        headers = {"Content-Type": "image/png"}
+
+    monkeypatch.setattr("modules.validations.requests.get", lambda *_args, **_kwargs: _Response())
+
+    resp = client.post(
+        "/validate_overlay_source_override",
+        json={
+            "source_type": "url",
+            "source_value": "https://example.com/badge.png",
+        },
+    )
+
+    assert resp.status_code == 400
+    payload = resp.get_json()
+    assert payload["valid"] is False
+    assert "must be 1 MB or smaller" in payload["error"]
+
+
+def test_overlay_source_make_local_rehomes_remote_image(client, isolated_config_dir, monkeypatch):
+    import io
+    from pathlib import Path
+
+    from PIL import Image
+
+    config_name = "pytest_make_local_overlay_source"
+    image_bytes = io.BytesIO()
+    Image.new("RGBA", (24, 24), (255, 0, 0, 0)).save(image_bytes, format="PNG")
+
+    class _Response:
+        status_code = 200
+        reason = "OK"
+        content = image_bytes.getvalue()
+        headers = {"Content-Type": "image/png"}
+
+    monkeypatch.setattr("modules.validations.requests.get", lambda *_args, **_kwargs: _Response())
+
+    resp = client.post(
+        "/overlay-source-make-local",
+        json={
+            "config_name": config_name,
+            "library_id": "mov-library_movies",
+            "overlay_id": "overlay_resolution",
+            "template_key": "url_4k",
+            "source_type": "url",
+            "source_value": "https://example.com/4k.png",
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["valid"] is True
+    assert payload["source_type"] == "file"
+    assert payload["organized"] is True
+    normalized_location = str(payload["normalized_location"]).replace("\\", "/")
+    assert normalized_location.startswith(f"config/{config_name}/overlay_images/mov-library_movies/overlay_resolution/")
+    managed_file = isolated_config_dir.parent / Path(normalized_location)
+    assert managed_file.exists()
+    assert managed_file.read_bytes() == image_bytes.getvalue()
+
+
+def test_overlay_source_make_local_rejects_file_source(client):
+    resp = client.post(
+        "/overlay-source-make-local",
+        json={
+            "config_name": "pytest_make_local_overlay_source",
+            "library_id": "mov-library_movies",
+            "overlay_id": "overlay_resolution",
+            "template_key": "file_4k",
+            "source_type": "file",
+            "source_value": "config/pytest/overlay_images/example.png",
+        },
+    )
+
+    assert resp.status_code == 400
+    payload = resp.get_json()
+    assert payload["valid"] is False
+    assert "Only URL, git, or repo overlay sources can be made local." in payload["error"]
+
+
+def test_overlay_source_cleanup_removes_requested_managed_file(client, isolated_config_dir):
+
+    config_name = "pytest_overlay_cleanup_remove"
+    managed_dir = isolated_config_dir / config_name / "overlay_images" / "mov-library_movies" / "overlay_resolution"
+    managed_dir.mkdir(parents=True, exist_ok=True)
+    managed_file = managed_dir / "file_4k.png"
+    managed_file.write_bytes(b"png")
+
+    resp = client.post(
+        "/overlay-source-cleanup",
+        json={
+            "config_name": config_name,
+            "library_id": "mov-library_movies",
+            "overlay_id": "overlay_resolution",
+            "remove_locations": [f"config/{config_name}/overlay_images/mov-library_movies/overlay_resolution/file_4k.png"],
+            "retain_locations": [],
+            "sweep": False,
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["valid"] is True
+    assert managed_file.exists() is False
+    assert f"config/{config_name}/overlay_images/mov-library_movies/overlay_resolution/file_4k.png" in payload["removed"]
+    assert payload["errors"] == []
+
+
+def test_overlay_source_cleanup_sweeps_only_unreferenced_files_in_scope(client, isolated_config_dir):
+    config_name = "pytest_overlay_cleanup_sweep"
+    scope_dir = isolated_config_dir / config_name / "overlay_images" / "mov-library_movies" / "overlay_resolution"
+    other_overlay_dir = isolated_config_dir / config_name / "overlay_images" / "mov-library_movies" / "overlay_audio_codec"
+    other_library_dir = isolated_config_dir / config_name / "overlay_images" / "sho-library_shows" / "overlay_resolution"
+    scope_dir.mkdir(parents=True, exist_ok=True)
+    other_overlay_dir.mkdir(parents=True, exist_ok=True)
+    other_library_dir.mkdir(parents=True, exist_ok=True)
+
+    keep_file = scope_dir / "keep.png"
+    orphan_file = scope_dir / "orphan.png"
+    other_overlay_file = other_overlay_dir / "other.png"
+    other_library_file = other_library_dir / "show.png"
+    keep_file.write_bytes(b"keep")
+    orphan_file.write_bytes(b"orphan")
+    other_overlay_file.write_bytes(b"other-overlay")
+    other_library_file.write_bytes(b"other-library")
+
+    resp = client.post(
+        "/overlay-source-cleanup",
+        json={
+            "config_name": config_name,
+            "library_id": "mov-library_movies",
+            "overlay_id": "overlay_resolution",
+            "retain_locations": [f"config/{config_name}/overlay_images/mov-library_movies/overlay_resolution/keep.png"],
+            "sweep": True,
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["valid"] is True
+    assert keep_file.exists() is True
+    assert orphan_file.exists() is False
+    assert other_overlay_file.exists() is True
+    assert other_library_file.exists() is True
+    assert f"config/{config_name}/overlay_images/mov-library_movies/overlay_resolution/orphan.png" in payload["removed"]
+
+
+def test_overlay_render_preview_stacks_resolution_and_edition_sources(client, isolated_config_dir):
+    import io
+
+    from PIL import Image
+
+    resolution_path = isolated_config_dir / "overlay_images" / "4k.png"
+    edition_path = isolated_config_dir / "overlay_images" / "enhanced.png"
+    resolution_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (160, 48), (255, 0, 0, 0)).save(resolution_path)
+    Image.new("RGBA", (220, 64), (0, 255, 0, 0)).save(edition_path)
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_resolution",
+            "use_resolution": True,
+            "use_edition": True,
+            "spacing": 12,
+            "resolution": {
+                "badge_key": "4k",
+                "source_type": "file",
+                "source_value": str(resolution_path),
+            },
+            "edition": {
+                "badge_key": "enhanced",
+                "source_type": "file",
+                "source_value": str(edition_path),
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size == (220, 124)
+
+
+def test_overlay_render_preview_returns_single_resolution_badge(client, isolated_config_dir):
+    import io
+
+    from PIL import Image
+
+    resolution_path = isolated_config_dir / "overlay_images" / "720p.png"
+    resolution_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (140, 52), (255, 0, 0, 0)).save(resolution_path)
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_resolution",
+            "use_resolution": True,
+            "use_edition": False,
+            "resolution": {
+                "badge_key": "720p",
+                "source_type": "file",
+                "source_value": str(resolution_path),
+            },
+            "edition": {
+                "badge_key": "enhanced",
+                "source_type": "",
+                "source_value": "",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size == (140, 52)
+
+
+def test_overlay_render_preview_returns_audio_codec_badge_from_file_source(client, isolated_config_dir):
+    import io
+
+    from PIL import Image
+
+    audio_path = isolated_config_dir / "overlay_images" / "plus_atmos.png"
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (180, 60), (255, 0, 0, 0)).save(audio_path)
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_audio_codec",
+            "audio_codec": {
+                "badge_key": "plus_atmos",
+                "source_type": "file",
+                "source_value": str(audio_path),
+                "variant": "compact",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size == (180, 60)
+
+
+def test_overlay_render_preview_returns_bundled_audio_codec_badge_with_underscores(client):
+    import io
+
+    from PIL import Image
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_audio_codec",
+            "audio_codec": {
+                "badge_key": "plus_atmos",
+                "source_type": "",
+                "source_value": "",
+                "variant": "compact",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size[0] > 0
+        assert rendered.size[1] > 0
+
+
+def test_overlay_render_preview_returns_streaming_badge_from_file_source(client, isolated_config_dir):
+    import io
+
+    from PIL import Image
+
+    streaming_path = isolated_config_dir / "overlay_images" / "Prime Video.png"
+    streaming_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (220, 72), (255, 0, 0, 0)).save(streaming_path)
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_streaming",
+            "streaming": {
+                "badge_key": "amazon",
+                "source_type": "file",
+                "source_value": str(streaming_path),
+                "variant": "color",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size == (220, 72)
+
+
+def test_overlay_render_preview_returns_bundled_streaming_badge_from_key_map(client):
+    import io
+
+    from PIL import Image
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_streaming",
+            "streaming": {
+                "badge_key": "amazon",
+                "source_type": "",
+                "source_value": "",
+                "variant": "white",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size[0] > 0
+        assert rendered.size[1] > 0
+
+
+def test_overlay_render_preview_returns_network_badge_from_file_source(client, isolated_config_dir):
+    import io
+
+    from PIL import Image
+
+    network_path = isolated_config_dir / "overlay_images" / "BBC One.png"
+    network_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (240, 80), (255, 0, 0, 0)).save(network_path)
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_network",
+            "network": {
+                "badge_key": "BBC One",
+                "source_type": "file",
+                "source_value": str(network_path),
+                "variant": "white",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size == (240, 80)
+
+
+def test_overlay_render_preview_returns_bundled_network_badge(client):
+    import io
+
+    from PIL import Image
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_network",
+            "network": {
+                "badge_key": "BBC One",
+                "source_type": "",
+                "source_value": "",
+                "variant": "color",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size[0] > 0
+        assert rendered.size[1] > 0
+
+
+def test_overlay_render_preview_returns_studio_badge_from_file_source(client, isolated_config_dir):
+    import io
+
+    from PIL import Image
+
+    studio_path = isolated_config_dir / "overlay_images" / "8bit.png"
+    studio_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (260, 90), (255, 0, 0, 0)).save(studio_path)
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_studio",
+            "studio": {
+                "badge_key": "8bit",
+                "source_type": "file",
+                "source_value": str(studio_path),
+                "variant": "standard",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size == (260, 90)
+
+
+def test_overlay_render_preview_returns_bundled_studio_badge(client):
+    import io
+
+    from PIL import Image
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_studio",
+            "studio": {
+                "badge_key": "8bit",
+                "source_type": "",
+                "source_value": "",
+                "variant": "bigger",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size[0] > 0
+        assert rendered.size[1] > 0
+
+
+def test_overlay_render_preview_returns_ribbon_badge_from_file_source(client, isolated_config_dir):
+    import io
+
+    from PIL import Image
+
+    ribbon_path = isolated_config_dir / "overlay_images" / "oscars_director.png"
+    ribbon_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (210, 60), (255, 0, 0, 0)).save(ribbon_path)
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_ribbon",
+            "ribbon": {
+                "badge_key": "oscars_director",
+                "source_type": "file",
+                "source_value": str(ribbon_path),
+                "variant": "gray",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size == (210, 60)
+
+
+def test_overlay_render_preview_returns_bundled_ribbon_badge(client):
+    import io
+
+    from PIL import Image
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_ribbon",
+            "ribbon": {
+                "badge_key": "oscars_director",
+                "source_type": "",
+                "source_value": "",
+                "variant": "black",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size[0] > 0
+        assert rendered.size[1] > 0
+
+
+def test_overlay_render_preview_returns_language_count_badge_from_file_source(client, isolated_config_dir):
+    import io
+
+    from PIL import Image
+
+    language_path = isolated_config_dir / "overlay_images" / "dual_audio.png"
+    language_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (166, 84), (255, 0, 0, 0)).save(language_path)
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_language_count",
+            "language_count": {
+                "badge_key": "dual",
+                "source_type": "file",
+                "source_value": str(language_path),
+                "variant": "audio",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size == (166, 84)
+
+
+def test_overlay_render_preview_returns_bundled_language_count_badge(client):
+    import io
+
+    from PIL import Image
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_language_count",
+            "language_count": {
+                "badge_key": "multi",
+                "source_type": "",
+                "source_value": "",
+                "variant": "subs",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size[0] > 0
+        assert rendered.size[1] > 0
+
+
+def test_overlay_render_preview_returns_versions_badge_from_file_source(client, isolated_config_dir):
+    import io
+
+    from PIL import Image
+
+    versions_path = isolated_config_dir / "overlay_images" / "versions.png"
+    versions_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (105, 105), (255, 0, 0, 0)).save(versions_path)
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_versions",
+            "versions": {
+                "badge_key": "versions",
+                "source_type": "file",
+                "source_value": str(versions_path),
+                "variant": "",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size == (105, 105)
+
+
+def test_overlay_render_preview_returns_bundled_versions_badge(client):
+    import io
+
+    from PIL import Image
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_versions",
+            "versions": {
+                "badge_key": "versions",
+                "source_type": "",
+                "source_value": "",
+                "variant": "",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size[0] > 0
+        assert rendered.size[1] > 0
+
+
+def test_overlay_render_preview_returns_mediastinger_badge_from_file_source(client, isolated_config_dir):
+    import io
+
+    from PIL import Image
+
+    mediastinger_path = isolated_config_dir / "overlay_images" / "Mediastinger.png"
+    mediastinger_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (85, 88), (255, 0, 0, 0)).save(mediastinger_path)
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_mediastinger",
+            "mediastinger": {
+                "badge_key": "Mediastinger",
+                "source_type": "file",
+                "source_value": str(mediastinger_path),
+                "variant": "",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size == (85, 88)
+
+
+def test_overlay_render_preview_returns_bundled_mediastinger_badge(client):
+    import io
+
+    from PIL import Image
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_mediastinger",
+            "mediastinger": {
+                "badge_key": "Mediastinger",
+                "source_type": "",
+                "source_value": "",
+                "variant": "",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size[0] > 0
+        assert rendered.size[1] > 0
+
+
+def test_overlay_render_preview_returns_direct_play_badge_from_file_source(client, isolated_config_dir):
+    import io
+
+    from PIL import Image
+
+    direct_play_path = isolated_config_dir / "overlay_images" / "Direct-Play.png"
+    direct_play_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (270, 132), (255, 0, 0, 0)).save(direct_play_path)
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_direct_play",
+            "direct_play": {
+                "badge_key": "Direct-Play",
+                "source_type": "file",
+                "source_value": str(direct_play_path),
+                "variant": "",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size == (270, 132)
+
+
+def test_overlay_render_preview_returns_bundled_direct_play_badge(client):
+    import io
+
+    from PIL import Image
+
+    resp = client.post(
+        "/overlay-render-preview",
+        json={
+            "overlay_id": "overlay_direct_play",
+            "direct_play": {
+                "badge_key": "Direct-Play",
+                "source_type": "",
+                "source_value": "",
+                "variant": "",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Image.open(io.BytesIO(resp.data)) as rendered:
+        assert rendered.size[0] > 0
+        assert rendered.size[1] > 0
+
+
+def test_overlay_preview_keys_returns_network_keys(client):
+    resp = client.get("/overlay-preview-keys?family=network")
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["status"] == "success"
+    assert payload["family"] == "network"
+    assert "BBC One" in payload["keys"]
+
+
+def test_overlay_preview_keys_returns_studio_keys(client):
+    resp = client.get("/overlay-preview-keys?family=studio")
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["status"] == "success"
+    assert payload["family"] == "studio"
+    assert "8bit" in payload["keys"]
+
+
+def test_overlay_preview_keys_rejects_unsupported_family(client):
+    resp = client.get("/overlay-preview-keys?family=resolution")
+
+    assert resp.status_code == 400
+    payload = resp.get_json()
+    assert payload["status"] == "error"
+    assert "Unsupported bundled overlay key family" in payload["message"]
 
 
 def test_validate_collection_file_rejects_missing_top_level_collections(client, tmp_path):
@@ -2588,6 +3512,44 @@ def test_download_redacted_bundles_managed_overlay_folder(client, isolated_confi
         assert "internal.example" not in bundled_text
 
 
+def test_download_redacted_bundles_managed_overlay_source_image(client, isolated_config_dir):
+    import io
+    import zipfile
+
+    from PIL import Image
+
+    config_name = "pytest_overlay_image_bundle"
+    managed_dir = isolated_config_dir / config_name / "overlay_images" / "mov-library_movies" / "overlay_resolution"
+    managed_dir.mkdir(parents=True, exist_ok=True)
+    managed_file = managed_dir / "file_4k.png"
+    Image.new("RGB", (2, 2), (0, 255, 0)).save(managed_file)
+
+    with client.session_transaction() as sess:
+        sess["config_name"] = config_name
+        sess["yaml_content"] = (
+            "libraries:\n"
+            "  Movies:\n"
+            "    overlay_files:\n"
+            "      - default: resolution\n"
+            "        template_variables:\n"
+            f"          file_4k: config/{config_name}/overlay_images/mov-library_movies/overlay_resolution/file_4k.png\n"
+        )
+
+    resp = client.get("/download_redacted")
+    assert resp.status_code == 200
+    assert resp.mimetype == "application/zip"
+
+    with zipfile.ZipFile(io.BytesIO(resp.data)) as archive:
+        names = set(archive.namelist())
+        assert "config_redacted.yml" in names
+        bundled_name = f"{config_name}/overlay_images/mov-library_movies/overlay_resolution/file_4k.png"
+        assert bundled_name in names
+        bundled_bytes = archive.read(bundled_name)
+        assert bundled_bytes == managed_file.read_bytes()
+        bundled_yaml = archive.read("config_redacted.yml").decode("utf-8")
+        assert f"file_4k: config/{config_name}/overlay_images/mov-library_movies/overlay_resolution/file_4k.png" in bundled_yaml
+
+
 def test_upload_fonts_store_in_active_config_directory(client, isolated_config_dir):
     import io
 
@@ -3340,7 +4302,7 @@ def test_retrieve_settings_sanitizes_already_persisted_transient_fields(client, 
     assert "importMode" not in stored["anidb"]
 
 
-def test_copy_library_settings_mirrors_metadata_files(client, isolated_config_dir, monkeypatch, app, qs_module):
+def test_copy_library_settings_mirrors_metadata_files(client, isolated_config_dir, monkeypatch, app, qs_module, library_routes_module):
     import json
     from pathlib import Path
 
@@ -3376,7 +4338,7 @@ def test_copy_library_settings_mirrors_metadata_files(client, isolated_config_di
         },
     )
     monkeypatch.setattr(
-        qs_module,
+        library_routes_module,
         "_build_library_lists",
         lambda: (
             [
@@ -3435,10 +4397,13 @@ def test_sync_managed_library_artifacts_to_kometa_copies_and_prunes(isolated_con
     config_name = "pytest_kometa_artifacts"
     metadata_dir = isolated_config_dir / config_name / "metadata_files" / "mov-library_movies"
     overlay_dir = isolated_config_dir / config_name / "overlay_files" / "mov-library_movies"
+    overlay_image_dir = isolated_config_dir / config_name / "overlay_images" / "mov-library_movies" / "overlay_resolution"
     metadata_dir.mkdir(parents=True, exist_ok=True)
     overlay_dir.mkdir(parents=True, exist_ok=True)
+    overlay_image_dir.mkdir(parents=True, exist_ok=True)
     (metadata_dir / "movies.yml").write_text("metadata:\n  test:\n    title: Example\n", encoding="utf-8")
     (overlay_dir / "awards.yml").write_text("overlays:\n  test:\n    template:\n      - name: ribbon\n", encoding="utf-8")
+    (overlay_image_dir / "file_4k.png").write_bytes(b"png-bytes")
 
     kometa_root = Path(app.config["KOMETA_ROOT"])
     stale_dir = kometa_root / "config" / config_name / "collection_files" / "mov-library_movies"
@@ -3449,9 +4414,11 @@ def test_sync_managed_library_artifacts_to_kometa_copies_and_prunes(isolated_con
 
     assert (kometa_root / "config" / config_name / "metadata_files" / "mov-library_movies" / "movies.yml").exists()
     assert (kometa_root / "config" / config_name / "overlay_files" / "mov-library_movies" / "awards.yml").exists()
+    assert (kometa_root / "config" / config_name / "overlay_images" / "mov-library_movies" / "overlay_resolution" / "file_4k.png").exists()
     assert not stale_dir.exists()
     assert any(path.endswith(f"{config_name}\\metadata_files") or path.endswith(f"{config_name}/metadata_files") for path in result["synced"])
     assert any(path.endswith(f"{config_name}\\overlay_files") or path.endswith(f"{config_name}/overlay_files") for path in result["synced"])
+    assert any(path.endswith(f"{config_name}\\overlay_images") or path.endswith(f"{config_name}/overlay_images") for path in result["synced"])
     assert any(path.endswith(f"{config_name}\\collection_files") or path.endswith(f"{config_name}/collection_files") for path in result["removed"])
     assert result["errors"] == []
 
@@ -3649,6 +4616,85 @@ def test_import_config_confirm_rehomes_bundled_library_files(client, isolated_co
     assert bundled_font.read_bytes() == b"font-bytes"
 
 
+def test_import_config_confirm_rehomes_bundled_overlay_source_images(client, isolated_config_dir, monkeypatch, qs_module):
+    import io
+    import zipfile
+    from pathlib import Path
+
+    from modules import database
+
+    class _Report:
+        def __init__(self, lines=None):
+            self.lines = list(lines or [])
+
+        def summary(self):
+            return {"imported": len(self.lines), "unmapped": 0, "skipped": 0}
+
+    def _fake_prepare_import_payload(config_data, *_args, **_kwargs):
+        location = config_data["libraries"]["Movies"]["overlay_files"][0]["template_variables"]["file_4k"]
+        payload = {
+            "libraries": {
+                "libraries": {
+                    "mov-library_movies-library": "Movies",
+                    "mov-library_movies-movie-overlay_resolution": True,
+                    "mov-library_movies-movie-template_overlay_resolution[file_4k]": location,
+                }
+            }
+        }
+        return payload, _Report(
+            [
+                "imported: libraries.Movies.library",
+                "imported: libraries.Movies.overlay_files[0].default",
+                "imported: libraries.Movies.overlay_files[0].template_variables.file_4k",
+                "imported: libraries.Movies.overlay_files",
+            ]
+        )
+
+    monkeypatch.setattr(qs_module.importer, "prepare_import_payload", _fake_prepare_import_payload)
+    monkeypatch.setattr(
+        qs_module.validations,
+        "validate_plex_server",
+        lambda _payload: {"validated": True, "movie_libraries": ["Movies"], "show_libraries": []},
+    )
+    monkeypatch.setattr(qs_module.validations, "validate_tmdb_server", lambda _payload: {"valid": True})
+
+    config_name = "pytest_import_overlay_bundle"
+    bundle = io.BytesIO()
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "config.yml",
+            "plex:\n  url: http://plex.local\n  token: test-token\ntmdb:\n  apikey: test-key\nlibraries:\n  Movies:\n    overlay_files:\n      - default: resolution\n        template_variables:\n          file_4k: pytest_import_overlay_bundle/overlay_images/mov-library_movies/overlay_resolution/file_4k.png\n",
+        )
+        archive.writestr(
+            f"{config_name}/overlay_images/mov-library_movies/overlay_resolution/file_4k.png",
+            b"\x89PNG\r\n\x1a\nimported-overlay",
+        )
+    bundle.seek(0)
+
+    preview = client.post(
+        "/import-config/preview",
+        data={"config_name": config_name, "file": (bundle, "bundle.zip")},
+        content_type="multipart/form-data",
+    )
+    assert preview.status_code == 200, preview.get_json()
+    preview_payload = preview.get_json()
+    assert preview_payload["success"] is True
+
+    confirm = client.post("/import-config/confirm", json={"token": preview_payload["token"]})
+    assert confirm.status_code == 200, confirm.get_json()
+    confirm_payload = confirm.get_json()
+    assert confirm_payload["success"] is True
+
+    validated, user_entered, stored = database.retrieve_section_data(config_name, "libraries")
+    assert validated is False
+    assert user_entered is True
+    normalized_location = stored["libraries"]["mov-library_movies-movie-template_overlay_resolution[file_4k]"]
+    assert normalized_location.startswith(f"config/{config_name}/overlay_images/mov-library_movies/overlay_resolution/")
+    bundled_image = isolated_config_dir.parent / Path(normalized_location)
+    assert bundled_image.exists()
+    assert bundled_image.read_bytes() == b"\x89PNG\r\n\x1a\nimported-overlay"
+
+
 def test_build_libraries_section_emits_schedule_overlays(app):
     from modules import output
 
@@ -3815,6 +4861,118 @@ def test_build_libraries_section_emits_subtitle_languages_overlay_language_list(
     assert subtitle_entry is not None
     assert subtitle_entry["template_variables"]["languages"] == ["en", "ja"]
     assert subtitle_entry["template_variables"]["style"] == "square"
+
+
+def test_build_libraries_section_emits_languages_overlay_alignment_template_variables(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            {"mov-library_movies-library": "Movies"},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {
+                "movies": {
+                    "mov-library_movies-movie-overlay_languages": True,
+                    "mov-library_movies-movie-template_overlay_languages[flag_alignment]": "right",
+                    "mov-library_movies-movie-template_overlay_languages[back_align]": "center",
+                }
+            },
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+        )
+
+    overlay_entries = libraries_section["libraries"]["Movies"]["overlay_files"]
+    languages_entry = next((entry for entry in overlay_entries if entry.get("default") == "languages"), None)
+    assert languages_entry is not None
+    assert languages_entry["template_variables"]["flag_alignment"] == "right"
+    assert languages_entry["template_variables"]["back_align"] == "center"
+    assert "use_subtitles" not in languages_entry["template_variables"]
+
+
+def test_build_libraries_section_emits_subtitle_languages_overlay_alignment_template_variables(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            {"mov-library_movies-library": "Movies"},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {
+                "movies": {
+                    "mov-library_movies-movie-overlay_languages_subtitles": True,
+                    "mov-library_movies-movie-template_overlay_languages_subtitles[flag_alignment]": "left",
+                    "mov-library_movies-movie-template_overlay_languages_subtitles[back_align]": "right",
+                }
+            },
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+        )
+
+    overlay_entries = libraries_section["libraries"]["Movies"]["overlay_files"]
+    subtitle_entry = next(
+        (entry for entry in overlay_entries if entry.get("default") == "languages" and entry.get("template_variables", {}).get("use_subtitles") is True),
+        None,
+    )
+    assert subtitle_entry is not None
+    assert subtitle_entry["template_variables"]["flag_alignment"] == "left"
+    assert subtitle_entry["template_variables"]["back_align"] == "right"
+
+
+def test_build_libraries_section_emits_streaming_overlay_region_originals_and_discover_overrides(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            {"mov-library_movies-library": "Movies"},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {
+                "movies": {
+                    "mov-library_movies-movie-overlay_streaming": True,
+                    "mov-library_movies-movie-template_overlay_streaming[region]": "CA",
+                    "mov-library_movies-movie-template_overlay_streaming[originals_only]": True,
+                }
+            },
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+        )
+
+    overlay_entries = libraries_section["libraries"]["Movies"]["overlay_files"]
+    streaming_entry = next((entry for entry in overlay_entries if entry.get("default") == "streaming"), None)
+    assert streaming_entry is not None
+    assert streaming_entry["template_variables"]["region"] == "CA"
+    assert streaming_entry["template_variables"]["originals_only"] is True
 
 
 def test_build_libraries_section_emits_only_non_default_language_weight_overrides(app):
@@ -4170,7 +5328,7 @@ def test_validate_kometa_root_existing_mode_does_not_create_missing_root(client,
     assert resp.status_code == 400
     payload = resp.get_json()
     assert payload["success"] is False
-    assert "does not exist" in payload["error"]
+    assert "does not exist in this Quickstart environment" in payload["error"]
     assert not missing_root.exists()
 
 

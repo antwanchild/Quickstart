@@ -1,5 +1,3 @@
-/* global MutationObserver, ImageHandler, OverlayHandler, ValidationHandler */
-
 const EventHandler = {
   attachLibraryListeners: function () {
     document.querySelectorAll('.library-checkbox').forEach((checkbox) => {
@@ -11,7 +9,7 @@ const EventHandler = {
         // Attach event listener to each checkbox
         checkbox.addEventListener('change', () => {
           EventHandler.toggleLibraryVisibility(libraryId, checkbox.checked)
-          ValidationHandler.updateValidationState()
+          window.ValidationHandler.updateValidationState()
         })
         checkbox.dataset.listenerAdded = 'true'
       }
@@ -90,65 +88,6 @@ const EventHandler = {
       // Initialize overlays after image listeners
       OverlayHandler.initializeOverlays(libraryId, isMovie)
 
-      // Allow unselecting Content Rating radio buttons
-      library.querySelectorAll('input[type="radio"][id*="-overlay_content_rating_"]').forEach(radio => {
-        if (!radio.dataset.listenerAdded) {
-          radio.addEventListener('click', function () {
-            console.log(`[DEBUG] Radio button clicked: ${this.name} -> ${this.value}`)
-
-            // More reliable way to get libraryId from DOM
-            const cardContainer = this.closest('.library-settings-card')
-            const clickedLibraryId = cardContainer?.id?.replace('-card-container', '')
-            if (!clickedLibraryId) {
-              console.warn(`[WARNING] Could not determine libraryId from ${this.id}`)
-              return
-            }
-            const isMovieRadio = clickedLibraryId.startsWith('mov-library_')
-
-            if (this.checked && this.dataset.wasChecked === 'true') {
-              // Unselect if clicked again
-              this.checked = false
-              this.dataset.wasChecked = 'false'
-
-              // Clear corresponding hidden input
-              const hiddenInput = document.querySelector(`input[name="${clickedLibraryId}-overlay_content_rating"]`)
-              if (hiddenInput) {
-                hiddenInput.value = ''
-              }
-
-              console.log(`[DEBUG] Unselected radio button: ${this.name}`)
-            } else {
-              // Reset all radios in group
-              document.querySelectorAll(`input[name="${this.name}"]`).forEach(r => {
-                r.dataset.wasChecked = 'false'
-              })
-              this.dataset.wasChecked = 'true'
-
-              const selectedValue = this.value
-              const hiddenInput = document.querySelector(`input[name="${clickedLibraryId}-overlay_content_rating"]`)
-              if (hiddenInput) {
-                hiddenInput.value = selectedValue
-              }
-
-              console.log(`[DEBUG] Selected radio button: ${this.name} -> ${selectedValue}`)
-            }
-
-            // Update UI and preview
-            EventHandler.updateAccordionHighlights()
-            ValidationHandler.updateValidationState()
-            if (isMovieRadio) {
-              ImageHandler.generateSinglePreview(clickedLibraryId, 'movie')
-            } else {
-              ['show', 'season', 'episode'].forEach(type => {
-                ImageHandler.generateSinglePreview(clickedLibraryId, type)
-              })
-            }
-          })
-
-          radio.dataset.listenerAdded = 'true'
-          radio.dataset.wasChecked = 'false'
-        }
-      })
       // Attach overlay selection listeners (CHANGE events)
       library.querySelectorAll('.accordion input').forEach((input) => {
         library.querySelectorAll('.accordion select').forEach(select => {
@@ -156,14 +95,14 @@ const EventHandler = {
             select.addEventListener('change', () => {
               console.log(`[DEBUG] Dropdown changed: ${select.id} -> ${select.value}`)
               EventHandler.updateAccordionHighlights()
-              ValidationHandler.updateValidationState()
+              window.ValidationHandler.updateValidationState()
 
               // Trigger preview update if template variable
               if (select.classList.contains('template-variable-select')) {
                 const nameParts = select.name.split('-')
-                const libraryId = nameParts.slice(0, 2).join('-') // e.g., mov-library_movies
+                const previewLibraryId = nameParts.slice(0, 2).join('-') // e.g., mov-library_movies
                 const type = nameParts[2] // e.g., movie
-                ImageHandler.generateSinglePreview(libraryId, type)
+                ImageHandler.generateSinglePreview(previewLibraryId, type)
               }
             })
             select.dataset.listenerAdded = 'true'
@@ -178,7 +117,7 @@ const EventHandler = {
             // Exclude preview overlay accordions from highlight updates
             if (!input.closest('.preview-accordion')) {
               EventHandler.updateAccordionHighlights()
-              ValidationHandler.updateValidationState()
+              window.ValidationHandler.updateValidationState()
             }
           })
           input.dataset.listenerAdded = true
@@ -195,7 +134,7 @@ const EventHandler = {
 
             // Ensure Highlights Update Properly
             EventHandler.updateAccordionHighlights()
-            ValidationHandler.updateValidationState()
+            window.ValidationHandler.updateValidationState()
           })
 
           dropdown.dataset.listenerAdded = 'true'
@@ -364,8 +303,8 @@ const EventHandler = {
         if (typeof EventHandler.updateAccordionHighlights === 'function') {
           EventHandler.updateAccordionHighlights()
         }
-        if (typeof ValidationHandler !== 'undefined' && ValidationHandler.updateValidationState) {
-          ValidationHandler.updateValidationState()
+        if (typeof window.ValidationHandler !== 'undefined' && window.ValidationHandler.updateValidationState) {
+          window.ValidationHandler.updateValidationState()
         }
       }
       library.querySelectorAll('input:not([type="hidden"]), select, textarea').forEach(el => {
@@ -635,6 +574,8 @@ const EventHandler = {
   }
 }
 
+window.EventHandler = EventHandler
+
 // MutationObserver for dynamically added elements
 const shouldReattachForNode = (node) => {
   if (!node || node.nodeType !== 1) return false
@@ -673,16 +614,13 @@ const observer = new MutationObserver((mutations) => {
 observer.observe(document.body, { childList: true, subtree: true })
 
 // Initial call on page load
-document.addEventListener('DOMContentLoaded', () => {
-  console.log('[DEBUG] Initializing EventHandler...')
+console.log('[DEBUG] Initializing EventHandler...')
 
-  // Run once on page load
-  EventHandler.attachLibraryListeners()
-  ValidationHandler.restoreSelectedLibraries()
-  ValidationHandler.updateValidationState()
-
-  installRatingSubmitGuard()
-})
+// Run once on page load
+EventHandler.attachLibraryListeners()
+window.ValidationHandler.restoreSelectedLibraries()
+window.ValidationHandler.updateValidationState()
+installRatingSubmitGuard()
 
 document.querySelectorAll('select.template-variable-select').forEach(select => {
   const selectedValue = select.dataset.selected

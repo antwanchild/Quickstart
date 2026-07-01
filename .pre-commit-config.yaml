@@ -1,4 +1,4 @@
-exclude: '^.*bootstrap.bundle.js$|^tests/fixtures/'
+exclude: '^.*bootstrap.bundle.js$|^tests/fixtures/|^PART$'
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -11,12 +11,21 @@ repos:
     -   id: check-merge-conflict
     -   id: no-commit-to-branch
     -   id: requirements-txt-fixer
--   repo: https://github.com/standard/standard
-    rev: v17.1.2
+-   repo: local
     hooks:
-      - id: standard
+    -   id: eslint
+        name: eslint
+        entry: npm run lint:eslint --
+        language: system
+        pass_filenames: false
+        files: ^static/local-js/.*\.js$
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.18
     hooks:
       - id: ruff
         args: [ --fix ]
+-   repo: https://github.com/psf/black
+    rev: 26.5.1
+    hooks:
+      - id: black
+        args: [ -l, '180' ]

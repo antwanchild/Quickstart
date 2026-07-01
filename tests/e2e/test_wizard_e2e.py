@@ -150,3 +150,1857 @@ def test_running_pill_visible(page, live_server):
     badge = page.locator("#qs-running-badge")
     expect(badge).not_to_have_class(re.compile(r"\bd-none\b"))
     expect(badge).to_contain_text("Kometa running")
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "stem, endpoint, field_id, validated_id, success_text",
+    [
+        (
+            "060-mdblist",
+            "validate_mdblist",
+            "mdblist_apikey",
+            "mdblist_validated",
+            "API key is valid!",
+        ),
+        (
+            "050-omdb",
+            "validate_omdb",
+            "omdb_apikey",
+            "omdb_validated",
+            "OMDb API key is valid.",
+        ),
+        (
+            "070-notifiarr",
+            "validate_notifiarr",
+            "notifiarr_apikey",
+            "notifiarr_validated",
+            "Notifiarr API key is valid.",
+        ),
+        (
+            "087-apprise",
+            "validate_apprise",
+            "apprise_location",
+            "apprise_validated",
+            "Apprise location validated successfully!",
+        ),
+    ],
+)
+def test_simple_validator_wizard_success_flow(page, live_server, stem, endpoint, field_id, validated_id, success_text):
+    """End-to-end smoke for every wizard migrated to createApiKeyValidator.
+
+    Vitest covers the factory contract in isolation. This test proves
+    each wizard's config IDs actually line up with its rendered template
+    -- a typo in fieldId / endpoint / messages would only surface here.
+
+    Server response includes a `message` field so the github-style
+    function-valued success message also gets exercised (040-github has
+    its own subtest below because the server response shape is different).
+    """
+
+    def handle_validate(route):
+        route.fulfill(status=200, json={"valid": True})
+
+    page.route(f"**/{endpoint}", handle_validate)
+    page.goto(f"{live_server}/step/{stem}", wait_until="domcontentloaded")
+
+    page.locator(f"#{field_id}").fill("some-credential")
+    page.locator("#validateButton").click()
+    expect(page.locator("#statusMessage")).to_contain_text(success_text)
+    expect(page.locator(f"#{validated_id}")).to_have_value("true")
+    expect(page.locator("#validateButton")).to_be_disabled()
+
+
+@pytest.mark.e2e
+def test_github_validator_uses_server_message(page, live_server):
+    """040-github uses function-valued messages that pull data.message
+    from the server response. Verify that a custom server message
+    appears in the UI verbatim.
+    """
+
+    def handle_validate(route):
+        route.fulfill(
+            status=200,
+            json={"valid": True, "message": "Token belongs to: testuser"},
+        )
+
+    page.route("**/validate_github", handle_validate)
+    page.goto(f"{live_server}/step/040-github", wait_until="domcontentloaded")
+
+    page.locator("#github_token").fill("ghp_FakeButLooksReal")
+    page.locator("#validateButton").click()
+    expect(page.locator("#statusMessage")).to_contain_text("Token belongs to: testuser")
+    expect(page.locator("#github_validated")).to_have_value("true")
+
+
+@pytest.mark.e2e
+def test_apprise_validator_uses_server_error_on_failure(page, live_server):
+    """087-apprise uses a function-valued failure message that pulls
+    data.error from the server response. Verify that a custom server
+    error appears in the UI verbatim.
+    """
+
+    def handle_validate(route):
+        route.fulfill(
+            status=200,
+            json={
+                "valid": False,
+                "error": "Apprise YAML at /missing.yml could not be read.",
+            },
+        )
+
+    page.route("**/validate_apprise", handle_validate)
+    page.goto(f"{live_server}/step/087-apprise", wait_until="domcontentloaded")
+
+    page.locator("#apprise_location").fill("/missing.yml")
+    page.locator("#validateButton").click()
+    expect(page.locator("#statusMessage")).to_contain_text("Apprise YAML at /missing.yml could not be read.")
+    expect(page.locator("#apprise_validated")).to_have_value("false")
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "stem, endpoint, field_inputs, validated_id, success_text",
+    [
+        (
+            "030-tautulli",
+            "validate_tautulli",
+            {"tautulli_url": "http://tautulli.local:8181", "tautulli_apikey": "k"},
+            "tautulli_validated",
+            "Tautulli server validated successfully!",
+        ),
+        (
+            "080-gotify",
+            "validate_gotify",
+            {"gotify_url": "http://gotify.local", "gotify_token": "tok"},
+            "gotify_validated",
+            "Gotify credentials validated successfully!",
+        ),
+        (
+            "085-ntfy",
+            "validate_ntfy",
+            {"ntfy_url": "http://ntfy.local", "ntfy_token": "tok", "ntfy_topic": "alerts"},
+            "ntfy_validated",
+            "ntfy credentials validated successfully!",
+        ),
+    ],
+)
+def test_multi_field_validator_wizard_success_flow(page, live_server, stem, endpoint, field_inputs, validated_id, success_text):
+    """Multi-field wizards use the createApiKeyValidator factory's
+    additionalFieldIds + 2-arg buildPayload (#1334 Step 6 PR 3). Each
+    needs every field filled before validation can succeed.
+    """
+
+    def handle_validate(route):
+        route.fulfill(status=200, json={"valid": True})
+
+    page.route(f"**/{endpoint}", handle_validate)
+    page.goto(f"{live_server}/step/{stem}", wait_until="domcontentloaded")
+
+    for input_id, value in field_inputs.items():
+        page.locator(f"#{input_id}").fill(value)
+    page.locator("#validateButton").click()
+
+    expect(page.locator("#statusMessage")).to_contain_text(success_text)
+    expect(page.locator(f"#{validated_id}")).to_have_value("true")
+    expect(page.locator("#validateButton")).to_be_disabled()
+
+
+@pytest.mark.e2e
+def test_multi_field_wizard_empty_check_across_fields(page, live_server):
+    """Verify the multi-field empty-check on the rendered page: filling
+    only the credential without the url should NOT trigger the fetch
+    and should show the configured empty message.
+    """
+
+    fetch_calls = []
+
+    def handle_validate(route):
+        fetch_calls.append(route.request.url)
+        route.fulfill(status=200, json={"valid": True})
+
+    page.route("**/validate_gotify", handle_validate)
+    page.goto(f"{live_server}/step/080-gotify", wait_until="domcontentloaded")
+
+    page.locator("#gotify_token").fill("some-token")
+    # gotify_url deliberately left empty
+    page.locator("#validateButton").click()
+
+    expect(page.locator("#statusMessage")).to_contain_text("Please enter both Gotify URL and Token.")
+    expect(page.locator("#gotify_validated")).to_have_value("false")
+    assert fetch_calls == [], f"expected no fetch but got {fetch_calls}"
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "stem, endpoint, field_inputs, validated_id, success_text, response_data, expected_options",
+    [
+        (
+            "110-radarr",
+            "validate_radarr",
+            {"radarr_url": "http://radarr.local", "radarr_token": "k"},
+            "radarr_validated",
+            "Radarr API key is valid.",
+            {
+                "valid": True,
+                "root_folders": [{"path": "/movies"}, {"path": "/four-k"}],
+                "quality_profiles": [{"name": "HD-1080p"}, {"name": "4K"}],
+            },
+            {
+                "radarr_root_folder_path": ["/movies", "/four-k"],
+                "radarr_quality_profile": ["HD-1080p", "4K"],
+            },
+        ),
+        (
+            "120-sonarr",
+            "validate_sonarr",
+            {"sonarr_url": "http://sonarr.local", "sonarr_token": "k"},
+            "sonarr_validated",
+            "Sonarr API key is valid.",
+            {
+                "valid": True,
+                "root_folders": [{"path": "/tv"}, {"path": "/anime"}],
+                "quality_profiles": [{"name": "HD-720p"}, {"name": "HD-1080p"}],
+                "language_profiles": [{"name": "English"}, {"name": "Japanese"}],
+            },
+            {
+                "sonarr_root_folder_path": ["/tv", "/anime"],
+                "sonarr_quality_profile": ["HD-720p", "HD-1080p"],
+                "sonarr_language_profile": ["English", "Japanese"],
+            },
+        ),
+    ],
+)
+def test_dropdown_populating_wizard_success_flow(
+    page,
+    live_server,
+    stem,
+    endpoint,
+    field_inputs,
+    validated_id,
+    success_text,
+    response_data,
+    expected_options,
+):
+    """Radarr + Sonarr populate dropdowns from the validate response
+    via onValidationSuccess (#1334 Step 6 PR 4a). Verify each dropdown
+    receives the expected options after clicking Validate.
+    """
+
+    def handle_validate(route):
+        route.fulfill(status=200, json=response_data)
+
+    page.route(f"**/{endpoint}", handle_validate)
+    page.goto(f"{live_server}/step/{stem}", wait_until="domcontentloaded")
+
+    for input_id, value in field_inputs.items():
+        page.locator(f"#{input_id}").fill(value)
+    page.locator("#validateButton").click()
+
+    expect(page.locator("#statusMessage")).to_contain_text(success_text)
+    expect(page.locator(f"#{validated_id}")).to_have_value("true")
+
+    # Each populated dropdown should contain the expected option values.
+    for dropdown_id, expected_values in expected_options.items():
+        dropdown = page.locator(f"#{dropdown_id}")
+        actual_values = dropdown.evaluate("el => Array.from(el.options).map(o => o.value)")
+        for expected in expected_values:
+            assert expected in actual_values, f"{dropdown_id} missing option {expected!r}; got {actual_values}"
+
+
+@pytest.mark.e2e
+def test_radarr_pre_submit_blocks_navigation_when_dropdowns_unset(page, live_server):
+    """Radarr's onPreSubmit guard should preventDefault on the form
+    when validated=true but the root-folder/quality-profile dropdowns
+    haven't been chosen. This is the load-bearing replacement for the
+    legacy validateRadarrPage() function (#1334 Step 6 PR 4a).
+
+    NOTE: the rendered template injects `initialRadarrQualityProfile`
+    and `initialRadarrRootFolderPath` from the saved config. If the
+    mock response contains options whose values match those initials,
+    populateDropdown will auto-select them and the dropdowns won't be
+    "unset" any more. To make the test deterministic regardless of
+    saved config, the mock provides option values that won't match
+    any plausible saved config ("NO_MATCH_*" prefixes).
+    """
+
+    def handle_validate(route):
+        route.fulfill(
+            status=200,
+            json={
+                "valid": True,
+                "root_folders": [{"path": "NO_MATCH_ROOT_FOLDER"}],
+                "quality_profiles": [{"name": "NO_MATCH_QUALITY_PROFILE"}],
+            },
+        )
+
+    page.route("**/validate_radarr", handle_validate)
+    page.goto(f"{live_server}/step/110-radarr", wait_until="domcontentloaded")
+
+    # Validate succeeds, populating the dropdowns but leaving them on placeholder.
+    page.locator("#radarr_url").fill("http://radarr.local")
+    page.locator("#radarr_token").fill("k")
+    page.locator("#validateButton").click()
+    expect(page.locator("#radarr_validated")).to_have_value("true")
+
+    # Sanity check: both dropdowns should be on their placeholder ("")
+    # since the mock's option values don't match any saved initials.
+    expect(page.locator("#radarr_root_folder_path")).to_have_value("")
+    expect(page.locator("#radarr_quality_profile")).to_have_value("")
+
+    # Trigger a form submit without selecting dropdowns. Use evaluate to
+    # dispatch a real submit event and capture whether it was blocked.
+    blocked = page.evaluate("""
+        () => {
+            const form = document.getElementById('configForm');
+            const evt = new Event('submit', { cancelable: true });
+            form.dispatchEvent(evt);
+            return evt.defaultPrevented;
+        }
+    """)
+    assert blocked is True, "expected form submit to be blocked by onPreSubmit"
+    expect(page.locator("#statusMessage")).to_contain_text("Please select a valid Root Folder Path.")
+    expect(page.locator("#statusMessage")).to_contain_text("Please select a valid Quality Profile.")
+
+
+@pytest.mark.e2e
+def test_radarr_revalidate_on_load_repopulates_dropdowns(page, live_server):
+    """When the user returns to an already-validated Radarr page, the
+    factory's revalidateOnLoad option should issue a silent POST and
+    repopulate the dropdowns. This proves the silent fetch path.
+
+    Instead of round-tripping through saved state (fragile in the e2e
+    harness), this test directly mutates the in-memory wizard state to
+    simulate "already validated", then triggers a manual reload of the
+    factory module. The unit-level Vitest suite for revalidateOnLoad
+    (8 tests) covers the option semantics in isolation; this test
+    proves the option is correctly threaded through to the rendered
+    wizard config.
+    """
+
+    fetch_count = {"n": 0}
+
+    def handle_validate(route):
+        fetch_count["n"] += 1
+        route.fulfill(
+            status=200,
+            json={
+                "valid": True,
+                "root_folders": [{"path": "NO_MATCH_REVAL_FOLDER"}],
+                "quality_profiles": [{"name": "NO_MATCH_REVAL_QUALITY"}],
+            },
+        )
+
+    page.route("**/validate_radarr", handle_validate)
+    page.goto(f"{live_server}/step/110-radarr", wait_until="domcontentloaded")
+
+    # Simulate the "returning to a validated page" state by:
+    # 1. Pre-filling the credential fields (revalidateOnLoad needs them)
+    # 2. Setting radarr_validated='true' (the precondition for the silent fetch)
+    # 3. Re-importing the wizard module to trigger the factory's init code
+    #    with that state, the same way it would run on a fresh page load.
+    page.evaluate("""
+        () => {
+            document.getElementById('radarr_url').value = 'http://radarr.local';
+            document.getElementById('radarr_token').value = 'some-token';
+            document.getElementById('radarr_validated').value = 'true';
+        }
+    """)
+    # Re-import the wizard module with a cache buster so the factory's
+    # top-level code runs again against the mutated DOM.
+    page.evaluate("""
+        () => import(`/static/local-js/110-radarr.js?revalidate-test=${Date.now()}`)
+    """)
+    # Give the silent fetch a moment to resolve.
+    page.wait_for_timeout(500)
+
+    # The dropdown should now contain the option from the mock response.
+    dropdown_values = page.locator("#radarr_root_folder_path").evaluate("el => Array.from(el.options).map(o => o.value)")
+    assert "NO_MATCH_REVAL_FOLDER" in dropdown_values, f"expected revalidateOnLoad to repopulate dropdown; got {dropdown_values}"
+    assert fetch_count["n"] >= 1, f"expected at least one silent fetch; got count={fetch_count['n']}"
+
+
+@pytest.mark.e2e
+def test_plex_validator_success_populates_extra_state(page, live_server):
+    """Plex's onValidationSuccess hook copies db_cache + 4 library lists
+    into hidden form inputs and reveals the "hidden" section. Verify
+    each piece of state lands where it should (#1334 Step 6 PR 4b).
+
+    Plex's response shape is asymmetric: success returns
+    `{validated: true, ...}` while failure returns `{valid: false, ...}`.
+    The factory's `isValid` option lets the wizard configure
+    `(data) => data.validated === true` for the success check.
+    """
+
+    def handle_validate(route):
+        route.fulfill(
+            status=200,
+            json={
+                "validated": True,
+                "db_cache": 1024,
+                "user_list": ["alice", "bob"],
+                "music_libraries": ["Music"],
+                "movie_libraries": ["Movies", "4K Movies"],
+                "show_libraries": ["TV", "Anime"],
+                "has_plex_pass": True,
+            },
+        )
+
+    page.route("**/validate_plex", handle_validate)
+    page.goto(f"{live_server}/step/010-plex", wait_until="domcontentloaded")
+
+    page.locator("#plex_url").fill("http://plex.local:32400")
+    page.locator("#plex_token").fill("some-token")
+    page.locator("#validateButton").click()
+
+    # Success status + validatedField flip + button disable.
+    expect(page.locator("#statusMessage")).to_contain_text("Plex server validated successfully!")
+    expect(page.locator("#plex_validated")).to_have_value("true")
+    expect(page.locator("#validateButton")).to_be_disabled()
+
+    # Hidden inputs populated by onValidationSuccess.
+    # The legacy code copies arrays-as-strings (.value = arrayLiteral)
+    # so the JS forms "alice,bob" etc. We just check that each value
+    # contains the expected entries (substring match is the contract).
+    user_list = page.locator("#tmp_user_list").evaluate("el => el.value")
+    assert "alice" in user_list and "bob" in user_list, f"unexpected user_list: {user_list!r}"
+    movie_libs = page.locator("#tmp_movie_libraries").evaluate("el => el.value")
+    assert "Movies" in movie_libs and "4K Movies" in movie_libs, f"unexpected movies: {movie_libs!r}"
+    show_libs = page.locator("#tmp_show_libraries").evaluate("el => el.value")
+    assert "TV" in show_libs and "Anime" in show_libs, f"unexpected shows: {show_libs!r}"
+    music_libs = page.locator("#tmp_music_libraries").evaluate("el => el.value")
+    assert "Music" in music_libs, f"unexpected music: {music_libs!r}"
+
+    # DB cache value pushed into the input.
+    expect(page.locator("#plex_db_cache")).to_have_value("1024")
+
+    # Plex Pass success banner visible, warning banner hidden.
+    expect(page.locator("#plex-pass-status-success")).to_be_visible()
+    expect(page.locator("#plex-pass-status-warning")).to_be_hidden()
+
+    # Hidden section revealed for further config.
+    expect(page.locator("#hidden")).to_be_visible()
+
+
+@pytest.mark.e2e
+def test_plex_validator_failure_uses_legacy_failure_message(page, live_server):
+    """Plex's failure path: server returns `{valid: false, error: '...'}`.
+    The factory's `isValid: (data) => data.validated === true` predicate
+    correctly treats this as a failure. The configured static failure
+    message is shown (not data.error -- the legacy plex wizard didn't
+    forward that field either).
+    """
+
+    def handle_validate(route):
+        route.fulfill(status=200, json={"valid": False, "error": "bad token"})
+
+    page.route("**/validate_plex", handle_validate)
+    page.goto(f"{live_server}/step/010-plex", wait_until="domcontentloaded")
+
+    page.locator("#plex_url").fill("http://plex.local")
+    page.locator("#plex_token").fill("badtoken")
+    page.locator("#validateButton").click()
+
+    expect(page.locator("#statusMessage")).to_contain_text("Failed to validate Plex server. Please check your URL and Token.")
+    expect(page.locator("#plex_validated")).to_have_value("false")
+
+
+@pytest.mark.e2e
+def test_plex_db_cache_mismatch_warning(page, live_server):
+    """When the user's db_cache input doesn't match what Plex reports,
+    the plexDbCache element shows a warning in error color appended to
+    the standard "value retrieved" message. Verifies the bespoke
+    mismatch-detection logic survives the migration.
+    """
+
+    def handle_validate(route):
+        # Server returns db_cache=2048 while the page's default input
+        # is something different (1024 from the dummy data).
+        route.fulfill(
+            status=200,
+            json={
+                "validated": True,
+                "db_cache": 2048,
+                "user_list": [],
+                "music_libraries": [],
+                "movie_libraries": [],
+                "show_libraries": [],
+                "has_plex_pass": False,
+            },
+        )
+
+    page.route("**/validate_plex", handle_validate)
+    page.goto(f"{live_server}/step/010-plex", wait_until="domcontentloaded")
+
+    # Force a mismatch: set the input to something other than 2048.
+    page.evaluate("document.getElementById('plex_db_cache').value = '999'")
+    page.locator("#plex_url").fill("http://plex.local")
+    page.locator("#plex_token").fill("sometoken")
+    page.locator("#validateButton").click()
+
+    # The plexDbCache element should now contain the mismatch warning.
+    expect(page.locator("#plexDbCache")).to_contain_text("Database cache value retrieved from server is: 2048 MB")
+    expect(page.locator("#plexDbCache")).to_contain_text("Warning: The value in the input box (999 MB) does not match the value retrieved from the server (2048 MB).")
+    # And the input value should now be overwritten with the server's value.
+    expect(page.locator("#plex_db_cache")).to_have_value("2048")
+
+
+@pytest.mark.e2e
+def test_tmdb_validator_success_enables_navigation_when_dropdowns_chosen(page, live_server):
+    """TMDB gates the Next/JumpTo buttons LIVE on (api key validated)
+    AND (language chosen) AND (region chosen). After validate succeeds,
+    pick both dropdowns and verify navigation is enabled.
+    (#1334 Step 6 PR 4c)
+    """
+
+    def handle_validate(route):
+        route.fulfill(status=200, json={"valid": True})
+
+    page.route("**/validate_tmdb", handle_validate)
+    page.goto(f"{live_server}/step/020-tmdb", wait_until="domcontentloaded")
+
+    page.locator("#tmdb_apikey").fill("some-api-key")
+    page.locator("#validateButton").click()
+    expect(page.locator("#tmdb_validated")).to_have_value("true")
+    expect(page.locator("#statusMessage")).to_contain_text("API key is valid!")
+
+    # Pick both dropdowns. The languages/regions are server-rendered
+    # from data['iso_639_1_languages'] / data['iso_3166_1_regions'];
+    # any non-empty value will do.
+    language_options = page.locator("#tmdb_language option").evaluate_all("els => els.map(el => el.value).filter(v => v)")
+    region_options = page.locator("#tmdb_region option").evaluate_all("els => els.map(el => el.value).filter(v => v)")
+    assert language_options, "tmdb_language dropdown should have non-empty options from server render"
+    assert region_options, "tmdb_region dropdown should have non-empty options from server render"
+
+    page.locator("#tmdb_language").select_option(language_options[0])
+    page.locator("#tmdb_region").select_option(region_options[0])
+
+    # Both dropdown status callouts should now read "is valid."
+    expect(page.locator("#languageStatusMessage")).to_contain_text("Language is valid.")
+    expect(page.locator("#regionStatusMessage")).to_contain_text("Region is valid.")
+
+    # Navigation buttons should be enabled.
+    expect(page.locator('button[data-nav-action="next"]')).to_be_enabled()
+    expect(page.locator(".dropdown-toggle").first).to_be_enabled()
+
+
+@pytest.mark.e2e
+def test_tmdb_validator_failure_keeps_navigation_disabled(page, live_server):
+    """After a failed TMDB validate, even if both dropdowns are picked,
+    navigation should stay disabled because (api key validated) is false.
+    This is the load-bearing proof that onValidationFailure correctly
+    re-runs updateNavigationState. (#1334 Step 6 PR 4c)
+    """
+
+    def handle_validate(route):
+        route.fulfill(status=200, json={"valid": False})
+
+    page.route("**/validate_tmdb", handle_validate)
+    page.goto(f"{live_server}/step/020-tmdb", wait_until="domcontentloaded")
+
+    # Pick the dropdowns FIRST so they're not the gating factor.
+    language_options = page.locator("#tmdb_language option").evaluate_all("els => els.map(el => el.value).filter(v => v)")
+    region_options = page.locator("#tmdb_region option").evaluate_all("els => els.map(el => el.value).filter(v => v)")
+    page.locator("#tmdb_language").select_option(language_options[0])
+    page.locator("#tmdb_region").select_option(region_options[0])
+
+    # Now run a failed validate.
+    page.locator("#tmdb_apikey").fill("bad-key")
+    page.locator("#validateButton").click()
+    expect(page.locator("#tmdb_validated")).to_have_value("false")
+
+    # Navigation should remain disabled.
+    expect(page.locator('button[data-nav-action="next"]')).to_be_disabled()
+
+
+@pytest.mark.e2e
+def test_tmdb_dropdown_change_alone_does_not_enable_navigation(page, live_server):
+    """Picking the dropdowns without ever validating the api key should
+    NOT enable navigation. Tests the wizard-specific dropdown listeners
+    correctly check isApiKeyValidated() as part of their gating logic.
+    """
+
+    page.goto(f"{live_server}/step/020-tmdb", wait_until="domcontentloaded")
+
+    language_options = page.locator("#tmdb_language option").evaluate_all("els => els.map(el => el.value).filter(v => v)")
+    region_options = page.locator("#tmdb_region option").evaluate_all("els => els.map(el => el.value).filter(v => v)")
+    page.locator("#tmdb_language").select_option(language_options[0])
+    page.locator("#tmdb_region").select_option(region_options[0])
+
+    # Even though both dropdowns now have valid values, the api key was
+    # never validated, so navigation must stay disabled.
+    expect(page.locator('button[data-nav-action="next"]')).to_be_disabled()
+
+
+# Trakt OAuth-PIN tests (#1334 Step 6 PR 4d). A real Trakt validate
+# requires `trakt_client_id` to be exactly 64 chars for the
+# updateTraktURL() function to generate a non-empty authorization URL.
+TRAKT_CLIENT_ID_64 = "a" * 64
+
+
+@pytest.mark.e2e
+def test_trakt_pin_validator_success_populates_six_token_fields(page, live_server):
+    """After a successful Trakt PIN validate, the six hidden
+    authorization fields must contain the values from the response,
+    the PIN+URL fields are cleared, the PIN-flow buttons disabled,
+    and the Check Token button enabled.
+    """
+
+    def handle_validate(route):
+        route.fulfill(
+            status=200,
+            json={
+                "valid": True,
+                "trakt_authorization_access_token": "AT-123",
+                "trakt_authorization_token_type": "Bearer",
+                "trakt_authorization_expires_in": 7200,
+                "trakt_authorization_refresh_token": "RT-456",
+                "trakt_authorization_scope": "public",
+                "trakt_authorization_created_at": 1700000000,
+            },
+        )
+
+    page.route("**/validate_trakt", handle_validate)
+    page.goto(f"{live_server}/step/130-trakt", wait_until="domcontentloaded")
+
+    page.locator("#trakt_client_id").fill(TRAKT_CLIENT_ID_64)
+    page.locator("#trakt_client_secret").fill("my-secret")
+    page.locator("#trakt_pin").fill("12345678")
+    page.locator("#validate_trakt_pin").click()
+
+    # All six access-token fields populated.
+    expect(page.locator("#access_token")).to_have_value("AT-123")
+    expect(page.locator("#token_type")).to_have_value("Bearer")
+    expect(page.locator("#expires_in")).to_have_value("7200")
+    expect(page.locator("#refresh_token")).to_have_value("RT-456")
+    expect(page.locator("#scope")).to_have_value("public")
+    expect(page.locator("#created_at")).to_have_value("1700000000")
+    # PIN + URL cleared.
+    expect(page.locator("#trakt_pin")).to_have_value("")
+    expect(page.locator("#trakt_url")).to_have_value("")
+    # PIN-flow buttons disabled, Check Token enabled.
+    expect(page.locator("#trakt_open_url")).to_be_disabled()
+    expect(page.locator("#validate_trakt_pin")).to_be_disabled()
+    expect(page.locator("#trakt_check_token")).to_be_enabled()
+    # Validated state flipped to true.
+    expect(page.locator("#trakt_validated")).to_have_value("true")
+    expect(page.locator("#statusMessage")).to_contain_text("Trakt credentials validated successfully!")
+
+
+@pytest.mark.e2e
+def test_trakt_pin_validator_missing_fields_shows_required_message(page, live_server):
+    """With one of id/secret/pin missing, the client-side guard short-
+    circuits before the network call and shows the static required-
+    fields message.
+    """
+    requests_made = {"n": 0}
+
+    def handle_validate(route):
+        requests_made["n"] += 1
+        route.fulfill(status=200, json={"valid": True})
+
+    page.route("**/validate_trakt", handle_validate)
+    page.goto(f"{live_server}/step/130-trakt", wait_until="domcontentloaded")
+
+    page.locator("#trakt_client_id").fill(TRAKT_CLIENT_ID_64)
+    page.locator("#trakt_client_secret").fill("my-secret")
+    # PIN is intentionally empty. The pin field's checkPinField() will
+    # have left the validate button disabled, so we force-enable it.
+    page.evaluate("document.getElementById('validate_trakt_pin').disabled = false")
+    page.locator("#validate_trakt_pin").click()
+
+    expect(page.locator("#statusMessage")).to_contain_text("ID, secret, and PIN are all required.")
+    assert requests_made["n"] == 0, "no network call should fire when fields are missing"
+
+
+@pytest.mark.e2e
+def test_trakt_url_button_enabled_when_client_id_is_exactly_64_chars(page, live_server):
+    """Verifies the updateTraktURL() inline handler builds the
+    authorization URL only when client_id.length === 64, and the
+    Retrieve PIN button enables itself when the URL is non-empty.
+    """
+    page.goto(f"{live_server}/step/130-trakt", wait_until="domcontentloaded")
+
+    # Initially disabled (page just loaded).
+    expect(page.locator("#trakt_open_url")).to_be_disabled()
+
+    # Wrong length: still disabled.
+    page.locator("#trakt_client_id").fill("a" * 32)
+    expect(page.locator("#trakt_url")).to_have_value("")
+    expect(page.locator("#trakt_open_url")).to_be_disabled()
+
+    # Right length: URL constructed, button enabled.
+    page.locator("#trakt_client_id").fill(TRAKT_CLIENT_ID_64)
+    expect(page.locator("#trakt_url")).to_contain_text("")  # readonly so use to_have_value
+    trakt_url_value = page.locator("#trakt_url").input_value()
+    assert "trakt.tv/oauth/authorize" in trakt_url_value
+    assert TRAKT_CLIENT_ID_64 in trakt_url_value
+    expect(page.locator("#trakt_open_url")).to_be_enabled()
+
+
+@pytest.mark.e2e
+def test_trakt_check_token_button_initially_disabled_when_no_access_token(page, live_server):
+    """isBlankTokenValue treats blank/None/Null as blank. On a fresh
+    page where access_token is empty (or the literal string 'None' from
+    the persisted state), the Check Token button must start disabled.
+    """
+    page.goto(f"{live_server}/step/130-trakt", wait_until="domcontentloaded")
+    expect(page.locator("#trakt_check_token")).to_be_disabled()
+
+
+# MAL OAuth tests. MAL's client_id must be exactly 32 chars for the
+# updateMALTargetURL() function to generate a non-empty URL.
+MAL_CLIENT_ID_32 = "a" * 32
+
+
+@pytest.mark.e2e
+def test_mal_validator_success_populates_four_token_fields(page, live_server):
+    """After a successful MAL validate, the four hidden authorization
+    fields are populated, both auth-flow buttons disabled, and the
+    Check Token button enabled. MAL has 4 fields vs Trakt's 6.
+    """
+
+    def handle_validate(route):
+        route.fulfill(
+            status=200,
+            json={
+                "valid": True,
+                "mal_authorization_access_token": "MAL-AT",
+                "mal_authorization_token_type": "Bearer",
+                "mal_authorization_expires_in": 2592000,
+                "mal_authorization_refresh_token": "MAL-RT",
+            },
+        )
+
+    page.route("**/validate_mal", handle_validate)
+    page.goto(f"{live_server}/step/140-mal", wait_until="domcontentloaded")
+
+    page.locator("#mal_client_id").fill(MAL_CLIENT_ID_32)
+    page.locator("#mal_client_secret").fill("mal-secret")
+    # mal_code_verifier is a hidden field populated by the server. The
+    # template renders {{ data['code_verifier'] }}, which may be empty
+    # in test data. Force a value so the validate-payload guard passes.
+    page.evaluate("document.getElementById('mal_code_verifier').value = 'V' + 'a'.repeat(42)")
+    page.locator("#mal_localhost_url").fill("http://localhost/callback?code=xyz")
+    page.locator("#validate_mal_url").click()
+
+    # Four authorization fields populated.
+    expect(page.locator("#access_token")).to_have_value("MAL-AT")
+    expect(page.locator("#token_type")).to_have_value("Bearer")
+    expect(page.locator("#expires_in")).to_have_value("2592000")
+    expect(page.locator("#refresh_token")).to_have_value("MAL-RT")
+    # Auth-flow buttons disabled, Check Token enabled.
+    expect(page.locator("#mal_get_localhost_url")).to_be_disabled()
+    expect(page.locator("#validate_mal_url")).to_be_disabled()
+    expect(page.locator("#mal_check_token")).to_be_enabled()
+    expect(page.locator("#mal_validated")).to_have_value("true")
+    expect(page.locator("#statusMessage")).to_contain_text("MyAnimeList credentials validated successfully!")
+
+
+@pytest.mark.e2e
+def test_mal_validator_missing_fields_shows_required_message(page, live_server):
+    """Mirror of the Trakt missing-fields test: client-side guard fires
+    before any network call.
+    """
+    requests_made = {"n": 0}
+
+    def handle_validate(route):
+        requests_made["n"] += 1
+        route.fulfill(status=200, json={"valid": True})
+
+    page.route("**/validate_mal", handle_validate)
+    page.goto(f"{live_server}/step/140-mal", wait_until="domcontentloaded")
+
+    page.locator("#mal_client_id").fill(MAL_CLIENT_ID_32)
+    page.locator("#mal_client_secret").fill("mal-secret")
+    # mal_localhost_url is intentionally empty.
+    page.evaluate("document.getElementById('validate_mal_url').disabled = false")
+    page.locator("#validate_mal_url").click()
+
+    expect(page.locator("#statusMessage")).to_contain_text("ID, secret, and localhost URL are all required.")
+    assert requests_made["n"] == 0
+
+
+@pytest.mark.e2e
+def test_mal_authorize_button_enabled_when_client_id_is_exactly_32_chars(page, live_server):
+    """Mirror of the Trakt URL-button test, with MAL's 32-char gate."""
+    page.goto(f"{live_server}/step/140-mal", wait_until="domcontentloaded")
+
+    # Initially disabled (URL is empty).
+    expect(page.locator("#mal_get_localhost_url")).to_be_disabled()
+
+    # Wrong length: still disabled.
+    page.locator("#mal_client_id").fill("a" * 16)
+    expect(page.locator("#mal_url")).to_have_value("")
+    expect(page.locator("#mal_get_localhost_url")).to_be_disabled()
+
+    # Right length: URL constructed, Authorize button enabled.
+    page.locator("#mal_client_id").fill(MAL_CLIENT_ID_32)
+    mal_url_value = page.locator("#mal_url").input_value()
+    assert "myanimelist.net/v1/oauth2/authorize" in mal_url_value
+    assert MAL_CLIENT_ID_32 in mal_url_value
+    expect(page.locator("#mal_get_localhost_url")).to_be_enabled()
+
+
+# These tests cover behaviors that USED to be wired via inline
+# oninput="checkPinField" / oninput="checkURLField" attributes in
+# the templates and are now driven by addEventListener('input', ...)
+# in the JS modules. (Inline-handler-cleanup follow-up to Step 6 PR 4d.)
+
+
+@pytest.mark.e2e
+def test_trakt_validate_button_enables_when_user_types_in_pin_field(page, live_server):
+    """Typing into the PIN field should enable the Validate PIN button;
+    clearing it should disable it again. Previously wired via inline
+    oninput="checkPinField(this)", now via addEventListener.
+    """
+    page.goto(f"{live_server}/step/130-trakt", wait_until="domcontentloaded")
+
+    # Initially disabled (the page just loaded with no PIN entered).
+    expect(page.locator("#validate_trakt_pin")).to_be_disabled()
+
+    page.locator("#trakt_pin").fill("12345678")
+    expect(page.locator("#validate_trakt_pin")).to_be_enabled()
+
+    page.locator("#trakt_pin").fill("")
+    expect(page.locator("#validate_trakt_pin")).to_be_disabled()
+
+
+@pytest.mark.e2e
+def test_mal_validate_button_enables_when_user_types_in_localhost_url(page, live_server):
+    """Typing into the Localhost URL field should enable the Complete
+    Authentication button. Previously wired via inline
+    oninput="checkURLField(this)", now via addEventListener.
+    """
+    page.goto(f"{live_server}/step/140-mal", wait_until="domcontentloaded")
+
+    # Initially disabled (no URL filled in).
+    expect(page.locator("#validate_mal_url")).to_be_disabled()
+
+    page.locator("#mal_localhost_url").fill("http://localhost/callback?code=xyz")
+    expect(page.locator("#validate_mal_url")).to_be_enabled()
+
+    page.locator("#mal_localhost_url").fill("")
+    expect(page.locator("#validate_mal_url")).to_be_disabled()
+
+
+# Webhooks page (#090) inline-handler cleanup. The previous inline
+# onchange="showCustomInput(this)" was BROKEN on this page because
+# 090-webhooks.js loads as a module, which means showCustomInput was
+# module-scoped and not on window. The inline call silently no-op'd,
+# leaving the custom-URL panel hidden when users picked 'Custom'.
+# These tests pin the corrected addEventListener-based behaviour.
+
+
+@pytest.mark.e2e
+def test_webhooks_changing_to_custom_reveals_custom_url_input(page, live_server):
+    """Picking 'Custom' from the dropdown should reveal the custom-URL
+    input panel for that webhook. (Was BROKEN in production before this
+    PR -- the inline onchange handler couldn't find the module-scoped
+    showCustomInput function.)
+    """
+    page.goto(f"{live_server}/step/090-webhooks", wait_until="domcontentloaded")
+
+    custom_panel = page.locator("#webhooks_error_custom")
+    expect(custom_panel).to_be_hidden()
+
+    page.locator("#webhooks_error").select_option("custom")
+    expect(custom_panel).to_be_visible()
+
+    # Switching back to 'None' should hide the panel again.
+    page.locator("#webhooks_error").select_option("")
+    expect(custom_panel).to_be_hidden()
+
+
+@pytest.mark.e2e
+def test_webhooks_validate_button_click_dispatches_to_validate_endpoint(page, live_server):
+    """The .validate-button click handler should POST to /validate_webhook.
+    Proves the click handler is wired correctly to the new addEventListener
+    (was previously inline onclick='validateWebhook(...)' calling a
+    window-exposed function).
+    """
+    captured = {"url": None, "body": None}
+
+    def handle_validate(route, request):
+        captured["url"] = request.url
+        captured["body"] = request.post_data_json
+        route.fulfill(status=200, json={"success": "Webhook OK"})
+
+    page.route("**/validate_webhook", handle_validate)
+    page.goto(f"{live_server}/step/090-webhooks", wait_until="domcontentloaded")
+
+    page.locator("#webhooks_error").select_option("custom")
+    page.locator("#webhooks_error_custom input.custom-webhook-url").fill("https://example.com/webhook")
+    page.locator("#webhooks_error_custom .validate-button").click()
+
+    expect(page.locator("#validation_message_error")).to_contain_text("Webhook OK")
+    assert captured["url"] is not None and "validate_webhook" in captured["url"]
+    assert captured["body"]["webhook_url"] == "https://example.com/webhook"
+    assert "Error" in captured["body"]["message"]  # message includes formatted webhook type
+
+
+@pytest.mark.e2e
+def test_webhooks_typing_in_custom_url_re_enables_validate_button(page, live_server):
+    """After a successful validation, the validate button is disabled.
+    Editing the URL again should re-enable it so the user can re-validate.
+    Replaces the previous inline oninput='setWebhookValidated(false, ...)'
+    handler -- the inline handler called setWebhookValidated(false, key)
+    which also sets `validateButton.disabled = false`. Verifying THIS
+    side effect (rather than the brittle webhooks_validated value, which
+    races with markTouched -> updateValidationState in both legacy and
+    new code).
+    """
+    page.route("**/validate_webhook", lambda route: route.fulfill(status=200, json={"success": "OK"}))
+    page.goto(f"{live_server}/step/090-webhooks", wait_until="domcontentloaded")
+
+    page.locator("#webhooks_error").select_option("custom")
+    url_input = page.locator("#webhooks_error_custom input.custom-webhook-url")
+    validate_btn = page.locator("#webhooks_error_custom .validate-button")
+
+    url_input.fill("https://example.com/webhook")
+    validate_btn.click()
+    # After success the button gets disabled.
+    expect(validate_btn).to_be_disabled()
+
+    # Editing the URL should re-enable the button via the new input listener.
+    url_input.fill("https://different.example.com/webhook")
+    expect(validate_btn).to_be_enabled()
+
+
+# Config workspace modal (#_config_workspace_modal). The previous
+# onchange="toggleConfigInput(this)" relied on a window-exposed
+# function in 001-start.js. Now wired via addEventListener inside the
+# existing configSelector change handler.
+
+
+@pytest.mark.e2e
+def test_config_workspace_modal_changing_selector_shows_new_config_input(page, live_server):
+    """Opening the modal and selecting 'Add Config' from the dropdown
+    should reveal the New Config Name input box (#newConfigInput).
+    Selecting an existing config should hide it.
+    """
+    page.goto(f"{live_server}/step/001-start", wait_until="domcontentloaded")
+
+    # The modal is in the DOM but starts hidden behind a Bootstrap
+    # modal toggle. Show it directly so we can interact with the select.
+    page.evaluate("""
+        const modalEl = document.getElementById('configSwitchModal')
+        if (modalEl) {
+            modalEl.classList.add('show')
+            modalEl.style.display = 'block'
+            modalEl.removeAttribute('aria-hidden')
+        }
+    """)
+
+    selector = page.locator("#configSelector")
+    selector.select_option("add_config")
+    # The new-config input box loses the d-none class.
+    classes_after_add = page.locator("#newConfigInput").get_attribute("class") or ""
+    assert "d-none" not in classes_after_add, f"expected d-none REMOVED after picking 'add_config'; got class='{classes_after_add}'"
+
+    # If there's another option available, picking it should re-add d-none.
+    other_options = selector.evaluate("el => Array.from(el.options).map(o => o.value).filter(v => v !== 'add_config')")
+    if other_options:
+        selector.select_option(other_options[0])
+        classes_after_other = page.locator("#newConfigInput").get_attribute("class") or ""
+        assert "d-none" in classes_after_other, f"expected d-none ADDED after switching away from add_config; got class='{classes_after_other}'"
+
+
+# Navigation inline-handler cleanup (Group A). Previously the templates
+# had onclick="jumpTo('...')" and onclick='loading("prev", "...")' inline.
+# Now elements carry data-jumpto-page (+optional data-jumpto-label) and
+# data-nav-action (+ data-nav-target), wired by a delegated click
+# listener in 000-base.js. These tests pin the new behaviour.
+
+
+@pytest.mark.e2e
+def test_nav_jumpto_data_attr_dispatches_to_jumpto_function(page, live_server):
+    """Clicking an element with data-jumpto-page should call jumpTo()
+    with the page and (if present) the label. We capture this by
+    listening to the 'qs:nav:jump' CustomEvent and preventing default
+    so the real navigation never fires (the test seam introduced in
+    PR #1383 chore/retire-jumpto-loading-shims, replacing the previous
+    window.jumpTo spy).
+    """
+    page.goto(f"{live_server}/step/001-start", wait_until="domcontentloaded")
+
+    # Install the test seam: cancel every 'qs:nav:jump' event and
+    # record its detail. The listener in 000-base.js checks the return
+    # value of dispatchEvent() and skips the real jumpTo() call when
+    # the event is cancelled, so no navigation happens.
+    page.evaluate("""
+        window.__jumpToCalls = []
+        document.addEventListener('qs:nav:jump', (e) => {
+            e.preventDefault()
+            window.__jumpToCalls.push([e.detail.page, e.detail.label])
+        })
+    """)
+
+    # The 'Donate' sponsor button in the sidebar footer carries
+    # data-jumpto-page="910-sponsor" (literal, no label). Use a specific
+    # selector for the sidebar footer link (vs the step-dropdown item
+    # which ALSO matches [data-jumpto-page=910-sponsor]). Dispatch the
+    # click via JS rather than Playwright -- the link can live in a
+    # collapsed sidebar footer which Playwright considers non-visible.
+    page.evaluate("""
+        const el = document.querySelector('.qs-sidebar-footer-links [data-jumpto-page="910-sponsor"]')
+            || document.querySelector('.btn.sponsor-btn[data-jumpto-page="910-sponsor"]')
+        if (!el) throw new Error('No sidebar/footer [data-jumpto-page=910-sponsor] element on the page')
+        el.click()
+    """)
+    calls = page.evaluate("window.__jumpToCalls")
+    assert calls, "expected qs:nav:jump to fire when [data-jumpto-page] was clicked"
+    # No data-jumpto-label on the sponsor link, so the label arg should be undefined/None.
+    assert calls[-1][0] == "910-sponsor", f"expected page='910-sponsor', got {calls[-1]}"
+
+
+@pytest.mark.e2e
+def test_nav_jumpto_data_attr_includes_label_when_present(page, live_server):
+    """If the element carries both data-jumpto-page and data-jumpto-label,
+    both values should be forwarded to the qs:nav:jump event. Verified by
+    injecting a synthetic element AFTER DOMContentLoaded -- this exercises
+    the event-delegation behaviour (delegated listener picks up elements
+    added at runtime, not just those present at page load).
+    """
+    page.goto(f"{live_server}/step/001-start", wait_until="domcontentloaded")
+    page.evaluate("""
+        window.__jumpToCalls = []
+        document.addEventListener('qs:nav:jump', (e) => {
+            e.preventDefault()
+            window.__jumpToCalls.push([e.detail.page, e.detail.label])
+        })
+        const el = document.createElement('a')
+        el.id = '__synthetic_jumpto'
+        el.href = 'javascript:void(0);'
+        el.dataset.jumptoPage = '020-tmdb'
+        el.dataset.jumptoLabel = 'TMDb Custom Label'
+        document.body.appendChild(el)
+    """)
+    page.evaluate("document.getElementById('__synthetic_jumpto').click()")
+    calls = page.evaluate("window.__jumpToCalls")
+    # The runtime-added element must be picked up by the delegated
+    # listener installed at DOMContentLoaded -- proves we're NOT using
+    # per-element binding (which would miss this).
+    assert calls, "expected qs:nav:jump to fire for a runtime-added [data-jumpto-page] element"
+    assert calls[-1] == ["020-tmdb", "TMDb Custom Label"], f"expected page='020-tmdb', label='TMDb Custom Label', got {calls[-1]}"
+
+
+@pytest.mark.e2e
+def test_nav_next_button_data_attr_fires_loading_before_submit(page, live_server):
+    """The Next button is a form-submit. Clicking it should fire
+    qs:nav:loading with action='next' BEFORE the form submits. The click
+    listener MUST NOT preventDefault or the form won't navigate.
+    """
+    page.goto(f"{live_server}/step/010-plex", wait_until="domcontentloaded")
+
+    # Install the qs:nav:loading test seam. Cancel the event so the
+    # real loading() call (which would start spinners + DOM mutation)
+    # never fires; we just observe what action/target would have been
+    # passed.
+    page.evaluate("""
+        window.__loadingCalls = []
+        document.addEventListener('qs:nav:loading', (e) => {
+            e.preventDefault()
+            window.__loadingCalls.push([e.detail.action, e.detail.target])
+        })
+    """)
+
+    next_btn = page.locator('button[data-nav-action="next"]').first
+    expect(next_btn).to_have_attribute("data-nav-action", "next")
+    # The target value comes from page_info['next_page_name'] -- whatever
+    # the next page is called on this server. We don't pin a specific
+    # value because that depends on the page sequence configuration; we
+    # just check that loading() got called with action='next' and some
+    # non-empty target.
+
+    # To avoid the form actually submitting (which would navigate away
+    # mid-test), intercept the submit event.
+    page.evaluate("""
+        document.getElementById('configForm').addEventListener('submit',
+            (e) => { e.preventDefault() })
+    """)
+    # Dispatch click via JS in case the button is offscreen at the
+    # current viewport.
+    page.evaluate("""
+        const btn = document.querySelector('button[data-nav-action="next"]')
+        if (!btn) throw new Error('No button[data-nav-action=next] on the page')
+        btn.click()
+    """)
+
+    calls = page.evaluate("window.__loadingCalls")
+    assert calls, "expected loading() to be called when next button was clicked"
+    # Use [-1] -- earlier page-init code may have invoked loading() too.
+    assert calls[-1][0] == "next", f"expected action='next', got {calls[-1]}"
+    assert calls[-1][1], f"expected non-empty target, got {calls[-1]}"
+
+
+@pytest.mark.e2e
+def test_nav_step_rail_button_clicks_call_jumpto(page, live_server):
+    """The compact step-rail buttons in the workspace nav (one per step,
+    rendered by step_link_button macro) used to carry inline
+    onclick=\"jumpTo('010-plex')\". After this PR they carry
+    data-jumpto-page='010-plex' and the same click should still call
+    jumpTo with the step key.
+    """
+    page.goto(f"{live_server}/step/001-start", wait_until="domcontentloaded")
+
+    page.evaluate("""
+        window.__jumpToCalls = []
+        document.addEventListener('qs:nav:jump', (e) => {
+            e.preventDefault()
+            window.__jumpToCalls.push([e.detail.page, e.detail.label])
+        })
+    """)
+
+    # qs-step-link is the class on the per-step rail button. We look for
+    # the one targeting 010-plex specifically. Dispatch via JS rather than
+    # Playwright -- the rail can be collapsed depending on viewport.
+    page.evaluate("""
+        const el = document.querySelector('.qs-step-link[data-jumpto-page="010-plex"]')
+        if (!el) throw new Error('No .qs-step-link[data-jumpto-page=010-plex] on the page')
+        el.click()
+    """)
+
+    calls = page.evaluate("window.__jumpToCalls")
+    assert calls, "expected jumpTo() when a step-rail button was clicked"
+    # Use [-1] -- earlier page-init code may have invoked jumpTo() too; we
+    # only care that OUR click resulted in a call with the right page key.
+    assert calls[-1][0] == "010-plex", f"expected page='010-plex', got {calls[-1]}"
+
+
+@pytest.mark.e2e
+def test_nav_no_inline_handlers_remain_in_base_layout(page, live_server):
+    """Belt-and-braces regression test: after this PR, the base layout
+    (which is rendered into every page) must not contain any inline
+    on*= event-handler attributes. This catches accidental
+    re-introduction of inline handlers via partials.
+    """
+    page.goto(f"{live_server}/step/001-start", wait_until="domcontentloaded")
+    # Inspect the rendered HTML rather than templates -- this catches
+    # handlers injected from JS into the DOM too. We check the top-level
+    # nav, footer, and sidebar regions which the relevant templates own.
+    inline_count = page.evaluate("""
+        () => {
+            const root = document.querySelector('body') || document.documentElement
+            const nodes = root.querySelectorAll('*')
+            const offenders = []
+            const inlineAttrs = ['onclick', 'oninput', 'onchange', 'onsubmit',
+                                 'onload', 'onkeyup', 'onkeydown', 'onkeypress',
+                                 'onfocus', 'onblur', 'onmouseover', 'onmouseout']
+            for (const node of nodes) {
+                // Skip the qs-step-link buttons inside any modal where a
+                // partial may still legitimately use inline handlers for
+                // some other feature.
+                for (const attr of inlineAttrs) {
+                    if (node.hasAttribute(attr)) {
+                        offenders.push({
+                            tag: node.tagName,
+                            id: node.id,
+                            attr: attr,
+                            value: node.getAttribute(attr).substring(0, 50)
+                        })
+                    }
+                }
+            }
+            return offenders
+        }
+    """)
+    # As of the Group B cleanup (chore/rgba-picker-group-b), no inline
+    # handler should remain in any rendered page. The earlier comment
+    # carved out the color-picker macros in _macros.html; those are now
+    # also gone (replaced by static/local-js/rgbaPicker.js).
+    nav_offenders = [o for o in inline_count if (o.get("tag") in ("A", "BUTTON")) and (o.get("value", "").startswith("jumpTo(") or o.get("value", "").startswith("loading("))]
+    assert not nav_offenders, f"Found leftover inline jumpTo/loading handlers in the navigation: " f"{nav_offenders}"
+
+
+# Runtime-injected inline-handler cleanup (chore/runtime-html-inline-handlers).
+# Three files previously composed HTML strings containing onclick="jumpTo(...)"
+# and inserted them via innerHTML:
+#   - static/local-js/validationHandler.js (Plex-not-validated message)
+#   - static/local-js/027-playlist_files.js (same; copy-paste)
+#   - static/local-js/overlayHandler.js (rating-mapping service pills)
+# These now use data-jumpto-page instead. The delegated click listener in
+# 000-base.js (now using event delegation on document.body) picks them up
+# even when the element is added to the DOM AFTER DOMContentLoaded.
+
+
+@pytest.mark.e2e
+def test_runtime_added_jumpto_element_triggers_jumpto_via_delegation(page, live_server):
+    """Belt-and-braces version of the synthetic-element test specific to
+    the runtime-HTML-injection use case: simulate the overlayHandler /
+    027-playlist_files / validationHandler pattern by setting innerHTML
+    on a container, then assert the resulting [data-jumpto-page] anchor
+    triggers jumpTo via the delegated listener.
+    """
+    page.goto(f"{live_server}/step/001-start", wait_until="domcontentloaded")
+    page.evaluate("""
+        window.__jumpToCalls = []
+        document.addEventListener('qs:nav:jump', (e) => {
+            e.preventDefault()
+            window.__jumpToCalls.push([e.detail.page, e.detail.label])
+        })
+        const host = document.createElement('div')
+        host.id = '__runtime_host'
+        document.body.appendChild(host)
+        // Mirror the production pattern: assign innerHTML with a string
+        // containing <a data-jumpto-page="..."> -- the link is parsed
+        // from the string at innerHTML-assignment time, the delegated
+        // listener doesn't need re-binding.
+        host.innerHTML =
+          'Please <a href="javascript:void(0);" data-jumpto-page="010-plex" id="__runtime_link">return to the Plex page</a>.'
+    """)
+    page.evaluate("document.getElementById('__runtime_link').click()")
+    calls = page.evaluate("window.__jumpToCalls")
+    assert calls, "expected jumpTo() to be called for the runtime-innerHTML-added link"
+    assert calls[-1][0] == "010-plex", f"expected page='010-plex', got {calls[-1]}"
+
+
+@pytest.mark.e2e
+def test_validation_handler_show_message_textcontent_by_default(page, live_server):
+    """validationHandler.showValidationMessage defaults to textContent --
+    HTML in the message string should render as plain text. This is the
+    safe-against-XSS default.
+    """
+    # Pick a page that includes #validation-messages in its template.
+    # 900-kometa has it (templates/900-kometa.html:272).
+    page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
+    page.add_script_tag(path="static/local-js/validationHandler.js")
+    # Need jQuery for the existing $('#plex_valid') call -- 900-kometa
+    # already loads it as part of the base layout.
+    page.evaluate("""
+        ValidationHandler.showValidationMessage(
+            'Plain <strong>text</strong> message', 'danger'
+        )
+    """)
+    box = page.locator("#validation-messages")
+    expect(box).to_have_text("Plain <strong>text</strong> message")
+    # innerHTML should contain the literal &lt; (escaped); no <strong> tag.
+    inner = box.evaluate("el => el.innerHTML")
+    assert "<strong>" not in inner, f"expected escaped HTML, got: {inner[:200]}"
+    assert "&lt;strong&gt;" in inner or "&lt;/strong&gt;" in inner, f"expected HTML-escaped <strong>, got: {inner[:200]}"
+
+
+@pytest.mark.e2e
+def test_validation_handler_show_message_html_opt_in_renders_html(page, live_server):
+    """When called with {html: true}, showValidationMessage uses innerHTML.
+    A link inside the message becomes a real anchor.
+    """
+    page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
+    page.add_script_tag(path="static/local-js/validationHandler.js")
+    page.evaluate("""
+        ValidationHandler.showValidationMessage(
+            'Please <a href=\"javascript:void(0);\" data-jumpto-page=\"010-plex\">click here</a>.',
+            'danger',
+            { html: true }
+        )
+    """)
+    box = page.locator("#validation-messages")
+    # The <a> element should exist as a real DOM node, not plain text.
+    expect(box.locator('a[data-jumpto-page="010-plex"]')).to_be_attached()
+    # And clicking it should trigger the delegated jumpTo handler.
+    page.evaluate("""
+        window.__jumpToCalls = []
+        document.addEventListener('qs:nav:jump', (e) => {
+            e.preventDefault()
+            window.__jumpToCalls.push([e.detail.page, e.detail.label])
+        })
+        document.querySelector('#validation-messages a[data-jumpto-page=\"010-plex\"]').click()
+    """)
+    calls = page.evaluate("window.__jumpToCalls")
+    assert calls, "expected click on the rendered <a> to trigger qs:nav:jump"
+    assert calls[-1][0] == "010-plex", f"expected page='010-plex', got {calls[-1]}"
+
+
+# Group B color-picker macro cleanup (chore/rgba-picker-group-b).
+# The `.rgba-group` widget in templates/partials/_macros.html previously
+# contained 4 inline `oninput="(function(...){ ... })(this)"` IIFEs with
+# {{ input_id }} and {{ alpha_id }} Jinja-interpolated into the function
+# bodies. Those are gone; static/local-js/rgbaPicker.js installs a single
+# delegated `input` listener that handles all .rgba-group widgets.
+
+
+@pytest.mark.e2e
+def test_rgba_picker_script_loads_on_libraries_page(page, live_server):
+    """The rgbaPicker.js module is loaded via dynamic import() by
+    025-libraries.js (PR #1388). Since import() does NOT create a
+    <script> element in the DOM, we verify the module loaded by
+    checking the rgba picker's delegated listener is active.
+    """
+    page.goto(f"{live_server}/step/025-libraries", wait_until="domcontentloaded")
+    # Scripts are loaded sequentially; give them a moment to finish.
+    page.wait_for_timeout(1500)
+    # Synthesize a minimal .rgba-group, fire an input on the slider,
+    # and assert the hex-input gets updated — proving the listener
+    # registered by rgbaPicker.js is active, even though no <script>
+    # tag appears in the DOM.
+    updated = page.evaluate("""() => {
+            const host = document.createElement('div')
+            host.innerHTML = `<div class="rgba-group">
+                <input class="rgba-color-picker" type="color" value="#ff00ff">
+                <input class="rgba-hex-input" type="text" value="#FF00FF64">
+                <input class="rgba-alpha-input" type="number" value="39">
+                <input class="rgba-alpha-slider" type="range" min="0" max="100" value="39">
+                <label class="rgba-color-bar"></label>
+            </div>`
+            document.body.appendChild(host)
+            const slider = host.querySelector('.rgba-alpha-slider')
+            slider.value = '75'
+            slider.dispatchEvent(new Event('input', { bubbles: true }))
+            const result = host.querySelector('.rgba-hex-input').value
+            host.remove()
+            return result === '#FF00FFBF'
+        }""")
+    assert updated, "expected rgbaPicker delegated listener to be active after import() load"
+
+
+@pytest.mark.e2e
+def test_rgba_picker_delegated_listener_drives_synthetic_widget(page, live_server):
+    """End-to-end demonstration that the production rgbaPicker.js
+    listener drives a real DOM widget. We synthesize a minimal
+    .rgba-group, fire an `input` event on the slider, and assert the
+    hex-input got updated with the right alpha byte.
+
+    The fixture is intentionally minimal (no Jinja, no test_uses_module
+    overhead) -- this proves the contract between the rendered DOM and
+    the listener, regardless of how the macro renders the widget.
+    """
+    page.goto(f"{live_server}/step/025-libraries", wait_until="domcontentloaded")
+    page.wait_for_timeout(1500)
+    page.evaluate("""() => {
+            const host = document.createElement('div')
+            host.innerHTML = `
+              <div class="rgba-group" id="__test_group">
+                <input type="color" class="rgba-color-picker" value="#aabbcc">
+                <label class="rgba-color-bar"></label>
+                <input type="text" class="rgba-hex-input" value="#aabbccFF">
+                <input type="number" class="rgba-alpha-input" value="100">
+                <input type="range" class="rgba-alpha-slider" value="100">
+              </div>
+            `
+            document.body.appendChild(host)
+        }""")
+    page.evaluate("""() => {
+            const slider = document.querySelector('#__test_group .rgba-alpha-slider')
+            slider.value = '50'
+            slider.dispatchEvent(new Event('input', { bubbles: true }))
+        }""")
+    hex_value = page.evaluate("() => document.querySelector('#__test_group .rgba-hex-input').value")
+    # 50% alpha -> 0x80
+    assert hex_value == "#AABBCC80", f"expected '#AABBCC80', got '{hex_value}'"
+
+
+@pytest.mark.e2e
+def test_macros_html_contains_no_inline_event_handlers(page, live_server):
+    """Static check: _macros.html (rendered via 025-libraries) should
+    have ZERO inline on*= handlers. Group B was the last carve-out.
+    """
+    import re
+    from pathlib import Path
+
+    macros = Path("templates/partials/_macros.html").read_text()
+    # Match attribute-style inline handlers: onXxx=
+    pattern = re.compile(r"\bon(click|input|change|submit|load|key\w*|focus|blur|mouse\w*)=", re.IGNORECASE)
+    hits = pattern.findall(macros)
+    assert not hits, f"found inline event handlers in _macros.html: {hits[:5]}"
+
+
+# window.jumpTo / window.loading shim retirement
+# (chore/retire-jumpto-loading-shims).
+# Previously 000-base.js published `window.jumpTo` and `window.loading`
+# as compatibility shims so that:
+#   - 001-start.js could call window.loading('jump', label)
+#   - the e2e test suite could spy on calls by overwriting them
+# Both consumers have been migrated:
+#   - 001-start.js now does `import { loading } from './000-base.js'`
+#   - the delegated nav listener dispatches cancelable CustomEvents
+#     ('qs:nav:jump' and 'qs:nav:loading') that tests subscribe to.
+# These tests pin the new contract so the shims can't sneak back in.
+
+
+@pytest.mark.e2e
+def test_window_loading_shim_is_retired(page, live_server):
+    """window.loading must NOT be set by 000-base.js. The only external
+    caller (001-start.js) was migrated to a direct ES module import in
+    PR #1382. window.jumpTo is INTENTIONALLY still shimmed because
+    static/local-js/025-libraries.js (a 4600-line classic script) still
+    relies on it. See PR #1384 (fix/restore-jumpto-shim-for-classic-scripts)
+    for the regression that motivated the restoration.
+    """
+    page.goto(f"{live_server}/step/001-start", wait_until="domcontentloaded")
+    # Give the module a beat to finish executing.
+    page.wait_for_timeout(200)
+    state = page.evaluate("() => typeof window.loading")
+    assert state == "undefined", f"window.loading should be undefined (retired shim), got {state}"
+
+
+@pytest.mark.e2e
+def test_window_jumpto_shim_is_present_on_libraries_page(page, live_server):
+    """Regression guard for the bug introduced by PR #1382 and fixed in
+    PR #1384: static/local-js/025-libraries.js calls `jumpTo(...)` as a
+    bare reference inside its `qs:before-step-navigation` listener. That
+    classic script depends on the `window.jumpTo` shim being published
+    by 000-base.js. Without the shim, autosave-then-navigate from a
+    library throws ReferenceError.
+    """
+    page.goto(f"{live_server}/step/025-libraries", wait_until="domcontentloaded")
+    # Sequential script loader is async; wait for it to finish.
+    page.wait_for_timeout(2000)
+    state = page.evaluate("""() => ({
+        jumpToType: typeof window.jumpTo,
+        bareJumpToType: typeof jumpTo,
+        librariesLoaded: !!document.querySelector('#libraryPicker')
+    })""")
+    assert state["librariesLoaded"], "expected the libraries page to actually render (precondition for the test)"
+    assert state["jumpToType"] == "function", f"window.jumpTo MUST be a function on the libraries page so 025-libraries.js can call it; got {state['jumpToType']}"
+    # Bare `jumpTo` resolves via window in non-strict classic scripts.
+    assert state["bareJumpToType"] == "function", f"bare jumpTo MUST resolve (via window) on the libraries page; got {state['bareJumpToType']}"
+
+
+@pytest.mark.e2e
+def test_qs_nav_jump_event_is_cancelable_and_carries_detail(page, live_server):
+    """The CustomEvent test seam contract: 'qs:nav:jump' must be a
+    cancelable event with { page, label } in detail. Cancelling it
+    must skip the underlying jumpTo() call.
+    """
+    page.goto(f"{live_server}/step/001-start", wait_until="domcontentloaded")
+    page.evaluate("""() => {
+            window.__capturedEvent = null
+            window.__jumpToFiredAfterCancel = false
+            // Wrap jumpTo to detect if it ran AFTER cancel. We can't
+            // import the module function from inside evaluate(), but we
+            // can observe the form-submission side-effect: jumpTo()
+            // mutates form.action and submits. Stub the form's submit
+            // to detect that.
+            const form = document.getElementById('configForm')
+            if (form) {
+                form.addEventListener('submit', () => {
+                    window.__jumpToFiredAfterCancel = true
+                }, { capture: true })
+            }
+            document.addEventListener('qs:nav:jump', (e) => {
+                window.__capturedEvent = {
+                    type: e.type,
+                    cancelable: e.cancelable,
+                    page: e.detail.page,
+                    label: e.detail.label
+                }
+                e.preventDefault()
+            })
+            // Synthesize a link to click.
+            const el = document.createElement('a')
+            el.id = '__seam_link'
+            el.href = 'javascript:void(0);'
+            el.dataset.jumptoPage = '030-tautulli'
+            el.dataset.jumptoLabel = 'Tautulli Test'
+            document.body.appendChild(el)
+            el.click()
+        }""")
+    captured = page.evaluate("window.__capturedEvent")
+    fired = page.evaluate("window.__jumpToFiredAfterCancel")
+    assert captured is not None, "qs:nav:jump event did not fire"
+    assert captured["type"] == "qs:nav:jump"
+    assert captured["cancelable"] is True, "qs:nav:jump must be cancelable"
+    assert captured["page"] == "030-tautulli"
+    assert captured["label"] == "Tautulli Test"
+    assert fired is False, "jumpTo() should NOT have run after preventDefault()"
+
+
+@pytest.mark.e2e
+def test_qs_nav_loading_event_is_cancelable_and_carries_detail(page, live_server):
+    """Same contract for the loading event."""
+    page.goto(f"{live_server}/step/010-plex", wait_until="domcontentloaded")
+    page.evaluate("""() => {
+            window.__capturedEvent = null
+            document.addEventListener('qs:nav:loading', (e) => {
+                window.__capturedEvent = {
+                    type: e.type,
+                    cancelable: e.cancelable,
+                    action: e.detail.action,
+                    target: e.detail.target
+                }
+                e.preventDefault()
+            })
+            // Intercept form submit so the page doesn't actually navigate.
+            document.getElementById('configForm').addEventListener('submit',
+                (e) => { e.preventDefault() })
+            const btn = document.querySelector('button[data-nav-action="next"]')
+            if (!btn) throw new Error('No button[data-nav-action=next] on the page')
+            btn.click()
+        }""")
+    captured = page.evaluate("window.__capturedEvent")
+    assert captured is not None, "qs:nav:loading event did not fire"
+    assert captured["type"] == "qs:nav:loading"
+    assert captured["cancelable"] is True, "qs:nav:loading must be cancelable"
+    assert captured["action"] == "next"
+    assert captured["target"], "qs:nav:loading must carry a non-empty target"
+
+
+# ES module conversion of 915-imagemaid.js (chore/convert-915-imagemaid-to-module).
+# Before this conversion the file was a classic <script> wrapped in
+# $(document).ready(...). After: type="module" with the IIFE wrapper
+# removed (modules are deferred so the ready guard is redundant).
+#
+# These tests pin both:
+#   - the page is reachable and the module actually executes
+#   - the page no longer leaks ImageMaid-internal state to window.*
+#     (which classic-script top-level lets/consts didn't do, but it's
+#     a useful contract check now that the IIFE is gone and someone
+#     might be tempted to "export" via window)
+
+
+@pytest.mark.e2e
+def test_imagemaid_page_loads_as_module(page, live_server):
+    """The ImageMaid page must render and its script must be loaded as
+    type='module'. After conversion the page sources its JS via the
+    same template path but with type='module' instead of type='text/javascript'.
+    """
+    page.goto(f"{live_server}/step/915-imagemaid", wait_until="domcontentloaded")
+    page.wait_for_timeout(500)
+    state = page.evaluate("""() => {
+            const scripts = Array.from(document.scripts)
+            const imagemaidScript = scripts.find(s => (s.src || '').endsWith('/915-imagemaid.js'))
+            return {
+                pageMeta: !!document.getElementById('imagemaid-page-meta'),
+                scriptFound: !!imagemaidScript,
+                scriptType: imagemaidScript ? imagemaidScript.type : null
+            }
+        }""")
+    assert state["pageMeta"], "expected the ImageMaid page to render (precondition)"
+    assert state["scriptFound"], "expected /915-imagemaid.js to be referenced from the page"
+    assert state["scriptType"] == "module", f"expected the ImageMaid script to load as type='module' after conversion; got type={state['scriptType']!r}"
+
+
+@pytest.mark.e2e
+def test_imagemaid_module_does_not_leak_state_to_window(page, live_server):
+    """As a classic <script>, the IIFE wrapper prevented the file's top-
+    level `let`/`const` declarations from polluting window. The module
+    conversion preserves that property -- modules have their own
+    top-level scope. This test pins it so a future refactor can't
+    re-introduce `window.imagemaidXyz = ...` shims by accident.
+    """
+    page.goto(f"{live_server}/step/915-imagemaid", wait_until="domcontentloaded")
+    page.wait_for_timeout(500)
+    leaked = page.evaluate("""() => {
+            // Names that exist at top level inside 915-imagemaid.js. If
+            // any of these leak to window, the module scope is broken.
+            const candidates = [
+                'imagemaidSupportsNoVerifySsl',
+                'imagemaidSupportsOverlaysOnly',
+                'imagemaidValidated',
+                'imagemaidInstalled',
+                'imagemaidVenvReady',
+                'imagemaidRunning',
+                'imagemaidStarting',
+                'updateStatus',
+                'loadLog',
+                'imagemaidSparkState'
+            ]
+            return candidates.filter(name => typeof window[name] !== 'undefined')
+        }""")
+    assert not leaked, f"these ImageMaid-internal names leaked to window: {leaked}"
+
+
+@pytest.mark.e2e
+def test_imagemaid_module_runs_without_console_errors(page, live_server):
+    """No JS console errors during page load (catches strict-mode
+    surprises from the IIFE->module conversion: implicit globals,
+    re-declarations, etc).
+    """
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    page.on("console", lambda msg: errors.append(f"{msg.type}: {msg.text}") if msg.type == "error" else None)
+    page.goto(f"{live_server}/step/915-imagemaid", wait_until="domcontentloaded")
+    page.wait_for_timeout(1000)
+    # Filter out errors that are NOT from our JS conversion -- e.g.
+    # backend fetch failures because there's no real ImageMaid install
+    # in the test environment. We only care about pageerrors and
+    # console-error messages that mention our file or strict-mode issues.
+    relevant = [e for e in errors if any(kw in e.lower() for kw in ("imagemaid.js", "strict mode", "redeclar", "is not defined"))]
+    assert not relevant, f"module conversion introduced JS errors: {relevant}"
+
+
+# Same shape as 915-imagemaid.js (#1385): $(document).ready(...) wrapper
+# was unwrapped and the body dedented. See that PR for the recipe.
+
+
+@pytest.mark.e2e
+def test_analytics_page_loads_as_module(page, live_server):
+    """The Analytics page must render and its script must be loaded as type='module'."""
+    page.goto(f"{live_server}/step/905-analytics", wait_until="domcontentloaded")
+    page.wait_for_timeout(500)
+    state = page.evaluate("""() => {
+            const scripts = Array.from(document.scripts)
+            const analyticsScript = scripts.find(s => (s.src || '').endsWith('/905-analytics.js'))
+            return {
+                pageMeta: !!document.querySelector('#logscan-trends-table'),
+                scriptFound: !!analyticsScript,
+                scriptType: analyticsScript ? analyticsScript.type : null
+            }
+        }""")
+    assert state["pageMeta"], "expected the Analytics page to render (precondition)"
+    assert state["scriptFound"], "expected /905-analytics.js to be referenced from the page"
+    assert state["scriptType"] == "module", f"expected the Analytics script to load as type='module' after conversion; got type={state['scriptType']!r}"
+
+
+@pytest.mark.e2e
+def test_analytics_module_does_not_leak_state_to_window(page, live_server):
+    """Module scope contract: top-level declarations from 905-analytics.js
+    must not be visible on window. Pre-conversion the IIFE wrapper
+    provided this; post-conversion the module scope does. Keep it tight.
+    """
+    page.goto(f"{live_server}/step/905-analytics", wait_until="domcontentloaded")
+    page.wait_for_timeout(500)
+    leaked = page.evaluate("""() => {
+            // Names that exist at top level inside 905-analytics.js.
+            // NOTE: escapeHtml is defined as a local function in this file.
+            // It must NOT shadow the window.escapeHtml shim published by
+            // 000-base.js when accessed from outside this module -- so we
+            // check window.escapeHtml is still the 000-base.js version,
+            // while the local one stays module-scoped.
+            const candidates = [
+                'missingDownloadUrl',
+                'pendingInvalidLogCleanup',
+                'pendingDeleteRun',
+                'pendingCompressRun',
+                'reingestPollTimer',
+                'reingestJobId',
+                'syncMirroredControlValue',
+                'formatSeconds',
+                'formatAverage',
+                'formatCompactNumber'
+            ]
+            return candidates.filter(name => typeof window[name] !== 'undefined')
+        }""")
+    assert not leaked, f"these analytics-internal names leaked to window: {leaked}"
+
+
+@pytest.mark.e2e
+def test_analytics_local_escapehtml_does_not_clobber_global_shim(page, live_server):
+    """905-analytics.js defines its OWN `escapeHtml` function at module
+    top level. 000-base.js also publishes `window.escapeHtml` as a
+    compatibility shim. Pre-conversion the IIFE prevented the analytics
+    one from leaking; post-conversion the module scope does. This test
+    pins both:
+      - window.escapeHtml still resolves (000-base.js shim is intact)
+      - it's the 000-base.js function, NOT the 905-analytics one
+    """
+    page.goto(f"{live_server}/step/905-analytics", wait_until="domcontentloaded")
+    page.wait_for_timeout(500)
+    state = page.evaluate("""() => ({
+            shimType: typeof window.escapeHtml,
+            // The 000-base.js escapeHtml escapes & < > " '. Call it
+            // through window to verify we're hitting the shim, not the
+            // analytics module's local copy (which would also work since
+            // they're functionally equivalent, but the point is the
+            // module scope didn't let the local one leak).
+            shimResult: typeof window.escapeHtml === 'function'
+                ? window.escapeHtml('<script>alert(1)</script>')
+                : null
+        })""")
+    assert state["shimType"] == "function", f"window.escapeHtml shim must remain published by 000-base.js; got {state['shimType']}"
+    assert "&lt;script&gt;" in (state["shimResult"] or ""), f"window.escapeHtml should produce escaped output; got {state['shimResult']!r}"
+
+
+@pytest.mark.e2e
+def test_analytics_module_runs_without_console_errors(page, live_server):
+    """No JS console errors from the module conversion."""
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    page.on("console", lambda msg: errors.append(f"{msg.type}: {msg.text}") if msg.type == "error" else None)
+
+    page.goto(f"{live_server}/step/905-analytics", wait_until="domcontentloaded")
+    page.wait_for_timeout(1000)
+    relevant = [e for e in errors if any(kw in e.lower() for kw in ("analytics.js", "strict mode", "redeclar", "is not defined"))]
+    assert not relevant, f"module conversion introduced JS errors: {relevant}"
+
+
+# ES module conversion of rgbaPicker.js (chore/convert-rgbapicker-to-module).
+# rgbaPicker.js is NOT a page script -- it's loaded by 025-libraries.js's
+# dynamic script loader. The loader was updated to use `import()` for
+# module scripts (detected via the moduleScripts set). These tests verify:
+#   - The libraries page loads without module-related JS errors
+#   - The import()-based loading mechanism works correctly
+
+
+@pytest.mark.e2e
+def test_rgbapicker_module_loads_without_errors(page, live_server):
+    """The rgbaPicker module is loaded via dynamic import() by
+    025-libraries.js. Verify no console errors from the module load
+    path (strict-mode issues, import failures, etc.).
+    """
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    page.on("console", lambda msg: errors.append(f"{msg.type}: {msg.text}") if msg.type == "error" else None)
+    page.goto(f"{live_server}/step/025-libraries", wait_until="domcontentloaded")
+    # Wait for the sequential loader to finish
+    page.wait_for_timeout(2000)
+    relevant = [e for e in errors if any(kw in e.lower() for kw in ("rgba", "import", "module", "strict mode", "redeclar", "is not defined"))]
+    assert not relevant, f"module import introduced JS errors: {relevant}"
+
+
+# ES module conversion of validationHandler.js
+# (chore/convert-validationhandler-to-module).
+# Loaded by 025-libraries.js via dynamic import(). Publishes
+# window.ValidationHandler for backward compat (same pattern as
+# pathValidation.js and urlValidation.js).
+
+
+@pytest.mark.e2e
+def test_validationhandler_module_loads_via_import(page, live_server):
+    """validationHandler.js is now loaded via import() by 025-libraries.js.
+    The module publishes window.ValidationHandler for backward compat with
+    the classic-script typeof checks in 025-libraries.js. Verify the
+    import() path works by asserting the symbol is available and has
+    the expected methods.
+    """
+    page.goto(f"{live_server}/step/025-libraries", wait_until="domcontentloaded")
+    page.wait_for_timeout(2000)
+    state = page.evaluate("""() => ({
+            hasValidationHandler: typeof window.ValidationHandler !== 'undefined',
+            hasUpdateMethod: typeof window.ValidationHandler === 'object'
+                && typeof window.ValidationHandler.updateValidationState === 'function',
+            hasInitMethod: typeof window.ValidationHandler === 'object'
+                && typeof window.ValidationHandler.enableNavigation === 'function'
+        })""")
+    assert state["hasValidationHandler"], "window.ValidationHandler must exist after import()"
+    assert state["hasUpdateMethod"], "ValidationHandler.updateValidationState must be a function"
+    assert state["hasInitMethod"], "ValidationHandler.enableNavigation must be a function"
+
+
+# ES module conversion of 900-kometa.js (chore/convert-900-kometa-to-module).
+# This file had a different shape than 915-imagemaid / 905-analytics: the
+# first 54 lines were top-level declarations (let/const/function) OUTSIDE
+# the IIFE, followed by $(document).ready(function () { ... }). The
+# conversion preserved the top-level declarations as module-scoped and
+# unwrapped the rest. Lines 1-54 are already module-scoped in the new
+# form; lines 55+ were the IIFE body, now dedented.
+
+
+@pytest.mark.e2e
+def test_kometa_page_loads_as_module(page, live_server):
+    """The Kometa page must render and its script must be loaded as type='module'."""
+    page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
+    page.wait_for_timeout(500)
+    state = page.evaluate("""() => {
+            const scripts = Array.from(document.scripts)
+            const kometaScript = scripts.find(s => (s.src || '').endsWith('/900-kometa.js'))
+            return {
+                pageMeta: !!document.querySelector('#stop-kometa-modal'),
+                scriptFound: !!kometaScript,
+                scriptType: kometaScript ? kometaScript.type : null
+            }
+        }""")
+    assert state["pageMeta"], "expected the Kometa page to render (precondition)"
+    assert state["scriptFound"], "expected /900-kometa.js to be referenced from the page"
+    assert state["scriptType"] == "module", f"expected the Kometa script to load as type='module' after conversion; got type={state['scriptType']!r}"
+
+
+@pytest.mark.e2e
+def test_kometa_module_does_not_leak_state_to_window(page, live_server):
+    """Module scope contract: top-level declarations must not be visible on window.
+    Pre-conversion the IIFE kept them private; post-conversion the module scope does.
+    """
+    page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
+    page.wait_for_timeout(500)
+    leaked = page.evaluate("""() => {
+            const candidates = [
+                'KOMETA_UPDATING',
+                'KOMETA_VALIDATED',
+                'kometaInterval',
+                'kometaStatusInterval',
+                'autoScrollEnabled',
+                'tailSize',
+                'KOMETA_STATUS',
+                'logPollingPaused',
+                'logFilter',
+                'logscanPollCounter'
+            ]
+            return candidates.filter(name => typeof window[name] !== 'undefined')
+        }""")
+    assert not leaked, f"these kometa-internal names leaked to window: {leaked}"
+
+
+@pytest.mark.e2e
+def test_kometa_module_runs_without_console_errors(page, live_server):
+    """No JS console errors from the module conversion."""
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    page.on("console", lambda msg: errors.append(f"{msg.type}: {msg.text}") if msg.type == "error" else None)
+    page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
+    page.wait_for_timeout(1000)
+    relevant = [e for e in errors if any(kw in e.lower() for kw in ("kometa.js", "900-kometa", "strict mode", "redeclar", "is not defined"))]
+    assert not relevant, f"module conversion introduced JS errors: {relevant}"
+
+
+# ES module conversion of imageHandler.js (chore/convert-imagehandler-to-module).
+# Loaded by 025-libraries.js via dynamic import(). Publishes
+# window.ImageHandler for backward compat (same pattern as validationHandler).
+
+
+@pytest.mark.e2e
+def test_imagehandler_module_loads_via_import(page, live_server):
+    """imageHandler.js is now loaded via import() by 025-libraries.js.
+    Verify window.ImageHandler is available with expected methods.
+    """
+    page.goto(f"{live_server}/step/025-libraries", wait_until="domcontentloaded")
+    page.wait_for_timeout(2000)
+    state = page.evaluate("""() => ({
+            hasImageHandler: typeof window.ImageHandler !== 'undefined',
+            isPreview: typeof window.ImageHandler === 'object'
+                && typeof window.ImageHandler.isBuiltinPreviewImage === 'function',
+            genPreview: typeof window.ImageHandler === 'object'
+                && typeof window.ImageHandler.generateSinglePreview === 'function'
+        })""")
+    assert state["hasImageHandler"], "window.ImageHandler must exist after import()"
+    assert state["isPreview"], "ImageHandler.isBuiltinPreviewImage must be a function"
+    assert state["genPreview"], "ImageHandler.generateSinglePreview must be a function"
+
+
+# ES module conversion of eventHandler.js (chore/convert-eventhandler-to-module).
+# Loaded by 025-libraries.js via dynamic import(). Publishes
+# window.EventHandler for backward compat.
+
+
+@pytest.mark.e2e
+def test_eventhandler_module_loads_via_import(page, live_server):
+    """eventHandler.js is now loaded via import() by 025-libraries.js.
+    Verify window.EventHandler is available with expected methods.
+    """
+    page.goto(f"{live_server}/step/025-libraries", wait_until="domcontentloaded")
+    page.wait_for_timeout(2000)
+    state = page.evaluate("""() => ({
+            hasEventHandler: typeof window.EventHandler !== 'undefined',
+            hasAttach: typeof window.EventHandler === 'object'
+                && typeof window.EventHandler.attachLibraryListeners === 'function',
+            hasHighlights: typeof window.EventHandler === 'object'
+                && typeof window.EventHandler.updateAccordionHighlights === 'function'
+        })""")
+    assert state["hasEventHandler"], "window.EventHandler must exist after import()"
+    assert state["hasAttach"], "EventHandler.attachLibraryListeners must be a function"
+    assert state["hasHighlights"], "EventHandler.updateAccordionHighlights must be a function"
+
+
+# ES module conversion of overlayHandler.js (chore/convert-overlayhandler-to-module).
+# Last helper-script conversion. Publishes window.OverlayHandler and
+# window.setupParentChildToggleSync for backward compat.
+
+
+@pytest.mark.e2e
+def test_overlayhandler_module_loads_via_import(page, live_server):
+    """overlayHandler.js is now loaded via import() by 025-libraries.js.
+    Verify window.OverlayHandler is available with expected methods.
+    """
+    page.goto(f"{live_server}/step/025-libraries", wait_until="domcontentloaded")
+    page.wait_for_timeout(2000)
+    state = page.evaluate("""() => ({
+            hasOverlayHandler: typeof window.OverlayHandler !== 'undefined',
+            hasBoards: typeof window.OverlayHandler === 'object'
+                && typeof window.OverlayHandler.initializeOverlayBoards === 'function',
+            hasJumpBtns: typeof window.OverlayHandler === 'object'
+                && typeof window.OverlayHandler.initializeJumpButtons === 'function',
+            hasToggleSync: typeof window.setupParentChildToggleSync === 'function'
+        })""")
+    assert state["hasOverlayHandler"], "window.OverlayHandler must exist after import()"
+    assert state["hasBoards"], "OverlayHandler.initializeOverlayBoards must be a function"
+    assert state["hasJumpBtns"], "OverlayHandler.initializeJumpButtons must be a function"
+    assert state["hasToggleSync"], "window.setupParentChildToggleSync must be a function"

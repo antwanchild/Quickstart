@@ -1,5 +1,3 @@
-/* global EventHandler, ValidationHandler, toggleOverlayTemplateSection, FontFace, Image, requestAnimationFrame, boardState, ResizeObserver, DOMParser */
-
 const OverlayHandler = {
   baseDimensions: {
     default: { width: 1000, height: 1500 },
@@ -19,7 +17,7 @@ const OverlayHandler = {
         OverlayHandler.updateSeparatorPreview(fieldId, separatorDropdown.value)
         OverlayHandler.toggleSeparatorPlaceholder(libraryId, selectedStyle)
         OverlayHandler.updateHiddenInputs(libraryId, isMovie)
-        EventHandler.updateAccordionHighlights()
+        window.EventHandler.updateAccordionHighlights()
       })
 
       separatorDropdown.dataset.listenerAdded = true
@@ -30,7 +28,7 @@ const OverlayHandler = {
       OverlayHandler.updateSeparatorPreview(fieldId, separatorDropdown.value)
       OverlayHandler.toggleSeparatorPlaceholder(libraryId, initialSelected)
       OverlayHandler.updateHiddenInputs(libraryId, isMovie)
-      EventHandler.updateAccordionHighlights()
+      window.EventHandler.updateAccordionHighlights()
     }
 
     const placeholderWrapper = OverlayHandler.getSeparatorPlaceholderWrapper(libraryId)
@@ -39,7 +37,7 @@ const OverlayHandler = {
       sourceSelect.addEventListener('change', () => {
         const separatorsEnabled = separatorDropdown ? separatorDropdown.value !== 'none' : true
         OverlayHandler.syncSeparatorPlaceholderFields(placeholderWrapper, { show: separatorsEnabled })
-        EventHandler.updateAccordionHighlights()
+        window.EventHandler.updateAccordionHighlights()
       })
       sourceSelect.dataset.listenerAdded = 'true'
     }
@@ -418,7 +416,7 @@ const OverlayHandler = {
               urlObj.pathname = parts.join('/')
               return urlObj.toString()
             }
-          } catch (e) {
+          } catch {
             // Fallback simple replace
             return cfg.image.replace(/c(\.[^.]+)$/i, '$1')
           }
@@ -520,8 +518,13 @@ const OverlayHandler = {
         }
         return el.value || fallback
       }
+      const mode = getOverlayTextPreviewMode(cfg)
+      const selectedPreview = ['toggle_text', 'episode_info'].includes(mode)
+        ? getOverlayTextPreviewSelectedValue(cfg)
+        : ''
+      if (selectedPreview) syncOverlayTextPreviewTextInput(cfg)
       return {
-        text: getVal('text', ''),
+        text: selectedPreview || getVal('text', ''),
         font: getVal('font', 'Inter-Medium.ttf'),
         font_size: getVal('font_size', 55),
         font_color: getVal('font_color', '#FFFFFFFF'),
@@ -564,7 +567,8 @@ const OverlayHandler = {
         return el.value || fallback
       }
 
-      const text = getVal('text_airing', 'AIRING')
+      const previewKey = getOverlayTextPreviewSelectedValue(cfg) || 'airing'
+      const text = getVal(`text_${previewKey}`, 'AIRING')
       return {
         text,
         font: getVal('font', 'Inter-Medium.ttf'),
@@ -631,6 +635,10 @@ const OverlayHandler = {
         size: String(getVal('size', 'small') || 'small').toLowerCase(),
         hide_text: normalizeBool(getVal('hide_text', false), false),
         use_lowercase: normalizeBool(getVal('use_lowercase', false), false),
+        flag_alignment: String(
+          getVal('flag_alignment', cfg.id === 'overlay_languages_subtitles' ? 'right' : 'left') ||
+          (cfg.id === 'overlay_languages_subtitles' ? 'right' : 'left')
+        ).toLowerCase(),
         group_alignment: String(getVal('group_alignment', 'vertical') || 'vertical').toLowerCase(),
         offset: Number(getVal('offset', 10)) || 10,
         font: String(getVal('font', 'Inter-Bold.ttf') || 'Inter-Bold.ttf'),
@@ -646,6 +654,143 @@ const OverlayHandler = {
       const templateName = container?.dataset.overlayTemplate
       if (!container || !templateName) return null
       return container.querySelector(`[name="${templateName}[${key}]"]`)
+    }
+
+    const getOverlayTextPreviewMode = (cfg) => {
+      const overlayId = String(cfg?.id || '').trim()
+      if (overlayId === 'overlay_aspect' || overlayId === 'overlay_video_format') return 'toggle_text'
+      if (overlayId === 'overlay_episode_info') return 'episode_info'
+      if (overlayId === 'overlay_status') return 'status'
+      if (overlayId === 'overlay_runtimes') return 'runtime'
+      return ''
+    }
+
+    const getOverlayTextPreviewStateKey = (cfg) => {
+      const overlayId = String(cfg?.id || '').trim()
+      if (overlayId === 'overlay_aspect') return 'aspect_text'
+      if (overlayId === 'overlay_video_format') return 'video_format_text'
+      if (overlayId === 'overlay_episode_info') return 'episode_info_text'
+      if (overlayId === 'overlay_status') return 'status_text'
+      if (overlayId === 'overlay_runtimes') return 'runtime_minutes'
+      return ''
+    }
+
+    const getOverlayTextPreviewOptions = (cfg) => {
+      const mode = getOverlayTextPreviewMode(cfg)
+      if (!mode || !cfg?.container) return []
+
+      if (mode === 'episode_info') {
+        return [
+          { value: 'S01E01', label: 'S01E01' },
+          { value: 'S03E15', label: 'S03E15' },
+          { value: 'S10E22', label: 'S10E22' },
+          { value: 'S00E01', label: 'Special (S00E01)' }
+        ]
+      }
+
+      if (mode === 'runtime') {
+        return [
+          { value: '24', label: '24 min' },
+          { value: '45', label: '45 min' },
+          { value: '93', label: '93 min (1h 33m)' },
+          { value: '130', label: '130 min (2h 10m)' }
+        ]
+      }
+
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return []
+
+      if (mode === 'toggle_text') {
+        const options = []
+        const seen = new Set()
+        const toggleInputs = Array.from(cfg.container.querySelectorAll(`[name^="${templateName}[use_"]`))
+          .filter(input => String(input?.type || '').toLowerCase() === 'checkbox')
+        toggleInputs.forEach((input) => {
+          const keyMatch = /\[([^\]]+)\]$/.exec(String(input.name || ''))
+          const toggleKey = String(keyMatch?.[1] || '').trim()
+          if (!toggleKey.startsWith('use_')) return
+          const labelEl = input.closest('.form-check')?.querySelector('.form-check-label')
+          let label = String(labelEl?.textContent || toggleKey.slice(4)).replace(/\s+/g, ' ').trim()
+          if (label.toLowerCase().startsWith('use ')) {
+            label = label.slice(4).trim()
+          }
+          if (!label || seen.has(label)) return
+          seen.add(label)
+          options.push({
+            value: label,
+            label,
+            enabled: input.checked
+          })
+        })
+        return options
+      }
+
+      if (mode === 'status') {
+        const statusDefs = [
+          { key: 'airing', label: 'Airing' },
+          { key: 'returning', label: 'Returning' },
+          { key: 'canceled', label: 'Canceled' },
+          { key: 'ended', label: 'Ended' }
+        ]
+        return statusDefs.map((statusDef) => {
+          const toggle = cfg.container.querySelector(`[name="${templateName}[use_${statusDef.key}]"]`)
+          return {
+            value: statusDef.key,
+            label: statusDef.label,
+            enabled: Boolean(toggle?.checked)
+          }
+        })
+      }
+
+      return []
+    }
+
+    const pickDefaultOverlayTextPreviewValue = (cfg) => {
+      const mode = getOverlayTextPreviewMode(cfg)
+      const options = getOverlayTextPreviewOptions(cfg)
+      if (mode === 'runtime') return options.find(option => option.value === '93')?.value || options[0]?.value || '93'
+      if (mode === 'episode_info') return options.find(option => option.value === 'S03E15')?.value || options[0]?.value || 'S03E15'
+      return options.find(option => option.enabled)?.value || options[0]?.value || ''
+    }
+
+    const getOverlayTextPreviewSelectedValue = (cfg) => {
+      const mode = getOverlayTextPreviewMode(cfg)
+      if (!mode) return ''
+      const stateKey = getOverlayTextPreviewStateKey(cfg)
+      const state = ensureResolutionPreviewState(cfg)
+      const options = getOverlayTextPreviewOptions(cfg)
+      const values = new Set(options.map(option => String(option.value || '').trim()))
+      const current = String(state[stateKey] || '').trim()
+      if (current && values.has(current)) return current
+
+      let fallback = ''
+      if (mode === 'toggle_text' || mode === 'episode_info') {
+        const textInput = getTemplateInput(cfg, 'text')
+        const currentText = String(textInput?.value || textInput?.dataset?.default || '').trim()
+        if (currentText && values.has(currentText)) {
+          fallback = currentText
+        }
+      }
+      if (!fallback) fallback = pickDefaultOverlayTextPreviewValue(cfg)
+      state[stateKey] = fallback
+      return fallback
+    }
+
+    const setOverlayTextPreviewSelectedValue = (cfg, value) => {
+      const stateKey = getOverlayTextPreviewStateKey(cfg)
+      if (!stateKey) return
+      const state = ensureResolutionPreviewState(cfg)
+      state[stateKey] = String(value || '').trim()
+    }
+
+    const syncOverlayTextPreviewTextInput = (cfg) => {
+      const mode = getOverlayTextPreviewMode(cfg)
+      if (!['toggle_text', 'episode_info'].includes(mode)) return
+      const textInput = getTemplateInput(cfg, 'text')
+      if (!textInput) return
+      const selected = getOverlayTextPreviewSelectedValue(cfg)
+      textInput.value = selected
+      textInput.dataset.default = selected
     }
 
     const setTemplateNumber = (cfg, key, value, emit = true) => {
@@ -666,6 +811,81 @@ const OverlayHandler = {
       setTemplateNumber(cfg, 'back_height', height, emit)
     }
 
+    const FLAG_PREVIEW_SLOT_COUNT = 3
+    const FLAG_PREVIEW_DEFAULT_KEYS = ['en', 'de', 'fr']
+    const FLAG_PREVIEW_METADATA = {
+      en: { previewKey: 'us', text: 'EN' },
+      de: { previewKey: 'de', text: 'DE' },
+      fr: { previewKey: 'fr', text: 'FR' },
+      es: { previewKey: 'es', text: 'ES' },
+      pt: { previewKey: 'pt', text: 'PT' },
+      ja: { previewKey: 'jp', text: 'JA' },
+      ko: { previewKey: 'kr', text: 'KO' },
+      zh: { previewKey: 'cn', text: 'ZH' },
+      da: { previewKey: 'dk', text: 'DA' },
+      ru: { previewKey: 'ru', text: 'RU' },
+      it: { previewKey: 'it', text: 'IT' },
+      hi: { previewKey: 'in', text: 'HI' },
+      te: { previewKey: 'in', text: 'TE' },
+      fa: { previewKey: 'ir', text: 'FA' },
+      th: { previewKey: 'th', text: 'TH' },
+      nl: { previewKey: 'nl', text: 'NL' },
+      no: { previewKey: 'no', text: 'NO' },
+      is: { previewKey: 'is', text: 'IS' },
+      sv: { previewKey: 'se', text: 'SV' },
+      tr: { previewKey: 'tr', text: 'TR' },
+      pl: { previewKey: 'pl', text: 'PL' },
+      cs: { previewKey: 'cz', text: 'CS' },
+      uk: { previewKey: 'ua', text: 'UK' },
+      hu: { previewKey: 'hu', text: 'HU' },
+      ar: { previewKey: 'eg', text: 'AR' },
+      bg: { previewKey: 'bg', text: 'BG' },
+      bn: { previewKey: 'bd', text: 'BN' },
+      bs: { previewKey: 'ba', text: 'BS' },
+      ca: { previewKey: 'ad', text: 'CA' },
+      cy: { previewKey: 'uk', text: 'CY' },
+      el: { previewKey: 'gr', text: 'EL' },
+      et: { previewKey: 'ee', text: 'ET' },
+      eu: { previewKey: 'es', text: 'EU' },
+      fi: { previewKey: 'fi', text: 'FI' },
+      tl: { previewKey: 'ph', text: 'FL' },
+      fil: { previewKey: 'ph', text: 'FIL' },
+      gl: { previewKey: 'es', text: 'GL' },
+      he: { previewKey: 'il', text: 'HE' },
+      hr: { previewKey: 'hr', text: 'HR' },
+      id: { previewKey: 'id', text: 'ID' },
+      ka: { previewKey: 'ge', text: 'KA' },
+      kk: { previewKey: 'kz', text: 'KK' },
+      kn: { previewKey: 'in', text: 'KN' },
+      la: { previewKey: 'it', text: 'LA' },
+      lt: { previewKey: 'lt', text: 'LT' },
+      lv: { previewKey: 'lv', text: 'LV' },
+      mk: { previewKey: 'mk', text: 'MK' },
+      ml: { previewKey: 'in', text: 'ML' },
+      mr: { previewKey: 'in', text: 'MR' },
+      ms: { previewKey: 'my', text: 'MS' },
+      nb: { previewKey: 'no', text: 'NB' },
+      nn: { previewKey: 'no', text: 'NN' },
+      pa: { previewKey: 'in', text: 'PA' },
+      ro: { previewKey: 'ro', text: 'RO' },
+      sk: { previewKey: 'sk', text: 'SK' },
+      sl: { previewKey: 'si', text: 'SL' },
+      sq: { previewKey: 'al', text: 'SQ' },
+      sr: { previewKey: 'rs', text: 'SR' },
+      sw: { previewKey: 'tz', text: 'SW' },
+      so: { previewKey: 'so', text: 'SO' },
+      ta: { previewKey: 'in', text: 'TA' },
+      ur: { previewKey: 'pk', text: 'UR' },
+      vi: { previewKey: 'vn', text: 'VI' },
+      wo: { previewKey: 'sn', text: 'WO' },
+      myn: { previewKey: 'mx', text: 'MYN' },
+      iu: { previewKey: 'ca', text: 'IK' },
+      rom: { previewKey: 'ro', text: 'ROM' },
+      am: { previewKey: 'et', text: 'AM' },
+      su: { previewKey: 'id', text: 'SU' },
+      zu: { previewKey: 'za', text: 'ZU' }
+    }
+
     const RESOLUTION_CHILD_TOGGLE_KEYS = [
       'use_4k',
       'use_1080p',
@@ -675,8 +895,13 @@ const OverlayHandler = {
       'use_dv',
       'use_hlg',
       'use_hdr',
+      'use_plus',
+      'use_dvhdr',
       'use_dvhdrplus'
     ]
+
+    const RESOLUTION_BASE_BADGE_KEYS = ['4k', '1080p', '720p', '576p', '480p']
+    const RESOLUTION_ALT_BADGE_KEYS = ['dvhdrplus', 'dvhdr', 'plus', 'dv', 'hlg', 'hdr']
 
     const EDITION_CHILD_TOGGLE_KEYS = [
       'use_extended',
@@ -722,6 +947,1132 @@ const OverlayHandler = {
         childKeys: EDITION_CHILD_TOGGLE_KEYS
       }
     ]
+
+    const AUDIO_CODEC_CHILD_TOGGLE_KEYS = [
+      'use_truehd_atmos',
+      'use_dtsx',
+      'use_plus_atmos',
+      'use_dolby_atmos',
+      'use_truehd',
+      'use_ma',
+      'use_flac',
+      'use_pcm',
+      'use_hra',
+      'use_plus',
+      'use_dtses',
+      'use_dts',
+      'use_digital',
+      'use_aac',
+      'use_mp3',
+      'use_opus'
+    ]
+
+    const STREAMING_CHILD_TOGGLE_KEYS = [
+      'use_netflix',
+      'use_amazon',
+      'use_disney',
+      'use_hbomax',
+      'use_crunchyroll',
+      'use_movistar',
+      'use_atresplayer',
+      'use_youtube',
+      'use_hulu',
+      'use_paramount',
+      'use_amc',
+      'use_appletv',
+      'use_peacock',
+      'use_discovery',
+      'use_crave',
+      'use_now',
+      'use_channel4',
+      'use_itvx',
+      'use_bet',
+      'use_hayu',
+      'use_tubi',
+      'use_filmin'
+    ]
+
+    const RIBBON_CHILD_TOGGLE_KEYS = [
+      'use_oscars',
+      'use_oscars_director',
+      'use_golden',
+      'use_golden_director',
+      'use_bafta',
+      'use_cannes',
+      'use_berlinale',
+      'use_venice',
+      'use_sundance',
+      'use_emmys',
+      'use_choice',
+      'use_spirit',
+      'use_cesar',
+      'use_imdb',
+      'use_letterboxd',
+      'use_rottenverified',
+      'use_rotten',
+      'use_metacritic',
+      'use_common',
+      'use_razzie'
+    ]
+
+    const LANGUAGE_COUNT_CHILD_TOGGLE_KEYS = [
+      'use_dual',
+      'use_multi'
+    ]
+
+    const STREAMING_BADGE_FILENAME_MAP = {
+      amazon: 'Prime Video',
+      amc: 'AMC+',
+      appletv: 'AppleTV',
+      atresplayer: 'Atres Player',
+      bet: 'BET+',
+      channel4: 'Channel 4',
+      crave: 'Crave',
+      crunchyroll: 'Crunchyroll',
+      discovery: 'discovery+',
+      disney: 'Disney',
+      filmin: 'Filmin',
+      hayu: 'hayu',
+      hbomax: 'HBO Max',
+      hulu: 'Hulu',
+      itvx: 'ITVX',
+      max: 'Max',
+      movistar: 'Movistar Plus+',
+      netflix: 'Netflix',
+      now: 'NOW',
+      paramount: 'Paramount+',
+      peacock: 'Peacock',
+      tubi: 'tubi',
+      youtube: 'YouTube'
+    }
+
+    const SINGLE_BADGE_OVERLAY_FAMILY_BY_ID = {
+      overlay_network: 'network',
+      overlay_studio: 'studio'
+    }
+
+    const FIXED_BADGE_OVERLAY_FAMILY_BY_ID = {
+      overlay_mediastinger: 'mediastinger',
+      overlay_versions: 'versions',
+      overlay_direct_play: 'direct_play'
+    }
+
+    const FIXED_BADGE_OVERLAY_KEY_BY_ID = {
+      overlay_mediastinger: 'Mediastinger',
+      overlay_versions: 'versions',
+      overlay_direct_play: 'Direct-Play'
+    }
+
+    const BUNDLED_OVERLAY_PREVIEW_ROOT = '/static/images/overlay-defaults'
+    const bundledOverlayKeyOptionsCache = new Map()
+    const bundledOverlayKeyOptionsInflight = new Map()
+
+    const getResolutionToggleFamilyDef = (family) => {
+      return RESOLUTION_TOGGLE_FAMILIES.find(item => item.family === family) || null
+    }
+
+    const parseResolutionBadgeKey = (badgeKey) => {
+      const key = String(badgeKey || '').trim().replace(/^use_/, '')
+      if (!key) return null
+      if (RESOLUTION_BASE_BADGE_KEYS.includes(key)) {
+        return { badgeKey: key, baseKey: key, altKey: '' }
+      }
+      if (RESOLUTION_ALT_BADGE_KEYS.includes(key)) {
+        return { badgeKey: key, baseKey: '', altKey: key }
+      }
+      for (const baseKey of RESOLUTION_BASE_BADGE_KEYS) {
+        const prefix = `${baseKey}_`
+        if (!key.startsWith(prefix)) continue
+        const altKey = key.slice(prefix.length)
+        if (RESOLUTION_ALT_BADGE_KEYS.includes(altKey)) {
+          return { badgeKey: key, baseKey, altKey }
+        }
+      }
+      return null
+    }
+
+    const getResolutionFamilyToggleKeys = (cfg) => {
+      if (!cfg?.container) return RESOLUTION_CHILD_TOGGLE_KEYS.slice()
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return RESOLUTION_CHILD_TOGGLE_KEYS.slice()
+
+      const seen = new Set()
+      const keys = []
+      const toggleInputs = Array.from(cfg.container.querySelectorAll(`[name^="${templateName}[use_"]`))
+        .filter(input => String(input?.type || '').toLowerCase() === 'checkbox')
+      toggleInputs.forEach(input => {
+        const keyMatch = /\[([^\]]+)\]$/.exec(String(input.name || ''))
+        const toggleKey = String(keyMatch?.[1] || '').trim()
+        if (toggleKey === 'use_resolution' || !parseResolutionBadgeKey(toggleKey) || seen.has(toggleKey)) return
+        seen.add(toggleKey)
+        keys.push(toggleKey)
+      })
+
+      return keys.length ? keys : RESOLUTION_CHILD_TOGGLE_KEYS.slice()
+    }
+
+    const getToggleFamilyChildKeys = (cfg, family) => {
+      if (family === 'resolution') return getResolutionFamilyToggleKeys(cfg)
+      if (family === 'edition') return EDITION_CHILD_TOGGLE_KEYS.slice()
+      if (family === 'audio_codec') return AUDIO_CODEC_CHILD_TOGGLE_KEYS.slice()
+      if (family === 'streaming') return STREAMING_CHILD_TOGGLE_KEYS.slice()
+      if (family === 'ribbon') return RIBBON_CHILD_TOGGLE_KEYS.slice()
+      if (family === 'language_count') return LANGUAGE_COUNT_CHILD_TOGGLE_KEYS.slice()
+      return []
+    }
+
+    const getResolutionToggleFamilyForBadgeKey = (badgeKey) => {
+      const key = String(badgeKey || '').trim()
+      if (!key) return ''
+      if (parseResolutionBadgeKey(key)) return 'resolution'
+      if (EDITION_CHILD_TOGGLE_KEYS.includes(`use_${key}`)) return 'edition'
+      return ''
+    }
+
+    const CONTENT_RATING_PREVIEW_FILENAMES = {
+      overlay_content_rating_us_movie: {
+        g: { color: 'usgc.png', mono: 'usg.png' },
+        pg: { color: 'uspgc.png', mono: 'uspg.png' },
+        'pg-13': { color: 'uspg-13c.png', mono: 'uspg-13.png' },
+        r: { color: 'usrc.png', mono: 'usr.png' },
+        'nc-17': { color: 'usnc-17c.png', mono: 'usnc-17.png' },
+        nr: { color: 'usnrc.png', mono: 'usnr.png' }
+      },
+      overlay_content_rating_us_show: {
+        'tv-g': { color: 'ustv-gc.png', mono: 'ustv-g.png' },
+        'tv-y': { color: 'ustv-yc.png', mono: 'ustv-y.png' },
+        'tv-pg': { color: 'ustv-pgc.png', mono: 'ustv-pg.png' },
+        'tv-14': { color: 'ustv-14c.png', mono: 'ustv-14.png' },
+        'tv-ma': { color: 'ustv-mac.png', mono: 'ustv-ma.png' },
+        nr: { color: 'usnrc.png', mono: 'usnr.png' }
+      },
+      overlay_content_rating_uk: {
+        u: { color: 'ukuc.png', mono: 'uku.png' },
+        pg: { color: 'ukpgc.png', mono: 'ukpg.png' },
+        12: { color: 'uk12c.png', mono: 'uk12.png' },
+        '12a': { color: 'uk12ac.png', mono: 'uk12a.png' },
+        15: { color: 'uk15c.png', mono: 'uk15.png' },
+        18: { color: 'uk18c.png', mono: 'uk18.png' },
+        r18: { color: 'ukr18c.png', mono: 'ukr18.png' },
+        nr: { color: 'uknrc.png', mono: 'uknr.png' }
+      },
+      overlay_content_rating_de: {
+        0: { color: 'de0c.png', mono: 'de0.png' },
+        6: { color: 'de6c.png', mono: 'de6.png' },
+        12: { color: 'de12c.png', mono: 'de12.png' },
+        16: { color: 'de16c.png', mono: 'de16.png' },
+        18: { color: 'de18c.png', mono: 'de18.png' },
+        bpjm: { color: 'debpjmc.png', mono: 'debpjm.png' },
+        nr: { color: 'denrc.png', mono: 'denr.png' }
+      },
+      overlay_content_rating_au: {
+        g: { color: 'au_gc.png', mono: 'au_g.png' },
+        pg: { color: 'au_pgc.png', mono: 'au_pg.png' },
+        m: { color: 'au_mc.png', mono: 'au_m.png' },
+        ma: { color: 'au_mac.png', mono: 'au_ma.png' },
+        r: { color: 'au_rc.png', mono: 'au_r.png' },
+        x: { color: 'au_xc.png', mono: 'au_x.png' },
+        nr: { color: 'au_nrc.png', mono: 'au_nr.png' }
+      },
+      overlay_content_rating_nz: {
+        g: { color: 'nz_gc.png', mono: 'nz_g.png' },
+        pg: { color: 'nz_pgc.png', mono: 'nz_pg.png' },
+        m: { color: 'nz_mc.png', mono: 'nz_m.png' },
+        r13: { color: 'nz_r13c.png', mono: 'nz_r13.png' },
+        rp13: { color: 'nz_rp13c.png', mono: 'nz_rp13.png' },
+        r15: { color: 'nz_r15c.png', mono: 'nz_r15.png' },
+        r16: { color: 'nz_r16c.png', mono: 'nz_r16.png' },
+        rp16: { color: 'nz_rp16c.png', mono: 'nz_rp16.png' },
+        R18: { color: 'nz_r18c.png', mono: 'nz_r18.png' },
+        rp18: { color: 'nz_rp18c.png', mono: 'nz_rp18.png' },
+        r: { color: 'nz_rc.png', mono: 'nz_r.png' },
+        nr: { color: 'nz_nrc.png', mono: 'nz_nr.png' }
+      },
+      overlay_content_rating_commonsense: {
+        commonsense: { color: 'Commonsense.png', mono: 'Commonsense.png' }
+      }
+    }
+
+    const REGIONAL_CONTENT_RATING_OVERLAY_IDS = new Set([
+      'overlay_content_rating_us_movie',
+      'overlay_content_rating_us_show',
+      'overlay_content_rating_uk',
+      'overlay_content_rating_de',
+      'overlay_content_rating_au',
+      'overlay_content_rating_nz'
+    ])
+
+    const getOverlayPreviewFilename = (badgeKey, family = '') => {
+      const normalizedFamily = String(family || '').trim().toLowerCase()
+      const rawKey = String(badgeKey || '').trim()
+      const normalizedKey = normalizedFamily === 'audio_codec' || normalizedFamily === 'ribbon'
+        ? rawKey
+        : normalizedFamily === 'streaming'
+          ? (STREAMING_BADGE_FILENAME_MAP[rawKey] || rawKey)
+          : rawKey.replace(/_/g, '')
+      return normalizedKey ? `${normalizedKey}.png` : ''
+    }
+
+    const buildBundledOverlayPreviewUrl = (family, badgeKey, variant = '') => {
+      const filename = getOverlayPreviewFilename(badgeKey, family)
+      if (!family || !filename) return ''
+      const normalizedVariant = String(variant || '').trim().toLowerCase()
+      if (family === 'flag') {
+        const style = normalizedVariant === 'square' ? 'square' : 'round'
+        return `${BUNDLED_OVERLAY_PREVIEW_ROOT}/${family}/${style}/${filename}`
+      }
+      if (family === 'audio_codec') {
+        const style = normalizedVariant === 'standard' ? 'standard' : 'compact'
+        return `${BUNDLED_OVERLAY_PREVIEW_ROOT}/${family}/${style}/${filename}`
+      }
+      if (family === 'streaming') {
+        const style = normalizedVariant === 'white' ? 'white' : 'color'
+        return `${BUNDLED_OVERLAY_PREVIEW_ROOT}/${family}/${style}/${filename}`
+      }
+      if (family === 'ribbon') {
+        const style = ['yellow', 'gray', 'black', 'red'].includes(normalizedVariant) ? normalizedVariant : 'yellow'
+        return `${BUNDLED_OVERLAY_PREVIEW_ROOT}/${family}/${style}/${filename}`
+      }
+      if (family === 'language_count') {
+        const style = normalizedVariant === 'subs' ? 'subs' : 'audio'
+        return `${BUNDLED_OVERLAY_PREVIEW_ROOT}/${family}/${String(badgeKey || '').trim()}_${style}.png`
+      }
+      return `${BUNDLED_OVERLAY_PREVIEW_ROOT}/${family}/${filename}`
+    }
+
+    const isRegionalContentRatingOverlay = (cfg) => {
+      return REGIONAL_CONTENT_RATING_OVERLAY_IDS.has(String(cfg?.id || '').trim())
+    }
+
+    const isCommonsenseContentRatingOverlay = (cfg) => {
+      return String(cfg?.id || '').trim() === 'overlay_content_rating_commonsense'
+    }
+
+    const getCommonsensePreviewTextInput = (cfg) => {
+      if (!cfg?.container) return null
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return null
+      return cfg.container.querySelector(`[name="${templateName}[text]"]`)
+    }
+
+    const getCommonsensePreviewOptions = (cfg) => {
+      if (!cfg?.container) return []
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return []
+      const options = []
+      cfg.container.querySelectorAll(`input[type="checkbox"][name^="${templateName}[use_"]`).forEach((input) => {
+        const rawName = String(input.name || '')
+        const match = new RegExp(`^${templateName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\[use_(.+)\\]$`).exec(rawName)
+        const value = String(match?.[1] || '').trim()
+        if (!value) return
+        const numericValue = Number(value)
+        const labelEl = input.closest('.form-check')?.querySelector('.form-check-label')
+        let label = String(labelEl?.textContent || `${value}+`).replace(/\s+/g, ' ').trim()
+        if (label.toLowerCase().startsWith('use ')) {
+          label = label.slice(4).trim()
+        }
+        options.push({
+          value,
+          label,
+          enabled: input.checked,
+          sortValue: Number.isFinite(numericValue) ? numericValue : Number.MAX_SAFE_INTEGER
+        })
+      })
+      options.sort((a, b) => {
+        if (a.sortValue !== b.sortValue) return a.sortValue - b.sortValue
+        return a.label.localeCompare(b.label)
+      })
+      return options
+    }
+
+    const pickDefaultCommonsensePreviewValue = (cfg) => {
+      const options = getCommonsensePreviewOptions(cfg)
+      return options.find(option => option.enabled)?.value || options[0]?.value || ''
+    }
+
+    const getCommonsensePreviewValue = (cfg) => {
+      const input = getCommonsensePreviewTextInput(cfg)
+      const current = String(input?.value || '').trim()
+      const options = getCommonsensePreviewOptions(cfg)
+      const values = new Set(options.map(option => option.value))
+      if (current && values.has(current)) return current
+      const fallback = pickDefaultCommonsensePreviewValue(cfg)
+      if (input && fallback) input.value = fallback
+      return fallback
+    }
+
+    const setCommonsensePreviewValue = (cfg, value) => {
+      const input = getCommonsensePreviewTextInput(cfg)
+      if (input) {
+        input.value = String(value || '').trim()
+      }
+    }
+
+    const normalizeCommonsensePreviewText = (value) => {
+      const normalized = String(value || '').trim()
+      if (!normalized) return ''
+      return normalized.toLowerCase() === 'nr' ? 'NR' : normalized
+    }
+
+    const getContentRatingPreviewOptions = (cfg) => {
+      if (isCommonsenseContentRatingOverlay(cfg)) {
+        return getCommonsensePreviewOptions(cfg)
+      }
+      if (!cfg?.container) return []
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return []
+      const overlayId = String(cfg?.id || '').trim()
+      const filenameMap = CONTENT_RATING_PREVIEW_FILENAMES[overlayId]
+      if (!filenameMap) return []
+      const options = []
+      Object.keys(filenameMap).forEach((badgeKey) => {
+        const toggleKey = `use_${badgeKey}`
+        const input = cfg.container.querySelector(`input[type="checkbox"][name="${templateName}[${toggleKey}]"]`)
+        if (!input) return
+        const labelEl = input.closest('.form-check')?.querySelector('.form-check-label')
+        let label = String(labelEl?.textContent || badgeKey).replace(/\s+/g, ' ').trim()
+        if (label.toLowerCase().startsWith('use ')) {
+          label = label.slice(4).trim()
+        }
+        options.push({
+          value: badgeKey,
+          label,
+          enabled: input.checked
+        })
+      })
+      return options
+    }
+
+    const pickDefaultContentRatingPreviewKey = (cfg) => {
+      if (isCommonsenseContentRatingOverlay(cfg)) {
+        return pickDefaultCommonsensePreviewValue(cfg)
+      }
+      const options = getContentRatingPreviewOptions(cfg)
+      return options.find(option => option.enabled)?.value || options[0]?.value || ''
+    }
+
+    const getContentRatingPreviewSelectedKey = (cfg) => {
+      if (isCommonsenseContentRatingOverlay(cfg)) {
+        return getCommonsensePreviewValue(cfg)
+      }
+      const state = ensureResolutionPreviewState(cfg)
+      const options = getContentRatingPreviewOptions(cfg)
+      const values = new Set(options.map(option => option.value))
+      const stateKey = String(cfg?.id || '').trim()
+      const current = String(state[stateKey] || '').trim()
+      if (current && values.has(current)) return current
+      const fallback = pickDefaultContentRatingPreviewKey(cfg)
+      state[stateKey] = fallback
+      return fallback
+    }
+
+    const setContentRatingPreviewSelectedKey = (cfg, badgeKey) => {
+      if (isCommonsenseContentRatingOverlay(cfg)) {
+        setCommonsensePreviewValue(cfg, badgeKey)
+        return
+      }
+      const state = ensureResolutionPreviewState(cfg)
+      const stateKey = String(cfg?.id || '').trim()
+      state[stateKey] = String(badgeKey || '').trim()
+    }
+
+    const getContentRatingPreviewOverrideEntries = (cfg) => {
+      const config = getOverlaySourceOverrideConfig(cfg)
+      const section = cfg?.container?.querySelector('[data-overlay-source-editor="true"]')
+      const hiddenHost = section?.querySelector('[data-overlay-source-hidden]')
+      if (!config || !hiddenHost) return []
+      return readOverlaySourceOverrideState(cfg, config, hiddenHost)
+    }
+
+    const getContentRatingPreviewColorMode = (cfg) => {
+      if (isCommonsenseContentRatingOverlay(cfg)) return 'color'
+      const colorInput = getTemplateInput(cfg, 'color')
+      return String(colorInput?.value || 'true').toLowerCase() === 'false' ? 'mono' : 'color'
+    }
+
+    const buildBundledContentRatingPreviewUrl = (cfg, badgeKey) => {
+      const overlayId = String(cfg?.id || '').trim()
+      const filenameMap = CONTENT_RATING_PREVIEW_FILENAMES[overlayId]
+      const badgeMap = filenameMap?.[String(badgeKey || '').trim()]
+      if (!badgeMap) return ''
+      const colorMode = getContentRatingPreviewColorMode(cfg)
+      const filename = badgeMap[colorMode] || badgeMap.color || badgeMap.mono || ''
+      if (!filename) return ''
+      return `${BUNDLED_OVERLAY_PREVIEW_ROOT}/content_rating/${filename}`
+    }
+
+    const resolveContentRatingPreviewImage = (cfg) => {
+      const overrideEntries = getContentRatingPreviewOverrideEntries(cfg)
+      if (isCommonsenseContentRatingOverlay(cfg)) {
+        const overrideEntry = overrideEntries.find(entry => entry.badgeKey === 'commonsense' && entry.sourceType && entry.value)
+        if (overrideEntry) {
+          return buildOverlaySourcePreviewUrl(overrideEntry.sourceType, overrideEntry.value)
+        }
+        return buildBundledContentRatingPreviewUrl(cfg, 'commonsense') || resolveOverlayImage(cfg)
+      }
+      const badgeKey = getContentRatingPreviewSelectedKey(cfg)
+      const overrideEntry = overrideEntries.find(entry => entry.badgeKey === badgeKey && entry.sourceType && entry.value)
+      if (overrideEntry) {
+        return buildOverlaySourcePreviewUrl(overrideEntry.sourceType, overrideEntry.value)
+      }
+      return buildBundledContentRatingPreviewUrl(cfg, badgeKey) || resolveOverlayImage(cfg)
+    }
+
+    const buildOverlaySourcePreviewUrl = (sourceType, sourceValue) => {
+      const normalizedType = String(sourceType || '').trim()
+      const normalizedValue = String(sourceValue || '').trim()
+      if (!normalizedType || !normalizedValue) return ''
+      const params = new URLSearchParams({
+        source_type: normalizedType,
+        source_value: normalizedValue
+      })
+      return `/overlay-source-preview?${params.toString()}`
+    }
+
+    const blobToDataUrl = (blob) => {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(reader.result)
+        reader.onerror = () => reject(reader.error || new Error('Unable to read preview image blob'))
+        reader.readAsDataURL(blob)
+      })
+    }
+
+    const getResolutionRenderPayload = (cfg) => {
+      const { useResolution, useEdition } = getResolutionToggleState(cfg)
+      const overrideEntries = getResolutionPreviewOverrideEntries(cfg)
+      const resolutionBadgeKey = getResolutionPreviewSelectedKey(cfg, 'resolution')
+      const editionBadgeKey = getResolutionPreviewSelectedKey(cfg, 'edition')
+      const resolutionOverride = overrideEntries.find(entry => entry.badgeKey === resolutionBadgeKey && entry.sourceType && entry.value)
+      const editionOverride = overrideEntries.find(entry => entry.badgeKey === editionBadgeKey && entry.sourceType && entry.value)
+
+      return {
+        overlay_id: cfg.id,
+        use_resolution: useResolution,
+        use_edition: useEdition,
+        spacing: Number(cfg.edition?.spacing) || 15,
+        resolution: {
+          badge_key: resolutionBadgeKey,
+          source_type: resolutionOverride?.sourceType || '',
+          source_value: resolutionOverride?.value || ''
+        },
+        edition: {
+          badge_key: editionBadgeKey,
+          source_type: editionOverride?.sourceType || '',
+          source_value: editionOverride?.value || ''
+        }
+      }
+    }
+
+    const getAudioCodecStyle = (cfg) => {
+      const style = String(cfg?.styleInput?.value || 'compact').trim().toLowerCase()
+      return style === 'standard' ? 'standard' : 'compact'
+    }
+
+    const getStreamingStyle = (cfg) => {
+      const style = String(cfg?.styleInput?.value || 'color').trim().toLowerCase()
+      return style === 'white' ? 'white' : 'color'
+    }
+
+    const getNetworkStyle = (cfg) => {
+      const style = String(cfg?.styleInput?.value || 'color').trim().toLowerCase()
+      return style === 'white' ? 'white' : 'color'
+    }
+
+    const getStudioStyle = (cfg) => {
+      const style = String(cfg?.styleInput?.value || 'standard').trim().toLowerCase()
+      return style === 'bigger' ? 'bigger' : 'standard'
+    }
+
+    const getRibbonStyle = (cfg) => {
+      const style = String(cfg?.styleInput?.value || 'yellow').trim().toLowerCase()
+      return ['yellow', 'gray', 'black', 'red'].includes(style) ? style : 'yellow'
+    }
+
+    const getLanguageCountVariant = (cfg) => {
+      const subtitlesToggle = getTemplateInput(cfg, 'use_subtitles')
+      return subtitlesToggle?.checked ? 'subs' : 'audio'
+    }
+
+    const getAudioCodecPreviewOptions = (cfg) => {
+      if (!cfg?.container) return []
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return []
+      const options = []
+      const childKeys = getToggleFamilyChildKeys(cfg, 'audio_codec')
+      childKeys.forEach(toggleKey => {
+        const badgeKey = String(toggleKey || '').trim().replace(/^use_/, '')
+        if (!badgeKey) return
+        const input = cfg.container.querySelector(`[name="${templateName}[${toggleKey}]"]`)
+        const labelEl = input?.closest('.form-check')?.querySelector('.form-check-label')
+        let label = String(labelEl?.textContent || badgeKey).replace(/\s+/g, ' ').trim()
+        if (label.toLowerCase().startsWith('use ')) {
+          label = label.slice(4).trim()
+        }
+        options.push({
+          value: badgeKey,
+          label,
+          enabled: input ? input.checked : false
+        })
+      })
+      return options
+    }
+
+    const getAudioCodecPreviewSelectedKey = (cfg) => {
+      const state = ensureResolutionPreviewState(cfg)
+      const options = getAudioCodecPreviewOptions(cfg)
+      const values = new Set(options.map(option => option.value))
+      const current = String(state.audio_codec || '').trim()
+      if (current && values.has(current)) return current
+      const fallback = options.find(option => option.enabled)?.value || options[0]?.value || ''
+      state.audio_codec = fallback
+      return fallback
+    }
+
+    const setAudioCodecPreviewSelectedKey = (cfg, badgeKey) => {
+      const state = ensureResolutionPreviewState(cfg)
+      state.audio_codec = String(badgeKey || '').trim()
+    }
+
+    const getAudioCodecPreviewOverrideEntries = (cfg) => {
+      const config = getOverlaySourceOverrideConfig(cfg)
+      const section = cfg?.container?.querySelector('[data-overlay-source-editor="true"]')
+      const hiddenHost = section?.querySelector('[data-overlay-source-hidden]')
+      if (!config || !hiddenHost) return []
+      return readOverlaySourceOverrideState(cfg, config, hiddenHost)
+    }
+
+    const getAudioCodecRenderPayload = (cfg) => {
+      const overrideEntries = getAudioCodecPreviewOverrideEntries(cfg)
+      const badgeKey = getAudioCodecPreviewSelectedKey(cfg)
+      const override = overrideEntries.find(entry => entry.badgeKey === badgeKey && entry.sourceType && entry.value)
+      return {
+        overlay_id: cfg.id,
+        audio_codec: {
+          badge_key: badgeKey,
+          source_type: override?.sourceType || '',
+          source_value: override?.value || '',
+          variant: getAudioCodecStyle(cfg)
+        }
+      }
+    }
+
+    const getStreamingPreviewOptions = (cfg) => {
+      if (!cfg?.container) return []
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return []
+      const options = []
+      const childKeys = getToggleFamilyChildKeys(cfg, 'streaming')
+      childKeys.forEach(toggleKey => {
+        const badgeKey = String(toggleKey || '').trim().replace(/^use_/, '')
+        if (!badgeKey) return
+        const input = cfg.container.querySelector(`[name="${templateName}[${toggleKey}]"]`)
+        const labelEl = input?.closest('.form-check')?.querySelector('.form-check-label')
+        let label = String(labelEl?.textContent || badgeKey).replace(/\s+/g, ' ').trim()
+        if (label.toLowerCase().startsWith('use ')) {
+          label = label.slice(4).trim()
+        }
+        options.push({
+          value: badgeKey,
+          label,
+          enabled: input ? input.checked : false
+        })
+      })
+      return options
+    }
+
+    const getStreamingPreviewSelectedKey = (cfg) => {
+      const state = ensureResolutionPreviewState(cfg)
+      const options = getStreamingPreviewOptions(cfg)
+      const values = new Set(options.map(option => option.value))
+      const current = String(state.streaming || '').trim()
+      if (current && values.has(current)) return current
+      const fallback = options.find(option => option.enabled)?.value || options[0]?.value || ''
+      state.streaming = fallback
+      return fallback
+    }
+
+    const setStreamingPreviewSelectedKey = (cfg, badgeKey) => {
+      const state = ensureResolutionPreviewState(cfg)
+      state.streaming = String(badgeKey || '').trim()
+    }
+
+    const getStreamingPreviewOverrideEntries = (cfg) => {
+      const config = getOverlaySourceOverrideConfig(cfg)
+      const section = cfg?.container?.querySelector('[data-overlay-source-editor="true"]')
+      const hiddenHost = section?.querySelector('[data-overlay-source-hidden]')
+      if (!config || !hiddenHost) return []
+      return readOverlaySourceOverrideState(cfg, config, hiddenHost)
+    }
+
+    const getStreamingRenderPayload = (cfg) => {
+      const overrideEntries = getStreamingPreviewOverrideEntries(cfg)
+      const badgeKey = getStreamingPreviewSelectedKey(cfg)
+      const override = overrideEntries.find(entry => entry.badgeKey === badgeKey && entry.sourceType && entry.value)
+      return {
+        overlay_id: cfg.id,
+        streaming: {
+          badge_key: badgeKey,
+          source_type: override?.sourceType || '',
+          source_value: override?.value || '',
+          variant: getStreamingStyle(cfg)
+        }
+      }
+    }
+
+    const getRibbonPreviewOptions = (cfg) => {
+      if (!cfg?.container) return []
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return []
+      const options = []
+      const childKeys = getToggleFamilyChildKeys(cfg, 'ribbon')
+      childKeys.forEach(toggleKey => {
+        const badgeKey = String(toggleKey || '').trim().replace(/^use_/, '')
+        if (!badgeKey) return
+        const input = cfg.container.querySelector(`[name="${templateName}[${toggleKey}]"]`)
+        const labelEl = input?.closest('.form-check')?.querySelector('.form-check-label')
+        let label = String(labelEl?.textContent || badgeKey).replace(/\s+/g, ' ').trim()
+        if (label.toLowerCase().startsWith('use ')) label = label.slice(4).trim()
+        options.push({
+          value: badgeKey,
+          label,
+          enabled: input ? input.checked : false
+        })
+      })
+      return options
+    }
+
+    const getRibbonPreviewSelectedKey = (cfg) => {
+      const state = ensureResolutionPreviewState(cfg)
+      const options = getRibbonPreviewOptions(cfg)
+      const values = new Set(options.map(option => option.value))
+      const current = String(state.ribbon || '').trim()
+      if (current && values.has(current)) return current
+      const fallback = options.find(option => option.enabled)?.value || options[0]?.value || ''
+      state.ribbon = fallback
+      return fallback
+    }
+
+    const setRibbonPreviewSelectedKey = (cfg, badgeKey) => {
+      const state = ensureResolutionPreviewState(cfg)
+      state.ribbon = String(badgeKey || '').trim()
+    }
+
+    const getRibbonPreviewOverrideEntries = (cfg) => {
+      const config = getOverlaySourceOverrideConfig(cfg)
+      const section = cfg?.container?.querySelector('[data-overlay-source-editor="true"]')
+      const hiddenHost = section?.querySelector('[data-overlay-source-hidden]')
+      if (!config || !hiddenHost) return []
+      return readOverlaySourceOverrideState(cfg, config, hiddenHost)
+    }
+
+    const getRibbonRenderPayload = (cfg) => {
+      const overrideEntries = getRibbonPreviewOverrideEntries(cfg)
+      const badgeKey = getRibbonPreviewSelectedKey(cfg)
+      const override = overrideEntries.find(entry => entry.badgeKey === badgeKey && entry.sourceType && entry.value)
+      return {
+        overlay_id: cfg.id,
+        ribbon: {
+          badge_key: badgeKey,
+          source_type: override?.sourceType || '',
+          source_value: override?.value || '',
+          variant: getRibbonStyle(cfg)
+        }
+      }
+    }
+
+    const getLanguageCountPreviewOptions = (cfg) => {
+      if (!cfg?.container) return []
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return []
+      const options = []
+      const childKeys = getToggleFamilyChildKeys(cfg, 'language_count')
+      childKeys.forEach(toggleKey => {
+        const badgeKey = String(toggleKey || '').trim().replace(/^use_/, '')
+        if (!badgeKey) return
+        const input = cfg.container.querySelector(`[name="${templateName}[${toggleKey}]"]`)
+        const labelEl = input?.closest('.form-check')?.querySelector('.form-check-label')
+        let label = String(labelEl?.textContent || badgeKey).replace(/\s+/g, ' ').trim()
+        if (label.toLowerCase().startsWith('use ')) label = label.slice(4).trim()
+        options.push({
+          value: badgeKey,
+          label,
+          enabled: input ? input.checked : false
+        })
+      })
+      return options
+    }
+
+    const getLanguageCountPreviewSelectedKey = (cfg) => {
+      const state = ensureResolutionPreviewState(cfg)
+      const options = getLanguageCountPreviewOptions(cfg)
+      const values = new Set(options.map(option => option.value))
+      const current = String(state.language_count || '').trim()
+      if (current && values.has(current)) return current
+      const fallback = options.find(option => option.enabled)?.value || options[0]?.value || ''
+      state.language_count = fallback
+      return fallback
+    }
+
+    const setLanguageCountPreviewSelectedKey = (cfg, badgeKey) => {
+      const state = ensureResolutionPreviewState(cfg)
+      state.language_count = String(badgeKey || '').trim()
+    }
+
+    const getLanguageCountPreviewOverrideEntries = (cfg) => {
+      const config = getOverlaySourceOverrideConfig(cfg)
+      const section = cfg?.container?.querySelector('[data-overlay-source-editor="true"]')
+      const hiddenHost = section?.querySelector('[data-overlay-source-hidden]')
+      if (!config || !hiddenHost) return []
+      return readOverlaySourceOverrideState(cfg, config, hiddenHost)
+    }
+
+    const getLanguageCountRenderPayload = (cfg) => {
+      const overrideEntries = getLanguageCountPreviewOverrideEntries(cfg)
+      const badgeKey = getLanguageCountPreviewSelectedKey(cfg)
+      const override = overrideEntries.find(entry => entry.badgeKey === badgeKey && entry.sourceType && entry.value)
+      return {
+        overlay_id: cfg.id,
+        language_count: {
+          badge_key: badgeKey,
+          source_type: override?.sourceType || '',
+          source_value: override?.value || '',
+          variant: getLanguageCountVariant(cfg)
+        }
+      }
+    }
+
+    const getFlagsPreviewOverrideEntries = (cfg) => {
+      const config = getOverlaySourceOverrideConfig(cfg)
+      const section = cfg?.container?.querySelector('[data-overlay-source-editor="true"]')
+      const hiddenHost = section?.querySelector('[data-overlay-source-hidden]')
+      if (!config || !hiddenHost) return []
+      return readOverlaySourceOverrideState(cfg, config, hiddenHost)
+    }
+
+    const resolveFlagPreviewImage = (cfg, previewItem, useSquareFlags) => {
+      const overrideEntries = getFlagsPreviewOverrideEntries(cfg)
+      const badgeKey = String(previewItem?.badgeKey || '').trim()
+      const override = overrideEntries.find(entry => entry.badgeKey === badgeKey && entry.sourceType && entry.value)
+      if (override) {
+        return buildOverlaySourcePreviewUrl(override.sourceType, override.value)
+      }
+      return useSquareFlags ? previewItem?.square : previewItem?.round
+    }
+
+    const getSingleBadgeOverlayPreviewDefaultKey = (cfg) => {
+      const imageUrl = String(cfg?.image || '').trim()
+      if (!imageUrl) return ''
+      try {
+        const url = new URL(imageUrl, window.location.origin)
+        const parts = String(url.pathname || '').split('/')
+        const rawName = parts[parts.length - 1] || ''
+        return decodeURIComponent(rawName.replace(/\.[^.]+$/, '')).trim()
+      } catch {
+        const rawName = imageUrl.split('/').pop() || ''
+        try {
+          return decodeURIComponent(rawName.replace(/\.[^.]+$/, '')).trim()
+        } catch {
+          return rawName.replace(/\.[^.]+$/, '').trim()
+        }
+      }
+    }
+
+    const getSingleBadgeOverlayFamily = (cfg) => {
+      return SINGLE_BADGE_OVERLAY_FAMILY_BY_ID[String(cfg?.id || '').trim()] || ''
+    }
+
+    const getFixedBadgeOverlayFamily = (cfg) => {
+      return FIXED_BADGE_OVERLAY_FAMILY_BY_ID[String(cfg?.id || '').trim()] || ''
+    }
+
+    const getFixedBadgeOverlayKey = (cfg) => {
+      return FIXED_BADGE_OVERLAY_KEY_BY_ID[String(cfg?.id || '').trim()] || ''
+    }
+
+    const getBundledOverlayKeyOptions = (cfg) => {
+      if (Array.isArray(cfg?.bundledPreviewKeyOptions) && cfg.bundledPreviewKeyOptions.length) {
+        return cfg.bundledPreviewKeyOptions
+      }
+      return []
+    }
+
+    const getBundledOverlayPreviewKeyOptions = async (cfg) => {
+      const family = getSingleBadgeOverlayFamily(cfg)
+      if (!family) return []
+      if (bundledOverlayKeyOptionsCache.has(family)) {
+        const cached = bundledOverlayKeyOptionsCache.get(family)
+        if (cfg) cfg.bundledPreviewKeyOptions = cached
+        return cached
+      }
+      if (bundledOverlayKeyOptionsInflight.has(family)) {
+        return bundledOverlayKeyOptionsInflight.get(family)
+      }
+
+      const request = fetch(`/overlay-preview-keys?family=${encodeURIComponent(family)}`)
+        .then(async response => {
+          if (!response.ok) {
+            let message = `HTTP ${response.status}`
+            try {
+              const payload = await response.json()
+              message = payload?.message || payload?.error || message
+            } catch {
+            }
+            throw new Error(message)
+          }
+          const payload = await response.json()
+          const options = Array.isArray(payload?.keys)
+            ? payload.keys
+              .map(value => String(value || '').trim())
+              .filter(Boolean)
+              .map(value => ({ value, label: value }))
+            : []
+          bundledOverlayKeyOptionsCache.set(family, options)
+          if (cfg) cfg.bundledPreviewKeyOptions = options
+          return options
+        })
+        .catch(error => {
+          console.warn('[OverlayBoards] Failed to load bundled overlay preview keys', { family, error })
+          return []
+        })
+        .finally(() => {
+          bundledOverlayKeyOptionsInflight.delete(family)
+        })
+
+      bundledOverlayKeyOptionsInflight.set(family, request)
+      return request
+    }
+
+    const getSingleBadgeOverlayPreviewStateKey = (cfg) => {
+      if (cfg?.id === 'overlay_network') return 'network'
+      if (cfg?.id === 'overlay_studio') return 'studio'
+      return ''
+    }
+
+    const getSingleBadgeOverlayPreviewSelectedKey = (cfg) => {
+      const stateKey = getSingleBadgeOverlayPreviewStateKey(cfg)
+      const state = ensureResolutionPreviewState(cfg)
+      const current = String(state[stateKey] || '').trim()
+      if (current) return current
+      const fallback = getSingleBadgeOverlayPreviewDefaultKey(cfg)
+      state[stateKey] = fallback
+      return fallback
+    }
+
+    const setSingleBadgeOverlayPreviewSelectedKey = (cfg, badgeKey) => {
+      const stateKey = getSingleBadgeOverlayPreviewStateKey(cfg)
+      const state = ensureResolutionPreviewState(cfg)
+      state[stateKey] = String(badgeKey || '').trim()
+    }
+
+    const getSingleBadgeOverlayPreviewOverrideEntries = (cfg) => {
+      const config = getOverlaySourceOverrideConfig(cfg)
+      const section = cfg?.container?.querySelector('[data-overlay-source-editor="true"]')
+      const hiddenHost = section?.querySelector('[data-overlay-source-hidden]')
+      if (!config || !hiddenHost) return []
+      return readOverlaySourceOverrideState(cfg, config, hiddenHost)
+    }
+
+    const getSingleBadgeOverlayRenderPayload = (cfg, family, variantResolver) => {
+      const overrideEntries = getSingleBadgeOverlayPreviewOverrideEntries(cfg)
+      const badgeKey = getSingleBadgeOverlayPreviewSelectedKey(cfg)
+      const override = overrideEntries.find(entry => entry.badgeKey === badgeKey && entry.sourceType && entry.value)
+      return {
+        overlay_id: cfg.id,
+        [family]: {
+          badge_key: badgeKey,
+          source_type: override?.sourceType || '',
+          source_value: override?.value || '',
+          variant: typeof variantResolver === 'function' ? variantResolver(cfg) : ''
+        }
+      }
+    }
+
+    const getFixedBadgeOverlayPreviewOverrideEntries = (cfg) => {
+      const config = getOverlaySourceOverrideConfig(cfg)
+      const section = cfg?.container?.querySelector('[data-overlay-source-editor="true"]')
+      const hiddenHost = section?.querySelector('[data-overlay-source-hidden]')
+      if (!config || !hiddenHost) return []
+      return readOverlaySourceOverrideState(cfg, config, hiddenHost)
+    }
+
+    const getFixedBadgeOverlayRenderPayload = (cfg) => {
+      const family = getFixedBadgeOverlayFamily(cfg)
+      const badgeKey = getFixedBadgeOverlayKey(cfg)
+      const overrideEntries = getFixedBadgeOverlayPreviewOverrideEntries(cfg)
+      const override = overrideEntries.find(entry => entry.badgeKey === badgeKey && entry.sourceType && entry.value)
+      return {
+        overlay_id: cfg.id,
+        [family]: {
+          badge_key: badgeKey,
+          source_type: override?.sourceType || '',
+          source_value: override?.value || '',
+          variant: ''
+        }
+      }
+    }
+
+    const getResolutionPreviewOptionsForFamily = (cfg, family) => {
+      if (!cfg?.container) return []
+      const templateName = cfg.container.dataset.overlayTemplate
+      const familyDef = getResolutionToggleFamilyDef(family)
+      if (!templateName || !familyDef) return []
+      const options = []
+      const childKeys = getToggleFamilyChildKeys(cfg, family)
+      childKeys.forEach(toggleKey => {
+        const badgeKey = String(toggleKey || '').trim().replace(/^use_/, '')
+        if (!badgeKey) return
+        const input = cfg.container.querySelector(`[name="${templateName}[${toggleKey}]"]`)
+        const labelEl = input?.closest('.form-check')?.querySelector('.form-check-label')
+        let label = String(labelEl?.textContent || badgeKey).replace(/\s+/g, ' ').trim()
+        if (label.toLowerCase().startsWith('use ')) {
+          label = label.slice(4).trim()
+        }
+        options.push({
+          value: badgeKey,
+          label,
+          enabled: input ? input.checked : false
+        })
+      })
+      return options
+    }
+
+    const ensureResolutionPreviewState = (cfg) => {
+      if (!cfg) return { resolution: '', edition: '' }
+      if (!cfg.previewSelection || typeof cfg.previewSelection !== 'object') {
+        cfg.previewSelection = { resolution: '', edition: '' }
+      }
+      return cfg.previewSelection
+    }
+
+    const pickDefaultResolutionPreviewKey = (cfg, family) => {
+      const options = getResolutionPreviewOptionsForFamily(cfg, family)
+      return options.find(option => option.enabled)?.value || options[0]?.value || ''
+    }
+
+    const getResolutionPreviewSelectedKey = (cfg, family) => {
+      const state = ensureResolutionPreviewState(cfg)
+      const options = getResolutionPreviewOptionsForFamily(cfg, family)
+      const values = new Set(options.map(option => option.value))
+      const current = String(state[family] || '').trim()
+      if (current && values.has(current)) return current
+      const fallback = pickDefaultResolutionPreviewKey(cfg, family)
+      state[family] = fallback
+      return fallback
+    }
+
+    const setResolutionPreviewSelectedKey = (cfg, family, badgeKey) => {
+      const state = ensureResolutionPreviewState(cfg)
+      state[family] = String(badgeKey || '').trim()
+    }
+
+    const getFlagPreviewStateKey = (slotIndex) => `flags_${slotIndex + 1}`
+
+    const getFlagPreviewOptions = (cfg) => {
+      const config = getOverlaySourceOverrideConfig(cfg)
+      if (!config) return []
+      return getOverlaySourceOverrideKeyOptions(cfg, config)
+        .filter(option => Boolean(FLAG_PREVIEW_METADATA[String(option.value || '').trim()]))
+        .map(option => {
+          const key = String(option.value || '').trim()
+          const meta = FLAG_PREVIEW_METADATA[key] || {}
+          return {
+            value: key,
+            label: meta.text || option.label || key.toUpperCase(),
+            enabled: Boolean(option.enabled),
+            previewKey: meta.previewKey || key,
+            text: meta.text || key.toUpperCase()
+          }
+        })
+    }
+
+    const pickDefaultFlagPreviewKeys = (cfg) => {
+      const options = getFlagPreviewOptions(cfg)
+      const values = new Set(options.map(option => option.value))
+      const ordered = []
+
+      FLAG_PREVIEW_DEFAULT_KEYS.forEach((key) => {
+        if (values.has(key) && !ordered.includes(key)) ordered.push(key)
+      })
+
+      options.forEach((option) => {
+        if (option.enabled && !ordered.includes(option.value)) ordered.push(option.value)
+      })
+
+      options.forEach((option) => {
+        if (!ordered.includes(option.value)) ordered.push(option.value)
+      })
+
+      return ordered.slice(0, FLAG_PREVIEW_SLOT_COUNT)
+    }
+
+    const getFlagPreviewSelectedKeys = (cfg) => {
+      const state = ensureResolutionPreviewState(cfg)
+      const options = getFlagPreviewOptions(cfg)
+      const values = new Set(options.map(option => option.value))
+      const selected = []
+
+      for (let i = 0; i < FLAG_PREVIEW_SLOT_COUNT; i += 1) {
+        const current = String(state[getFlagPreviewStateKey(i)] || '').trim()
+        if (current && values.has(current) && !selected.includes(current)) {
+          selected.push(current)
+        }
+      }
+
+      pickDefaultFlagPreviewKeys(cfg).forEach((key) => {
+        if (!selected.includes(key)) selected.push(key)
+      })
+
+      const normalized = selected.slice(0, FLAG_PREVIEW_SLOT_COUNT)
+      normalized.forEach((key, idx) => {
+        state[getFlagPreviewStateKey(idx)] = key
+      })
+      return normalized
+    }
+
+    const setFlagPreviewSelectedKey = (cfg, slotIndex, badgeKey) => {
+      const state = ensureResolutionPreviewState(cfg)
+      state[getFlagPreviewStateKey(slotIndex)] = String(badgeKey || '').trim()
+    }
+
+    const buildFlagPreviewItems = (cfg) => {
+      const optionMap = new Map(getFlagPreviewOptions(cfg).map(option => [option.value, option]))
+      return getFlagPreviewSelectedKeys(cfg)
+        .map((key) => {
+          const option = optionMap.get(key)
+          if (!option) return null
+          const previewKey = option.previewKey || key
+          const text = option.text || option.label || key.toUpperCase()
+          return {
+            badgeKey: key,
+            previewKey,
+            text,
+            round: buildBundledOverlayPreviewUrl('flag', previewKey, 'round'),
+            square: buildBundledOverlayPreviewUrl('flag', previewKey, 'square')
+          }
+        })
+        .filter(Boolean)
+    }
+
+    const getResolutionPreviewOverrideEntries = (cfg) => {
+      const config = getOverlaySourceOverrideConfig(cfg)
+      const section = cfg?.container?.querySelector('[data-overlay-source-editor="true"]')
+      const hiddenHost = section?.querySelector('[data-overlay-source-hidden]')
+      if (!config || !hiddenHost) return []
+      return readOverlaySourceOverrideState(cfg, config, hiddenHost)
+    }
+
+    const resolveResolutionPreviewImage = (cfg, family) => {
+      const badgeKey = getResolutionPreviewSelectedKey(cfg, family)
+      if (!badgeKey) return ''
+      const overrideEntry = getResolutionPreviewOverrideEntries(cfg).find(entry => {
+        return entry.badgeKey === badgeKey && entry.sourceType && entry.value
+      })
+      if (overrideEntry) {
+        return buildOverlaySourcePreviewUrl(overrideEntry.sourceType, overrideEntry.value)
+      }
+      return buildBundledOverlayPreviewUrl(family, badgeKey)
+    }
 
     const getResolutionToggleState = (cfg) => {
       if (cfg.id !== 'overlay_resolution') {
@@ -824,7 +2175,35 @@ const OverlayHandler = {
           group.insertBefore(masterRow, copy || childContainer || null)
         }
 
-        familyDef.childKeys.forEach((key) => {
+        let previewWrap = group.querySelector(`[data-resolution-preview-wrap="${familyDef.family}"]`)
+        let previewSelect = group.querySelector(`[data-resolution-preview-select="${familyDef.family}"]`)
+        if (!previewWrap) {
+          previewWrap = document.createElement('div')
+          previewWrap.className = 'mb-2'
+          previewWrap.dataset.resolutionPreviewWrap = familyDef.family
+          previewWrap.innerHTML = `
+            <label class="form-label small fw-semibold mb-1">Preview badge</label>
+            <select class="form-select form-select-sm" data-resolution-preview-select="${familyDef.family}"></select>
+          `
+          if (copy) {
+            copy.insertAdjacentElement('afterend', previewWrap)
+          } else if (childContainer) {
+            group.insertBefore(previewWrap, childContainer)
+          } else {
+            group.appendChild(previewWrap)
+          }
+          previewSelect = previewWrap.querySelector(`[data-resolution-preview-select="${familyDef.family}"]`)
+        }
+        if (previewSelect && previewSelect.dataset.listenerAdded !== 'true') {
+          previewSelect.dataset.listenerAdded = 'true'
+          previewSelect.addEventListener('change', () => {
+            setResolutionPreviewSelectedKey(cfg, familyDef.family, previewSelect.value)
+            refreshResolutionOverlayPreview(cfg)
+          })
+        }
+
+        const childKeys = getToggleFamilyChildKeys(cfg, familyDef.family)
+        childKeys.forEach((key) => {
           const input = cfg.container.querySelector(`[name="${templateName}[${key}]"]`)
           const row = input?.closest('.form-check')
           if (row && childContainer) {
@@ -832,6 +2211,7 @@ const OverlayHandler = {
           }
         })
       })
+      syncResolutionPreviewControls(cfg)
     }
 
     const syncResolutionToggleFamilyVisibility = (cfg, family, keys, enabled) => {
@@ -863,8 +2243,9 @@ const OverlayHandler = {
     const syncResolutionChildToggleVisibility = (cfg) => {
       if (cfg.id !== 'overlay_resolution' || !cfg.container) return
       const { useResolution, useEdition } = getResolutionToggleState(cfg)
-      syncResolutionToggleFamilyVisibility(cfg, 'resolution', RESOLUTION_CHILD_TOGGLE_KEYS, useResolution)
-      syncResolutionToggleFamilyVisibility(cfg, 'edition', EDITION_CHILD_TOGGLE_KEYS, useEdition)
+      syncResolutionToggleFamilyVisibility(cfg, 'resolution', getToggleFamilyChildKeys(cfg, 'resolution'), useResolution)
+      syncResolutionToggleFamilyVisibility(cfg, 'edition', getToggleFamilyChildKeys(cfg, 'edition'), useEdition)
+      syncResolutionPreviewControls(cfg)
     }
 
     const syncResolutionToggleWarning = (cfg) => {
@@ -886,6 +2267,23 @@ const OverlayHandler = {
       warning.classList.toggle('d-none', useResolution || useEdition)
     }
 
+    const bindResolutionPreviewInputs = (cfg) => {
+      if (cfg.id !== 'overlay_resolution' || !cfg.container) return
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return
+      const toggleKeys = ['use_resolution', 'use_edition', ...getToggleFamilyChildKeys(cfg, 'resolution'), ...getToggleFamilyChildKeys(cfg, 'edition')]
+      toggleKeys.forEach((toggleKey) => {
+        const input = cfg.container.querySelector(`[name="${templateName}[${toggleKey}]"]`)
+        if (!input || input.dataset.resolutionPreviewBound === 'true') return
+        input.dataset.resolutionPreviewBound = 'true'
+        input.addEventListener('change', () => {
+          syncResolutionChildToggleVisibility(cfg)
+          syncResolutionToggleWarning(cfg)
+          refreshResolutionOverlayPreview(cfg)
+        })
+      })
+    }
+
     const getOverlaySourceOverrideConfig = (cfg) => {
       if (!cfg.container) return null
       const raw = String(cfg.container.dataset.overlaySourceOverrides || '').trim()
@@ -901,6 +2299,11 @@ const OverlayHandler = {
           description: String(parsed.description || 'Advanced source overrides for this overlay.').trim(),
           addLabel: String(parsed.add_label || 'Add override').trim(),
           keyMode: String(parsed.key_mode || '').trim().toLowerCase(),
+          fixedKey: String(parsed.fixed_key || '').trim(),
+          keyPlaceholder: String(parsed.key_placeholder || '').trim(),
+          keyFields: Array.isArray(parsed.key_fields)
+            ? parsed.key_fields.map(item => String(item || '').trim()).filter(Boolean)
+            : [],
           sourceTypes,
           excludeToggleKeys: Array.isArray(parsed.exclude_toggle_keys)
             ? parsed.exclude_toggle_keys.map(item => String(item || '').trim()).filter(Boolean)
@@ -935,7 +2338,31 @@ const OverlayHandler = {
 
     const getOverlaySourceOverrideKeyOptions = (cfg, config) => {
       const options = []
-      if (!cfg.container || config.keyMode !== 'from_use_toggles') return options
+      if (!cfg.container) return options
+      if (config.keyMode === 'fixed_key' && config.fixedKey) {
+        return [{ value: config.fixedKey, label: config.fixedKey }]
+      }
+      if (config.keyMode === 'bundled_preview_keys') {
+        return getBundledOverlayKeyOptions(cfg)
+      }
+      if (config.keyMode === 'from_select_options') {
+        const seen = new Set()
+        ;(config.keyFields || []).forEach((fieldKey) => {
+          const input = getTemplateInput(cfg, fieldKey)
+          if (!input || input.tagName !== 'SELECT') return
+          Array.from(input.options || []).forEach((option) => {
+            const value = String(option.value || '').trim()
+            if (!value || seen.has(value)) return
+            seen.add(value)
+            options.push({
+              value,
+              label: String(option.textContent || value).trim() || value
+            })
+          })
+        })
+        return options
+      }
+      if (config.keyMode !== 'from_use_toggles') return options
 
       const templateName = cfg.container.dataset.overlayTemplate
       if (!templateName) return options
@@ -943,6 +2370,7 @@ const OverlayHandler = {
       const seen = new Set()
       const excludedToggleKeys = new Set(config.excludeToggleKeys || [])
       const toggleInputs = Array.from(cfg.container.querySelectorAll(`[name^="${templateName}[use_"]`))
+        .filter(input => String(input?.type || '').toLowerCase() === 'checkbox')
 
       toggleInputs.forEach(input => {
         const keyMatch = /\[([^\]]+)\]$/.exec(String(input.name || ''))
@@ -1020,6 +2448,1177 @@ const OverlayHandler = {
       return state
     }
 
+    const syncResolutionPreviewControls = (cfg) => {
+      if (cfg?.id !== 'overlay_resolution' || !cfg.container) return
+      RESOLUTION_TOGGLE_FAMILIES.forEach((familyDef) => {
+        const group = cfg.container.querySelector(`[data-resolution-family-group="${familyDef.family}"]`)
+        const select = group?.querySelector(`[data-resolution-preview-select="${familyDef.family}"]`)
+        if (!select) return
+        const options = getResolutionPreviewOptionsForFamily(cfg, familyDef.family)
+        const selected = getResolutionPreviewSelectedKey(cfg, familyDef.family)
+        const masterInput = getTemplateInput(cfg, familyDef.masterKey)
+        const enabled = masterInput ? masterInput.checked : true
+
+        select.replaceChildren()
+        options.forEach((option) => {
+          const el = document.createElement('option')
+          el.value = option.value
+          el.textContent = option.label
+          select.appendChild(el)
+        })
+        if (selected && options.some(option => option.value === selected)) {
+          select.value = selected
+        } else if (options[0]?.value) {
+          setResolutionPreviewSelectedKey(cfg, familyDef.family, options[0].value)
+          select.value = options[0].value
+        }
+        select.disabled = !enabled || options.length === 0
+      })
+    }
+
+    const refreshResolutionOverlayPreview = (cfg) => {
+      if (cfg?.id !== 'overlay_resolution' || !cfg.layer) return
+      buildBackdropDataUrl(cfg).then(dataUrl => {
+        if (!dataUrl) return
+        cfg.layer.src = dataUrl
+      })
+    }
+
+    const syncContentRatingPreviewControls = (cfg) => {
+      if ((!isRegionalContentRatingOverlay(cfg) && !isCommonsenseContentRatingOverlay(cfg)) || !cfg.container) return
+      const select = cfg.container.querySelector('[data-content-rating-preview-select="true"]')
+      if (!select) return
+      const options = getContentRatingPreviewOptions(cfg)
+      const selected = getContentRatingPreviewSelectedKey(cfg)
+
+      select.replaceChildren()
+      options.forEach((option) => {
+        const el = document.createElement('option')
+        el.value = option.value
+        el.textContent = option.label
+        select.appendChild(el)
+      })
+      if (selected && options.some(option => option.value === selected)) {
+        select.value = selected
+      } else if (options[0]?.value) {
+        setContentRatingPreviewSelectedKey(cfg, options[0].value)
+        select.value = options[0].value
+      }
+      select.disabled = options.length === 0
+    }
+
+    const refreshContentRatingOverlayPreview = (cfg) => {
+      if (!cfg?.layer || (!isRegionalContentRatingOverlay(cfg) && !isCommonsenseContentRatingOverlay(cfg))) return
+      if (isCommonsenseContentRatingOverlay(cfg)) {
+        const baseOverride = resolveContentRatingPreviewImage(cfg)
+        buildCommonsenseDataUrl(cfg, baseOverride).then(dataUrl => {
+          buildBackdropDataUrl(cfg, dataUrl).then(backdropUrl => {
+            if (!backdropUrl) return
+            cfg.layer.src = backdropUrl
+          })
+        })
+        return
+      }
+      const baseOverride = resolveContentRatingPreviewImage(cfg)
+      buildBackdropDataUrl(cfg, baseOverride).then(dataUrl => {
+        if (!dataUrl) return
+        cfg.layer.src = dataUrl
+      })
+    }
+
+    const ensureFlagsPreviewControl = (cfg) => {
+      if (!isFlagsOverlay(cfg) || !cfg?.container) return
+      const anchorInput = getTemplateInput(cfg, 'font')
+      const anchorRow = anchorInput?.closest('.font-row') ||
+        anchorInput?.closest('.rgba-group') ||
+        anchorInput?.closest('.input-group') ||
+        anchorInput?.closest('.mb-3') ||
+        anchorInput?.parentElement
+      if (!anchorRow) return
+
+      let previewWrap = cfg.container.querySelector('[data-flag-preview-wrap]')
+      if (!previewWrap) {
+        previewWrap = document.createElement('div')
+        previewWrap.className = 'mb-3 w-100'
+        previewWrap.dataset.flagPreviewWrap = 'true'
+        previewWrap.style.flexBasis = '100%'
+        previewWrap.style.width = '100%'
+        previewWrap.innerHTML = `
+          <label class="form-label small fw-semibold mb-1">Preview flags</label>
+          <div class="row g-2" data-flag-preview-row="true">
+            <div class="col-12 col-md-4">
+              <select class="form-select form-select-sm" data-flag-preview-select="0"></select>
+            </div>
+            <div class="col-12 col-md-4">
+              <select class="form-select form-select-sm" data-flag-preview-select="1"></select>
+            </div>
+            <div class="col-12 col-md-4">
+              <select class="form-select form-select-sm" data-flag-preview-select="2"></select>
+            </div>
+          </div>
+        `
+      }
+
+      anchorRow.insertAdjacentElement('beforebegin', previewWrap)
+
+      previewWrap.querySelectorAll('[data-flag-preview-select]').forEach((select) => {
+        if (select.dataset.listenerAdded === 'true') return
+        select.dataset.listenerAdded = 'true'
+        select.addEventListener('change', () => {
+          const slotIndex = Number(select.dataset.flagPreviewSelect)
+          setFlagPreviewSelectedKey(cfg, slotIndex, select.value)
+          syncFlagsPreviewControls(cfg)
+          refreshFlagsOverlayPreview(cfg)
+        })
+      })
+    }
+
+    const syncFlagsPreviewControls = (cfg) => {
+      if (!isFlagsOverlay(cfg) || !cfg?.container) return
+      const options = getFlagPreviewOptions(cfg)
+      const selectedKeys = getFlagPreviewSelectedKeys(cfg)
+      const selects = cfg.container.querySelectorAll('[data-flag-preview-select]')
+      selects.forEach((select, index) => {
+        select.replaceChildren()
+        options.forEach((option) => {
+          const el = document.createElement('option')
+          el.value = option.value
+          el.textContent = option.label
+          select.appendChild(el)
+        })
+        const selected = selectedKeys[index] || options[0]?.value || ''
+        if (selected) {
+          select.value = selected
+          setFlagPreviewSelectedKey(cfg, index, selected)
+        }
+        select.disabled = options.length === 0
+      })
+    }
+
+    const refreshFlagsOverlayPreview = (cfg) => {
+      if (!cfg?.layer) return
+      buildFlagsCompositeDataUrl(cfg).then(dataUrl => {
+        cfg.layer.src = dataUrl
+      })
+    }
+
+    const bindFlagsPreviewInputs = (cfg) => {
+      if (!isFlagsOverlay(cfg) || !cfg?.container) return
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return
+      const selectors = Array.from(cfg.container.querySelectorAll(`[name^="${templateName}[use_"]`))
+        .filter(input => String(input?.type || '').toLowerCase() === 'checkbox')
+      selectors.forEach((input) => {
+        if (input.dataset.flagPreviewBound === 'true') return
+        input.dataset.flagPreviewBound = 'true'
+        input.addEventListener('change', () => {
+          syncFlagsPreviewControls(cfg)
+          refreshFlagsOverlayPreview(cfg)
+        })
+      })
+    }
+
+    const ensureContentRatingPreviewControl = (cfg) => {
+      if ((!isRegionalContentRatingOverlay(cfg) && !isCommonsenseContentRatingOverlay(cfg)) || !cfg.container) return
+      const anchorInput = isCommonsenseContentRatingOverlay(cfg)
+        ? getTemplateInput(cfg, 'post_text')
+        : getTemplateInput(cfg, 'color')
+      const anchorRow = anchorInput?.closest('.input-group') || anchorInput?.closest('.mb-3') || anchorInput?.parentElement
+      if (!anchorRow) return
+
+      let previewWrap = cfg.container.querySelector('[data-content-rating-preview-wrap]')
+      let previewSelect = cfg.container.querySelector('[data-content-rating-preview-select]')
+      if (!previewWrap) {
+        previewWrap = document.createElement('div')
+        previewWrap.className = 'mb-3'
+        previewWrap.dataset.contentRatingPreviewWrap = 'true'
+        previewWrap.innerHTML = `
+          <label class="form-label small fw-semibold mb-1">${isCommonsenseContentRatingOverlay(cfg) ? 'Preview rating' : 'Preview badge'}</label>
+          <select class="form-select form-select-sm" data-content-rating-preview-select="true"></select>
+        `
+        anchorRow.insertAdjacentElement('afterend', previewWrap)
+        previewSelect = previewWrap.querySelector('[data-content-rating-preview-select]')
+      }
+
+      if (previewSelect && previewSelect.dataset.listenerAdded !== 'true') {
+        previewSelect.dataset.listenerAdded = 'true'
+        previewSelect.addEventListener('change', () => {
+          setContentRatingPreviewSelectedKey(cfg, previewSelect.value)
+          refreshContentRatingOverlayPreview(cfg)
+        })
+      }
+    }
+
+    const ensureOverlayTextPreviewControl = (cfg) => {
+      const mode = getOverlayTextPreviewMode(cfg)
+      if (!mode || !cfg?.container) return
+
+      const anchorInput = getTemplateInput(cfg, 'font') || (mode === 'status' ? getTemplateInput(cfg, 'text_airing') : null)
+      const anchorRow = anchorInput?.closest('.font-row') ||
+        anchorInput?.closest('.rgba-group') ||
+        anchorInput?.closest('.input-group') ||
+        anchorInput?.closest('.mb-3') ||
+        anchorInput?.parentElement
+      if (!anchorRow) return
+
+      let previewWrap = cfg.container.querySelector('[data-overlay-text-preview-wrap]')
+      let previewSelect = cfg.container.querySelector('[data-overlay-text-preview-select]')
+      if (!previewWrap) {
+        let label = 'Preview badge'
+        if (mode === 'runtime') label = 'Preview runtime'
+        else if (mode === 'status') label = 'Preview status'
+        else if (mode === 'episode_info') label = 'Preview text'
+        previewWrap = document.createElement('div')
+        previewWrap.className = 'mb-3 w-100'
+        previewWrap.dataset.overlayTextPreviewWrap = 'true'
+        previewWrap.style.flexBasis = '100%'
+        previewWrap.style.width = '100%'
+        previewWrap.innerHTML = `
+          <label class="form-label small fw-semibold mb-1">${label}</label>
+          <select class="form-select form-select-sm" data-overlay-text-preview-select="true"></select>
+        `
+        previewSelect = previewWrap.querySelector('[data-overlay-text-preview-select]')
+      }
+
+      anchorRow.insertAdjacentElement('beforebegin', previewWrap)
+
+      if (previewSelect && previewSelect.dataset.listenerAdded !== 'true') {
+        previewSelect.dataset.listenerAdded = 'true'
+        previewSelect.addEventListener('change', () => {
+          setOverlayTextPreviewSelectedValue(cfg, previewSelect.value)
+          syncOverlayTextPreviewTextInput(cfg)
+          refreshOverlayTextPreview(cfg)
+        })
+      }
+    }
+
+    const syncOverlayTextPreviewControls = (cfg) => {
+      const mode = getOverlayTextPreviewMode(cfg)
+      if (!mode || !cfg?.container) return
+      const select = cfg.container.querySelector('[data-overlay-text-preview-select="true"]')
+      if (!select) return
+
+      const options = getOverlayTextPreviewOptions(cfg)
+      const selected = getOverlayTextPreviewSelectedValue(cfg)
+      select.replaceChildren()
+      options.forEach((option) => {
+        const el = document.createElement('option')
+        el.value = option.value
+        el.textContent = option.label
+        select.appendChild(el)
+      })
+
+      if (selected && options.some(option => option.value === selected)) {
+        select.value = selected
+      } else if (options[0]?.value) {
+        setOverlayTextPreviewSelectedValue(cfg, options[0].value)
+        select.value = options[0].value
+      }
+      select.disabled = options.length === 0
+      syncOverlayTextPreviewTextInput(cfg)
+    }
+
+    const refreshOverlayTextPreview = (cfg) => {
+      if (!cfg?.layer) return
+      if (cfg.id === 'overlay_runtimes') {
+        const { font } = getRuntimeVars(cfg)
+        ensureRuntimeFontLoaded(font).then(family => {
+          const { family: norm } = normalizeFontFile(font)
+          const dataUrl = buildRuntimeDataUrl(cfg, family || norm)
+          if (BACKDROP_TEXT_OVERLAYS.has(cfg.id)) {
+            buildBackdropDataUrl(cfg, dataUrl).then(backdropUrl => {
+              cfg.layer.src = backdropUrl
+            })
+            return
+          }
+          cfg.layer.src = dataUrl
+        })
+        return
+      }
+
+      if (cfg.id === 'overlay_status') {
+        const vars = getStatusTextVars(cfg)
+        ensureRuntimeFontLoaded(vars.font).then(family => {
+          const { family: norm } = normalizeFontFile(vars.font)
+          const dataUrl = buildSimpleTextDataUrl(cfg, vars, family || norm)
+          if (BACKDROP_TEXT_OVERLAYS.has(cfg.id)) {
+            buildBackdropDataUrl(cfg, dataUrl).then(backdropUrl => {
+              cfg.layer.src = backdropUrl
+            })
+            return
+          }
+          cfg.layer.src = dataUrl
+        })
+        return
+      }
+
+      if (cfg.id === 'overlay_aspect' || cfg.id === 'overlay_video_format' || cfg.id === 'overlay_episode_info') {
+        const vars = getSimpleTextVars(cfg)
+        ensureRuntimeFontLoaded(vars.font).then(family => {
+          const { family: norm } = normalizeFontFile(vars.font)
+          const dataUrl = buildSimpleTextDataUrl(cfg, vars, family || norm)
+          if (BACKDROP_TEXT_OVERLAYS.has(cfg.id)) {
+            buildBackdropDataUrl(cfg, dataUrl).then(backdropUrl => {
+              cfg.layer.src = backdropUrl
+            })
+            return
+          }
+          cfg.layer.src = dataUrl
+        })
+      }
+    }
+
+    const bindOverlayTextPreviewInputs = (cfg) => {
+      const mode = getOverlayTextPreviewMode(cfg)
+      if (!mode || !cfg?.container) return
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return
+
+      if (mode === 'toggle_text') {
+        const toggleInputs = Array.from(cfg.container.querySelectorAll(`[name^="${templateName}[use_"]`))
+          .filter(input => String(input?.type || '').toLowerCase() === 'checkbox')
+        toggleInputs.forEach((input) => {
+          if (input.dataset.overlayTextPreviewBound === 'true') return
+          input.dataset.overlayTextPreviewBound = 'true'
+          input.addEventListener('change', () => {
+            syncOverlayTextPreviewControls(cfg)
+            refreshOverlayTextPreview(cfg)
+          })
+        })
+      }
+
+      if (mode === 'status') {
+        const selectors = [
+          `[name="${templateName}[use_airing]"]`,
+          `[name="${templateName}[use_returning]"]`,
+          `[name="${templateName}[use_canceled]"]`,
+          `[name="${templateName}[use_ended]"]`,
+          `[name="${templateName}[text_airing]"]`,
+          `[name="${templateName}[text_returning]"]`,
+          `[name="${templateName}[text_canceled]"]`,
+          `[name="${templateName}[text_ended]"]`
+        ]
+        const inputs = cfg.container.querySelectorAll(selectors.join(', '))
+        inputs.forEach((input) => {
+          if (input.dataset.overlayTextPreviewBound === 'true') return
+          input.dataset.overlayTextPreviewBound = 'true'
+          input.addEventListener('input', () => {
+            syncOverlayTextPreviewControls(cfg)
+            refreshOverlayTextPreview(cfg)
+          })
+          input.addEventListener('change', () => {
+            syncOverlayTextPreviewControls(cfg)
+            refreshOverlayTextPreview(cfg)
+          })
+        })
+      }
+    }
+
+    const ensureSingleBadgeOverlayPreviewControl = (cfg) => {
+      if (!cfg?.container || !cfg.styleInput || !['overlay_network', 'overlay_studio'].includes(cfg.id)) return
+      const styleRow = cfg.styleInput.closest('.input-group') || cfg.styleInput.closest('.mb-3') || cfg.styleInput.parentElement
+      if (!styleRow) return
+
+      let previewWrap = cfg.container.querySelector('[data-single-badge-preview-wrap]')
+      let previewInput = cfg.container.querySelector('[data-single-badge-preview-input]')
+      let previewList = cfg.container.querySelector('[data-single-badge-preview-list]')
+      if (!previewWrap) {
+        previewWrap = document.createElement('div')
+        previewWrap.className = 'mb-3'
+        previewWrap.dataset.singleBadgePreviewWrap = 'true'
+        previewWrap.innerHTML = `
+          <label class="form-label small fw-semibold mb-1">Preview badge key</label>
+          <input type="text" class="form-control form-control-sm" data-single-badge-preview-input="true" data-single-badge-preview-list-input="true">
+          <datalist data-single-badge-preview-list="true"></datalist>
+          <div class="form-text">Start typing to search bundled keys, or enter a custom key manually for edge cases.</div>
+        `
+        styleRow.insertAdjacentElement('afterend', previewWrap)
+        previewInput = previewWrap.querySelector('[data-single-badge-preview-input]')
+        previewList = previewWrap.querySelector('[data-single-badge-preview-list]')
+      }
+
+      if (previewInput && previewList && !previewInput.hasAttribute('list')) {
+        const listId = `${cfg.instanceId}__single-badge-preview-list`
+        previewList.id = listId
+        previewInput.setAttribute('list', listId)
+      }
+
+      if (previewInput && previewInput.dataset.listenerAdded !== 'true') {
+        previewInput.dataset.listenerAdded = 'true'
+        previewInput.addEventListener('change', () => {
+          setSingleBadgeOverlayPreviewSelectedKey(cfg, previewInput.value)
+          refreshSingleBadgeOverlayPreview(cfg)
+        })
+        previewInput.addEventListener('blur', () => {
+          setSingleBadgeOverlayPreviewSelectedKey(cfg, previewInput.value)
+          refreshSingleBadgeOverlayPreview(cfg)
+        })
+      }
+    }
+
+    const ensureStreamingPreviewControl = (cfg) => {
+      if (cfg?.id !== 'overlay_streaming' || !cfg.container || !cfg.styleInput) return
+      const styleRow = cfg.styleInput.closest('.input-group') || cfg.styleInput.closest('.mb-3') || cfg.styleInput.parentElement
+      if (!styleRow) return
+
+      let previewWrap = cfg.container.querySelector('[data-streaming-preview-wrap]')
+      let previewSelect = cfg.container.querySelector('[data-streaming-preview-select]')
+      if (!previewWrap) {
+        previewWrap = document.createElement('div')
+        previewWrap.className = 'mb-3'
+        previewWrap.dataset.streamingPreviewWrap = 'true'
+        previewWrap.innerHTML = `
+          <label class="form-label small fw-semibold mb-1">Preview badge</label>
+          <select class="form-select form-select-sm" data-streaming-preview-select="true"></select>
+        `
+        styleRow.insertAdjacentElement('afterend', previewWrap)
+        previewSelect = previewWrap.querySelector('[data-streaming-preview-select]')
+      }
+
+      if (previewSelect && previewSelect.dataset.listenerAdded !== 'true') {
+        previewSelect.dataset.listenerAdded = 'true'
+        previewSelect.addEventListener('change', () => {
+          setStreamingPreviewSelectedKey(cfg, previewSelect.value)
+          refreshStreamingOverlayPreview(cfg)
+        })
+      }
+    }
+
+    const ensureRibbonPreviewControl = (cfg) => {
+      if (cfg?.id !== 'overlay_ribbon' || !cfg.container || !cfg.styleInput) return
+      const styleRow = cfg.styleInput.closest('.input-group') || cfg.styleInput.closest('.mb-3') || cfg.styleInput.parentElement
+      if (!styleRow) return
+
+      let previewWrap = cfg.container.querySelector('[data-ribbon-preview-wrap]')
+      let previewSelect = cfg.container.querySelector('[data-ribbon-preview-select]')
+      if (!previewWrap) {
+        previewWrap = document.createElement('div')
+        previewWrap.className = 'mb-3'
+        previewWrap.dataset.ribbonPreviewWrap = 'true'
+        previewWrap.innerHTML = `
+          <label class="form-label small fw-semibold mb-1">Preview badge</label>
+          <select class="form-select form-select-sm" data-ribbon-preview-select="true"></select>
+        `
+        styleRow.insertAdjacentElement('afterend', previewWrap)
+        previewSelect = previewWrap.querySelector('[data-ribbon-preview-select]')
+      }
+
+      if (previewSelect && previewSelect.dataset.listenerAdded !== 'true') {
+        previewSelect.dataset.listenerAdded = 'true'
+        previewSelect.addEventListener('change', () => {
+          setRibbonPreviewSelectedKey(cfg, previewSelect.value)
+          refreshRibbonOverlayPreview(cfg)
+        })
+      }
+    }
+
+    const ensureLanguageCountPreviewControl = (cfg) => {
+      if (cfg?.id !== 'overlay_language_count' || !cfg.container) return
+      const anchorInput = getTemplateInput(cfg, 'use_dual') || getTemplateInput(cfg, 'use_multi')
+      const anchorRow = anchorInput?.closest('.form-check') || anchorInput?.closest('.input-group') || anchorInput?.closest('.mb-3') || anchorInput?.parentElement
+      if (!anchorRow) return
+
+      let previewWrap = cfg.container.querySelector('[data-language-count-preview-wrap]')
+      let previewSelect = cfg.container.querySelector('[data-language-count-preview-select]')
+      if (!previewWrap) {
+        previewWrap = document.createElement('div')
+        previewWrap.className = 'mb-3'
+        previewWrap.dataset.languageCountPreviewWrap = 'true'
+        previewWrap.innerHTML = `
+          <label class="form-label small fw-semibold mb-1">Preview badge</label>
+          <select class="form-select form-select-sm" data-language-count-preview-select="true"></select>
+        `
+        anchorRow.insertAdjacentElement('afterend', previewWrap)
+        previewSelect = previewWrap.querySelector('[data-language-count-preview-select]')
+      }
+
+      if (previewSelect && previewSelect.dataset.listenerAdded !== 'true') {
+        previewSelect.dataset.listenerAdded = 'true'
+        previewSelect.addEventListener('change', () => {
+          setLanguageCountPreviewSelectedKey(cfg, previewSelect.value)
+          refreshLanguageCountOverlayPreview(cfg)
+        })
+      }
+    }
+
+    const ensureAudioCodecPreviewControl = (cfg) => {
+      if (cfg?.id !== 'overlay_audio_codec' || !cfg.container || !cfg.styleInput) return
+      const styleRow = cfg.styleInput.closest('.input-group') || cfg.styleInput.closest('.mb-3') || cfg.styleInput.parentElement
+      if (!styleRow) return
+
+      let previewWrap = cfg.container.querySelector('[data-audio-codec-preview-wrap]')
+      let previewSelect = cfg.container.querySelector('[data-audio-codec-preview-select]')
+      if (!previewWrap) {
+        previewWrap = document.createElement('div')
+        previewWrap.className = 'mb-3'
+        previewWrap.dataset.audioCodecPreviewWrap = 'true'
+        previewWrap.innerHTML = `
+          <label class="form-label small fw-semibold mb-1">Preview badge</label>
+          <select class="form-select form-select-sm" data-audio-codec-preview-select="true"></select>
+        `
+        styleRow.insertAdjacentElement('afterend', previewWrap)
+        previewSelect = previewWrap.querySelector('[data-audio-codec-preview-select]')
+      }
+
+      if (previewSelect && previewSelect.dataset.listenerAdded !== 'true') {
+        previewSelect.dataset.listenerAdded = 'true'
+        previewSelect.addEventListener('change', () => {
+          setAudioCodecPreviewSelectedKey(cfg, previewSelect.value)
+          refreshAudioCodecOverlayPreview(cfg)
+        })
+      }
+    }
+
+    const syncAudioCodecPreviewControls = (cfg) => {
+      if (cfg?.id !== 'overlay_audio_codec' || !cfg.container) return
+      const select = cfg.container.querySelector('[data-audio-codec-preview-select]')
+      if (!select) return
+      const options = getAudioCodecPreviewOptions(cfg)
+      const selected = getAudioCodecPreviewSelectedKey(cfg)
+
+      select.replaceChildren()
+      options.forEach((option) => {
+        const el = document.createElement('option')
+        el.value = option.value
+        el.textContent = option.label
+        select.appendChild(el)
+      })
+      if (selected && options.some(option => option.value === selected)) {
+        select.value = selected
+      } else if (options[0]?.value) {
+        setAudioCodecPreviewSelectedKey(cfg, options[0].value)
+        select.value = options[0].value
+      }
+      select.disabled = options.length === 0
+    }
+
+    const syncRibbonPreviewControls = (cfg) => {
+      if (cfg?.id !== 'overlay_ribbon' || !cfg.container) return
+      const select = cfg.container.querySelector('[data-ribbon-preview-select]')
+      if (!select) return
+      const options = getRibbonPreviewOptions(cfg)
+      const selected = getRibbonPreviewSelectedKey(cfg)
+
+      select.replaceChildren()
+      options.forEach((option) => {
+        const el = document.createElement('option')
+        el.value = option.value
+        el.textContent = option.label
+        select.appendChild(el)
+      })
+      if (selected && options.some(option => option.value === selected)) {
+        select.value = selected
+      } else if (options[0]?.value) {
+        setRibbonPreviewSelectedKey(cfg, options[0].value)
+        select.value = options[0].value
+      }
+      select.disabled = options.length === 0
+    }
+
+    const syncLanguageCountPreviewControls = (cfg) => {
+      if (cfg?.id !== 'overlay_language_count' || !cfg.container) return
+      const select = cfg.container.querySelector('[data-language-count-preview-select]')
+      if (!select) return
+      const options = getLanguageCountPreviewOptions(cfg)
+      const selected = getLanguageCountPreviewSelectedKey(cfg)
+
+      select.replaceChildren()
+      options.forEach((option) => {
+        const el = document.createElement('option')
+        el.value = option.value
+        el.textContent = option.label
+        select.appendChild(el)
+      })
+      if (selected && options.some(option => option.value === selected)) {
+        select.value = selected
+      } else if (options[0]?.value) {
+        setLanguageCountPreviewSelectedKey(cfg, options[0].value)
+        select.value = options[0].value
+      }
+      select.disabled = options.length === 0
+    }
+
+    const syncStreamingPreviewControls = (cfg) => {
+      if (cfg?.id !== 'overlay_streaming' || !cfg.container) return
+      const select = cfg.container.querySelector('[data-streaming-preview-select]')
+      if (!select) return
+      const options = getStreamingPreviewOptions(cfg)
+      const selected = getStreamingPreviewSelectedKey(cfg)
+
+      select.replaceChildren()
+      options.forEach((option) => {
+        const el = document.createElement('option')
+        el.value = option.value
+        el.textContent = option.label
+        select.appendChild(el)
+      })
+      if (selected && options.some(option => option.value === selected)) {
+        select.value = selected
+      } else if (options[0]?.value) {
+        setStreamingPreviewSelectedKey(cfg, options[0].value)
+        select.value = options[0].value
+      }
+      select.disabled = options.length === 0
+    }
+
+    const syncSingleBadgeOverlayPreviewControls = (cfg) => {
+      if (!cfg?.container || !['overlay_network', 'overlay_studio'].includes(cfg.id)) return
+      const input = cfg.container.querySelector('[data-single-badge-preview-input]')
+      const list = cfg.container.querySelector('[data-single-badge-preview-list]')
+      if (!input) return
+      const options = getBundledOverlayKeyOptions(cfg)
+      if (list) {
+        list.replaceChildren()
+        options.forEach((option) => {
+          const el = document.createElement('option')
+          el.value = option.value
+          list.appendChild(el)
+        })
+      }
+      input.placeholder = options.length ? 'Search bundled keys or enter custom key' : 'Enter badge key'
+      input.value = getSingleBadgeOverlayPreviewSelectedKey(cfg)
+    }
+
+    const bindContentRatingPreviewInputs = (cfg) => {
+      if ((!isRegionalContentRatingOverlay(cfg) && !isCommonsenseContentRatingOverlay(cfg)) || !cfg.container) return
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return
+      const toggleInputs = Array.from(cfg.container.querySelectorAll(`[name^="${templateName}[use_"]`))
+        .filter(input => String(input?.type || '').toLowerCase() === 'checkbox')
+      toggleInputs.forEach((input) => {
+        if (!input || input.dataset.contentRatingPreviewBound === 'true') return
+        input.dataset.contentRatingPreviewBound = 'true'
+        input.addEventListener('change', () => {
+          syncContentRatingPreviewControls(cfg)
+          refreshContentRatingOverlayPreview(cfg)
+        })
+      })
+      const textInput = getCommonsensePreviewTextInput(cfg)
+      if (textInput && textInput.dataset.commonsensePreviewBound !== 'true') {
+        textInput.dataset.commonsensePreviewBound = 'true'
+        const refreshText = () => {
+          syncContentRatingPreviewControls(cfg)
+          refreshContentRatingOverlayPreview(cfg)
+        }
+        textInput.addEventListener('input', refreshText)
+        textInput.addEventListener('change', refreshText)
+      }
+      const colorInput = cfg.container.querySelector(`[name="${templateName}[color]"]`)
+      if (colorInput && colorInput.dataset.contentRatingColorPreviewBound !== 'true') {
+        colorInput.dataset.contentRatingColorPreviewBound = 'true'
+        colorInput.addEventListener('change', () => {
+          refreshContentRatingOverlayPreview(cfg)
+        })
+        colorInput.addEventListener('input', () => {
+          refreshContentRatingOverlayPreview(cfg)
+        })
+      }
+    }
+
+    const bindAudioCodecPreviewInputs = (cfg) => {
+      if (cfg?.id !== 'overlay_audio_codec' || !cfg.container) return
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return
+      const toggleKeys = getToggleFamilyChildKeys(cfg, 'audio_codec')
+      toggleKeys.forEach((toggleKey) => {
+        const input = cfg.container.querySelector(`[name="${templateName}[${toggleKey}]"]`)
+        if (!input || input.dataset.audioCodecPreviewBound === 'true') return
+        input.dataset.audioCodecPreviewBound = 'true'
+        input.addEventListener('change', () => {
+          syncAudioCodecPreviewControls(cfg)
+          refreshAudioCodecOverlayPreview(cfg)
+        })
+      })
+    }
+
+    const bindStreamingPreviewInputs = (cfg) => {
+      if (cfg?.id !== 'overlay_streaming' || !cfg.container) return
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return
+      const toggleKeys = getToggleFamilyChildKeys(cfg, 'streaming')
+      toggleKeys.forEach((toggleKey) => {
+        const input = cfg.container.querySelector(`[name="${templateName}[${toggleKey}]"]`)
+        if (!input || input.dataset.streamingPreviewBound === 'true') return
+        input.dataset.streamingPreviewBound = 'true'
+        input.addEventListener('change', () => {
+          syncStreamingPreviewControls(cfg)
+          refreshStreamingOverlayPreview(cfg)
+        })
+      })
+    }
+
+    const bindRibbonPreviewInputs = (cfg) => {
+      if (cfg?.id !== 'overlay_ribbon' || !cfg.container) return
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return
+      const toggleKeys = getToggleFamilyChildKeys(cfg, 'ribbon')
+      toggleKeys.forEach((toggleKey) => {
+        const input = cfg.container.querySelector(`[name="${templateName}[${toggleKey}]"]`)
+        if (!input || input.dataset.ribbonPreviewBound === 'true') return
+        input.dataset.ribbonPreviewBound = 'true'
+        input.addEventListener('change', () => {
+          syncRibbonPreviewControls(cfg)
+          refreshRibbonOverlayPreview(cfg)
+        })
+      })
+    }
+
+    const bindLanguageCountPreviewInputs = (cfg) => {
+      if (cfg?.id !== 'overlay_language_count' || !cfg.container) return
+      const templateName = cfg.container.dataset.overlayTemplate
+      if (!templateName) return
+      const toggleKeys = getToggleFamilyChildKeys(cfg, 'language_count')
+      toggleKeys.forEach((toggleKey) => {
+        const input = cfg.container.querySelector(`[name="${templateName}[${toggleKey}]"]`)
+        if (!input || input.dataset.languageCountPreviewBound === 'true') return
+        input.dataset.languageCountPreviewBound = 'true'
+        input.addEventListener('change', () => {
+          syncLanguageCountPreviewControls(cfg)
+          refreshLanguageCountOverlayPreview(cfg)
+        })
+      })
+      const subtitlesInput = cfg.container.querySelector(`[name="${templateName}[use_subtitles]"]`)
+      if (subtitlesInput && subtitlesInput.dataset.languageCountVariantBound !== 'true') {
+        subtitlesInput.dataset.languageCountVariantBound = 'true'
+        subtitlesInput.addEventListener('change', () => {
+          refreshLanguageCountOverlayPreview(cfg)
+        })
+      }
+    }
+
+    const bindSingleBadgeOverlayPreviewInputs = (cfg) => {
+      if (!cfg?.container || !['overlay_network', 'overlay_studio'].includes(cfg.id)) return
+      getBundledOverlayPreviewKeyOptions(cfg).then(() => {
+        syncSingleBadgeOverlayPreviewControls(cfg)
+      })
+      syncSingleBadgeOverlayPreviewControls(cfg)
+    }
+
+    const refreshAudioCodecOverlayPreview = (cfg) => {
+      if (cfg?.id !== 'overlay_audio_codec' || !cfg.layer) return
+      buildBackdropDataUrl(cfg).then(dataUrl => {
+        if (!dataUrl) return
+        cfg.layer.src = dataUrl
+      })
+    }
+
+    const refreshRatingsOverlayPreview = (cfg) => {
+      if (cfg?.id !== 'overlay_ratings' || !cfg.layer) return
+      buildBackdropDataUrl(cfg).then(dataUrl => {
+        if (!dataUrl) return
+        cfg.layer.src = dataUrl
+        applyPosition(cfg)
+      })
+    }
+
+    const refreshSingleBadgeOverlayPreview = (cfg) => {
+      if (!cfg?.layer || !['overlay_network', 'overlay_studio'].includes(cfg.id)) return
+      buildBackdropDataUrl(cfg).then(dataUrl => {
+        if (!dataUrl) return
+        cfg.layer.src = dataUrl
+      })
+    }
+
+    const refreshStreamingOverlayPreview = (cfg) => {
+      if (cfg?.id !== 'overlay_streaming' || !cfg.layer) return
+      buildBackdropDataUrl(cfg).then(dataUrl => {
+        if (!dataUrl) return
+        cfg.layer.src = dataUrl
+      })
+    }
+
+    const refreshRibbonOverlayPreview = (cfg) => {
+      if (cfg?.id !== 'overlay_ribbon' || !cfg.layer) return
+      buildRibbonCompositeDataUrl(cfg).then(dataUrl => {
+        if (!dataUrl) return
+        cfg.layer.src = dataUrl
+      })
+    }
+
+    const refreshLanguageCountOverlayPreview = (cfg) => {
+      if (cfg?.id !== 'overlay_language_count' || !cfg.layer) return
+      buildBackdropDataUrl(cfg).then(dataUrl => {
+        if (!dataUrl) return
+        cfg.layer.src = dataUrl
+      })
+    }
+
+    const refreshFixedBadgeOverlayPreview = (cfg) => {
+      if (!cfg?.layer || !getFixedBadgeOverlayFamily(cfg)) return
+      buildBackdropDataUrl(cfg).then(dataUrl => {
+        if (!dataUrl) return
+        cfg.layer.src = dataUrl
+      })
+    }
+
+    const getOverlaySourceOverrideActiveConfigName = () => {
+      return String(document.getElementById('qs-active-config-input')?.value || '').trim()
+    }
+
+    const isManagedOverlaySourceLocation = (value) => {
+      const normalized = String(value || '').trim().replace(/\\/g, '/').toLowerCase()
+      if (!normalized) return false
+      return normalized.startsWith('config/') && normalized.includes('/overlay_images/')
+    }
+
+    const getTrackedManagedOverlaySourceLocation = (row) => {
+      const tracked = String(row?.dataset?.overlaySourceManagedLocation || '').trim()
+      return isManagedOverlaySourceLocation(tracked) ? tracked : ''
+    }
+
+    const setTrackedManagedOverlaySourceLocation = (row, value) => {
+      if (!row) return
+      const normalized = String(value || '').trim()
+      if (isManagedOverlaySourceLocation(normalized)) {
+        row.dataset.overlaySourceManagedLocation = normalized
+      } else {
+        delete row.dataset.overlaySourceManagedLocation
+      }
+    }
+
+    const collectManagedOverlaySourceRetainLocations = (cfg, config, section) => {
+      const hiddenHost = section?.querySelector('[data-overlay-source-hidden]')
+      if (!hiddenHost) return []
+      return readOverlaySourceOverrideState(cfg, config, hiddenHost)
+        .filter(entry => entry.sourceType === 'file' && isManagedOverlaySourceLocation(entry.value))
+        .map(entry => String(entry.value || '').trim())
+    }
+
+    const cleanupManagedOverlaySourceImages = async (cfg, config, section, options = {}) => {
+      if (!cfg?.container || !config || !section) return null
+
+      const configName = getOverlaySourceOverrideActiveConfigName()
+      const libraryId = String(cfg.container.dataset.libraryId || '').trim()
+      const overlayId = String(cfg.id || '').trim()
+      if (!configName || !libraryId || !overlayId) return null
+
+      const removeLocations = Array.isArray(options.removeLocations)
+        ? options.removeLocations.map(value => String(value || '').trim()).filter(Boolean)
+        : []
+      const sweep = Boolean(options.sweep)
+      if (!removeLocations.length && !sweep) return null
+
+      const retainLocations = collectManagedOverlaySourceRetainLocations(cfg, config, section)
+      try {
+        const response = await fetch('/overlay-source-cleanup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            config_name: configName,
+            library_id: libraryId,
+            overlay_id: overlayId,
+            remove_locations: removeLocations,
+            retain_locations: retainLocations,
+            sweep
+          })
+        })
+        const payload = await response.json().catch(() => ({}))
+        if (!response.ok || payload.valid === false) {
+          console.warn('[OverlaySourceOverrides] Cleanup request failed', { overlayId, payload })
+          return null
+        }
+        return payload
+      } catch (error) {
+        console.warn('[OverlaySourceOverrides] Cleanup request errored', { overlayId, error })
+        return null
+      }
+    }
+
+    const updateOverlaySourceOverrideRowActions = (row) => {
+      if (!row) return
+      const sourceSelect = row.querySelector('[data-overlay-source-type="true"]')
+      const makeLocalBtn = row.querySelector('[data-overlay-source-make-local="true"]')
+      if (!sourceSelect || !makeLocalBtn) return
+
+      const sourceType = String(sourceSelect.value || '').trim()
+      const validationState = String(row.dataset.overlaySourceValidationState || '').trim()
+      const payload = row._overlaySourceValidationPayload || null
+      const isRemote = ['url', 'git', 'repo'].includes(sourceType)
+      const canMakeLocal = isRemote && (validationState === 'valid' || validationState === 'warn') && Boolean(payload?.resolved_url)
+
+      makeLocalBtn.classList.toggle('d-none', !isRemote)
+      makeLocalBtn.disabled = !canMakeLocal || row.dataset.overlaySourceMakingLocal === 'true'
+    }
+
+    const setOverlaySourceOverrideRowState = (row, state, message = '') => {
+      if (!row) return
+      const status = row.querySelector('[data-overlay-source-status="true"]')
+      const keySelect = row.querySelector('[data-overlay-source-key="true"]')
+      const sourceSelect = row.querySelector('[data-overlay-source-type="true"]')
+      const valueInput = row.querySelector('[data-overlay-source-value="true"]')
+
+      row.dataset.overlaySourceValidationState = state || ''
+      row.classList.remove('border-danger', 'border-warning', 'border-success')
+      keySelect?.classList.remove('is-invalid')
+      sourceSelect?.classList.remove('is-invalid')
+      valueInput?.classList.remove('is-invalid', 'is-valid')
+
+      if (state === 'invalid') {
+        row.classList.add('border-danger')
+        valueInput?.classList.add('is-invalid')
+      } else if (state === 'warn') {
+        row.classList.add('border-warning')
+      } else if (state === 'valid') {
+        row.classList.add('border-success')
+        valueInput?.classList.add('is-valid')
+      }
+
+      if (!status) return
+      if (message) {
+        const className = state === 'invalid'
+          ? 'small mt-2 text-danger'
+          : state === 'warn'
+            ? 'small mt-2 text-warning'
+            : state === 'pending'
+              ? 'small mt-2 text-muted'
+              : 'small mt-2 text-success'
+        status.className = className
+        status.textContent = message
+        status.classList.remove('d-none')
+      } else {
+        status.textContent = ''
+        status.className = 'small mt-2 d-none'
+      }
+
+      updateOverlaySourceOverrideRowActions(row)
+    }
+
+    const collectOverlaySourceOverrideRowPayload = (cfg, row) => {
+      const keySelect = row.querySelector('[data-overlay-source-key="true"]')
+      const sourceSelect = row.querySelector('[data-overlay-source-type="true"]')
+      const valueInput = row.querySelector('[data-overlay-source-value="true"]')
+      const badgeKey = String(keySelect?.value || '').trim()
+      const sourceType = String(sourceSelect?.value || '').trim()
+      const sourceValue = String(valueInput?.value || '').trim()
+      return {
+        badgeKey,
+        sourceType,
+        sourceValue,
+        templateKey: encodeOverlaySourceOverrideVarName(sourceType, badgeKey)
+      }
+    }
+
+    const validateOverlaySourceOverrideRow = async (cfg, config, section, row) => {
+      if (!cfg?.container || !row || !section) return
+
+      const { badgeKey, sourceType, sourceValue, templateKey } = collectOverlaySourceOverrideRowPayload(cfg, row)
+      const valueInput = row.querySelector('[data-overlay-source-value="true"]')
+      if (!badgeKey || !sourceType || !sourceValue) {
+        setOverlaySourceOverrideRowState(row, '', '')
+        syncOverlaySourceOverrideRows(cfg, config, section)
+        return
+      }
+
+      if (row._overlaySourceAbortController) {
+        row._overlaySourceAbortController.abort()
+      }
+      const controller = new AbortController()
+      row._overlaySourceAbortController = controller
+
+      const previousManagedLocation = getTrackedManagedOverlaySourceLocation(row)
+      row._overlaySourceValidationPayload = null
+      setOverlaySourceOverrideRowState(row, 'pending', 'Validating image source...')
+
+      try {
+        const response = await fetch('/validate_overlay_source_override', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            config_name: getOverlaySourceOverrideActiveConfigName(),
+            library_id: String(cfg.container.dataset.libraryId || '').trim(),
+            overlay_id: String(cfg.id || '').trim(),
+            template_key: templateKey,
+            source_type: sourceType,
+            source_value: sourceValue
+          }),
+          signal: controller.signal
+        })
+
+        const payload = await response.json().catch(() => ({}))
+        if (!response.ok || payload.valid === false) {
+          setOverlaySourceOverrideRowState(row, 'invalid', String(payload.error || 'Overlay image validation failed.').trim())
+          syncOverlaySourceOverrideRows(cfg, config, section)
+          return
+        }
+
+        if (sourceType === 'file' && payload.normalized_location && valueInput) {
+          valueInput.value = String(payload.normalized_location).trim()
+        }
+
+        const nextManagedLocation = sourceType === 'file' && payload.normalized_location
+          ? String(payload.normalized_location || '').trim()
+          : ''
+        setTrackedManagedOverlaySourceLocation(row, nextManagedLocation)
+        row._overlaySourceValidationPayload = payload
+        const message = String(payload.warning || payload.message || 'Validated overlay image source.').trim()
+        const state = payload.warning ? 'warn' : 'valid'
+        setOverlaySourceOverrideRowState(row, state, message)
+        if (cfg.id === 'overlay_resolution' && badgeKey) {
+          const family = getResolutionToggleFamilyForBadgeKey(badgeKey)
+          if (family) {
+            setResolutionPreviewSelectedKey(cfg, family, badgeKey)
+            syncResolutionPreviewControls(cfg)
+            refreshResolutionOverlayPreview(cfg)
+          }
+        } else if (cfg.id === 'overlay_audio_codec' && badgeKey) {
+          setAudioCodecPreviewSelectedKey(cfg, badgeKey)
+          syncAudioCodecPreviewControls(cfg)
+          refreshAudioCodecOverlayPreview(cfg)
+        } else if (cfg.id === 'overlay_streaming' && badgeKey) {
+          setStreamingPreviewSelectedKey(cfg, badgeKey)
+          syncStreamingPreviewControls(cfg)
+          refreshStreamingOverlayPreview(cfg)
+        } else if (cfg.id === 'overlay_ribbon' && badgeKey) {
+          setRibbonPreviewSelectedKey(cfg, badgeKey)
+          syncRibbonPreviewControls(cfg)
+          refreshRibbonOverlayPreview(cfg)
+        } else if (cfg.id === 'overlay_language_count' && badgeKey) {
+          setLanguageCountPreviewSelectedKey(cfg, badgeKey)
+          syncLanguageCountPreviewControls(cfg)
+          refreshLanguageCountOverlayPreview(cfg)
+        } else if (cfg.id === 'overlay_ratings') {
+          refreshRatingsOverlayPreview(cfg)
+        } else if (isRegionalContentRatingOverlay(cfg) && badgeKey) {
+          setContentRatingPreviewSelectedKey(cfg, badgeKey)
+          syncContentRatingPreviewControls(cfg)
+          refreshContentRatingOverlayPreview(cfg)
+        } else if (isCommonsenseContentRatingOverlay(cfg)) {
+          refreshContentRatingOverlayPreview(cfg)
+        } else if ((cfg.id === 'overlay_network' || cfg.id === 'overlay_studio') && badgeKey) {
+          setSingleBadgeOverlayPreviewSelectedKey(cfg, badgeKey)
+          syncSingleBadgeOverlayPreviewControls(cfg)
+          refreshSingleBadgeOverlayPreview(cfg)
+        } else if (getFixedBadgeOverlayFamily(cfg)) {
+          refreshFixedBadgeOverlayPreview(cfg)
+        }
+        syncOverlaySourceOverrideRows(cfg, config, section)
+        if (previousManagedLocation && previousManagedLocation !== nextManagedLocation) {
+          await cleanupManagedOverlaySourceImages(cfg, config, section, {
+            removeLocations: [previousManagedLocation],
+            sweep: true
+          })
+        }
+      } catch (error) {
+        if (error?.name === 'AbortError') return
+        setOverlaySourceOverrideRowState(row, 'invalid', 'Overlay image validation request failed.')
+        syncOverlaySourceOverrideRows(cfg, config, section)
+      } finally {
+        if (row._overlaySourceAbortController === controller) {
+          row._overlaySourceAbortController = null
+        }
+      }
+    }
+
+    const makeOverlaySourceOverrideRowLocal = async (cfg, config, section, row) => {
+      if (!cfg?.container || !row || !section) return
+
+      const { badgeKey, sourceType, sourceValue, templateKey } = collectOverlaySourceOverrideRowPayload(cfg, row)
+      const sourceSelect = row.querySelector('[data-overlay-source-type="true"]')
+      const valueInput = row.querySelector('[data-overlay-source-value="true"]')
+      const makeLocalBtn = row.querySelector('[data-overlay-source-make-local="true"]')
+      if (!sourceSelect || !valueInput || !makeLocalBtn) return
+      if (!['url', 'git', 'repo'].includes(sourceType)) return
+
+      if (row._overlaySourceAbortController) {
+        row._overlaySourceAbortController.abort()
+      }
+
+      const originalText = makeLocalBtn.textContent
+      row.dataset.overlaySourceMakingLocal = 'true'
+      makeLocalBtn.textContent = 'Making local...'
+      updateOverlaySourceOverrideRowActions(row)
+      setOverlaySourceOverrideRowState(row, 'pending', 'Saving local copy of overlay image...')
+      const previousManagedLocation = getTrackedManagedOverlaySourceLocation(row)
+
+      try {
+        const response = await fetch('/overlay-source-make-local', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            config_name: getOverlaySourceOverrideActiveConfigName(),
+            library_id: String(cfg.container.dataset.libraryId || '').trim(),
+            overlay_id: String(cfg.id || '').trim(),
+            template_key: templateKey,
+            badge_key: badgeKey,
+            source_type: sourceType,
+            source_value: sourceValue
+          })
+        })
+
+        const payload = await response.json().catch(() => ({}))
+        if (!response.ok || payload.valid === false) {
+          row._overlaySourceValidationPayload = null
+          setOverlaySourceOverrideRowState(row, 'invalid', String(payload.error || 'Failed to make overlay image local.').trim())
+          syncOverlaySourceOverrideRows(cfg, config, section)
+          return
+        }
+
+        sourceSelect.value = 'file'
+        valueInput.value = String(payload.normalized_location || '').trim()
+        const nextManagedLocation = String(payload.normalized_location || '').trim()
+        setTrackedManagedOverlaySourceLocation(row, nextManagedLocation)
+        row._overlaySourceValidationPayload = payload
+
+        const message = String(payload.warning || payload.message || 'Saved overlay image into managed storage.').trim()
+        const state = payload.warning ? 'warn' : 'valid'
+        setOverlaySourceOverrideRowState(row, state, message)
+        syncOverlaySourceOverrideRows(cfg, config, section)
+
+        if (cfg.id === 'overlay_resolution' && badgeKey) {
+          const family = getResolutionToggleFamilyForBadgeKey(badgeKey)
+          if (family) {
+            setResolutionPreviewSelectedKey(cfg, family, badgeKey)
+            syncResolutionPreviewControls(cfg)
+            refreshResolutionOverlayPreview(cfg)
+          }
+        } else if (cfg.id === 'overlay_audio_codec' && badgeKey) {
+          setAudioCodecPreviewSelectedKey(cfg, badgeKey)
+          syncAudioCodecPreviewControls(cfg)
+          refreshAudioCodecOverlayPreview(cfg)
+        } else if (cfg.id === 'overlay_streaming' && badgeKey) {
+          setStreamingPreviewSelectedKey(cfg, badgeKey)
+          syncStreamingPreviewControls(cfg)
+          refreshStreamingOverlayPreview(cfg)
+        } else if (cfg.id === 'overlay_ribbon' && badgeKey) {
+          setRibbonPreviewSelectedKey(cfg, badgeKey)
+          syncRibbonPreviewControls(cfg)
+          refreshRibbonOverlayPreview(cfg)
+        } else if (cfg.id === 'overlay_language_count' && badgeKey) {
+          setLanguageCountPreviewSelectedKey(cfg, badgeKey)
+          syncLanguageCountPreviewControls(cfg)
+          refreshLanguageCountOverlayPreview(cfg)
+        } else if (cfg.id === 'overlay_ratings') {
+          refreshRatingsOverlayPreview(cfg)
+        } else if (isRegionalContentRatingOverlay(cfg) && badgeKey) {
+          setContentRatingPreviewSelectedKey(cfg, badgeKey)
+          syncContentRatingPreviewControls(cfg)
+          refreshContentRatingOverlayPreview(cfg)
+        } else if (isCommonsenseContentRatingOverlay(cfg)) {
+          refreshContentRatingOverlayPreview(cfg)
+        } else if ((cfg.id === 'overlay_network' || cfg.id === 'overlay_studio') && badgeKey) {
+          setSingleBadgeOverlayPreviewSelectedKey(cfg, badgeKey)
+          syncSingleBadgeOverlayPreviewControls(cfg)
+          refreshSingleBadgeOverlayPreview(cfg)
+        } else if (getFixedBadgeOverlayFamily(cfg)) {
+          refreshFixedBadgeOverlayPreview(cfg)
+        }
+        if (previousManagedLocation && previousManagedLocation !== nextManagedLocation) {
+          await cleanupManagedOverlaySourceImages(cfg, config, section, {
+            removeLocations: [previousManagedLocation],
+            sweep: true
+          })
+        }
+      } catch {
+        row._overlaySourceValidationPayload = null
+        setOverlaySourceOverrideRowState(row, 'invalid', 'Failed to save overlay image locally.')
+        syncOverlaySourceOverrideRows(cfg, config, section)
+      } finally {
+        delete row.dataset.overlaySourceMakingLocal
+        makeLocalBtn.textContent = originalText
+        updateOverlaySourceOverrideRowActions(row)
+      }
+    }
+
     const buildOverlaySourceOverrideRow = (cfg, config, keyOptions, entry = {}) => {
       const row = document.createElement('div')
       row.className = 'border rounded-3 p-2'
@@ -1030,29 +3629,69 @@ const OverlayHandler = {
       row.appendChild(layout)
 
       const keyCol = document.createElement('div')
-      keyCol.className = 'col-lg-4'
-      const keySelect = document.createElement('select')
-      keySelect.className = 'form-select form-select-sm'
-      keySelect.dataset.overlaySourceKey = 'true'
-      keyOptions.forEach(option => {
-        const opt = document.createElement('option')
-        opt.value = option.value
-        opt.textContent = option.label
-        keySelect.appendChild(opt)
-      })
+      keyCol.className = 'col-12 col-xl-4'
       const requestedKey = String(entry.badgeKey || '').trim()
-      if (requestedKey && !keyOptions.some(option => option.value === requestedKey)) {
-        const opt = document.createElement('option')
-        opt.value = requestedKey
-        opt.textContent = requestedKey
-        keySelect.appendChild(opt)
+      const useBundledPreviewKeys = config.keyMode === 'bundled_preview_keys'
+      const useFixedKey = config.keyMode === 'fixed_key'
+      const useSelectKeys = config.keyMode === 'from_use_toggles' || config.keyMode === 'from_select_options'
+      const useFreeTextKey = !useSelectKeys && !useFixedKey && !useBundledPreviewKeys
+      let keySelect
+      if (useFixedKey) {
+        keySelect = document.createElement('input')
+        keySelect.type = 'hidden'
+        keySelect.value = requestedKey || config.fixedKey || ''
+        const fixedKeyLabel = document.createElement('div')
+        fixedKeyLabel.className = 'form-control form-control-sm bg-body-secondary-subtle'
+        fixedKeyLabel.textContent = keySelect.value || 'Badge key'
+        keyCol.appendChild(fixedKeyLabel)
+      } else if (useBundledPreviewKeys) {
+        keySelect = document.createElement('input')
+        keySelect.type = 'text'
+        keySelect.className = 'form-control form-control-sm'
+        keySelect.placeholder = config.keyPlaceholder || 'Badge key'
+        keySelect.value = requestedKey
+        const dataList = document.createElement('datalist')
+        dataList.id = `${cfg.instanceId}__overlay-source-key-list__${Math.random().toString(36).slice(2, 10)}`
+        dataList.dataset.overlaySourceKeyList = 'true'
+        keyOptions.forEach(option => {
+          const el = document.createElement('option')
+          el.value = option.value
+          dataList.appendChild(el)
+        })
+        keySelect.setAttribute('list', dataList.id)
+        keyCol.appendChild(keySelect)
+        keyCol.appendChild(dataList)
+      } else if (useFreeTextKey) {
+        keySelect = document.createElement('input')
+        keySelect.type = 'text'
+        keySelect.className = 'form-control form-control-sm'
+        keySelect.placeholder = config.keyPlaceholder || 'Badge key'
+        keySelect.value = requestedKey
+      } else {
+        keySelect = document.createElement('select')
+        keySelect.className = 'form-select form-select-sm'
+        keyOptions.forEach(option => {
+          const opt = document.createElement('option')
+          opt.value = option.value
+          opt.textContent = option.label
+          keySelect.appendChild(opt)
+        })
+        if (requestedKey && !keyOptions.some(option => option.value === requestedKey)) {
+          const opt = document.createElement('option')
+          opt.value = requestedKey
+          opt.textContent = requestedKey
+          keySelect.appendChild(opt)
+        }
+        keySelect.value = requestedKey
       }
-      keySelect.value = requestedKey
-      keyCol.appendChild(keySelect)
+      keySelect.dataset.overlaySourceKey = 'true'
+      if (!useBundledPreviewKeys) {
+        keyCol.appendChild(keySelect)
+      }
       layout.appendChild(keyCol)
 
       const sourceCol = document.createElement('div')
-      sourceCol.className = 'col-lg-2'
+      sourceCol.className = 'col-12 col-md-4 col-xl-2'
       const sourceSelect = document.createElement('select')
       sourceSelect.className = 'form-select form-select-sm'
       sourceSelect.dataset.overlaySourceType = 'true'
@@ -1067,26 +3706,36 @@ const OverlayHandler = {
       layout.appendChild(sourceCol)
 
       const valueCol = document.createElement('div')
-      valueCol.className = 'col-lg-5'
+      valueCol.className = 'col-12 col-md-8 col-xl-4'
       const valueInput = document.createElement('input')
       valueInput.type = 'text'
       valueInput.className = 'form-control form-control-sm'
       valueInput.dataset.overlaySourceValue = 'true'
       valueInput.dataset.skipLibraryInputBubble = 'true'
       valueInput.value = String(entry.value || '').trim()
+      if (String(entry.sourceType || '').trim() === 'file' && isManagedOverlaySourceLocation(entry.value)) {
+        row.dataset.overlaySourceManagedLocation = String(entry.value || '').trim()
+      }
       valueCol.appendChild(valueInput)
       layout.appendChild(valueCol)
 
-      const removeCol = document.createElement('div')
-      removeCol.className = 'col-lg-1 d-grid'
+      const actionCol = document.createElement('div')
+      actionCol.className = 'col-12 col-xl-2 d-grid gap-2'
+      const makeLocalBtn = document.createElement('button')
+      makeLocalBtn.type = 'button'
+      makeLocalBtn.className = 'btn btn-outline-info btn-sm d-none'
+      makeLocalBtn.dataset.overlaySourceMakeLocal = 'true'
+      makeLocalBtn.textContent = 'Make Local'
+      actionCol.appendChild(makeLocalBtn)
+
       const removeBtn = document.createElement('button')
       removeBtn.type = 'button'
       removeBtn.className = 'btn btn-outline-danger btn-sm'
       removeBtn.dataset.overlaySourceRemove = 'true'
       removeBtn.innerHTML = '<i class="bi bi-x-lg"></i>'
       removeBtn.setAttribute('aria-label', 'Remove source override')
-      removeCol.appendChild(removeBtn)
-      layout.appendChild(removeCol)
+      actionCol.appendChild(removeBtn)
+      layout.appendChild(actionCol)
 
       const help = document.createElement('div')
       help.className = 'small text-muted mt-2'
@@ -1095,27 +3744,38 @@ const OverlayHandler = {
 
       const updatePlaceholder = () => {
         const sourceType = String(sourceSelect.value || '').trim()
+        const overlayFolder = String(cfg?.id || '').replace(/^overlay_/, '') || 'custom'
         if (sourceType === 'url') {
           valueInput.placeholder = 'https://example.com/badge.png'
-          help.textContent = 'Use a direct URL to a badge image. Quickstart stores this value as-is and does not live-check the target.'
+          help.textContent = 'Use a direct URL to a badge image. Quickstart validates the image target and can rehome it into managed storage with Make Local.'
           return
         }
         if (sourceType === 'git') {
-          valueInput.placeholder = 'defaults/overlays/images/resolution/custom.png'
-          help.textContent = 'Use a Community-Configs git path. Quickstart stores this value as-is and does not live-check the target.'
+          valueInput.placeholder = `defaults/overlays/images/${overlayFolder}/custom.png`
+          help.textContent = 'Use a Community-Configs git path. Quickstart validates the resolved image and can rehome it into managed storage with Make Local.'
           return
         }
         if (sourceType === 'repo') {
-          valueInput.placeholder = 'overlays/resolution/custom.png'
-          help.textContent = 'Use a custom_repo-backed repo path. Quickstart stores this value as-is and does not live-check the target.'
+          valueInput.placeholder = `overlays/${overlayFolder}/custom.png`
+          help.textContent = 'Use a custom_repo-backed repo path. Quickstart validates the resolved image and can rehome it into managed storage with Make Local.'
           return
         }
-        valueInput.placeholder = 'config/overlays/resolution/custom.png'
-        help.textContent = 'Use a local file path that Kometa can read. Quickstart stores this value as-is and does not verify the file exists yet.'
+        valueInput.placeholder = `config/overlays/${overlayFolder}/custom.png`
+        help.textContent = 'Use a local file path that Kometa can read. Quickstart validates the image and copies it into managed config storage.'
       }
 
+      const status = document.createElement('div')
+      status.className = 'small mt-2 d-none'
+      status.dataset.overlaySourceStatus = 'true'
+      row.appendChild(status)
+
       updatePlaceholder()
-      sourceSelect.addEventListener('change', updatePlaceholder)
+      sourceSelect.addEventListener('change', () => {
+        updatePlaceholder()
+        row._overlaySourceValidationPayload = null
+        setOverlaySourceOverrideRowState(row, '', '')
+      })
+      updateOverlaySourceOverrideRowActions(row)
       return row
     }
 
@@ -1127,8 +3787,11 @@ const OverlayHandler = {
       if (!hiddenHost || !warning) return
 
       const seen = new Set()
+      const seenValues = new Map()
       const nextState = []
       let warningText = ''
+      let asyncInvalidCount = 0
+      let asyncWarnCount = 0
 
       rows.forEach(row => {
         const keySelect = row.querySelector('[data-overlay-source-key="true"]')
@@ -1171,18 +3834,48 @@ const OverlayHandler = {
           return
         }
 
+        const normalizedValueKey = `${sourceType}:${value.toLowerCase()}`
+        const priorBadge = seenValues.get(normalizedValueKey)
+        if (priorBadge && priorBadge !== badgeKey) {
+          if (!warningText) {
+            warningText = 'Different badges cannot reuse the same source override value.'
+          }
+          keySelect.classList.add('is-invalid')
+          valueInput.classList.add('is-invalid')
+          return
+        }
+
         seen.add(combo)
+        seenValues.set(normalizedValueKey, badgeKey)
         nextState.push({ badgeKey, sourceType, value })
+
+        const rowState = String(row.dataset.overlaySourceValidationState || '').trim()
+        if (rowState === 'invalid') {
+          asyncInvalidCount += 1
+        } else if (rowState === 'warn') {
+          asyncWarnCount += 1
+        }
       })
 
       const serializedState = JSON.stringify(nextState)
-      if (hiddenHost.dataset.overlaySourceSerialized !== serializedState) {
+      const didStateChange = hiddenHost.dataset.overlaySourceSerialized !== serializedState
+      if (didStateChange) {
         hiddenHost.replaceChildren()
         nextState.forEach(entry => {
           const varName = encodeOverlaySourceOverrideVarName(entry.sourceType, entry.badgeKey)
           createOverlaySourceOverrideHiddenInput(cfg, hiddenHost, varName, entry.value)
         })
         hiddenHost.dataset.overlaySourceSerialized = serializedState
+      }
+
+      if (!warningText && asyncInvalidCount > 0) {
+        warningText = asyncInvalidCount === 1
+          ? 'One source override failed validation.'
+          : `${asyncInvalidCount} source overrides failed validation.`
+      } else if (!warningText && asyncWarnCount > 0) {
+        warningText = asyncWarnCount === 1
+          ? 'One source override is valid but stays external to Quickstart bundles.'
+          : `${asyncWarnCount} source overrides are valid but stay external to Quickstart bundles.`
       }
 
       warning.textContent = warningText
@@ -1193,11 +3886,62 @@ const OverlayHandler = {
         emptyState.classList.toggle('d-none', rows.length > 0)
       }
 
-      if (typeof EventHandler !== 'undefined' && typeof EventHandler.updateAccordionHighlights === 'function') {
-        EventHandler.updateAccordionHighlights()
+      if (typeof window.EventHandler !== 'undefined' && window.EventHandler.updateAccordionHighlights === 'function') {
+        window.EventHandler.updateAccordionHighlights()
       }
       if (typeof ValidationHandler !== 'undefined' && typeof ValidationHandler.updateValidationState === 'function') {
         ValidationHandler.updateValidationState()
+      }
+      if (cfg.id === 'overlay_resolution') {
+        syncResolutionPreviewControls(cfg)
+        if (didStateChange) {
+          refreshResolutionOverlayPreview(cfg)
+        }
+      }
+      if (cfg.id === 'overlay_audio_codec') {
+        syncAudioCodecPreviewControls(cfg)
+        if (didStateChange) {
+          refreshAudioCodecOverlayPreview(cfg)
+        }
+      }
+      if (cfg.id === 'overlay_streaming') {
+        syncStreamingPreviewControls(cfg)
+        if (didStateChange) {
+          refreshStreamingOverlayPreview(cfg)
+        }
+      }
+      if (cfg.id === 'overlay_ribbon') {
+        syncRibbonPreviewControls(cfg)
+        if (didStateChange) {
+          refreshRibbonOverlayPreview(cfg)
+        }
+      }
+      if (cfg.id === 'overlay_language_count') {
+        syncLanguageCountPreviewControls(cfg)
+        if (didStateChange) {
+          refreshLanguageCountOverlayPreview(cfg)
+        }
+      }
+      if (cfg.id === 'overlay_ratings' && didStateChange) {
+        refreshRatingsOverlayPreview(cfg)
+      }
+      if (isRegionalContentRatingOverlay(cfg)) {
+        syncContentRatingPreviewControls(cfg)
+        if (didStateChange) {
+          refreshContentRatingOverlayPreview(cfg)
+        }
+      }
+      if (isCommonsenseContentRatingOverlay(cfg) && didStateChange) {
+        refreshContentRatingOverlayPreview(cfg)
+      }
+      if (cfg.id === 'overlay_network' || cfg.id === 'overlay_studio') {
+        syncSingleBadgeOverlayPreviewControls(cfg)
+        if (didStateChange) {
+          refreshSingleBadgeOverlayPreview(cfg)
+        }
+      }
+      if (getFixedBadgeOverlayFamily(cfg) && didStateChange) {
+        refreshFixedBadgeOverlayPreview(cfg)
       }
     }
 
@@ -1221,20 +3965,52 @@ const OverlayHandler = {
 
       rowsHost.querySelectorAll('[data-overlay-source-remove="true"]').forEach(btn => {
         btn.addEventListener('click', () => {
+          const row = btn.closest('[data-overlay-source-row="true"]')
+          const previousManagedLocation = getTrackedManagedOverlaySourceLocation(row)
+          if (row?._overlaySourceAbortController) {
+            row._overlaySourceAbortController.abort()
+          }
           btn.closest('[data-overlay-source-row="true"]')?.remove()
           syncOverlaySourceOverrideRows(cfg, config, section)
+          cleanupManagedOverlaySourceImages(cfg, config, section, {
+            removeLocations: previousManagedLocation ? [previousManagedLocation] : [],
+            sweep: true
+          }).catch(() => {})
+        })
+      })
+
+      rowsHost.querySelectorAll('[data-overlay-source-make-local="true"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const row = btn.closest('[data-overlay-source-row="true"]')
+          makeOverlaySourceOverrideRowLocal(cfg, config, section, row)
         })
       })
 
       rowsHost.querySelectorAll('[data-overlay-source-key="true"], [data-overlay-source-type="true"]').forEach(input => {
-        input.addEventListener('change', () => syncOverlaySourceOverrideRows(cfg, config, section))
+        input.addEventListener('change', () => {
+          const row = input.closest('[data-overlay-source-row="true"]')
+          row._overlaySourceValidationPayload = null
+          setOverlaySourceOverrideRowState(row, '', '')
+          syncOverlaySourceOverrideRows(cfg, config, section)
+          validateOverlaySourceOverrideRow(cfg, config, section, row)
+        })
       })
 
       rowsHost.querySelectorAll('[data-overlay-source-value="true"]').forEach(input => {
         input.addEventListener('input', () => {
-          input.classList.remove('is-invalid')
+          const row = input.closest('[data-overlay-source-row="true"]')
+          row._overlaySourceValidationPayload = null
+          setOverlaySourceOverrideRowState(row, '', '')
         })
-        input.addEventListener('change', () => syncOverlaySourceOverrideRows(cfg, config, section))
+        input.addEventListener('change', () => {
+          const row = input.closest('[data-overlay-source-row="true"]')
+          syncOverlaySourceOverrideRows(cfg, config, section)
+          validateOverlaySourceOverrideRow(cfg, config, section, row)
+        })
+        input.addEventListener('blur', () => {
+          const row = input.closest('[data-overlay-source-row="true"]')
+          validateOverlaySourceOverrideRow(cfg, config, section, row)
+        })
       })
     }
 
@@ -1274,6 +4050,17 @@ const OverlayHandler = {
       renderOverlaySourceOverrideRows(cfg, config, section, state)
       syncOverlaySourceOverrideRows(cfg, config, section)
 
+      if (config.keyMode === 'bundled_preview_keys' && section.dataset.overlaySourceKeyOptionsLoaded !== 'true') {
+        section.dataset.overlaySourceKeyOptionsLoaded = 'loading'
+        getBundledOverlayPreviewKeyOptions(cfg).then(() => {
+          section.dataset.overlaySourceKeyOptionsLoaded = 'true'
+          const nextState = readOverlaySourceOverrideState(cfg, config, hiddenHost)
+          renderOverlaySourceOverrideRows(cfg, config, section, nextState)
+          syncOverlaySourceOverrideRows(cfg, config, section)
+          syncSingleBadgeOverlayPreviewControls(cfg)
+        })
+      }
+
       const addBtn = section.querySelector('[data-overlay-source-add="true"]')
       if (addBtn && addBtn.dataset.listenerAdded !== 'true') {
         addBtn.dataset.listenerAdded = 'true'
@@ -1281,9 +4068,12 @@ const OverlayHandler = {
           const rowsHost = section.querySelector('[data-overlay-source-rows]')
           if (!rowsHost) return
           const keyOptions = getOverlaySourceOverrideKeyOptions(cfg, config)
+          const fallbackBadgeKey = config.keyMode === 'fixed_key'
+            ? String(config.fixedKey || '').trim()
+            : keyOptions[0]?.value || getSingleBadgeOverlayPreviewSelectedKey(cfg) || ''
           rowsHost.appendChild(buildOverlaySourceOverrideRow(cfg, config, keyOptions, {
             sourceType: config.sourceTypes[0] || 'file',
-            badgeKey: keyOptions[0]?.value || '',
+            badgeKey: fallbackBadgeKey,
             value: ''
           }))
           renderOverlaySourceOverrideRows(cfg, config, section, Array.from(rowsHost.querySelectorAll('[data-overlay-source-row="true"]')).map(row => ({
@@ -1299,10 +4089,17 @@ const OverlayHandler = {
       if (resetBtn && resetBtn.dataset.sourceOverrideResetBound !== 'true') {
         resetBtn.dataset.sourceOverrideResetBound = 'true'
         resetBtn.addEventListener('click', () => {
+          const previousManagedLocations = Array.from(section.querySelectorAll('[data-overlay-source-row="true"]'))
+            .map(row => getTrackedManagedOverlaySourceLocation(row))
+            .filter(Boolean)
           setTimeout(() => {
             const nextState = readOverlaySourceOverrideState(cfg, config, hiddenHost)
             renderOverlaySourceOverrideRows(cfg, config, section, nextState)
             syncOverlaySourceOverrideRows(cfg, config, section)
+            cleanupManagedOverlaySourceImages(cfg, config, section, {
+              removeLocations: previousManagedLocations,
+              sweep: true
+            }).catch(() => {})
           }, 0)
         })
       }
@@ -1489,24 +4286,6 @@ const OverlayHandler = {
       omdb: 'OMDb',
       plex: 'Plex'
     }
-    const FLAG_PREVIEW_ITEMS = [
-      {
-        text: 'EN',
-        round: 'https://raw.githubusercontent.com/Kometa-Team/Kometa/refs/heads/nightly/defaults/overlays/images/flag/round/us.png',
-        square: 'https://raw.githubusercontent.com/Kometa-Team/Kometa/refs/heads/nightly/defaults/overlays/images/flag/square/us.png'
-      },
-      {
-        text: 'DE',
-        round: 'https://raw.githubusercontent.com/Kometa-Team/Kometa/refs/heads/nightly/defaults/overlays/images/flag/round/de.png',
-        square: 'https://raw.githubusercontent.com/Kometa-Team/Kometa/refs/heads/nightly/defaults/overlays/images/flag/square/de.png'
-      },
-      {
-        text: 'FR',
-        round: 'https://raw.githubusercontent.com/Kometa-Team/Kometa/refs/heads/nightly/defaults/overlays/images/flag/round/fr.png',
-        square: 'https://raw.githubusercontent.com/Kometa-Team/Kometa/refs/heads/nightly/defaults/overlays/images/flag/square/fr.png'
-      }
-    ]
-
     const buildRatingFilenameCandidates = (value, label) => {
       const valueKey = (value || '').toString().trim().toLowerCase()
       const labelKey = (label || '').toString().trim().toLowerCase()
@@ -1528,9 +4307,9 @@ const OverlayHandler = {
       return names.map(name => `${RATINGS_IMAGE_BASE}${encodeURIComponent(`${name}.png`)}`)
     }
 
-    const enhanceRatingImageSelects = (scope) => {
-      const root = scope || document
-      root.querySelectorAll('select[data-rating-image-select="true"]').forEach(select => {
+    const enhanceRatingImageSelects = (ratingScope) => {
+      const ratingRoot = ratingScope || document
+      ratingRoot.querySelectorAll('select[data-rating-image-select="true"]').forEach(select => {
         if (select.dataset.ratingImageEnhanced) return
         select.dataset.ratingImageEnhanced = 'true'
 
@@ -2031,7 +4810,7 @@ const OverlayHandler = {
           const pickedLabels = new Set(
             typeMappings
               .map(entry => entry.toggleLabel)
-              .filter(label => label && label !== '—' && label !== 'Pick a source')
+              .filter(toggleLabel => toggleLabel && toggleLabel !== '—' && toggleLabel !== 'Pick a source')
               .map(normalizeLabel)
           )
           const pillJumpMap = {
@@ -2095,7 +4874,7 @@ const OverlayHandler = {
               }
               const viaHtml = serviceTag
                 ? (jumpTarget && serviceTag !== 'N/A'
-                    ? ` <a class="rating-mapping-option-via rating-mapping-option-link rating-mapping-option-via--${validationStatus}" href="javascript:void(0);" onclick="jumpTo('${jumpTarget}')">${escapeHtml(serviceTag)}</a>`
+                    ? ` <a class="rating-mapping-option-via rating-mapping-option-link rating-mapping-option-via--${validationStatus}" href="javascript:void(0);" data-jumpto-page="${escapeHtml(jumpTarget)}">${escapeHtml(serviceTag)}</a>`
                     : ` <span class="rating-mapping-option-via rating-mapping-option-via--${validationStatus}">${escapeHtml(serviceTag)}</span>`)
                 : ''
               return `<div class="rating-mapping-option${isPicked ? ' is-picked' : ''}"><span class="rating-mapping-option-label">${escapeHtml(labelText)}</span>${pickedHtml}${arrowHtml}${viaHtml}</div>`
@@ -2237,6 +5016,22 @@ const OverlayHandler = {
       hydrateRatingMappingSamples(cfg, token)
     }
 
+    const getRatingsPreviewOverrideEntries = (cfg) => {
+      const config = getOverlaySourceOverrideConfig(cfg)
+      const section = cfg?.container?.querySelector('[data-overlay-source-editor="true"]')
+      const hiddenHost = section?.querySelector('[data-overlay-source-hidden]')
+      if (!config || !hiddenHost) return []
+      return readOverlaySourceOverrideState(cfg, config, hiddenHost)
+    }
+
+    const getRatingsPreviewOverrideEntry = (cfg, imageValue, imageLabel = '') => {
+      const imageKey = normalizeRatingImageKey(imageValue, imageLabel)
+      if (!imageKey) return null
+      return getRatingsPreviewOverrideEntries(cfg).find(entry => {
+        return entry.badgeKey === imageKey && entry.sourceType && entry.value
+      }) || null
+    }
+
     const getTemplateValue = (cfg, key, fallback) => {
       const input = getTemplateInput(cfg, key)
       if (!input) return fallback
@@ -2301,18 +5096,33 @@ const OverlayHandler = {
       if (!imageVal) return null
       const imageKey = normalizeRatingImageKey(imageVal, labelVal)
       const sample = getRatingSampleValue(ratingType, imageVal, labelVal, sampleVariant)
-      const urls = getRatingSampleImageUrls(imageVal, labelVal, sample)
-      if (!urls.length) return null
       let img
       let useStarFallback = false
-      try {
-        img = await loadImageWithFallback(urls)
-      } catch (err) {
-        if (imageKey === 'star' || imageKey === 'plex_star') {
-          useStarFallback = true
-        } else {
-          console.warn('[OverlayBoards] Failed to load rating image', { value: imageVal, label: labelVal, err })
-          return null
+      const overrideEntry = getRatingsPreviewOverrideEntry(cfg, imageVal, labelVal)
+      if (overrideEntry) {
+        try {
+          img = await loadImage(buildOverlaySourcePreviewUrl(overrideEntry.sourceType, overrideEntry.value))
+        } catch (err) {
+          console.warn('[OverlayBoards] Failed to load rating override image', {
+            value: imageVal,
+            label: labelVal,
+            override: overrideEntry,
+            err
+          })
+        }
+      }
+      if (!img) {
+        const urls = getRatingSampleImageUrls(imageVal, labelVal, sample)
+        if (!urls.length) return null
+        try {
+          img = await loadImageWithFallback(urls)
+        } catch (err) {
+          if (imageKey === 'star' || imageKey === 'plex_star') {
+            useStarFallback = true
+          } else {
+            console.warn('[OverlayBoards] Failed to load rating image', { value: imageVal, label: labelVal, err })
+            return null
+          }
         }
       }
       const overrideFont = (fontOverride || '').toString().trim()
@@ -2740,10 +5550,26 @@ const OverlayHandler = {
         if (isEmpty(ratingVal) || isEmpty(imageVal)) continue
         const label = imageSelect?.selectedOptions?.[0]?.textContent?.trim()
         const sample = getRatingSampleValue(ratingVal, imageVal, label)
-        const urls = getRatingSampleImageUrls(imageVal, label, sample)
-        if (!urls.length) continue
         try {
-          const img = await loadImageWithFallback(urls)
+          const overrideEntry = getRatingsPreviewOverrideEntry(cfg, imageVal, label)
+          let img = null
+          if (overrideEntry) {
+            try {
+              img = await loadImage(buildOverlaySourcePreviewUrl(overrideEntry.sourceType, overrideEntry.value))
+            } catch (overrideError) {
+              console.warn('[OverlayBoards] Failed to load rating override image', {
+                value: imageVal,
+                label,
+                override: overrideEntry,
+                err: overrideError
+              })
+            }
+          }
+          if (!img) {
+            const urls = getRatingSampleImageUrls(imageVal, label, sample)
+            if (!urls.length) continue
+            img = await loadImageWithFallback(urls)
+          }
           const text = sample.text || 'NR'
           const hOffset = Number(getSlotValue(`${slot.ratingKey}_horizontal_offset`, 0))
           const vOffset = Number(getSlotValue(`${slot.ratingKey}_vertical_offset`, 0))
@@ -3025,7 +5851,12 @@ const OverlayHandler = {
       const fontSize = size === 'big' ? 70 : 50
       const fontFile = vars.font || 'Inter-Bold.ttf'
       const fontFamily = (await ensureRuntimeFontLoaded(fontFile)) || normalizeFontFile(fontFile).family || 'Inter-Bold'
-      const align = cfg.id === 'overlay_languages_subtitles' ? 'right' : 'left'
+      const defaultFlagAlign = cfg.id === 'overlay_languages_subtitles' ? 'right' : 'left'
+      const align = vars.flag_alignment === 'right'
+        ? 'right'
+        : vars.flag_alignment === 'left'
+          ? 'left'
+          : (backdrop.back_align === 'right' ? 'right' : backdrop.back_align === 'left' ? 'left' : defaultFlagAlign)
       const hideText = vars.hide_text
       const textCase = vars.use_lowercase
       const useSquareFlags = vars.style === 'square' || vars.style === 'half'
@@ -3040,11 +5871,12 @@ const OverlayHandler = {
       const fill = parseHexColor(backdrop.back_color, { r: 0, g: 0, b: 0, a: 0 })
       const stroke = parseHexColor(backdrop.back_line_color, { r: 0, g: 0, b: 0, a: 0 })
 
-      const items = FLAG_PREVIEW_ITEMS
+      const items = buildFlagPreviewItems(cfg)
+      if (!items.length) return resolveOverlayImage(cfg)
       let images = []
       try {
         images = await Promise.all(
-          items.map(item => loadImage(useSquareFlags ? item.square : item.round))
+          items.map(item => loadImage(resolveFlagPreviewImage(cfg, item, useSquareFlags)))
         )
       } catch (err) {
         console.warn('[OverlayBoards] Failed to load flag images', err)
@@ -3153,30 +5985,276 @@ const OverlayHandler = {
 
     const buildResolutionCompositeDataUrl = async (cfg) => {
       if (cfg.id !== 'overlay_resolution') return null
-      const { useResolution, useEdition } = getResolutionToggleState(cfg)
-      const baseSrc = useResolution ? resolveOverlayImage(cfg) : null
-      const editionSrc = useEdition ? cfg.edition?.image : null
-      if (!useResolution && !useEdition) return resolveOverlayImage(cfg)
-      if (!useResolution) return editionSrc || resolveOverlayImage(cfg)
-      if (!useEdition || !editionSrc) return baseSrc
+
+      const payload = getResolutionRenderPayload(cfg)
+      if (!payload.use_resolution && !payload.use_edition) {
+        return resolveOverlayImage(cfg)
+      }
 
       try {
-        const [baseImg, editionImg] = await Promise.all([
-          loadImage(baseSrc),
-          loadImage(editionSrc)
-        ])
-        const spacing = Number(cfg.edition?.spacing) || 15
-        const canvas = document.createElement('canvas')
-        canvas.width = Math.max(baseImg.width, editionImg.width)
-        canvas.height = baseImg.height + spacing + editionImg.height
-        const ctx = canvas.getContext('2d')
-        if (!ctx) return baseSrc
-        ctx.drawImage(baseImg, 0, 0)
-        ctx.drawImage(editionImg, 0, baseImg.height + spacing)
-        return canvas.toDataURL('image/png')
+        const response = await fetch('/overlay-render-preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+        if (!response.ok) {
+          let message = `HTTP ${response.status}`
+          try {
+            const errorPayload = await response.json()
+            message = errorPayload?.message || errorPayload?.error || message
+          } catch {
+            // ignore JSON parse failure and keep HTTP message
+          }
+          throw new Error(message)
+        }
+        const blob = await response.blob()
+        return await blobToDataUrl(blob)
       } catch (err) {
-        console.warn('[OverlayBoards] Failed to build resolution composite', err)
-        return baseSrc
+        console.warn('[OverlayBoards] Failed to build server-rendered resolution preview', err)
+        return payload.use_resolution
+          ? (resolveResolutionPreviewImage(cfg, 'resolution') || resolveOverlayImage(cfg))
+          : (resolveResolutionPreviewImage(cfg, 'edition') || cfg.edition?.image || resolveOverlayImage(cfg))
+      }
+    }
+
+    const buildAudioCodecCompositeDataUrl = async (cfg) => {
+      if (cfg.id !== 'overlay_audio_codec') return null
+
+      const payload = getAudioCodecRenderPayload(cfg)
+      try {
+        const response = await fetch('/overlay-render-preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+        if (!response.ok) {
+          let message = `HTTP ${response.status}`
+          try {
+            const errorPayload = await response.json()
+            message = errorPayload?.message || errorPayload?.error || message
+          } catch {
+            // ignore JSON parse failure and keep HTTP message
+          }
+          throw new Error(message)
+        }
+        const blob = await response.blob()
+        return await blobToDataUrl(blob)
+      } catch (err) {
+        console.warn('[OverlayBoards] Failed to build server-rendered audio codec preview', err)
+        const badgeKey = getAudioCodecPreviewSelectedKey(cfg)
+        const overrideEntry = getAudioCodecPreviewOverrideEntries(cfg).find(entry => {
+          return entry.badgeKey === badgeKey && entry.sourceType && entry.value
+        })
+        if (overrideEntry) {
+          return buildOverlaySourcePreviewUrl(overrideEntry.sourceType, overrideEntry.value)
+        }
+        return buildBundledOverlayPreviewUrl('audio_codec', badgeKey, getAudioCodecStyle(cfg)) || resolveOverlayImage(cfg)
+      }
+    }
+
+    const buildStreamingCompositeDataUrl = async (cfg) => {
+      if (cfg.id !== 'overlay_streaming') return null
+
+      const payload = getStreamingRenderPayload(cfg)
+      try {
+        const response = await fetch('/overlay-render-preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+        if (!response.ok) {
+          let message = `HTTP ${response.status}`
+          try {
+            const errorPayload = await response.json()
+            message = errorPayload?.message || errorPayload?.error || message
+          } catch {
+            // ignore JSON parse failure and keep HTTP message
+          }
+          throw new Error(message)
+        }
+        const blob = await response.blob()
+        return await blobToDataUrl(blob)
+      } catch (err) {
+        console.warn('[OverlayBoards] Failed to build server-rendered streaming preview', err)
+        const badgeKey = getStreamingPreviewSelectedKey(cfg)
+        const overrideEntry = getStreamingPreviewOverrideEntries(cfg).find(entry => {
+          return entry.badgeKey === badgeKey && entry.sourceType && entry.value
+        })
+        if (overrideEntry) {
+          return buildOverlaySourcePreviewUrl(overrideEntry.sourceType, overrideEntry.value)
+        }
+        return buildBundledOverlayPreviewUrl('streaming', badgeKey, getStreamingStyle(cfg)) || resolveOverlayImage(cfg)
+      }
+    }
+
+    const buildRibbonCompositeDataUrl = async (cfg) => {
+      if (cfg.id !== 'overlay_ribbon') return null
+
+      const payload = getRibbonRenderPayload(cfg)
+      try {
+        const response = await fetch('/overlay-render-preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+        if (!response.ok) {
+          let message = `HTTP ${response.status}`
+          try {
+            const errorPayload = await response.json()
+            message = errorPayload?.message || errorPayload?.error || message
+          } catch {
+          }
+          throw new Error(message)
+        }
+        const blob = await response.blob()
+        return await blobToDataUrl(blob)
+      } catch (err) {
+        console.warn('[OverlayBoards] Failed to build server-rendered ribbon preview', err)
+        const badgeKey = getRibbonPreviewSelectedKey(cfg)
+        const overrideEntry = getRibbonPreviewOverrideEntries(cfg).find(entry => {
+          return entry.badgeKey === badgeKey && entry.sourceType && entry.value
+        })
+        if (overrideEntry) {
+          return buildOverlaySourcePreviewUrl(overrideEntry.sourceType, overrideEntry.value)
+        }
+        return buildBundledOverlayPreviewUrl('ribbon', badgeKey, getRibbonStyle(cfg)) || resolveOverlayImage(cfg)
+      }
+    }
+
+    const buildLanguageCountCompositeDataUrl = async (cfg) => {
+      if (cfg.id !== 'overlay_language_count') return null
+
+      const payload = getLanguageCountRenderPayload(cfg)
+      try {
+        const response = await fetch('/overlay-render-preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+        if (!response.ok) {
+          let message = `HTTP ${response.status}`
+          try {
+            const errorPayload = await response.json()
+            message = errorPayload?.message || errorPayload?.error || message
+          } catch {
+          }
+          throw new Error(message)
+        }
+        const blob = await response.blob()
+        return await blobToDataUrl(blob)
+      } catch (err) {
+        console.warn('[OverlayBoards] Failed to build server-rendered language count preview', err)
+        const badgeKey = getLanguageCountPreviewSelectedKey(cfg)
+        const overrideEntry = getLanguageCountPreviewOverrideEntries(cfg).find(entry => {
+          return entry.badgeKey === badgeKey && entry.sourceType && entry.value
+        })
+        if (overrideEntry) {
+          return buildOverlaySourcePreviewUrl(overrideEntry.sourceType, overrideEntry.value)
+        }
+        return buildBundledOverlayPreviewUrl('language_count', badgeKey, getLanguageCountVariant(cfg)) || resolveOverlayImage(cfg)
+      }
+    }
+
+    const buildNetworkCompositeDataUrl = async (cfg) => {
+      if (cfg.id !== 'overlay_network') return null
+
+      const payload = getSingleBadgeOverlayRenderPayload(cfg, 'network', getNetworkStyle)
+      try {
+        const response = await fetch('/overlay-render-preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+        if (!response.ok) {
+          let message = `HTTP ${response.status}`
+          try {
+            const errorPayload = await response.json()
+            message = errorPayload?.message || errorPayload?.error || message
+          } catch {
+          }
+          throw new Error(message)
+        }
+        const blob = await response.blob()
+        return await blobToDataUrl(blob)
+      } catch (err) {
+        console.warn('[OverlayBoards] Failed to build server-rendered network preview', err)
+        const badgeKey = getSingleBadgeOverlayPreviewSelectedKey(cfg)
+        const overrideEntry = getSingleBadgeOverlayPreviewOverrideEntries(cfg).find(entry => {
+          return entry.badgeKey === badgeKey && entry.sourceType && entry.value
+        })
+        if (overrideEntry) {
+          return buildOverlaySourcePreviewUrl(overrideEntry.sourceType, overrideEntry.value)
+        }
+        return buildBundledOverlayPreviewUrl('network', badgeKey, getNetworkStyle(cfg)) || resolveOverlayImage(cfg)
+      }
+    }
+
+    const buildStudioCompositeDataUrl = async (cfg) => {
+      if (cfg.id !== 'overlay_studio') return null
+
+      const payload = getSingleBadgeOverlayRenderPayload(cfg, 'studio', getStudioStyle)
+      try {
+        const response = await fetch('/overlay-render-preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+        if (!response.ok) {
+          let message = `HTTP ${response.status}`
+          try {
+            const errorPayload = await response.json()
+            message = errorPayload?.message || errorPayload?.error || message
+          } catch {
+          }
+          throw new Error(message)
+        }
+        const blob = await response.blob()
+        return await blobToDataUrl(blob)
+      } catch (err) {
+        console.warn('[OverlayBoards] Failed to build server-rendered studio preview', err)
+        const badgeKey = getSingleBadgeOverlayPreviewSelectedKey(cfg)
+        const overrideEntry = getSingleBadgeOverlayPreviewOverrideEntries(cfg).find(entry => {
+          return entry.badgeKey === badgeKey && entry.sourceType && entry.value
+        })
+        if (overrideEntry) {
+          return buildOverlaySourcePreviewUrl(overrideEntry.sourceType, overrideEntry.value)
+        }
+        return buildBundledOverlayPreviewUrl('studio', badgeKey, getStudioStyle(cfg)) || resolveOverlayImage(cfg)
+      }
+    }
+
+    const buildFixedBadgeCompositeDataUrl = async (cfg) => {
+      const family = getFixedBadgeOverlayFamily(cfg)
+      if (!family) return null
+
+      const payload = getFixedBadgeOverlayRenderPayload(cfg)
+      try {
+        const response = await fetch('/overlay-render-preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+        if (!response.ok) {
+          let message = `HTTP ${response.status}`
+          try {
+            const errorPayload = await response.json()
+            message = errorPayload?.message || errorPayload?.error || message
+          } catch {
+          }
+          throw new Error(message)
+        }
+        const blob = await response.blob()
+        return await blobToDataUrl(blob)
+      } catch (err) {
+        console.warn('[OverlayBoards] Failed to build server-rendered fixed badge preview', { family, err })
+        const badgeKey = getFixedBadgeOverlayKey(cfg)
+        const overrideEntry = getFixedBadgeOverlayPreviewOverrideEntries(cfg).find(entry => {
+          return entry.badgeKey === badgeKey && entry.sourceType && entry.value
+        })
+        if (overrideEntry) {
+          return buildOverlaySourcePreviewUrl(overrideEntry.sourceType, overrideEntry.value)
+        }
+        return buildBundledOverlayPreviewUrl(family, badgeKey) || resolveOverlayImage(cfg)
       }
     }
 
@@ -3191,6 +6269,38 @@ const OverlayHandler = {
       let baseImg = baseOverride || resolveOverlayImage(cfg)
       if (!baseOverride && cfg.id === 'overlay_resolution') {
         const composite = await buildResolutionCompositeDataUrl(cfg)
+        if (composite) baseImg = composite
+      }
+      if (!baseOverride && cfg.id === 'overlay_audio_codec') {
+        const composite = await buildAudioCodecCompositeDataUrl(cfg)
+        if (composite) baseImg = composite
+      }
+      if (!baseOverride && cfg.id === 'overlay_streaming') {
+        const composite = await buildStreamingCompositeDataUrl(cfg)
+        if (composite) baseImg = composite
+      }
+      if (!baseOverride && cfg.id === 'overlay_ribbon') {
+        const composite = await buildRibbonCompositeDataUrl(cfg)
+        if (composite) baseImg = composite
+      }
+      if (!baseOverride && cfg.id === 'overlay_language_count') {
+        const composite = await buildLanguageCountCompositeDataUrl(cfg)
+        if (composite) baseImg = composite
+      }
+      if (!baseOverride && (isRegionalContentRatingOverlay(cfg) || isCommonsenseContentRatingOverlay(cfg))) {
+        const composite = await resolveContentRatingPreviewImage(cfg)
+        if (composite) baseImg = composite
+      }
+      if (!baseOverride && cfg.id === 'overlay_network') {
+        const composite = await buildNetworkCompositeDataUrl(cfg)
+        if (composite) baseImg = composite
+      }
+      if (!baseOverride && cfg.id === 'overlay_studio') {
+        const composite = await buildStudioCompositeDataUrl(cfg)
+        if (composite) baseImg = composite
+      }
+      if (!baseOverride && getFixedBadgeOverlayFamily(cfg)) {
+        const composite = await buildFixedBadgeCompositeDataUrl(cfg)
         if (composite) baseImg = composite
       }
       if (!baseOverride && cfg.id === 'overlay_ratings') {
@@ -3263,7 +6373,7 @@ const OverlayHandler = {
       return canvas.toDataURL('image/png')
     }
 
-    const buildCommonsenseDataUrl = async (cfg) => {
+    const buildCommonsenseDataUrl = async (cfg, baseOverride = null) => {
       const container = cfg.container
       const templateName = container?.dataset.overlayTemplate
       const getVal = (key, defaultVal) => {
@@ -3277,8 +6387,8 @@ const OverlayHandler = {
         return el.value || defaultVal
       }
 
-      const baseImg = cfg.image
-      const textVal = getVal('text', 17)
+      const baseImg = baseOverride || cfg.image
+      const textVal = normalizeCommonsensePreviewText(getVal('text', 17))
       const postText = getVal('post_text', '+')
       const addonOffset = getVal('addon_offset', 15)
       const font = getVal('font', 'Inter-Medium.ttf')
@@ -3293,7 +6403,8 @@ const OverlayHandler = {
       const canvas = document.createElement('canvas')
       const ctx = canvas.getContext('2d')
       ctx.font = `${fontSize}px "${fontFamily}"`
-      const textString = `${textVal}${postText || ''}`
+      const effectivePostText = textVal === 'NR' ? '' : postText
+      const textString = `${textVal}${effectivePostText || ''}`
       const textBox = getTextBoxMetrics(ctx, textString, fontSize, 10, strokeWidth)
 
       canvas.width = img.width + addonOffset + textBox.width
@@ -3314,7 +6425,7 @@ const OverlayHandler = {
     const buildRuntimeDataUrl = (cfg, loadedFamily = null) => {
       const { text, format, font, font_size: fontSize, font_color: fontColor, stroke_width: strokeWidth, stroke_color: strokeColor } = getRuntimeVars(cfg)
       const { family: normalizedFamily } = normalizeFontFile(font)
-      const runtimeMinutes = 93
+      const runtimeMinutes = Number(getOverlayTextPreviewSelectedValue(cfg) || 93) || 93
       const runtimeH = Math.floor(runtimeMinutes / 60)
       const runtimeM = runtimeMinutes % 60
       const rendered = format
@@ -3716,8 +6827,8 @@ const OverlayHandler = {
           }
 
           const { scaleX, scaleY } = getScale()
-          const layers = Array.from(canvas.querySelectorAll('.overlay-board-layer'))
-          for (const layer of layers) {
+          const layerNodes = Array.from(canvas.querySelectorAll('.overlay-board-layer'))
+          for (const layer of layerNodes) {
             const style = window.getComputedStyle(layer)
             if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue
             const src = layer.currentSrc || layer.src
@@ -4595,6 +7706,7 @@ const OverlayHandler = {
         layer.alt = instanceId
         layer.dataset.overlayId = instanceId
         layer.dataset.overlayType = cfg.id
+        cfg.layer = layer
         layers.set(instanceId, layer)
         canvas.appendChild(layer)
 
@@ -4607,28 +7719,40 @@ const OverlayHandler = {
         layer.addEventListener('load', handleLoad)
 
         let initialSrc = resolveOverlayImage(cfg)
+        let shouldAssignInitialSrc = true
         if (isFlagsOverlay(cfg)) {
+          shouldAssignInitialSrc = false
           updateFlagsLayer(cfg, layer)
+        } else if (cfg.id === 'overlay_ribbon') {
+          shouldAssignInitialSrc = false
+          buildRibbonCompositeDataUrl(cfg).then(dataUrl => {
+            layer.src = dataUrl
+            applyPosition(cfg)
+          })
         } else if (BACKDROP_IMAGE_OVERLAYS.has(cfg.id)) {
+          shouldAssignInitialSrc = false
           buildBackdropDataUrl(cfg).then(dataUrl => {
             layer.src = dataUrl
             applyPosition(cfg)
           })
         } else if (cfg.id && cfg.id.startsWith('overlay_content_rating_') && cfg.id !== 'overlay_content_rating_commonsense') {
-          buildBackdropDataUrl(cfg).then(dataUrl => {
-            layer.src = dataUrl
+          shouldAssignInitialSrc = false
+          const applyContentRatingPreview = () => {
+            refreshContentRatingOverlayPreview(cfg)
             applyPosition(cfg)
-          })
+          }
+          applyContentRatingPreview()
         } else if (cfg.id === 'overlay_content_rating_commonsense') {
-          buildCommonsenseDataUrl(cfg).then(dataUrl => {
-            buildBackdropDataUrl(cfg, dataUrl).then(backdropUrl => {
-              layer.src = backdropUrl
-              applyPosition(cfg)
-            })
-          })
+          shouldAssignInitialSrc = false
+          const applyContentRatingPreview = () => {
+            refreshContentRatingOverlayPreview(cfg)
+            applyPosition(cfg)
+          }
+          applyContentRatingPreview()
         } else if (cfg.id === 'overlay_runtimes') {
           initialSrc = buildRuntimeDataUrl(cfg)
           if (BACKDROP_TEXT_OVERLAYS.has(cfg.id)) {
+            shouldAssignInitialSrc = false
             buildBackdropDataUrl(cfg, initialSrc).then(backdropUrl => {
               layer.src = backdropUrl
               applyPosition(cfg)
@@ -4637,6 +7761,7 @@ const OverlayHandler = {
         } else if (cfg.id === 'overlay_status') {
           initialSrc = buildSimpleTextDataUrl(cfg, getStatusTextVars(cfg))
           if (BACKDROP_TEXT_OVERLAYS.has(cfg.id)) {
+            shouldAssignInitialSrc = false
             buildBackdropDataUrl(cfg, initialSrc).then(backdropUrl => {
               layer.src = backdropUrl
               applyPosition(cfg)
@@ -4645,7 +7770,9 @@ const OverlayHandler = {
         } else if (cfg.id === 'overlay_episode_info') {
           initialSrc = buildSimpleTextDataUrl(cfg, getSimpleTextVars(cfg))
         }
-        layer.src = initialSrc
+        if (shouldAssignInitialSrc && initialSrc) {
+          layer.src = initialSrc
+        }
         if (layer.complete) handleLoad()
 
         bindDrag(cfg, layer)
@@ -4658,6 +7785,13 @@ const OverlayHandler = {
             }
             if (isFlagsOverlay(cfg)) {
               updateFlagsLayer(cfg, layer)
+              return
+            }
+            if (cfg.id === 'overlay_ribbon') {
+              buildRibbonCompositeDataUrl(cfg).then(dataUrl => {
+                layer.src = dataUrl
+                applyPosition(cfg)
+              })
               return
             }
             if (BACKDROP_IMAGE_OVERLAYS.has(cfg.id)) {
@@ -4721,20 +7855,16 @@ const OverlayHandler = {
           if (colorInput) {
             const refreshColor = () => {
               if (cfg.id === 'overlay_content_rating_commonsense') return
-              buildBackdropDataUrl(cfg).then(dataUrl => {
-                layer.src = dataUrl
-                applyPosition(cfg)
-              })
+              refreshContentRatingOverlayPreview(cfg)
+              applyPosition(cfg)
             }
             colorInput.addEventListener('change', refreshColor)
             colorInput.addEventListener('input', refreshColor)
           }
           if (cfg.id !== 'overlay_content_rating_commonsense') {
             const refreshBackdrop = () => {
-              buildBackdropDataUrl(cfg).then(dataUrl => {
-                layer.src = dataUrl
-                applyPosition(cfg)
-              })
+              refreshContentRatingOverlayPreview(cfg)
+              applyPosition(cfg)
             }
             const backInputs = cfg.container.querySelectorAll(
               `[name="${templateName}[back_align]"], [name="${templateName}[back_color]"], [name="${templateName}[back_height]"], [name="${templateName}[back_width]"], [name="${templateName}[back_line_color]"], [name="${templateName}[back_line_width]"], [name="${templateName}[back_padding]"], [name="${templateName}[back_radius]"]`
@@ -4840,8 +7970,33 @@ const OverlayHandler = {
           }
         }
         ensureResolutionToggleFamilyGroups(cfg)
+        ensureContentRatingPreviewControl(cfg)
+        ensureFlagsPreviewControl(cfg)
+        ensureOverlayTextPreviewControl(cfg)
+        ensureSingleBadgeOverlayPreviewControl(cfg)
+        ensureStreamingPreviewControl(cfg)
+        ensureAudioCodecPreviewControl(cfg)
+        ensureRibbonPreviewControl(cfg)
+        ensureLanguageCountPreviewControl(cfg)
         ensureOverlaySourceOverrideEditor(cfg)
+        bindResolutionPreviewInputs(cfg)
+        bindContentRatingPreviewInputs(cfg)
+        bindFlagsPreviewInputs(cfg)
+        bindOverlayTextPreviewInputs(cfg)
+        bindSingleBadgeOverlayPreviewInputs(cfg)
+        bindStreamingPreviewInputs(cfg)
+        bindAudioCodecPreviewInputs(cfg)
+        bindRibbonPreviewInputs(cfg)
+        bindLanguageCountPreviewInputs(cfg)
+        syncContentRatingPreviewControls(cfg)
+        syncFlagsPreviewControls(cfg)
+        syncOverlayTextPreviewControls(cfg)
+        syncSingleBadgeOverlayPreviewControls(cfg)
+        syncStreamingPreviewControls(cfg)
+        syncRibbonPreviewControls(cfg)
+        syncLanguageCountPreviewControls(cfg)
         syncAudioCodecBackdropHeight(cfg, false)
+        syncAudioCodecPreviewControls(cfg)
         syncResolutionBackdropHeight(cfg, false)
         syncResolutionEditionVisibility(cfg, false)
         syncResolutionChildToggleVisibility(cfg)
@@ -4849,6 +8004,7 @@ const OverlayHandler = {
         configs.push(cfg)
         configsById.set(cfg.instanceId, cfg)
         const layer = addOverlayLayer(cfg)
+        cfg.layer = layer
         const { hAlignInput, vAlignInput } = getAlignmentInputs(cfg)
         ;[hAlignInput, vAlignInput].forEach(input => {
           if (!input || input.dataset.overlayAlignBound === 'true') return
@@ -4894,25 +8050,25 @@ const OverlayHandler = {
             })
           }
 
-          const templateName = cfg.container.dataset.overlayTemplate
+          const overlayTemplateName = cfg.container.dataset.overlayTemplate
           const textSelectors = [
-            `[name="${templateName}[text]"]`,
-            `[name="${templateName}[font]"]`,
-            `[name="${templateName}[font_size]"]`,
-            `[name="${templateName}[font_color]"]`,
-            `[name="${templateName}[stroke_width]"]`,
-            `[name="${templateName}[stroke_color]"]`
+            `[name="${overlayTemplateName}[text]"]`,
+            `[name="${overlayTemplateName}[font]"]`,
+            `[name="${overlayTemplateName}[font_size]"]`,
+            `[name="${overlayTemplateName}[font_color]"]`,
+            `[name="${overlayTemplateName}[stroke_width]"]`,
+            `[name="${overlayTemplateName}[stroke_color]"]`
           ]
           if (BACKDROP_TEXT_OVERLAYS.has(cfg.id)) {
             textSelectors.push(
-              `[name="${templateName}[back_align]"]`,
-              `[name="${templateName}[back_color]"]`,
-              `[name="${templateName}[back_height]"]`,
-              `[name="${templateName}[back_width]"]`,
-              `[name="${templateName}[back_line_color]"]`,
-              `[name="${templateName}[back_line_width]"]`,
-              `[name="${templateName}[back_padding]"]`,
-              `[name="${templateName}[back_radius]"]`
+              `[name="${overlayTemplateName}[back_align]"]`,
+              `[name="${overlayTemplateName}[back_color]"]`,
+              `[name="${overlayTemplateName}[back_height]"]`,
+              `[name="${overlayTemplateName}[back_width]"]`,
+              `[name="${overlayTemplateName}[back_line_color]"]`,
+              `[name="${overlayTemplateName}[back_line_width]"]`,
+              `[name="${overlayTemplateName}[back_padding]"]`,
+              `[name="${overlayTemplateName}[back_radius]"]`
             )
           }
           const inputs = cfg.container.querySelectorAll(textSelectors.join(', '))
@@ -4941,28 +8097,28 @@ const OverlayHandler = {
             })
           }
 
-          const templateName = cfg.container.dataset.overlayTemplate
+          const overlayTemplateName = cfg.container.dataset.overlayTemplate
           const statusSelectors = [
-            `[name="${templateName}[text_airing]"]`,
-            `[name="${templateName}[text_returning]"]`,
-            `[name="${templateName}[text_canceled]"]`,
-            `[name="${templateName}[text_ended]"]`,
-            `[name="${templateName}[font]"]`,
-            `[name="${templateName}[font_size]"]`,
-            `[name="${templateName}[font_color]"]`,
-            `[name="${templateName}[stroke_width]"]`,
-            `[name="${templateName}[stroke_color]"]`
+            `[name="${overlayTemplateName}[text_airing]"]`,
+            `[name="${overlayTemplateName}[text_returning]"]`,
+            `[name="${overlayTemplateName}[text_canceled]"]`,
+            `[name="${overlayTemplateName}[text_ended]"]`,
+            `[name="${overlayTemplateName}[font]"]`,
+            `[name="${overlayTemplateName}[font_size]"]`,
+            `[name="${overlayTemplateName}[font_color]"]`,
+            `[name="${overlayTemplateName}[stroke_width]"]`,
+            `[name="${overlayTemplateName}[stroke_color]"]`
           ]
           if (BACKDROP_TEXT_OVERLAYS.has(cfg.id)) {
             statusSelectors.push(
-              `[name="${templateName}[back_align]"]`,
-              `[name="${templateName}[back_color]"]`,
-              `[name="${templateName}[back_height]"]`,
-              `[name="${templateName}[back_width]"]`,
-              `[name="${templateName}[back_line_color]"]`,
-              `[name="${templateName}[back_line_width]"]`,
-              `[name="${templateName}[back_padding]"]`,
-              `[name="${templateName}[back_radius]"]`
+              `[name="${overlayTemplateName}[back_align]"]`,
+              `[name="${overlayTemplateName}[back_color]"]`,
+              `[name="${overlayTemplateName}[back_height]"]`,
+              `[name="${overlayTemplateName}[back_width]"]`,
+              `[name="${overlayTemplateName}[back_line_color]"]`,
+              `[name="${overlayTemplateName}[back_line_width]"]`,
+              `[name="${overlayTemplateName}[back_padding]"]`,
+              `[name="${overlayTemplateName}[back_radius]"]`
             )
           }
           const inputs = cfg.container.querySelectorAll(statusSelectors.join(', '))
@@ -5025,10 +8181,7 @@ const OverlayHandler = {
             applyRatingFontDefaults(cfg)
             updateRatingSyncStatus(cfg)
             renderRatingMappingModal(cfg)
-            buildBackdropDataUrl(cfg).then(dataUrl => {
-              layer.src = dataUrl
-              applyPosition(cfg)
-            })
+            refreshRatingsOverlayPreview(cfg)
           }
           const scheduleRatingsUpdate = (event, forceSync = false, preserveExistingSources = false) => {
             if (!cfg.container) return
@@ -5051,7 +8204,7 @@ const OverlayHandler = {
               runRatingsUpdate(null, doForce, doPreserve)
             })
           }
-          const templateName = cfg.container.dataset.overlayTemplate
+          const overlayTemplateName = cfg.container.dataset.overlayTemplate
           const ratingFontInputs = [
             getTemplateInput(cfg, 'rating1_font'),
             getTemplateInput(cfg, 'rating2_font'),
@@ -5068,35 +8221,35 @@ const OverlayHandler = {
             input.dataset.ratingFontWatch = 'true'
           })
           const ratingSelectors = [
-            `[name="${templateName}[rating1]"]`,
-            `[name="${templateName}[rating1_image]"]`,
-            `[name="${templateName}[rating1_font]"]`,
-            `[name="${templateName}[rating1_font_size]"]`,
-            `[name="${templateName}[rating1_font_color]"]`,
-            `[name="${templateName}[rating1_stroke_width]"]`,
-            `[name="${templateName}[rating1_stroke_color]"]`,
-            `[name="${templateName}[rating2]"]`,
-            `[name="${templateName}[rating2_image]"]`,
-            `[name="${templateName}[rating2_font]"]`,
-            `[name="${templateName}[rating2_font_size]"]`,
-            `[name="${templateName}[rating2_font_color]"]`,
-            `[name="${templateName}[rating2_stroke_width]"]`,
-            `[name="${templateName}[rating2_stroke_color]"]`,
-            `[name="${templateName}[rating3]"]`,
-            `[name="${templateName}[rating3_image]"]`,
-            `[name="${templateName}[rating3_font]"]`,
-            `[name="${templateName}[rating3_font_size]"]`,
-            `[name="${templateName}[rating3_font_color]"]`,
-            `[name="${templateName}[rating3_stroke_width]"]`,
-            `[name="${templateName}[rating3_stroke_color]"]`,
-            `[name="${templateName}[horizontal_position]"]`,
-            `[name="${templateName}[vertical_position]"]`,
-            `[name="${templateName}[rating_alignment]"]`,
-            `[name="${templateName}[back_width]"]`,
-            `[name="${templateName}[back_height]"]`,
-            `[name="${templateName}[back_padding]"]`,
-            `[name="${templateName}[addon_position]"]`,
-            `[name="${templateName}[addon_offset]"]`
+            `[name="${overlayTemplateName}[rating1]"]`,
+            `[name="${overlayTemplateName}[rating1_image]"]`,
+            `[name="${overlayTemplateName}[rating1_font]"]`,
+            `[name="${overlayTemplateName}[rating1_font_size]"]`,
+            `[name="${overlayTemplateName}[rating1_font_color]"]`,
+            `[name="${overlayTemplateName}[rating1_stroke_width]"]`,
+            `[name="${overlayTemplateName}[rating1_stroke_color]"]`,
+            `[name="${overlayTemplateName}[rating2]"]`,
+            `[name="${overlayTemplateName}[rating2_image]"]`,
+            `[name="${overlayTemplateName}[rating2_font]"]`,
+            `[name="${overlayTemplateName}[rating2_font_size]"]`,
+            `[name="${overlayTemplateName}[rating2_font_color]"]`,
+            `[name="${overlayTemplateName}[rating2_stroke_width]"]`,
+            `[name="${overlayTemplateName}[rating2_stroke_color]"]`,
+            `[name="${overlayTemplateName}[rating3]"]`,
+            `[name="${overlayTemplateName}[rating3_image]"]`,
+            `[name="${overlayTemplateName}[rating3_font]"]`,
+            `[name="${overlayTemplateName}[rating3_font_size]"]`,
+            `[name="${overlayTemplateName}[rating3_font_color]"]`,
+            `[name="${overlayTemplateName}[rating3_stroke_width]"]`,
+            `[name="${overlayTemplateName}[rating3_stroke_color]"]`,
+            `[name="${overlayTemplateName}[horizontal_position]"]`,
+            `[name="${overlayTemplateName}[vertical_position]"]`,
+            `[name="${overlayTemplateName}[rating_alignment]"]`,
+            `[name="${overlayTemplateName}[back_width]"]`,
+            `[name="${overlayTemplateName}[back_height]"]`,
+            `[name="${overlayTemplateName}[back_padding]"]`,
+            `[name="${overlayTemplateName}[addon_position]"]`,
+            `[name="${overlayTemplateName}[addon_offset]"]`
           ]
           const inputs = cfg.container.querySelectorAll(ratingSelectors.join(', '))
           inputs.forEach(input => {
@@ -5119,33 +8272,35 @@ const OverlayHandler = {
         }
 
         if (isFlagsOverlay(cfg) && layer && cfg.container) {
-          const templateName = cfg.container.dataset.overlayTemplate
+          const overlayTemplateName = cfg.container.dataset.overlayTemplate
           const refreshFlags = () => updateFlagsLayer(cfg, layer)
           const flagSelectors = [
-            `[name="${templateName}[style]"]`,
-            `[name="${templateName}[hide_text]"]`,
-            `[name="${templateName}[use_lowercase]"]`,
-            `[name="${templateName}[group_alignment]"]`,
-            `[name="${templateName}[offset]"]`,
-            `[name="${templateName}[font]"]`,
-            `[name="${templateName}[font_size]"]`,
-            `[name="${templateName}[font_color]"]`,
-            `[name="${templateName}[stroke_width]"]`,
-            `[name="${templateName}[stroke_color]"]`,
-            `[name="${templateName}[back_color]"]`,
-            `[name="${templateName}[back_height]"]`,
-            `[name="${templateName}[back_width]"]`,
-            `[name="${templateName}[back_line_color]"]`,
-            `[name="${templateName}[back_line_width]"]`,
-            `[name="${templateName}[back_padding]"]`,
-            `[name="${templateName}[back_radius]"]`
+            `[name="${overlayTemplateName}[style]"]`,
+            `[name="${overlayTemplateName}[hide_text]"]`,
+            `[name="${overlayTemplateName}[use_lowercase]"]`,
+            `[name="${overlayTemplateName}[flag_alignment]"]`,
+            `[name="${overlayTemplateName}[group_alignment]"]`,
+            `[name="${overlayTemplateName}[offset]"]`,
+            `[name="${overlayTemplateName}[font]"]`,
+            `[name="${overlayTemplateName}[font_size]"]`,
+            `[name="${overlayTemplateName}[font_color]"]`,
+            `[name="${overlayTemplateName}[stroke_width]"]`,
+            `[name="${overlayTemplateName}[stroke_color]"]`,
+            `[name="${overlayTemplateName}[back_align]"]`,
+            `[name="${overlayTemplateName}[back_color]"]`,
+            `[name="${overlayTemplateName}[back_height]"]`,
+            `[name="${overlayTemplateName}[back_width]"]`,
+            `[name="${overlayTemplateName}[back_line_color]"]`,
+            `[name="${overlayTemplateName}[back_line_width]"]`,
+            `[name="${overlayTemplateName}[back_padding]"]`,
+            `[name="${overlayTemplateName}[back_radius]"]`
           ]
           const inputs = cfg.container.querySelectorAll(flagSelectors.join(', '))
           inputs.forEach(input => {
             input.addEventListener('input', refreshFlags)
             input.addEventListener('change', refreshFlags)
           })
-          const sizeInput = cfg.container.querySelector(`[name="${templateName}[size]"]`)
+          const sizeInput = cfg.container.querySelector(`[name="${overlayTemplateName}[size]"]`)
           if (sizeInput) {
             const handleSizeChange = () => {
               syncFlagSizeDefaults(cfg, true)
@@ -5164,9 +8319,9 @@ const OverlayHandler = {
               applyPosition(cfg)
             })
           }
-          const templateName = cfg.container.dataset.overlayTemplate
+          const overlayTemplateName = cfg.container.dataset.overlayTemplate
           const inputs = cfg.container.querySelectorAll(
-            `[name="${templateName}[back_align]"], [name="${templateName}[back_color]"], [name="${templateName}[back_height]"], [name="${templateName}[back_width]"], [name="${templateName}[back_line_color]"], [name="${templateName}[back_line_width]"], [name="${templateName}[back_padding]"], [name="${templateName}[back_radius]"]`
+            `[name="${overlayTemplateName}[back_align]"], [name="${overlayTemplateName}[back_color]"], [name="${overlayTemplateName}[back_height]"], [name="${overlayTemplateName}[back_width]"], [name="${overlayTemplateName}[back_line_color]"], [name="${overlayTemplateName}[back_line_width]"], [name="${overlayTemplateName}[back_padding]"], [name="${overlayTemplateName}[back_radius]"]`
           )
           inputs.forEach(input => {
             input.addEventListener('input', refreshBackdrop)
@@ -5177,16 +8332,12 @@ const OverlayHandler = {
 
         if (cfg.id === 'overlay_content_rating_commonsense' && layer && cfg.container) {
           const refreshCommonsense = () => {
-            buildCommonsenseDataUrl(cfg).then(dataUrl => {
-              buildBackdropDataUrl(cfg, dataUrl).then(backdropUrl => {
-                layer.src = backdropUrl
-                applyPosition(cfg)
-              })
-            })
+            refreshContentRatingOverlayPreview(cfg)
+            applyPosition(cfg)
           }
-          const templateName = cfg.container.dataset.overlayTemplate
+          const overlayTemplateName = cfg.container.dataset.overlayTemplate
           const inputs = cfg.container.querySelectorAll(
-            `[name="${templateName}[text]"], [name="${templateName}[post_text]"], [name="${templateName}[addon_offset]"], [name="${templateName}[font]"], [name="${templateName}[font_size]"], [name="${templateName}[font_color]"], [name="${templateName}[stroke_width]"], [name="${templateName}[stroke_color]"], [name="${templateName}[back_align]"], [name="${templateName}[back_color]"], [name="${templateName}[back_height]"], [name="${templateName}[back_width]"], [name="${templateName}[back_line_color]"], [name="${templateName}[back_line_width]"], [name="${templateName}[back_padding]"], [name="${templateName}[back_radius]"]`
+            `[name="${overlayTemplateName}[text]"], [name="${overlayTemplateName}[post_text]"], [name="${overlayTemplateName}[addon_offset]"], [name="${overlayTemplateName}[font]"], [name="${overlayTemplateName}[font_size]"], [name="${overlayTemplateName}[font_color]"], [name="${overlayTemplateName}[stroke_width]"], [name="${overlayTemplateName}[stroke_color]"], [name="${overlayTemplateName}[back_align]"], [name="${overlayTemplateName}[back_color]"], [name="${overlayTemplateName}[back_height]"], [name="${overlayTemplateName}[back_width]"], [name="${overlayTemplateName}[back_line_color]"], [name="${overlayTemplateName}[back_line_width]"], [name="${overlayTemplateName}[back_padding]"], [name="${overlayTemplateName}[back_radius]"]`
           )
           inputs.forEach(input => {
             input.addEventListener('input', refreshCommonsense)
@@ -5236,9 +8387,9 @@ const OverlayHandler = {
           if (!board.classList.contains('overlay-board--modal')) return
           const baseW = Number(board.dataset.baseWidth) || defaultDims.default.width
           const baseH = Number(board.dataset.baseHeight) || defaultDims.default.height
-          const ratio = baseW / baseH
+          const boardRatio = baseW / baseH
           const toolbarWidth = toolbar?.offsetWidth || 0
-          const maxWidthByHeight = (window.innerHeight - 200) * ratio
+          const maxWidthByHeight = (window.innerHeight - 200) * boardRatio
           const maxWidthByWindow = Math.max(0, window.innerWidth - 64 - toolbarWidth)
           const maxWidth = Math.min(maxWidthByWindow || maxWidthByHeight, maxWidthByHeight)
           board.style.maxWidth = `${Math.max(280, Math.floor(maxWidth))}px`
@@ -5258,7 +8409,7 @@ const OverlayHandler = {
             if (fallback && typeof fallback.focus === 'function') {
               try {
                 fallback.focus({ preventScroll: true })
-              } catch (err) {
+              } catch {
                 fallback.focus()
               }
             }
@@ -5398,6 +8549,8 @@ const OverlayHandler = {
   }
 }
 
+window.OverlayHandler = OverlayHandler
+
 function bootstrapOverlayHandler () {
   const separatorPlaceholders = document.querySelectorAll('[data-separator-placeholder-wrapper="true"]')
 
@@ -5443,7 +8596,6 @@ if (document.readyState === 'loading') {
   bootstrapOverlayHandler()
 }
 
-// eslint-disable-next-line no-unused-vars
 function setupParentChildToggleSync () {
   let syncing = false
 
@@ -5462,6 +8614,9 @@ function setupParentChildToggleSync () {
     const groupId = parent.dataset.templateGroup
     const wrapper = document.querySelector(`[data-toggle-parent="${groupId}"]`)
     const isRadioStyle = parent.type === 'radio' || parent.dataset.radioGroup === 'true'
+    if (isRadioStyle) {
+      parent.dataset.wasChecked = parent.checked ? 'true' : 'false'
+    }
 
     const groupName = parent.name
     const childToggles = wrapper?.querySelectorAll('.template-child-toggle') || []
@@ -5569,3 +8724,5 @@ function setupParentChildToggleSync () {
     })
   })
 }
+
+window.setupParentChildToggleSync = setupParentChildToggleSync

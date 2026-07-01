@@ -10,14 +10,18 @@ config
 configs
 Deduped
 deduplicated
+DOM
 else's
 Emby
 exe
 executables
+Frontend
 https
 ImageMaid
 Jellyfin
 jQuery
+JS
+jsdom
 kometa
 KStatusNotifierItem
 localhost
@@ -33,6 +37,7 @@ Plex
 PowerShell
 Precompiled
 prefill
+PRs
 py
 PyQt
 pytest
@@ -41,6 +46,7 @@ Radarr
 reingests
 Reingest
 repo
+roadmap
 scm
 Seerr
 Sonarr
@@ -53,7 +59,10 @@ Trakt
 truthy
 txt
 ui
+unreferenced
 venv
+Vite
+Vitest
 walkthrough
 walkthroughs
 Wayland

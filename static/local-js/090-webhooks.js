@@ -1,10 +1,4 @@
-/* global $ */
-
-function refreshValidationCallout () {
-  if (window.QSValidationCallouts && typeof window.QSValidationCallouts.refresh === 'function') {
-    window.QSValidationCallouts.refresh('webhooks_validated')
-  }
-}
+import { refreshValidationCallout } from './modules/validationPageBase.js'
 
 const validatedWebhooks = {}
 const validatedAtInput = document.getElementById('webhooks_validated_at')
@@ -31,7 +25,7 @@ function hasConfiguredWebhooks () {
 
 function setWebhookValidated (state, webhookType = null) {
   document.getElementById('webhooks_validated').value = state ? 'true' : 'false'
-  refreshValidationCallout()
+  refreshValidationCallout('webhooks_validated')
 
   if (webhookType) {
     // Enable the validate button if the URL changes and validation is false
@@ -83,80 +77,114 @@ function updateValidationState () {
   }
 }
 
-$(document).ready(function () {
-  const isValidated = document.getElementById('webhooks_validated').value.toLowerCase() === 'true'
-  initialValidated = isValidated
-  console.log('Page Load - Is Validated:', isValidated)
+const isValidated = document.getElementById('webhooks_validated').value.toLowerCase() === 'true'
+initialValidated = isValidated
+console.log('Page Load - Is Validated:', isValidated)
 
-  $('select.form-select').each(function () {
-    const selectElement = this
-    const customInputId = selectElement.id + '_custom'
-    const customUrl = $('#' + customInputId).find('input.custom-webhook-url').val()
+document.querySelectorAll('select.form-select').forEach(selectElement => {
+  const customInputId = selectElement.id + '_custom'
+  const customUrlEl = document.getElementById(customInputId)?.querySelector('input.custom-webhook-url')
+  const customUrl = customUrlEl ? customUrlEl.value : ''
 
-    showCustomInput(selectElement, isValidated)
+  showCustomInput(selectElement, isValidated)
 
-    if (selectElement.value === 'custom' && customUrl) {
-      validatedWebhooks[selectElement.id] = isValidated
-      console.log(`Custom webhook found: ${selectElement.id}, URL: ${customUrl}`)
-    } else {
-      validatedWebhooks[selectElement.id] = isValidated
-    }
-  })
-  initialConfigured = hasConfiguredWebhooks()
-
-  if (isValidated === true) {
-    $('.validate-button').prop('disabled', true)
+  if (selectElement.value === 'custom' && customUrl) {
+    validatedWebhooks[selectElement.id] = isValidated
+    console.log(`Custom webhook found: ${selectElement.id}, URL: ${customUrl}`)
   } else {
-    $('.validate-button').prop('disabled', false)
+    validatedWebhooks[selectElement.id] = isValidated
   }
+})
+initialConfigured = hasConfiguredWebhooks()
 
-  document.querySelectorAll('select.form-select, input.custom-webhook-url').forEach((element) => {
-    const markTouched = (event) => {
-      if (event && event.isTrusted === false) return
-      webhooksTouched = true
-      updateValidationState()
-    }
-    element.addEventListener('change', markTouched)
-    element.addEventListener('input', markTouched)
-  })
-
-  updateValidationState()
-
-  // Debugging for navigation actions
-  document.getElementById('configForm').addEventListener('submit', function (event) {
-    const actionType = event.submitter?.getAttribute('onclick')?.includes('loading') ? event.submitter.innerText.trim() : 'unknown'
-    console.log(`Form Submitted - Action: ${actionType}`)
-
-    $('select.form-select').each(function () {
-      if ($(this).val() === 'custom') {
-        const customInputId = $(this).attr('id') + '_custom'
-        const customUrl = $('#' + customInputId).find('input.custom-webhook-url').val()
-        if (customUrl) {
-          console.log(`Serializing custom webhook for dropdown: ${$(this).attr('id')}, URL: ${customUrl}`)
-          $(this).append('<option value="' + customUrl + '" selected="selected">' + customUrl + '</option>')
-          $(this).val(customUrl)
-        } else {
-          console.log(`Custom webhook dropdown ${$(this).attr('id')} has no URL to serialize.`)
-        }
-      }
-    })
+document.querySelectorAll('.validate-button').forEach(button => {
+  button.disabled = isValidated === true
+  button.addEventListener('click', () => {
+    const webhookKey = button.dataset.webhookKey
+    if (webhookKey) validateWebhook(webhookKey)
   })
 })
 
-/* eslint-disable no-unused-vars, no-undef */
+// The select dropdown handles three concerns when it changes:
+//   1. showCustomInput reveals/hides the custom-URL input panel
+//      depending on whether 'custom' is selected.
+//   2. markTouched updates the validation state callout.
+// Both fire on every 'change' event. (Previously #1 was wired via the
+// inline onchange="showCustomInput(this)" attribute, which was broken
+// for module-scoped scripts -- the function wasn't on window so the
+// inline call silently no-op'd, leaving the custom-URL panel hidden
+// when the user picked 'Custom' from the dropdown.)
+document.querySelectorAll('select.form-select').forEach((selectElement) => {
+  selectElement.addEventListener('change', () => showCustomInput(selectElement, false))
+})
+
+// The custom-URL input fires setWebhookValidated(false, ...) on every
+// keystroke -- typing a new URL invalidates whatever previous
+// validation succeeded. (Previously wired via inline oninput=.)
+document.querySelectorAll('input.custom-webhook-url').forEach((input) => {
+  input.addEventListener('input', () => {
+    const webhookKey = input.dataset.webhookKey
+    if (webhookKey) setWebhookValidated(false, webhookKey)
+  })
+})
+
+document.querySelectorAll('select.form-select, input.custom-webhook-url').forEach((element) => {
+  const markTouched = (event) => {
+    if (event && event.isTrusted === false) return
+    webhooksTouched = true
+    updateValidationState()
+  }
+  element.addEventListener('change', markTouched)
+  element.addEventListener('input', markTouched)
+})
+
+updateValidationState()
+
+// Debugging for navigation actions
+document.getElementById('configForm').addEventListener('submit', function (event) {
+  const actionType = event.submitter?.getAttribute('onclick')?.includes('loading') ? event.submitter.innerText.trim() : 'unknown'
+  console.log(`Form Submitted - Action: ${actionType}`)
+
+  document.querySelectorAll('select.form-select').forEach(selectElement => {
+    if (selectElement.value === 'custom') {
+      const customInputId = selectElement.id + '_custom'
+      const customUrlEl = document.getElementById(customInputId)?.querySelector('input.custom-webhook-url')
+      const customUrl = customUrlEl ? customUrlEl.value : ''
+      if (customUrl) {
+        console.log(`Serializing custom webhook for dropdown: ${selectElement.id}, URL: ${customUrl}`)
+        const option = document.createElement('option')
+        option.value = customUrl
+        option.textContent = customUrl
+        option.selected = true
+        selectElement.appendChild(option)
+        selectElement.value = customUrl
+      } else {
+        console.log(`Custom webhook dropdown ${selectElement.id} has no URL to serialize.`)
+      }
+    }
+  })
+})
+
 function validateWebhook (webhookType) {
-  const inputGroup = $('#webhooks_' + webhookType + '_custom').find('.input-group')
-  const webhookUrl = inputGroup.find('input.custom-webhook-url').val()
-  const validationMessage = inputGroup.siblings('.validation-message')
-  const validateButton = inputGroup.find('.validate-button')
+  const customContainer = document.getElementById('webhooks_' + webhookType + '_custom')
+  if (!customContainer) return
+  const inputGroup = customContainer.querySelector('.input-group')
+  if (!inputGroup) return
+  const webhookUrlEl = inputGroup.querySelector('input.custom-webhook-url')
+  const webhookUrl = webhookUrlEl ? webhookUrlEl.value : ''
+  // .validation-message is a sibling of .input-group, both children of customContainer
+  const validationMessage = customContainer.querySelector('.validation-message')
+  const validateButton = inputGroup.querySelector('.validate-button')
   const webhookTypeFormatted = webhookType.replace(/_/g, ' ').replace(/\b\w/g, function (l) { return l.toUpperCase() })
 
   webhooksTouched = true
   console.log(`Validating webhook: ${webhookType}, URL: ${webhookUrl}`)
 
   showSpinner(webhookType)
-  validationMessage.html('<div class="alert alert-info" role="alert">Validating...</div>')
-  validationMessage.show()
+  if (validationMessage) {
+    validationMessage.innerHTML = '<div class="alert alert-info" role="alert">Validating...</div>'
+    validationMessage.style.display = ''
+  }
 
   fetch('/validate_webhook', {
     method: 'POST',
@@ -173,13 +201,13 @@ function validateWebhook (webhookType) {
       if (data.success) {
         console.log(`Webhook validation successful for: ${webhookType}`)
         hideSpinner(webhookType)
-        validationMessage.html('<div class="alert alert-success" role="alert">' + data.success + '</div>')
-        validateButton.prop('disabled', true)
+        if (validationMessage) validationMessage.innerHTML = '<div class="alert alert-success" role="alert">' + data.success + '</div>'
+        if (validateButton) validateButton.disabled = true
         validatedWebhooks['webhooks_' + webhookType] = true
       } else {
         console.error(`Webhook validation failed for: ${webhookType}, Error: ${data.error}`)
         hideSpinner(webhookType)
-        validationMessage.html('<div class="alert alert-danger" role="alert">' + data.error + '</div>')
+        if (validationMessage) validationMessage.innerHTML = '<div class="alert alert-danger" role="alert">' + data.error + '</div>'
         validatedWebhooks['webhooks_' + webhookType] = false
       }
       updateValidationState()
@@ -187,9 +215,8 @@ function validateWebhook (webhookType) {
     .catch((error) => {
       console.error(`Error during webhook validation for: ${webhookType}`, error)
       hideSpinner(webhookType)
-      validationMessage.html('<div class="alert alert-danger" role="alert">An error occurred. Please try again.</div>')
+      if (validationMessage) validationMessage.innerHTML = '<div class="alert alert-danger" role="alert">An error occurred. Please try again.</div>'
       validatedWebhooks['webhooks_' + webhookType] = false
       updateValidationState()
     })
 }
-/* eslint-enable no-unused-vars, no-undef */

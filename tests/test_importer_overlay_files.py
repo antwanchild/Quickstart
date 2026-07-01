@@ -127,6 +127,42 @@ def test_prepare_import_payload_accepts_resolution_source_override_template_vari
     assert any("libraries.Movies.overlay_files[0].template_variables.repo_openmatte" in line for line in report.lines)
 
 
+def test_prepare_import_payload_accepts_ratings_source_override_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "overlay_files": [
+                        {
+                            "default": "ratings",
+                            "template_variables": {
+                                "file_rt_tomato": "config/overlays/ratings/rt_tomato.png",
+                                "url_imdb": "https://example.com/imdb.png",
+                                "git_tmdb": "defaults/overlays/images/ratings/tmdb.png",
+                                "repo_star": "overlays/ratings/star.png",
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-movie-overlay_ratings"] is True
+    assert libraries_payload["mov-library_movies-movie-template_overlay_ratings[file_rt_tomato]"] == "config/overlays/ratings/rt_tomato.png"
+    assert libraries_payload["mov-library_movies-movie-template_overlay_ratings[url_imdb]"] == "https://example.com/imdb.png"
+    assert libraries_payload["mov-library_movies-movie-template_overlay_ratings[git_tmdb]"] == "defaults/overlays/images/ratings/tmdb.png"
+    assert libraries_payload["mov-library_movies-movie-template_overlay_ratings[repo_star]"] == "overlays/ratings/star.png"
+    assert any("libraries.Movies.overlay_files[0].template_variables.file_rt_tomato" in line for line in report.lines)
+    assert any("libraries.Movies.overlay_files[0].template_variables.url_imdb" in line for line in report.lines)
+    assert any("libraries.Movies.overlay_files[0].template_variables.git_tmdb" in line for line in report.lines)
+    assert any("libraries.Movies.overlay_files[0].template_variables.repo_star" in line for line in report.lines)
+
+
 def test_prepare_import_payload_accepts_audio_codec_template_variables():
     payload, report = importer.prepare_import_payload(
         {
@@ -373,6 +409,67 @@ def test_prepare_import_payload_accepts_languages_subtitles_use_key_template_var
     assert any("libraries.Movies.overlay_files[0].template_variables.use_myn" in line for line in report.lines)
 
 
+def test_prepare_import_payload_accepts_languages_alignment_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "overlay_files": [
+                        {
+                            "default": "languages",
+                            "template_variables": {
+                                "flag_alignment": "right",
+                                "back_align": "center",
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-movie-overlay_languages"] is True
+    assert libraries_payload["mov-library_movies-movie-template_overlay_languages[flag_alignment]"] == "right"
+    assert libraries_payload["mov-library_movies-movie-template_overlay_languages[back_align]"] == "center"
+    assert any("libraries.Movies.overlay_files[0].template_variables.flag_alignment" in line for line in report.lines)
+    assert any("libraries.Movies.overlay_files[0].template_variables.back_align" in line for line in report.lines)
+
+
+def test_prepare_import_payload_accepts_languages_subtitles_alignment_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "overlay_files": [
+                        {
+                            "default": "languages",
+                            "template_variables": {
+                                "use_subtitles": True,
+                                "flag_alignment": "left",
+                                "back_align": "right",
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-movie-overlay_languages_subtitles"] is True
+    assert libraries_payload["mov-library_movies-movie-template_overlay_languages_subtitles[flag_alignment]"] == "left"
+    assert libraries_payload["mov-library_movies-movie-template_overlay_languages_subtitles[back_align]"] == "right"
+    assert any("libraries.Movies.overlay_files[0].template_variables.flag_alignment" in line for line in report.lines)
+    assert any("libraries.Movies.overlay_files[0].template_variables.back_align" in line for line in report.lines)
+
+
 def test_prepare_import_payload_accepts_status_use_key_template_variables():
     payload, report = importer.prepare_import_payload(
         {
@@ -507,6 +604,36 @@ def test_prepare_import_payload_accepts_streaming_use_key_template_variables():
     assert any("libraries.Movies.overlay_files[0].template_variables.use_netflix" in line for line in report.lines)
     assert any("libraries.Movies.overlay_files[0].template_variables.use_paramount" in line for line in report.lines)
     assert any("libraries.Movies.overlay_files[0].template_variables.use_filmin" in line for line in report.lines)
+
+
+def test_prepare_import_payload_accepts_streaming_region_originals_and_discover_overrides():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "overlay_files": [
+                        {
+                            "default": "streaming",
+                            "template_variables": {
+                                "region": "CA",
+                                "originals_only": True,
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-movie-overlay_streaming"] is True
+    assert libraries_payload["mov-library_movies-movie-template_overlay_streaming[region]"] == "CA"
+    assert libraries_payload["mov-library_movies-movie-template_overlay_streaming[originals_only]"] is True
+    assert any("libraries.Movies.overlay_files[0].template_variables.region" in line for line in report.lines)
+    assert any("libraries.Movies.overlay_files[0].template_variables.originals_only" in line for line in report.lines)
 
 
 def test_prepare_import_payload_accepts_ribbon_use_key_template_variables():

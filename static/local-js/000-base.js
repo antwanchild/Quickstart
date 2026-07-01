@@ -1,7 +1,7 @@
-/* global bootstrap, $, location, MutationObserver, requestAnimationFrame, PathValidation, URLValidation */
+import { getAppConfig, setAppConfig } from './modules/appConfig.js'
 
 (function () {
-  const isDebug = typeof window.QS_DEBUG !== 'undefined' && String(window.QS_DEBUG).toLowerCase() === 'true'
+  const isDebug = String(getAppConfig('QS_DEBUG', false)).toLowerCase() === 'true'
 
   function getLocalTimestamp () {
     const now = new Date()
@@ -386,7 +386,6 @@ document.addEventListener('submit', function (event) {
   }, 0)
 })
 
-/* eslint-disable no-unused-vars */
 // Function to show the spinner on validate
 function showSpinner (webhookType) {
   document.getElementById(`spinner_${webhookType}`).style.display = 'inline-block'
@@ -396,6 +395,9 @@ function showSpinner (webhookType) {
 function hideSpinner (webhookType) {
   document.getElementById(`spinner_${webhookType}`).style.display = 'none'
 }
+
+window.showSpinner = showSpinner
+window.hideSpinner = hideSpinner
 
 // Function to handle jump to action
 function qsGetStepLabel (targetPage) {
@@ -548,8 +550,6 @@ let qsLastMaintenanceToastAt = 0
 let qsLastMaintenancePaused = false
 let qsLastQueuedStartedAt = null
 const QS_LOGSCAN_REINGEST_POLL_INTERVAL_MS = 15000
-let qsLastLogscanReingestStatus = 'idle'
-let qsLastLogscanReingestJobId = null
 const QS_BACKGROUND_JOBS_POLL_INTERVAL_MS = 15000
 const qsCurrentTemplate = String(window.QS_CURRENT_TEMPLATE || document.documentElement.dataset.qsTemplate || '').trim()
 const qsSkipMaintenancePoll = qsCurrentTemplate === '900-kometa'
@@ -1014,10 +1014,6 @@ function qsHandleImageMaidStatus (data) {
 window.QS_handleImageMaidStatus = qsHandleImageMaidStatus
 
 function qsHandleLogscanReingestStatus (data) {
-  const status = String((data && data.status) || 'idle').trim().toLowerCase()
-  const jobId = String((data && data.job_id) || '').trim() || null
-  qsLastLogscanReingestStatus = status
-  qsLastLogscanReingestJobId = jobId
   qsRenderActiveWorkCard()
 }
 
@@ -2018,7 +2014,7 @@ function qsFetchWorkspaceStatus (options = {}) {
       let data = null
       try {
         data = await response.json()
-      } catch (err) {
+      } catch {
         data = null
       }
       if (!response.ok || !data || data.success !== true) {
@@ -2181,7 +2177,7 @@ function qsRunBulkValidation (options = {}) {
       let data = null
       try {
         data = await res.json()
-      } catch (err) {
+      } catch {
         data = null
       }
 
@@ -2448,7 +2444,6 @@ function setupValidationCallouts () {
     applyDynamicValidationCalloutState(alert, isValidated)
     const heading = alert.querySelector('h6, h4')
     const title = alert.dataset.qsCalloutTitle || (heading ? heading.textContent.trim() : 'Setup guidance')
-    const accordionId = `qs-validation-accordion-${index}`
     const collapseId = `qs-validation-collapse-${index}`
     const headingId = `qs-validation-heading-${index}`
 
@@ -2619,14 +2614,14 @@ document.addEventListener('qs:bulk-validation-complete', () => {
 })
 
 document.addEventListener('DOMContentLoaded', () => {
-  const notice = window.QS_RESTART_NOTICE
+  const notice = getAppConfig('QS_RESTART_NOTICE')
   if (!notice || notice.reason !== 'update') return
 
   const noticeKey = `qs_restart_notice_${notice.reason}_${notice.created_at || ''}`
   try {
     if (window.localStorage && window.localStorage.getItem(noticeKey)) return
     if (window.localStorage) window.localStorage.setItem(noticeKey, '1')
-  } catch (err) {
+  } catch {
     // Ignore localStorage failures (private mode, etc.)
   }
 
@@ -2777,7 +2772,6 @@ async function runQuickstartUpdateCheck (options = {}) {
   return data.version_info
 }
 
-/* eslint-enable no-unused-vars */
 function bindQuickstartUpdateButtons (root = document) {
   const buttons = root.querySelectorAll ? root.querySelectorAll('#updateQuickstartBtn') : []
   buttons.forEach(updateBtn => {
@@ -3025,18 +3019,21 @@ document.addEventListener('DOMContentLoaded', () => {
         if (modal) modal.hide()
         try {
           showToast('success', `Switched to config "${nextName}".`)
-        } catch (toastErr) {
+        } catch {
           // Navigation should not depend on toast rendering.
         }
         const nextConfig = encodeURIComponent(nextName)
         const nextUrl = `${window.location.pathname}?config_name=${nextConfig}`
-        if (window.history && typeof window.history.replaceState === 'function') {
-          window.history.replaceState(null, '', nextUrl)
-        }
         const navigate = () => window.location.replace(nextUrl)
-        // Yield one task so the updated config badge/state becomes observable
-        // before the page unload starts.
-        window.setTimeout(navigate, 0)
+        // Yield real paint frames so the updated config badge/state becomes
+        // observable before the page unload starts.
+        if (typeof window.requestAnimationFrame === 'function') {
+          window.requestAnimationFrame(() => {
+            window.requestAnimationFrame(navigate)
+          })
+        } else {
+          window.setTimeout(navigate, 16)
+        }
       } catch (err) {
         window.QS_SWITCHING_CONFIG = false
         confirmBtn.disabled = false
@@ -3087,26 +3084,26 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function getCurrentDebug () {
-    const raw = (triggerBtn && triggerBtn.dataset.currentDebug) ? triggerBtn.dataset.currentDebug : window.QS_DEBUG
+    const raw = (triggerBtn && triggerBtn.dataset.currentDebug) ? triggerBtn.dataset.currentDebug : getAppConfig('QS_DEBUG', false)
     return String(raw).toLowerCase() === 'true'
   }
 
   function getCurrentTheme () {
     if (triggerBtn && triggerBtn.dataset.currentTheme) return triggerBtn.dataset.currentTheme
-    return window.QS_THEME || 'kometa'
+    return getAppConfig('QS_THEME', 'kometa') || 'kometa'
   }
 
   function getCurrentOptimizeDefaults () {
     const raw = (triggerBtn && triggerBtn.dataset.currentOptimizeDefaults)
       ? triggerBtn.dataset.currentOptimizeDefaults
-      : window.QS_OPTIMIZE_DEFAULTS
+      : getAppConfig('QS_OPTIMIZE_DEFAULTS', true)
     return String(raw).toLowerCase() === 'true'
   }
 
   function getCurrentConfigHistory () {
     const raw = (triggerBtn && triggerBtn.dataset.currentConfigHistory)
       ? triggerBtn.dataset.currentConfigHistory
-      : window.QS_CONFIG_HISTORY
+      : getAppConfig('QS_CONFIG_HISTORY', 0)
     const parsed = Number.parseInt(raw, 10)
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
   }
@@ -3114,7 +3111,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function getCurrentLogKeep () {
     const raw = (triggerBtn && triggerBtn.dataset.currentLogKeep)
       ? triggerBtn.dataset.currentLogKeep
-      : window.QS_KOMETA_LOG_KEEP
+      : getAppConfig('QS_KOMETA_LOG_KEEP', 0)
     const parsed = Number.parseInt(raw, 10)
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
   }
@@ -3122,32 +3119,32 @@ document.addEventListener('DOMContentLoaded', () => {
   function getCurrentImageMaidLogKeep () {
     const raw = (triggerBtn && triggerBtn.dataset.currentImagemaidLogKeep)
       ? triggerBtn.dataset.currentImagemaidLogKeep
-      : window.QS_IMAGEMAID_LOG_KEEP
+      : getAppConfig('QS_IMAGEMAID_LOG_KEEP', 0)
     const parsed = Number.parseInt(raw, 10)
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
   }
 
   function getCurrentTestLibsTmp () {
     if (triggerBtn && triggerBtn.dataset.currentTestLibsTmp) return triggerBtn.dataset.currentTestLibsTmp
-    return window.QS_TEST_LIBS_TMP || ''
+    return getAppConfig('QS_TEST_LIBS_TMP', '') || ''
   }
 
   function getCurrentTestLibsPath () {
     if (triggerBtn && triggerBtn.dataset.currentTestLibsPath) return triggerBtn.dataset.currentTestLibsPath
-    return window.QS_TEST_LIBS_PATH || ''
+    return getAppConfig('QS_TEST_LIBS_PATH', '') || ''
   }
 
   function getCurrentSessionLifetimeDays () {
     const raw = (triggerBtn && triggerBtn.dataset.currentSessionLifetime)
       ? triggerBtn.dataset.currentSessionLifetime
-      : window.QS_SESSION_LIFETIME_DAYS
+      : getAppConfig('QS_SESSION_LIFETIME_DAYS', 30)
     const parsed = Number.parseInt(raw, 10)
     return Number.isFinite(parsed) && parsed >= 1 ? parsed : 30
   }
 
   function getCurrentSessionDir () {
     if (triggerBtn && triggerBtn.dataset.currentSessionDir) return triggerBtn.dataset.currentSessionDir
-    return window.QS_FLASK_SESSION_DIR || ''
+    return getAppConfig('QS_FLASK_SESSION_DIR', '') || ''
   }
 
   function getQuickstartRoot () {
@@ -3245,8 +3242,8 @@ document.addEventListener('DOMContentLoaded', () => {
       if (data.final_path) triggerBtn.dataset.currentTestLibsPath = data.final_path
       if (data.temp_path) triggerBtn.dataset.currentTestLibsTmp = data.temp_path
     }
-    if (typeof data.final_path === 'string') window.QS_TEST_LIBS_PATH = data.final_path
-    if (typeof data.temp_path === 'string') window.QS_TEST_LIBS_TMP = data.temp_path
+    if (typeof data.final_path === 'string') setAppConfig({ QS_TEST_LIBS_PATH: data.final_path })
+    if (typeof data.temp_path === 'string') setAppConfig({ QS_TEST_LIBS_TMP: data.temp_path })
     if (testLibsTmpInput && data.temp_path) testLibsTmpInput.value = data.temp_path
     if (testLibsPathInput && data.final_path) testLibsPathInput.value = data.final_path
     return data
@@ -3412,47 +3409,47 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!data.restart) {
           if (data.theme) {
             document.documentElement.setAttribute('data-theme', data.theme)
-            window.QS_THEME = data.theme
+            setAppConfig({ QS_THEME: data.theme })
             if (triggerBtn) triggerBtn.dataset.currentTheme = data.theme
             updateThemeUi(data.theme)
           }
           if (typeof payload.debug !== 'undefined') {
             const debugFlag = Boolean(payload.debug)
-            window.QS_DEBUG = debugFlag
+            setAppConfig({ QS_DEBUG: debugFlag })
             if (triggerBtn) triggerBtn.dataset.currentDebug = debugFlag ? 'true' : 'false'
           }
           if (typeof payload.optimize_defaults !== 'undefined') {
             const optimizeFlag = Boolean(payload.optimize_defaults)
-            window.QS_OPTIMIZE_DEFAULTS = optimizeFlag
+            setAppConfig({ QS_OPTIMIZE_DEFAULTS: optimizeFlag })
             if (triggerBtn) triggerBtn.dataset.currentOptimizeDefaults = optimizeFlag ? 'true' : 'false'
           }
           if (typeof payload.config_history !== 'undefined') {
             const historyFlag = Number(payload.config_history)
-            window.QS_CONFIG_HISTORY = historyFlag
+            setAppConfig({ QS_CONFIG_HISTORY: historyFlag })
             if (triggerBtn) triggerBtn.dataset.currentConfigHistory = String(historyFlag)
           }
           if (typeof payload.kometa_log_keep !== 'undefined') {
             const logKeepFlag = Number(payload.kometa_log_keep)
-            window.QS_KOMETA_LOG_KEEP = logKeepFlag
+            setAppConfig({ QS_KOMETA_LOG_KEEP: logKeepFlag })
             if (triggerBtn) triggerBtn.dataset.currentLogKeep = String(logKeepFlag)
           }
           if (typeof payload.imagemaid_log_keep !== 'undefined') {
             const imagemaidLogKeepFlag = Number(payload.imagemaid_log_keep)
-            window.QS_IMAGEMAID_LOG_KEEP = imagemaidLogKeepFlag
+            setAppConfig({ QS_IMAGEMAID_LOG_KEEP: imagemaidLogKeepFlag })
             if (triggerBtn) triggerBtn.dataset.currentImagemaidLogKeep = String(imagemaidLogKeepFlag)
           }
           if (typeof data.session_lifetime_days !== 'undefined' || typeof payload.session_lifetime_days !== 'undefined') {
             const lifetimeFlag = Number(
               (typeof data.session_lifetime_days !== 'undefined') ? data.session_lifetime_days : payload.session_lifetime_days
             )
-            window.QS_SESSION_LIFETIME_DAYS = lifetimeFlag
+            setAppConfig({ QS_SESSION_LIFETIME_DAYS: lifetimeFlag })
             if (triggerBtn) triggerBtn.dataset.currentSessionLifetime = String(lifetimeFlag)
           }
           if (typeof data.session_dir !== 'undefined' || typeof payload.session_dir !== 'undefined') {
             const sessionDirFlag = String(
               (typeof data.session_dir !== 'undefined') ? data.session_dir : (payload.session_dir || '')
             )
-            window.QS_FLASK_SESSION_DIR = sessionDirFlag
+            setAppConfig({ QS_FLASK_SESSION_DIR: sessionDirFlag })
             if (triggerBtn) triggerBtn.dataset.currentSessionDir = sessionDirFlag
           }
           if (hasPortChange && triggerBtn) {
@@ -3487,37 +3484,37 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (data.theme) {
           document.documentElement.setAttribute('data-theme', data.theme)
-          window.QS_THEME = data.theme
+          setAppConfig({ QS_THEME: data.theme })
           if (triggerBtn) triggerBtn.dataset.currentTheme = data.theme
           updateThemeUi(data.theme)
         }
         if (typeof payload.config_history !== 'undefined') {
           const historyFlag = Number(payload.config_history)
-          window.QS_CONFIG_HISTORY = historyFlag
+          setAppConfig({ QS_CONFIG_HISTORY: historyFlag })
           if (triggerBtn) triggerBtn.dataset.currentConfigHistory = String(historyFlag)
         }
         if (typeof payload.kometa_log_keep !== 'undefined') {
           const logKeepFlag = Number(payload.kometa_log_keep)
-          window.QS_KOMETA_LOG_KEEP = logKeepFlag
+          setAppConfig({ QS_KOMETA_LOG_KEEP: logKeepFlag })
           if (triggerBtn) triggerBtn.dataset.currentLogKeep = String(logKeepFlag)
         }
         if (typeof payload.imagemaid_log_keep !== 'undefined') {
           const imagemaidLogKeepFlag = Number(payload.imagemaid_log_keep)
-          window.QS_IMAGEMAID_LOG_KEEP = imagemaidLogKeepFlag
+          setAppConfig({ QS_IMAGEMAID_LOG_KEEP: imagemaidLogKeepFlag })
           if (triggerBtn) triggerBtn.dataset.currentImagemaidLogKeep = String(imagemaidLogKeepFlag)
         }
         if (typeof data.session_lifetime_days !== 'undefined' || typeof payload.session_lifetime_days !== 'undefined') {
           const lifetimeFlag = Number(
             (typeof data.session_lifetime_days !== 'undefined') ? data.session_lifetime_days : payload.session_lifetime_days
           )
-          window.QS_SESSION_LIFETIME_DAYS = lifetimeFlag
+          setAppConfig({ QS_SESSION_LIFETIME_DAYS: lifetimeFlag })
           if (triggerBtn) triggerBtn.dataset.currentSessionLifetime = String(lifetimeFlag)
         }
         if (typeof data.session_dir !== 'undefined' || typeof payload.session_dir !== 'undefined') {
           const sessionDirFlag = String(
             (typeof data.session_dir !== 'undefined') ? data.session_dir : (payload.session_dir || '')
           )
-          window.QS_FLASK_SESSION_DIR = sessionDirFlag
+          setAppConfig({ QS_FLASK_SESSION_DIR: sessionDirFlag })
           if (triggerBtn) triggerBtn.dataset.currentSessionDir = sessionDirFlag
         }
         const rawPort = data.new_port ?? portNum ?? getCurrentPort()
@@ -3835,7 +3832,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return true
       }
       if (showFailureToast) showToast('error', 'Copy failed. Please copy manually.')
-    } catch (err) {
+    } catch {
       if (showFailureToast) showToast('error', 'Copy failed. Please copy manually.')
     } finally {
       document.body.removeChild(textarea)
@@ -3852,7 +3849,7 @@ document.addEventListener('DOMContentLoaded', () => {
       selection.removeAllRanges()
       selection.addRange(range)
       if (typeof output.focus === 'function') output.focus()
-    } catch (err) {
+    } catch {
       // No-op: selection best-effort only.
     }
   }
@@ -3870,7 +3867,7 @@ document.addEventListener('DOMContentLoaded', () => {
         await navigator.clipboard.writeText(text)
         showToast('success', 'Support info copied to clipboard.')
         return
-      } catch (err) {
+      } catch {
         // Fall back to execCommand below.
       }
     }
@@ -4249,3 +4246,120 @@ style.textContent = `
   }
 `
 document.head.appendChild(style)
+
+// Delegated click handlers for navigation data-attributes.
+//
+// Replaces the inline onclick="jumpTo(...)" / onclick='loading(...)' that
+// previously lived in:
+//   - templates/000-base.html (Donate sponsor link)
+//   - templates/900-kometa.html (final-gate cards, setup blockers,
+//     rating-mapping pills)
+//   - templates/partials/_workspace_macros.html (step dropdown items,
+//     step rail buttons, prev/next form-submit buttons, sidebar donate)
+// AND the runtime-injected HTML strings in:
+//   - static/local-js/validationHandler.js (Plex-not-validated message)
+//   - static/local-js/027-playlist_files.js (same; copy-paste)
+//   - static/local-js/overlayHandler.js (rating-mapping service pills)
+//
+// Two patterns:
+//   - [data-jumpto-page]  -> jumpTo(page, label?)
+//     Read `data-jumpto-page` and optional `data-jumpto-label`. Calls
+//     jumpTo() inside the click handler. The element is typically an
+//     <a href="javascript:void(0);"> or a <button type="button">, so no
+//     default action needs preventing for buttons; for anchors we call
+//     preventDefault to keep the browser from chasing the `javascript:`
+//     href.
+//   - [data-nav-action]   -> loading(action, target)
+//     Read `data-nav-action` ('prev' | 'next') and `data-nav-target`
+//     (the human-readable page label). Used on <button type="submit">
+//     inside #configForm -- the click fires BEFORE the form submit, so
+//     the spinner starts before navigation. We MUST NOT preventDefault
+//     here or the form won't submit.
+//
+// EVENT DELEGATION (vs per-element binding): the listeners attach ONCE
+// to document.body and use event.target.closest() to find the matching
+// element. This means elements added AFTER DOMContentLoaded (e.g. the
+// overlay handler's runtime-generated rating-mapping pills) are picked
+// up automatically -- no re-binding needed.
+//
+// TEST SEAM via CANCELABLE CustomEvent (NOT window.* shim):
+// Before calling jumpTo() / loading(), the listener dispatches a
+// cancelable custom event ('qs:nav:jump' or 'qs:nav:loading') on
+// document with { page, label } or { action, target } in event.detail.
+// Tests subscribe to the event and call event.preventDefault() to
+// observe the call args WITHOUT triggering real navigation / spinner.
+// Production code that doesn't listen has zero overhead beyond the
+// CustomEvent allocation.
+//
+// This replaces the previous `(typeof window !== 'undefined' &&
+// window.jumpTo) || jumpTo` indirection that existed solely so the
+// e2e test suite could spy on calls by overwriting window.jumpTo.
+// CustomEvent is a documented test seam (not a leaked implementation
+// detail) and doesn't require polluting the global namespace.
+document.addEventListener('DOMContentLoaded', () => {
+  document.body.addEventListener('click', (event) => {
+    const jumpEl = event.target.closest('[data-jumpto-page]')
+    if (jumpEl) {
+      const tag = (jumpEl.tagName || '').toLowerCase()
+      if (tag === 'a') event.preventDefault()
+      const page = jumpEl.dataset.jumptoPage
+      const label = jumpEl.dataset.jumptoLabel
+      if (page) {
+        const navEvent = new CustomEvent('qs:nav:jump', {
+          cancelable: true,
+          detail: { page, label }
+        })
+        const allowed = document.dispatchEvent(navEvent)
+        if (allowed) jumpTo(page, label)
+      }
+      return
+    }
+
+    const navEl = event.target.closest('[data-nav-action]')
+    if (navEl) {
+      // Do NOT preventDefault -- this button is type="submit" and the form
+      // submission carries the navigation. We just kick off the spinner.
+      const action = navEl.dataset.navAction
+      const target = navEl.dataset.navTarget
+      if (action) {
+        const navEvent = new CustomEvent('qs:nav:loading', {
+          cancelable: true,
+          detail: { action, target }
+        })
+        const allowed = document.dispatchEvent(navEvent)
+        if (allowed) loading(action, target)
+      }
+    }
+  })
+})
+
+// Module compatibility shims.
+// Now that this file loads as type="module", its top-level declarations are
+// no longer visible to unconverted classic <script> pages. Re-publish the
+// names that other files reference until those files are themselves modules.
+// Remove each entry as its consumers are converted.
+//
+// jumpTo: restored in PR #1384 after PR #1382 missed a remaining classic-
+// script consumer. static/local-js/025-libraries.js (a 4600-line classic
+// script) has a `qs:before-step-navigation` listener that calls
+// `jumpTo(detail.targetPage, detail.targetLabel)` after autosaving. That
+// call relied on the shim; without it, navigating away from a library
+// throws ReferenceError. The shim stays until 025-libraries.js is
+// converted to an ES module (separate roadmap item).
+//
+// loading: NOT shimmed. PR #1382 successfully migrated the only external
+// caller (001-start.js) to a direct `import { loading }`. Don't republish
+// it here -- that's the regression-prevention regression test in
+// tests/e2e/test_wizard_e2e.py (test_window_loading_shim_is_retired).
+window.escapeHtml = escapeHtml
+window.hideNavigationLoadingOverlay = hideNavigationLoadingOverlay
+window.hideSpinner = hideSpinner
+window.jumpTo = jumpTo
+window.setButtonIconAndText = setButtonIconAndText
+window.showNavigationLoadingOverlay = showNavigationLoadingOverlay
+window.showSpinner = showSpinner
+window.showToast = showToast
+
+// ES module exports for other modules. Currently consumed by
+// static/local-js/001-start.js (which is also loaded as type="module").
+export { loading, jumpTo }
