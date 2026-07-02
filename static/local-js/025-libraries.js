@@ -103,6 +103,7 @@ const metadataCustomRepoBase = String(window.QS_SETTINGS_CUSTOM_REPO_BASE || '')
 const metadataRepoDependencyMessage = 'Metadata file repo entries require Custom Repo to be configured and saved first within the Settings page.'
 const collectionRepoDependencyMessage = 'Collection file repo entries require Custom Repo to be configured and saved first within the Settings page.'
 const overlayRepoDependencyMessage = 'Overlay file repo entries require Custom Repo to be configured and saved first within the Settings page.'
+const playlistRepoDependencyMessage = 'Playlist file repo entries require Custom Repo to be configured and saved first within the Settings page.'
 
 function appendMetadataSettingsLink (target, className = 'link-light fw-semibold text-decoration-underline') {
   const link = document.createElement('a')
@@ -135,6 +136,211 @@ function appendInlineCodeText (target, text, options = {}) {
     } else {
       target.appendChild(document.createTextNode(part))
     }
+  })
+}
+
+function ensureLibrariesModalRoot (modalEl) {
+  if (!modalEl || !document.body) return modalEl
+  const modalId = modalEl.id
+  modalEl.dataset.librariesModal = 'true'
+  if (modalId) {
+    const bodyModal = Array.from(document.body.querySelectorAll('[data-libraries-modal]'))
+      .find(el => el.id === modalId && el !== modalEl)
+    if (bodyModal) {
+      if (modalEl.parentElement) modalEl.remove()
+      return bodyModal
+    }
+  }
+  if (modalEl.parentElement !== document.body) {
+    document.body.appendChild(modalEl)
+  }
+  return modalEl
+}
+
+function syncLibrariesModalBackdrop (modalEl) {
+  if (!modalEl) return
+  modalEl.style.zIndex = '2000'
+  modalEl.style.pointerEvents = 'auto'
+  modalEl.removeAttribute('inert')
+
+  const dialog = modalEl.querySelector('.modal-dialog')
+  if (dialog) dialog.style.pointerEvents = 'auto'
+
+  const content = modalEl.querySelector('.modal-content')
+  if (content) content.style.pointerEvents = 'auto'
+
+  const latestBackdrop = Array.from(document.querySelectorAll('.modal-backdrop')).at(-1)
+  if (latestBackdrop) latestBackdrop.style.zIndex = '1990'
+}
+
+function cleanupLibrariesModalBackdrops () {
+  if (document.querySelector('.modal.show')) return
+  document.querySelectorAll('.modal-backdrop').forEach(backdrop => backdrop.remove())
+}
+
+function queueLibrariesModalBackdropSync (modalEl) {
+  if (window && typeof window.requestAnimationFrame === 'function') {
+    window.requestAnimationFrame(() => syncLibrariesModalBackdrop(modalEl))
+    return
+  }
+  syncLibrariesModalBackdrop(modalEl)
+}
+
+function prepareLibrariesModal (modalEl) {
+  if (!modalEl) return modalEl
+  modalEl = ensureLibrariesModalRoot(modalEl)
+  if (modalEl.dataset.librariesModalPrepared === 'true') return modalEl
+  modalEl.dataset.librariesModalPrepared = 'true'
+  modalEl.addEventListener('show.bs.modal', function () {
+    syncLibrariesModalBackdrop(modalEl)
+    queueLibrariesModalBackdropSync(modalEl)
+  })
+  modalEl.addEventListener('shown.bs.modal', function () {
+    syncLibrariesModalBackdrop(modalEl)
+  })
+  modalEl.addEventListener('hidden.bs.modal', function () {
+    cleanupLibrariesModalBackdrops()
+  })
+  return modalEl
+}
+
+function hideLibrariesModal (modalEl) {
+  if (!modalEl || typeof bootstrap === 'undefined' || !bootstrap.Modal) return
+  const modal = bootstrap.Modal.getInstance(modalEl)
+  if (modal) modal.hide()
+}
+
+function parsePlaylistUserInputValue (value) {
+  if (Array.isArray(value)) {
+    return value.map(item => String(item || '').trim()).filter(Boolean)
+  }
+  const text = String(value || '').trim()
+  if (!text) return []
+  if (text.startsWith('[') && text.endsWith(']')) {
+    try {
+      const parsed = JSON.parse(text)
+      if (Array.isArray(parsed)) {
+        return parsed.map(item => String(item || '').trim()).filter(Boolean)
+      }
+    } catch {}
+  }
+  return text.split(',').map(item => item.trim()).filter(Boolean)
+}
+
+function initPlaylistUserPickers (scope) {
+  const root = scope || document
+  root.querySelectorAll('[data-playlist-user-picker]').forEach(wrapper => {
+    if (wrapper.dataset.playlistUserPickerReady === 'true') return
+    const inputId = String(wrapper.dataset.inputId || '').trim()
+    const modalId = String(wrapper.dataset.modalId || '').trim()
+    const allowAll = String(wrapper.dataset.allowAll || '').trim().toLowerCase() === 'true'
+    const input = inputId ? document.getElementById(inputId) : wrapper.querySelector('[data-playlist-user-input]')
+    let modalEl = modalId ? document.getElementById(modalId) : wrapper.querySelector('.modal')
+    if (!input || !modalEl) return
+
+    modalEl = prepareLibrariesModal(modalEl)
+    const applyButton = modalEl.querySelector('[data-playlist-user-apply]')
+    const allToggle = modalEl.querySelector('[data-playlist-user-all-toggle]')
+
+    const syncTogglesFromInput = () => {
+      const selected = parsePlaylistUserInputValue(input.value)
+      const hasAll = selected.includes('all')
+      if (allowAll && allToggle) {
+        allToggle.checked = hasAll
+      }
+      modalEl.querySelectorAll('[data-playlist-user-toggle]').forEach(toggle => {
+        toggle.checked = !hasAll && selected.includes(toggle.value)
+      })
+    }
+
+    if (modalEl.dataset.playlistUserModalBound !== 'true') {
+      modalEl.addEventListener('show.bs.modal', syncTogglesFromInput)
+      modalEl.dataset.playlistUserModalBound = 'true'
+    }
+
+    if (applyButton && applyButton.dataset.playlistUserApplyBound !== 'true') {
+      applyButton.addEventListener('click', () => {
+        const values = []
+        if (allowAll && allToggle && allToggle.checked) {
+          values.push('all')
+        } else {
+          modalEl.querySelectorAll('[data-playlist-user-toggle]:checked').forEach(toggle => {
+            values.push(toggle.value)
+          })
+        }
+        input.value = values.join(', ')
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        input.dispatchEvent(new Event('change', { bubbles: true }))
+        hideLibrariesModal(modalEl)
+      })
+      applyButton.dataset.playlistUserApplyBound = 'true'
+    }
+
+    const normalizedValues = parsePlaylistUserInputValue(input.value)
+    input.value = normalizedValues.join(', ')
+    wrapper.dataset.playlistUserPickerReady = 'true'
+  })
+}
+
+function initPlaylistKeyToggleGroups (scope) {
+  const root = scope || document
+  root.querySelectorAll('[data-playlist-key-toggle-group]').forEach(wrapper => {
+    if (wrapper.dataset.playlistKeyToggleReady === 'true') return
+    const hiddenId = String(wrapper.dataset.hiddenInput || '').trim()
+    const hidden = hiddenId ? document.getElementById(hiddenId) : wrapper.querySelector('input[type="hidden"]')
+    const toggles = Array.from(wrapper.querySelectorAll('[data-playlist-key-toggle]'))
+    if (!hidden || !toggles.length) return
+
+    const parseStoredMapping = () => {
+      const raw = String(hidden.value || '').trim()
+      if (!raw) return {}
+      try {
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return parsed
+        }
+      } catch {}
+      return {}
+    }
+
+    const isFalseValue = (value) => {
+      if (value === false || value === 0) return true
+      const text = String(value ?? '').trim().toLowerCase()
+      return text === 'false' || text === '0' || text === 'off' || text === 'no'
+    }
+
+    const syncFromHidden = () => {
+      const mapping = parseStoredMapping()
+      toggles.forEach(toggle => {
+        const key = String(toggle.dataset.playlistKey || '').trim()
+        if (!key) return
+        const storedValue = Object.prototype.hasOwnProperty.call(mapping, key) ? mapping[key] : undefined
+        toggle.checked = storedValue === undefined ? true : !isFalseValue(storedValue)
+      })
+    }
+
+    const syncToHidden = () => {
+      const mapping = parseStoredMapping()
+      toggles.forEach(toggle => {
+        const key = String(toggle.dataset.playlistKey || '').trim()
+        if (!key) return
+        if (toggle.checked) {
+          delete mapping[key]
+        } else {
+          mapping[key] = false
+        }
+      })
+      hidden.value = JSON.stringify(mapping)
+      hidden.dispatchEvent(new Event('input', { bubbles: true }))
+      hidden.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+
+    toggles.forEach(toggle => {
+      toggle.addEventListener('change', syncToHidden)
+    })
+    hidden.addEventListener('change', syncFromHidden)
+    syncFromHidden()
+    wrapper.dataset.playlistKeyToggleReady = 'true'
   })
 }
 
@@ -1479,6 +1685,418 @@ initOverlayFilesEditors(document)
 if (libraryContainer && typeof MutationObserver !== 'undefined') {
   const overlayObserver = new MutationObserver(() => initOverlayFilesEditors(libraryContainer))
   overlayObserver.observe(libraryContainer, { childList: true, subtree: true })
+}
+
+function normalizePlaylistFileEntry (entry) {
+  if (!entry || typeof entry !== 'object') return null
+  const type = String(entry.type || '').trim().toLowerCase()
+  const location = String(entry.location || '').trim()
+  const validated = entry.validated === true || String(entry.validated || '').trim().toLowerCase() === 'true'
+  if (!type && !location) return null
+  const normalized = { type, location }
+  if (validated) normalized.validated = true
+  return normalized
+}
+
+function parsePlaylistFilesValue (rawValue) {
+  if (!rawValue) return []
+  try {
+    const parsed = JSON.parse(String(rawValue))
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .map(normalizePlaylistFileEntry)
+      .filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function buildPlaylistFileRow (entry = {}) {
+  const wrapper = document.createElement('div')
+  wrapper.className = 'card bg-body-tertiary border-secondary'
+  wrapper.setAttribute('data-playlist-file-row', 'true')
+  wrapper.innerHTML = `
+    <div class="card-body">
+      <div class="row g-3 align-items-end">
+        <div class="col-md-2">
+          <label class="form-label small text-muted">Type</label>
+          <select class="form-select form-select-sm" data-playlist-file-type>
+            <option value="file">file</option>
+            <option value="git">git</option>
+            <option value="repo">repo</option>
+            <option value="url">url</option>
+          </select>
+        </div>
+        <div class="col-md-7">
+          <label class="form-label small text-muted">Location</label>
+          <input type="text" class="form-control form-control-sm" data-playlist-file-location placeholder="config/playlists.yml, user/playlists.yml, or https://example.com/playlists.yml">
+        </div>
+        <div class="col-md-3 d-flex gap-2 justify-content-md-end">
+          <button type="button" class="btn btn-success btn-sm" data-validate-playlist-file>Validate</button>
+          <button type="button" class="btn btn-danger btn-sm" data-remove-playlist-file>Remove</button>
+        </div>
+      </div>
+      <div class="mt-2 small d-none" data-playlist-file-status></div>
+    </div>
+  `
+  const typeSelect = wrapper.querySelector('[data-playlist-file-type]')
+  const locationInput = wrapper.querySelector('[data-playlist-file-location]')
+  if (typeSelect && ['file', 'url', 'git', 'repo'].includes(entry.type)) {
+    typeSelect.value = entry.type
+  }
+  if (locationInput && entry.location) {
+    locationInput.value = entry.location
+  }
+  if (entry.validated) {
+    wrapper.dataset.playlistFileState = 'success'
+    wrapper.dataset.playlistFileButtonState = 'success'
+  }
+  updatePlaylistFileValidateButton(wrapper, Boolean(entry.validated))
+  return wrapper
+}
+
+function updatePlaylistFileValidateButton (row, isValidated) {
+  if (!row) return
+  const button = row.querySelector('[data-validate-playlist-file]')
+  if (!button) return
+  const state = String(row.dataset.playlistFileButtonState || '').trim() || (isValidated ? 'success' : 'idle')
+  button.classList.remove('btn-success', 'btn-secondary')
+  if (state === 'success') {
+    button.disabled = true
+    button.classList.add('btn-secondary')
+    button.textContent = 'Validated'
+    return
+  }
+  if (state === 'blocked') {
+    button.disabled = true
+    button.classList.add('btn-secondary')
+    button.textContent = 'Needs Repo'
+    return
+  }
+  if (state === 'loading') {
+    button.disabled = true
+    button.classList.add('btn-secondary')
+    button.textContent = 'Validating...'
+    return
+  }
+  button.disabled = false
+  button.classList.add('btn-success')
+  button.textContent = 'Validate'
+}
+
+function setPlaylistFileButtonState (row, state) {
+  if (!row) return
+  row.dataset.playlistFileButtonState = state || 'idle'
+  updatePlaylistFileValidateButton(row, state === 'success')
+}
+
+function updatePlaylistCustomRepoStatus (editor) {
+  if (!editor) return
+  const target = editor.querySelector('[data-playlist-custom-repo-status]')
+  if (!target) return
+
+  target.replaceChildren()
+  target.className = 'alert small mb-3'
+  if (!metadataCustomRepoBase) {
+    target.classList.add('alert-warning')
+    target.append('Custom Repo is not configured. ')
+    target.append('Use ')
+    appendMetadataSettingsLink(target, 'alert-link fw-semibold')
+    target.append(' to configure and save it before using ')
+    const code = document.createElement('code')
+    code.textContent = 'repo'
+    target.appendChild(code)
+    target.append(' playlist files.')
+    return
+  }
+
+  target.classList.add('alert-secondary')
+  const label = document.createElement('div')
+  label.className = 'fw-semibold mb-1'
+  label.textContent = 'Custom Repo base used for repo entries'
+  target.appendChild(label)
+
+  const baseValue = document.createElement('code')
+  baseValue.textContent = metadataCustomRepoBase
+  target.appendChild(baseValue)
+}
+
+function applyPlaylistFileDependencyState (row, opts = {}) {
+  if (!row) return false
+  const skipStatus = Boolean(opts.skipStatus)
+  const type = row.querySelector('[data-playlist-file-type]')?.value || ''
+  if (type !== 'repo') {
+    if (row.dataset.playlistFileDependency === 'repo-missing') {
+      row.dataset.playlistFileDependency = ''
+    }
+    return false
+  }
+
+  if (metadataCustomRepoBase) {
+    if (row.dataset.playlistFileDependency === 'repo-missing') {
+      row.dataset.playlistFileDependency = ''
+    }
+    return false
+  }
+
+  row.dataset.playlistFileDependency = 'repo-missing'
+  setPlaylistFileButtonState(row, 'blocked')
+  if (!skipStatus) {
+    setPlaylistFileStatus(row, 'error', playlistRepoDependencyMessage)
+  }
+  return true
+}
+
+function renderPlaylistFileStatusMessage (target, message) {
+  target.replaceChildren()
+  if (!message) return
+
+  if (typeof message === 'object' && message !== null) {
+    const text = String(message.text || message.message || '').trim()
+    const files = Array.isArray(message.files) ? message.files.filter(Boolean) : []
+    if (text) {
+      const summary = document.createElement('div')
+      appendInlineCodeText(summary, text)
+      target.appendChild(summary)
+    }
+    if (files.length) {
+      const list = document.createElement('ul')
+      list.className = 'mb-0 mt-1 ps-3'
+      files.forEach(file => {
+        const item = document.createElement('li')
+        appendInlineCodeText(item, file, { wrapPlainInCode: true })
+        list.appendChild(item)
+      })
+      target.appendChild(list)
+    }
+    return
+  }
+
+  const text = String(message || '').trim()
+  if (!text) return
+
+  if (text === playlistRepoDependencyMessage) {
+    target.append('Playlist file repo entries require Custom Repo to be configured and saved first within the ')
+    appendMetadataSettingsLink(target)
+    target.append(' page.')
+    return
+  }
+
+  appendInlineCodeText(target, text)
+}
+
+function setPlaylistFileStatus (row, kind, message) {
+  if (!row) return
+  const target = row.querySelector('[data-playlist-file-status]')
+  if (!target) return
+  row.dataset.playlistFileState = kind || ''
+  target.className = 'mt-2 small'
+  if (!message) {
+    target.classList.add('d-none')
+    target.textContent = ''
+    if (applyPlaylistFileDependencyState(row, { skipStatus: true })) {
+      setPlaylistFileButtonState(row, 'blocked')
+    } else {
+      setPlaylistFileButtonState(row, 'idle')
+    }
+    const editor = row.closest('[data-playlist-files-editor]')
+    if (editor) updatePlaylistFilesAccordionState(editor)
+    return
+  }
+  target.classList.remove('d-none')
+  if (kind === 'success') {
+    target.classList.add('text-success')
+  } else if (kind === 'error') {
+    target.classList.add('text-danger')
+  } else {
+    target.classList.add('text-warning')
+  }
+  renderPlaylistFileStatusMessage(target, message)
+  if (kind === 'success') {
+    setPlaylistFileButtonState(row, 'success')
+  } else if (row.dataset.playlistFileDependency === 'repo-missing') {
+    setPlaylistFileButtonState(row, 'blocked')
+  } else {
+    setPlaylistFileButtonState(row, 'idle')
+  }
+  const editor = row.closest('[data-playlist-files-editor]')
+  if (editor) updatePlaylistFilesAccordionState(editor)
+}
+
+function updatePlaylistFilesAccordionState (editor) {
+  if (!editor) return
+  const accordionItem = editor.closest('.accordion-item')
+  const accordionHeader = accordionItem?.querySelector(':scope > .accordion-header')
+  if (!accordionHeader) return
+
+  const rows = Array.from(editor.querySelectorAll('[data-playlist-file-row]'))
+  const hasEntries = rows.some(row => {
+    const type = row.querySelector('[data-playlist-file-type]')?.value || ''
+    const location = row.querySelector('[data-playlist-file-location]')?.value || ''
+    return Boolean(normalizePlaylistFileEntry({ type, location }))
+  })
+  const hasInvalid = rows.some(row => {
+    const state = String(row.dataset.playlistFileState || '').trim().toLowerCase()
+    return state === 'error' || state === 'warning'
+  })
+
+  accordionHeader.classList.remove('invalid', 'warning')
+  if (hasInvalid) {
+    accordionHeader.classList.add('invalid')
+    return
+  }
+  if (hasEntries) {
+    accordionHeader.classList.add('selected')
+  } else {
+    accordionHeader.classList.remove('selected')
+  }
+}
+
+function syncPlaylistFilesEditor (editor, emitEvents = true) {
+  if (!editor) return []
+  const hidden = editor.querySelector('input[type="hidden"][name="playlist_files_entries"]')
+  if (!hidden) return []
+  const rows = Array.from(editor.querySelectorAll('[data-playlist-file-row]'))
+  const entries = rows.map(row => {
+    const type = row.querySelector('[data-playlist-file-type]')?.value
+    const location = row.querySelector('[data-playlist-file-location]')?.value
+    const validated = String(row.dataset.playlistFileState || '').trim().toLowerCase() === 'success'
+    return normalizePlaylistFileEntry({ type, location, validated })
+  }).filter(Boolean)
+  hidden.value = JSON.stringify(entries)
+  if (emitEvents) {
+    hidden.dispatchEvent(new Event('input', { bubbles: true }))
+    hidden.dispatchEvent(new Event('change', { bubbles: true }))
+  }
+  updatePlaylistFilesAccordionState(editor)
+  return entries
+}
+
+function renderPlaylistFilesEditor (editor) {
+  if (!editor) return
+  const hidden = editor.querySelector('input[type="hidden"][name="playlist_files_entries"]')
+  const list = editor.querySelector('[data-playlist-files-list]')
+  if (!hidden || !list) return
+  updatePlaylistCustomRepoStatus(editor)
+  const entries = parsePlaylistFilesValue(hidden.value)
+  list.replaceChildren()
+  entries.forEach(entry => list.appendChild(buildPlaylistFileRow(entry)))
+  list.querySelectorAll('[data-playlist-file-row]').forEach(row => {
+    if (applyPlaylistFileDependencyState(row)) return
+    if (String(row.dataset.playlistFileState || '').trim().toLowerCase() === 'success') {
+      setPlaylistFileButtonState(row, 'success')
+    } else {
+      setPlaylistFileButtonState(row, 'idle')
+    }
+  })
+  syncPlaylistFilesEditor(editor, false)
+  updatePlaylistFilesAccordionState(editor)
+}
+
+function initPlaylistFilesEditors (scope) {
+  const root = scope || document
+  root.querySelectorAll('[data-playlist-files-editor]').forEach(editor => {
+    if (editor.dataset.playlistFilesReady === 'true') return
+    renderPlaylistFilesEditor(editor)
+    editor.dataset.playlistFilesReady = 'true'
+  })
+}
+
+document.addEventListener('click', async event => {
+  const addButton = event.target.closest('[data-add-playlist-file]')
+  if (addButton) {
+    const editor = addButton.closest('[data-playlist-files-editor]')
+    const list = editor?.querySelector('[data-playlist-files-list]')
+    if (!editor || !list) return
+    list.appendChild(buildPlaylistFileRow())
+    syncPlaylistFilesEditor(editor)
+    return
+  }
+
+  const removeButton = event.target.closest('[data-remove-playlist-file]')
+  if (removeButton) {
+    const row = removeButton.closest('[data-playlist-file-row]')
+    const editor = removeButton.closest('[data-playlist-files-editor]')
+    if (!row || !editor) return
+    row.remove()
+    syncPlaylistFilesEditor(editor)
+    return
+  }
+
+  const validateButton = event.target.closest('[data-validate-playlist-file]')
+  if (validateButton) {
+    const row = validateButton.closest('[data-playlist-file-row]')
+    const editor = validateButton.closest('[data-playlist-files-editor]')
+    if (!row || !editor) return
+    const type = row.querySelector('[data-playlist-file-type]')?.value || ''
+    const location = row.querySelector('[data-playlist-file-location]')?.value || ''
+    syncPlaylistFilesEditor(editor, false)
+    setPlaylistFileStatus(row, '', 'Validating...')
+    setPlaylistFileButtonState(row, 'loading')
+    try {
+      const response = await fetch('/validate_playlist_file', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          playlist_file_type: type,
+          playlist_file_location: location,
+          config_name: getActiveConfigName()
+        })
+      })
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok || payload.valid === false) {
+        setPlaylistFileStatus(row, 'error', payload.error_details || payload.error || 'Validation failed.')
+        return
+      }
+      applyNormalizedLibraryFileLocation(row, '[data-playlist-file-location]', payload, editor, syncPlaylistFilesEditor)
+      setPlaylistFileStatus(row, 'success', payload.message || 'Validated successfully.')
+    } catch {
+      setPlaylistFileStatus(row, 'error', 'Validation failed.')
+    }
+    syncPlaylistFilesEditor(editor)
+    return
+  }
+})
+
+document.addEventListener('input', event => {
+  const target = event.target
+  if (!target || !target.closest('[data-playlist-files-editor]')) return
+  const row = target.closest('[data-playlist-file-row]')
+  const editor = target.closest('[data-playlist-files-editor]')
+  if (row) {
+    setPlaylistFileStatus(row, '', '')
+    applyPlaylistFileDependencyState(row)
+  }
+  syncPlaylistFilesEditor(editor)
+})
+
+document.addEventListener('change', event => {
+  const target = event.target
+  if (!target || !target.closest('[data-playlist-files-editor]')) return
+  const row = target.closest('[data-playlist-file-row]')
+  const editor = target.closest('[data-playlist-files-editor]')
+  if (row) {
+    setPlaylistFileStatus(row, '', '')
+    applyPlaylistFileDependencyState(row)
+  }
+  syncPlaylistFilesEditor(editor)
+})
+
+initPlaylistFilesEditors(document)
+if (libraryContainer && typeof MutationObserver !== 'undefined') {
+  const playlistFilesObserver = new MutationObserver(() => initPlaylistFilesEditors(libraryContainer))
+  playlistFilesObserver.observe(libraryContainer, { childList: true, subtree: true })
+}
+initPlaylistKeyToggleGroups(document)
+if (libraryContainer && typeof MutationObserver !== 'undefined') {
+  const playlistKeyToggleObserver = new MutationObserver(() => initPlaylistKeyToggleGroups(libraryContainer))
+  playlistKeyToggleObserver.observe(libraryContainer, { childList: true, subtree: true })
+}
+initPlaylistUserPickers(document)
+if (libraryContainer && typeof MutationObserver !== 'undefined') {
+  const playlistUserPickerObserver = new MutationObserver(() => initPlaylistUserPickers(libraryContainer))
+  playlistUserPickerObserver.observe(libraryContainer, { childList: true, subtree: true })
 }
 
 // Ensure hidden "false" inputs don't submit alongside checked checkboxes with the same name
@@ -2922,6 +3540,110 @@ function setupTemplateStringListHandlers (scope) {
     return String(el?.value || '').trim().toLowerCase() === 'true'
   }
 
+    function setLookupState (target, state) {
+      if (!target) return
+      target.textContent = state?.message || ''
+      const inlineLookup = target.dataset.lookupInline === 'true'
+      target.className = inlineLookup ? 'small ms-2' : 'small mt-1'
+      if (!state?.message) {
+        target.classList.add('d-none')
+        return
+      }
+    target.classList.remove('d-none')
+    if (state.level === 'warning') {
+      target.classList.add('text-warning')
+    } else if (state.valid && state.verified) {
+      target.classList.add('text-success')
+    } else if (state.verified) {
+      target.classList.add('text-danger')
+    } else {
+      target.classList.add('text-warning')
+    }
+  }
+
+  function applyLookupState (target, presetConfig, presetName, value, context = {}) {
+    if (!target || !presetConfig?.lookupService || !value) return
+
+    if (presetConfig.lookupService === 'tmdb') {
+      if (!getServiceValidationState('tmdb')) {
+        setLookupState(target, {
+          valid: false,
+          verified: false,
+          message: 'TMDb not validated, so the collection title could not be checked.'
+        })
+        return
+      }
+
+      setLookupState(target, {
+        valid: false,
+        verified: false,
+        message: 'Checking TMDb collection title...'
+      })
+      lookupTemplateStringValue(presetName, value, context).then(result => {
+        if (!target.isConnected) return
+        if (result.valid && result.verified && result.label) {
+          const successMessage = result.message || `TMDb: ${result.label}`
+          setLookupState(target, {
+            valid: true,
+            verified: true,
+            level: result.level,
+            message: successMessage
+          })
+          return
+        }
+        setLookupState(target, {
+          valid: Boolean(result.valid),
+          verified: Boolean(result.verified),
+          message: result.message || 'TMDb lookup failed.'
+        })
+      })
+      return
+    }
+
+    if (presetConfig.lookupService === 'plex') {
+      if (!getServiceValidationState('plex')) {
+        setLookupState(target, {
+          valid: false,
+          verified: false,
+          message: 'Plex not validated, so the IMDb ID could not be checked against the active library.'
+        })
+        return
+      }
+      if (!String(context.libraryName || '').trim()) {
+        setLookupState(target, {
+          valid: false,
+          verified: false,
+          message: 'Library context is unavailable for Plex lookup.'
+        })
+        return
+      }
+
+      setLookupState(target, {
+        valid: false,
+        verified: false,
+        message: 'Checking Plex library for this IMDb ID...'
+      })
+      lookupTemplateStringValue(presetName, value, context).then(result => {
+        if (!target.isConnected) return
+        if (result.valid && result.verified && result.label) {
+          const successMessage = result.message || `Plex: ${result.label}`
+          setLookupState(target, {
+            valid: true,
+            verified: true,
+            level: result.level,
+            message: successMessage
+          })
+          return
+        }
+        setLookupState(target, {
+          valid: Boolean(result.valid),
+          verified: Boolean(result.verified),
+          message: result.message || 'Plex lookup failed.'
+        })
+      })
+    }
+  }
+
   async function lookupTemplateStringValue (presetName, value, context = {}) {
     const libraryName = String(context.libraryName || '').trim()
     const mediaType = String(context.mediaType || '').trim()
@@ -3017,26 +3739,6 @@ function setupTemplateStringListHandlers (scope) {
       return parseStoredStringList(counterpartHidden?.value)
     }
 
-    function setLookupState (target, state) {
-      if (!target) return
-      target.textContent = state?.message || ''
-      target.className = 'small mt-1'
-      if (!state?.message) {
-        target.classList.add('d-none')
-        return
-      }
-      target.classList.remove('d-none')
-      if (state.level === 'warning') {
-        target.classList.add('text-warning')
-      } else if (state.valid && state.verified) {
-        target.classList.add('text-success')
-      } else if (state.verified) {
-        target.classList.add('text-danger')
-      } else {
-        target.classList.add('text-warning')
-      }
-    }
-
     function setFeedback (message, persistent = false, level = 'error') {
       const isError = Boolean(message) && level === 'error'
       if (feedback) {
@@ -3117,8 +3819,13 @@ function setupTemplateStringListHandlers (scope) {
         textWrap.appendChild(titleRow)
 
         const lookupMeta = document.createElement('div')
-        lookupMeta.className = 'small mt-1 d-none'
-        textWrap.appendChild(lookupMeta)
+        if (presetConfig.lookupService) {
+          lookupMeta.dataset.lookupInline = 'true'
+          titleRow.appendChild(lookupMeta)
+        } else {
+          textWrap.appendChild(lookupMeta)
+        }
+        lookupMeta.className = presetConfig.lookupService ? 'small ms-2 d-none' : 'small mt-1 d-none'
 
         const button = document.createElement('button')
         button.type = 'button'
@@ -3137,76 +3844,8 @@ function setupTemplateStringListHandlers (scope) {
           syncState(updated)
         })
 
-        if (item.valid && presetConfig.lookupService === 'tmdb') {
-          if (!getServiceValidationState('tmdb')) {
-            setLookupState(lookupMeta, {
-              valid: false,
-              verified: false,
-              message: 'TMDb not validated, so the collection title could not be checked.'
-            })
-          } else {
-            setLookupState(lookupMeta, {
-              valid: false,
-              verified: false,
-              message: 'Checking TMDb collection title...'
-            })
-            lookupTemplateStringValue(presetName, item.value, { libraryName, mediaType }).then(result => {
-              if (!lookupMeta.isConnected) return
-              if (result.valid && result.verified && result.label) {
-                const successMessage = result.message || `TMDb: ${result.label}`
-                setLookupState(lookupMeta, {
-                  valid: true,
-                  verified: true,
-                  level: result.level,
-                  message: successMessage
-                })
-                return
-              }
-              setLookupState(lookupMeta, {
-                valid: Boolean(result.valid),
-                verified: Boolean(result.verified),
-                message: result.message || 'TMDb lookup failed.'
-              })
-            })
-          }
-        } else if (item.valid && presetConfig.lookupService === 'plex') {
-          if (!getServiceValidationState('plex')) {
-            setLookupState(lookupMeta, {
-              valid: false,
-              verified: false,
-              message: 'Plex not validated, so the IMDb ID could not be checked against the active library.'
-            })
-          } else if (!libraryName) {
-            setLookupState(lookupMeta, {
-              valid: false,
-              verified: false,
-              message: 'Library context is unavailable for Plex lookup.'
-            })
-          } else {
-            setLookupState(lookupMeta, {
-              valid: false,
-              verified: false,
-              message: 'Checking Plex library for this IMDb ID...'
-            })
-            lookupTemplateStringValue(presetName, item.value, { libraryName, mediaType }).then(result => {
-              if (!lookupMeta.isConnected) return
-              if (result.valid && result.verified && result.label) {
-                const successMessage = result.message || `Plex: ${result.label}`
-                setLookupState(lookupMeta, {
-                  valid: true,
-                  verified: true,
-                  level: result.level,
-                  message: successMessage
-                })
-                return
-              }
-              setLookupState(lookupMeta, {
-                valid: Boolean(result.valid),
-                verified: Boolean(result.verified),
-                message: result.message || 'Plex lookup failed.'
-              })
-            })
-          }
+        if (item.valid && presetConfig.lookupService) {
+          applyLookupState(lookupMeta, presetConfig, presetName, item.value, { libraryName, mediaType })
         }
       })
     }
@@ -3285,6 +3924,8 @@ function setupTemplateStringListHandlers (scope) {
 }
 
 function setupTemplateMappingListHandlers (scope) {
+  const templateStringLookupCache = window.__qsTemplateStringLookupCache || new Map()
+  window.__qsTemplateStringLookupCache = templateStringLookupCache
   const root = scope || document
   root.querySelectorAll('[data-template-mapping-list]').forEach(wrapper => {
     if (wrapper.dataset.listenerAdded) return
@@ -3297,9 +3938,171 @@ function setupTemplateMappingListHandlers (scope) {
     const list = wrapper.querySelector('[data-template-mapping-items]')
     const feedback = wrapper.querySelector('[data-template-mapping-feedback]')
     const validationPreset = String(wrapper.dataset.validationPreset || '').trim().toLowerCase()
+    const keyValidationPreset = String(wrapper.dataset.keyValidationPreset || '').trim().toLowerCase()
+    const lookupDisplayMode = String(wrapper.dataset.lookupDisplayMode || 'stacked').trim().toLowerCase()
+    const valueDisplayLabel = String(wrapper.dataset.valueDisplayLabel || '').trim()
     const valueKind = String(wrapper.dataset.mappingValueKind || 'string_list').trim().toLowerCase()
+    const libraryName = String(wrapper.dataset.libraryName || '').trim()
+    const mediaType = String(wrapper.dataset.mediaType || '').trim()
+    const keyPresetConfig = keyValidationPreset && templateStringListPresetConfigs[keyValidationPreset]
+      ? templateStringListPresetConfigs[keyValidationPreset]
+      : null
 
     if (!hidden || !keyInput || !valueInput || !addBtn || !list) return
+
+    function getServiceValidationState (serviceName) {
+      const el = document.getElementById(`qs-validate-${serviceName}`)
+      return String(el?.value || '').trim().toLowerCase() === 'true'
+    }
+
+    function setLookupState (target, state) {
+      if (!target) return
+      target.textContent = state?.message || ''
+      const inlineLookup = target.dataset.lookupInline === 'true'
+      target.className = inlineLookup ? 'small ms-2' : 'small mt-1'
+      if (!state?.message) {
+        target.classList.add('d-none')
+        return
+      }
+      target.classList.remove('d-none')
+      if (state.level === 'warning') {
+        target.classList.add('text-warning')
+      } else if (state.valid && state.verified) {
+        target.classList.add('text-success')
+      } else if (state.verified) {
+        target.classList.add('text-danger')
+      } else {
+        target.classList.add('text-warning')
+      }
+    }
+
+    async function lookupTemplateStringValue (presetName, value, context = {}) {
+      const currentLibraryName = String(context.libraryName || '').trim()
+      const currentMediaType = String(context.mediaType || '').trim()
+      const cacheKey = `${presetName}:${currentLibraryName}:${currentMediaType}:${value}`
+      if (templateStringLookupCache.has(cacheKey)) {
+        return templateStringLookupCache.get(cacheKey)
+      }
+      const request = fetch('/lookup_template_string_value', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          preset: presetName,
+          value,
+          library_name: currentLibraryName,
+          media_type: currentMediaType
+        })
+      })
+        .then(async (response) => {
+          const data = await response.json().catch(() => ({}))
+          if (!response.ok) {
+            return {
+              valid: false,
+              verified: false,
+              message: data.error || data.message || `Lookup failed (${response.status})`
+            }
+          }
+          return data
+        })
+        .catch(() => ({
+          valid: false,
+          verified: false,
+          message: 'Lookup unavailable right now.'
+        }))
+      templateStringLookupCache.set(cacheKey, request)
+      return request
+    }
+
+    function applyLookupState (target, presetConfig, presetName, value, context = {}) {
+      if (!target || !presetConfig?.lookupService || !value) return
+
+      if (presetConfig.lookupService === 'tmdb') {
+        if (!getServiceValidationState('tmdb')) {
+          setLookupState(target, {
+            valid: false,
+            verified: false,
+            message: 'TMDb not validated, so the collection title could not be checked.'
+          })
+          return
+        }
+
+        setLookupState(target, {
+          valid: false,
+          verified: false,
+          message: 'Checking TMDb collection title...'
+        })
+        lookupTemplateStringValue(presetName, value, context).then(result => {
+          if (!target.isConnected) return
+          if (result.valid && result.verified && result.label) {
+            const successMessage = result.message || `TMDb: ${result.label}`
+            setLookupState(target, {
+              valid: true,
+              verified: true,
+              level: result.level,
+              message: successMessage
+            })
+            return
+          }
+          setLookupState(target, {
+            valid: Boolean(result.valid),
+            verified: Boolean(result.verified),
+            message: result.message || 'TMDb lookup failed.'
+          })
+        })
+        return
+      }
+
+      if (presetConfig.lookupService === 'plex') {
+        if (!getServiceValidationState('plex')) {
+          setLookupState(target, {
+            valid: false,
+            verified: false,
+            message: 'Plex not validated, so the IMDb ID could not be checked against the active library.'
+          })
+          return
+        }
+        if (!String(context.libraryName || '').trim()) {
+          setLookupState(target, {
+            valid: false,
+            verified: false,
+            message: 'Library context is unavailable for Plex lookup.'
+          })
+          return
+        }
+
+        setLookupState(target, {
+          valid: false,
+          verified: false,
+          message: 'Checking Plex library for this IMDb ID...'
+        })
+        lookupTemplateStringValue(presetName, value, context).then(result => {
+          if (!target.isConnected) return
+          if (result.valid && result.verified && result.label) {
+            const successMessage = result.message || `Plex: ${result.label}`
+            setLookupState(target, {
+              valid: true,
+              verified: true,
+              level: result.level,
+              message: successMessage
+            })
+            return
+          }
+          setLookupState(target, {
+            valid: Boolean(result.valid),
+            verified: Boolean(result.verified),
+            message: result.message || 'Plex lookup failed.'
+          })
+        })
+      }
+    }
+
+    if (keyValidationPreset === 'tmdb_collection_id' || keyValidationPreset === 'numeric_id' || keyValidationPreset === 'year' || keyValidationPreset === 'decade') {
+      keyInput.setAttribute('inputmode', 'numeric')
+    }
+    if (keyValidationPreset.startsWith('imdb_id')) {
+      keyInput.setAttribute('autocapitalize', 'off')
+    }
 
     function parseValuesList (rawValue) {
       if (Array.isArray(rawValue)) {
@@ -3338,6 +4141,15 @@ function setupTemplateMappingListHandlers (scope) {
       feedback.classList.toggle('d-block', Boolean(message))
     }
 
+    function setKeyInputValidity (result) {
+      if (!keyInput) return
+      if (!result || result.valid) {
+        keyInput.classList.remove('is-invalid')
+        return
+      }
+      keyInput.classList.add('is-invalid')
+    }
+
     function setValueInputValidity (result) {
       if (!valueInput) return
       if (!result || result.valid) {
@@ -3345,6 +4157,28 @@ function setupTemplateMappingListHandlers (scope) {
         return
       }
       valueInput.classList.add('is-invalid')
+    }
+
+    function normalizeMappingKey (rawKey) {
+      const keyText = String(rawKey || '').trim()
+      if (!keyText) return ''
+      return keyPresetConfig?.normalize ? keyPresetConfig.normalize(keyText) : keyText
+    }
+
+    function validateKey (rawKey) {
+      const normalized = normalizeMappingKey(rawKey)
+      if (!normalized) {
+        return { value: '', valid: false, message: 'Enter a key before adding it.' }
+      }
+      if (!keyPresetConfig?.validate) {
+        return { value: normalized, valid: true, message: '' }
+      }
+      const result = keyPresetConfig.validate(normalized)
+      return {
+        value: normalized,
+        valid: Boolean(result.valid),
+        message: result.message || 'Enter a valid key.'
+      }
     }
 
     function normalizeMappingValue (rawValue) {
@@ -3359,7 +4193,7 @@ function setupTemplateMappingListHandlers (scope) {
     function normalizeMapping (mapping) {
       const normalized = {}
       Object.entries(mapping || {}).forEach(([rawKey, rawValues]) => {
-        const key = String(rawKey || '').trim()
+        const key = normalizeMappingKey(rawKey)
         if (!key) return
         const value = normalizeMappingValue(rawValues)
         if (value == null) return
@@ -3371,19 +4205,47 @@ function setupTemplateMappingListHandlers (scope) {
     function renderList (mapping) {
       list.replaceChildren()
       Object.entries(mapping).forEach(([key, value]) => {
+        const keyResult = validateKey(key)
         const li = document.createElement('li')
         li.className = 'list-group-item d-flex justify-content-between align-items-center'
+        if (!keyResult.valid) li.classList.add('list-group-item-danger')
 
         const textWrap = document.createElement('div')
         textWrap.className = 'd-flex flex-column'
 
+        const titleRow = document.createElement('div')
+        titleRow.className = 'd-flex align-items-center gap-2'
+
         const title = document.createElement('span')
         title.textContent = key
-        textWrap.appendChild(title)
+        titleRow.appendChild(title)
+
+        if (!keyResult.valid) {
+          const badge = document.createElement('span')
+          badge.className = 'badge text-bg-danger'
+          badge.textContent = 'Invalid'
+          badge.title = keyResult.message
+          titleRow.appendChild(badge)
+        }
+
+        textWrap.appendChild(titleRow)
+
+        const lookupMeta = document.createElement('div')
+        if (lookupDisplayMode === 'inline') {
+          lookupMeta.dataset.lookupInline = 'true'
+          titleRow.appendChild(lookupMeta)
+        }
+        lookupMeta.className = lookupDisplayMode === 'inline' ? 'small ms-2 d-none' : 'small mt-1 d-none'
+        if (lookupDisplayMode !== 'inline') {
+          textWrap.appendChild(lookupMeta)
+        }
 
         const details = document.createElement('div')
         details.className = 'small text-muted'
-        details.textContent = Array.isArray(value) ? value.join(', ') : String(value || '')
+        const rawDetails = Array.isArray(value) ? value.join(', ') : String(value || '')
+        details.textContent = valueDisplayLabel && !Array.isArray(value)
+          ? `${valueDisplayLabel}: ${rawDetails}`
+          : rawDetails
         textWrap.appendChild(details)
 
         const button = document.createElement('button')
@@ -3396,6 +4258,10 @@ function setupTemplateMappingListHandlers (scope) {
 
         li.append(textWrap, button)
         list.appendChild(li)
+
+        if (keyResult.valid && keyPresetConfig?.lookupService) {
+          applyLookupState(lookupMeta, keyPresetConfig, keyValidationPreset, keyResult.value, { libraryName, mediaType })
+        }
 
         button.addEventListener('click', () => {
           const current = normalizeMapping(parseStoredMapping(hidden.value))
@@ -3412,18 +4278,21 @@ function setupTemplateMappingListHandlers (scope) {
       hidden.value = JSON.stringify(normalized)
       renderList(normalized)
       setFeedback(message)
+      setKeyInputValidity({ valid: true })
       setValueInputValidity({ valid: true })
       return normalized
     }
 
     function addEntry () {
-      const key = String(keyInput.value || '').trim()
-      if (!key) {
-        setFeedback('Enter a key before adding it.')
+      const keyResult = validateKey(keyInput.value)
+      if (!keyResult.valid) {
+        setKeyInputValidity(keyResult)
+        setFeedback(keyResult.message || 'Enter a valid key before adding it.')
         return
       }
       const normalizedValue = normalizeMappingValue(valueInput.value)
       if (normalizedValue == null) {
+        setKeyInputValidity({ valid: true })
         setFeedback('Enter at least one value before adding it.')
         return
       }
@@ -3431,12 +4300,13 @@ function setupTemplateMappingListHandlers (scope) {
         const validationResult = URLValidation.validateValue(normalizedValue)
         if (!validationResult.valid) {
           setValueInputValidity(validationResult)
+          setKeyInputValidity({ valid: true })
           setFeedback(validationResult.message || 'Enter a valid URL before adding it.')
           return
         }
       }
       const current = normalizeMapping(parseStoredMapping(hidden.value))
-      current[key] = normalizedValue
+      current[keyResult.value] = normalizedValue
       syncState(current)
       keyInput.value = ''
       valueInput.value = ''
@@ -3450,6 +4320,7 @@ function setupTemplateMappingListHandlers (scope) {
     })
     keyInput.addEventListener('input', () => {
       setFeedback('')
+      setKeyInputValidity({ valid: true })
     })
     valueInput.addEventListener('input', () => {
       setFeedback('')
@@ -4086,6 +4957,9 @@ function mountCard (card, libraryId) {
   card.style.display = ''
   libraryContainer.appendChild(card)
   activeLibraryId = libraryId
+  initPlaylistKeyToggleGroups(card)
+  initPlaylistUserPickers(card)
+  initPlaylistFilesEditors(card)
   initSecretVisibilityToggles(card)
   syncHiddenCheckboxPairs(card)
   wireIncludeToggle(card, libraryId)

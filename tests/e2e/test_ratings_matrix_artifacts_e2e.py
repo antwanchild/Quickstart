@@ -67,7 +67,6 @@ PROGRESS_WRITE_INTERVAL = max(1, int(os.environ.get("RATINGS_PROGRESS_WRITE_INTE
 RANDOM_SEED_RAW = (os.environ.get("RATINGS_MATRIX_RANDOM_SEED", "") or "").strip()
 EXECUTION_MODE = (os.environ.get("RATINGS_MATRIX_EXECUTION_MODE", "batch") or "batch").strip().lower()
 CHUNK_SIZE = max(1, int(os.environ.get("RATINGS_MATRIX_CHUNK_SIZE", "12")))
-WITH_KOMETA_RENDER = str(os.environ.get("RATINGS_MATRIX_WITH_KOMETA", "1")).strip().lower() not in {"0", "false", "no"}
 FAIL_ON_DIFF = str(os.environ.get("RATINGS_MATRIX_FAIL_ON_DIFF", "0")).strip().lower() in {"1", "true", "yes"}
 DIFF_THRESHOLD_PERCENT = max(0.0, float(os.environ.get("RATINGS_MATRIX_DIFF_THRESHOLD_PERCENT", "0.0")))
 DIFF_IGNORE_ALPHA = str(os.environ.get("RATINGS_MATRIX_DIFF_IGNORE_ALPHA", "1")).strip().lower() in {"1", "true", "yes"}
@@ -87,6 +86,23 @@ INCLUDE_NUDGES = str(os.environ.get("RATINGS_MATRIX_INCLUDE_NUDGES", "0")).strip
 NUDGE_PROFILES_RAW = (os.environ.get("RATINGS_MATRIX_NUDGE_PROFILES", "none") or "none").strip()
 NUDGE_APPLY_TO = (os.environ.get("RATINGS_MATRIX_NUDGE_APPLY_TO", "enabled_slots") or "enabled_slots").strip().lower()
 FAILED_PROFILE = object()
+
+
+def _requested_kometa_render_root():
+    override = (os.environ.get("RATINGS_MATRIX_KOMETA_ROOT", "") or "").strip()
+    candidate = Path(override).expanduser() if override else (Path.cwd() / "config" / "kometa")
+    return candidate.resolve()
+
+
+def _has_usable_kometa_render_root(path):
+    return (path / "kometa.py").exists() and (path / "modules" / "overlay.py").exists()
+
+
+WITH_KOMETA_RENDER_REQUESTED = str(os.environ.get("RATINGS_MATRIX_WITH_KOMETA", "1")).strip().lower() not in {"0", "false", "no"}
+KOMETA_RENDER_ROOT = _requested_kometa_render_root()
+WITH_KOMETA_RENDER = WITH_KOMETA_RENDER_REQUESTED and _has_usable_kometa_render_root(KOMETA_RENDER_ROOT)
+if WITH_KOMETA_RENDER_REQUESTED and not WITH_KOMETA_RENDER:
+    print(f"[ratings-artifacts] Kometa render disabled: no usable checkout at {KOMETA_RENDER_ROOT}", flush=True)
 
 ALIGNMENTS = ("vertical", "horizontal")
 HORIZONTAL_POSITIONS = ("left", "center", "right")
@@ -578,6 +594,24 @@ def _apply_nudge_offsets(page, board_selector, library_id, board_type, template,
     if dx == 0 and dy == 0:
         return True, ""
 
+    selectable_timeout_ms = SHOW_LAYER_READY_TIMEOUT_MS if str(board_type or "").lower() == "show" else LAYER_READY_TIMEOUT_MS
+    try:
+        page.wait_for_function(
+            """([selector, templateName]) => {
+              const board = document.querySelector(selector);
+              if (!board) return false;
+              const canvas = board.querySelector('.overlay-board-canvas');
+              if (!canvas) return false;
+              const exactLayer = canvas.querySelector(`.overlay-board-layer[data-overlay-id="${templateName}"]`);
+              const genericLayer = canvas.querySelector('.overlay-board-layer[data-overlay-type="overlay_ratings"]');
+              return !!(exactLayer || genericLayer);
+            }""",
+            arg=[board_selector, template],
+            timeout=max(1500, selectable_timeout_ms * 2),
+        )
+    except Exception:
+        pass
+
     result = page.evaluate(
         """([selector, libId, type, templateName, dx, dy]) => {
           const board = document.querySelector(selector);
@@ -593,10 +627,41 @@ def _apply_nudge_offsets(page, board_selector, library_id, board_type, template,
               selected = false;
             }
           }
+          const canvas = board.querySelector('.overlay-board-canvas');
+          const exactLayer = canvas?.querySelector(`.overlay-board-layer[data-overlay-id="${templateName}"]`) || null;
+          const fallbackLayer = exactLayer || canvas?.querySelector('.overlay-board-layer[data-overlay-type="overlay_ratings"]') || null;
           if (!selected) {
-            const fallbackLayer = board.querySelector('.overlay-board-layer[data-overlay-type="overlay_ratings"]');
-            if (fallbackLayer) {
-              fallbackLayer.click();
+            const fallbackId = fallbackLayer?.dataset?.overlayId || '';
+            if (fallbackId && typeof board._overlaySelectById === 'function') {
+              try {
+                selected = !!board._overlaySelectById(fallbackId);
+              } catch (_err) {
+                selected = false;
+              }
+            }
+          }
+          if (!selected && fallbackLayer) {
+            const pointerEventInit = {
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+              button: 0,
+              buttons: 1,
+              pointerId: 1,
+              pointerType: 'mouse',
+              isPrimary: true,
+              clientX: 0,
+              clientY: 0
+            };
+            try {
+              fallbackLayer.dispatchEvent(new PointerEvent('pointerdown', pointerEventInit));
+              fallbackLayer.dispatchEvent(new PointerEvent('pointerup', pointerEventInit));
+            } catch (_err) {
+              fallbackLayer.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, buttons: 1 }));
+              fallbackLayer.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, button: 0, buttons: 1 }));
+            }
+            selected = fallbackLayer.classList.contains('is-active') || fallbackLayer.classList.contains('is-selected');
+            if (!selected && board.querySelector('.overlay-board-layer.is-active') === fallbackLayer) {
               selected = true;
             }
           }
@@ -1121,6 +1186,8 @@ def _run_kometa_render_batch(output_dir, jobs, kometa_dir):
         "--repo-root",
         str(Path.cwd()),
     ]
+    if KOMETA_RENDER_ROOT:
+        cmd.extend(["--kometa-root", str(KOMETA_RENDER_ROOT)])
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0 and not results_path.exists():
         stderr = (proc.stderr or "").strip()

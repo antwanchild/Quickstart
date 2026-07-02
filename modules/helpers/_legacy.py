@@ -1,17 +1,13 @@
 import datetime
-import hashlib
 import io
 import os
-import psutil
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
 import time
 import zipfile
-import copy
 
 from pathlib import Path
 from plexapi.server import PlexServer
@@ -104,216 +100,10 @@ JSON_SCHEMA_SYNC_FILES = (
 )
 
 
-def _kometa_update_cache_key(kometa_root, branch, local_version, local_sha=None, local_branch=None):
-    try:
-        root = str(Path(kometa_root).resolve())
-    except Exception:
-        root = str(kometa_root or "")
-    return root, str(branch or "").strip(), str(local_version or "").strip(), str(local_sha or "").strip(), str(local_branch or "").strip()
-
-
-def normalize_kometa_branch_override(value):
-    branch = str(value or "").strip().lower()
-    return branch if branch in KOMETA_BRANCH_OVERRIDES else ""
-
-
-def resolve_kometa_update_branch(branch_override=None):
-    branch = normalize_kometa_branch_override(branch_override)
-    return branch or get_kometa_branch()
-
-
-def get_cached_kometa_update(kometa_root=None, force_refresh=False, branch_override=None):
-    branch = resolve_kometa_update_branch(branch_override)
-    local_version = get_kometa_local_version(kometa_root)
-    local_sha = get_kometa_local_sha(kometa_root)
-    local_branch = get_kometa_local_branch(kometa_root)
-    key = _kometa_update_cache_key(kometa_root or ".", branch, local_version, local_sha=local_sha, local_branch=local_branch)
-
-    if not force_refresh:
-        entry = _KOMETA_UPDATE_CACHE.get(key)
-        if entry:
-            age = time.monotonic() - entry.get("created_at", 0)
-            if age <= KOMETA_UPDATE_CACHE_TTL_SECONDS:
-                payload = copy.deepcopy(entry.get("payload") or {})
-                payload["cached"] = True
-                return payload
-            _KOMETA_UPDATE_CACHE.pop(key, None)
-
-    payload = check_kometa_update(kometa_root, branch_override=branch_override)
-    if isinstance(payload, dict):
-        payload = copy.deepcopy(payload)
-        payload["cached"] = False
-        _KOMETA_UPDATE_CACHE[key] = {
-            "created_at": time.monotonic(),
-            "payload": copy.deepcopy(payload),
-        }
-        return payload
-    return {
-        "local_version": local_version,
-        "local_sha": local_sha,
-        "local_branch": local_branch,
-        "remote_version": None,
-        "remote_sha": None,
-        "branch": branch,
-        "update_available": False,
-        "cached": False,
-    }
-
-
-def _managed_kometa_root_default() -> Path:
-    return Path(os.path.join(CONFIG_DIR, "kometa")).resolve()
-
-
-def _get_persisted_kometa_runtime_section() -> dict:
-    try:
-        settings = persistence.retrieve_settings("900-kometa") or {}
-    except Exception:
-        return {}
-    section = settings.get("kometa", {}) if isinstance(settings, dict) else {}
-    return section if isinstance(section, dict) else {}
-
-
-def get_kometa_install_mode() -> str:
-    mode = None
-    if has_app_context():
-        mode = app.config.get("KOMETA_INSTALL_MODE")
-    if not mode and has_request_context():
-        mode = session.get("kometa_install_mode")
-    if not mode and has_request_context():
-        mode = _get_persisted_kometa_runtime_section().get("install_mode")
-    normalized = str(mode or "").strip().lower()
-    if normalized in {"existing", "external"}:
-        return normalized
-    return "managed"
-
-
-def get_kometa_install_mode_label(mode=None) -> str:
-    normalized = str(mode or get_kometa_install_mode()).strip().lower()
-    if normalized == "existing":
-        return "Existing direct install"
-    if normalized == "external":
-        return "External/containerized config+logs"
-    return "Quickstart-managed install"
-
-
-def invalidate_cached_kometa_update(kometa_root=None):
-    if kometa_root is None:
-        _KOMETA_UPDATE_CACHE.clear()
-        return
-    try:
-        target_root = str(Path(kometa_root).resolve())
-    except Exception:
-        target_root = str(kometa_root or "")
-    for key in list(_KOMETA_UPDATE_CACHE.keys()):
-        if key[0] == target_root:
-            _KOMETA_UPDATE_CACHE.pop(key, None)
-
-
-def _imagemaid_update_cache_key(imagemaid_root, branch, local_version=None, local_sha=None, local_branch=None):
-    try:
-        root = str(Path(imagemaid_root).resolve())
-    except Exception:
-        root = str(imagemaid_root or "")
-    return root, str(branch or "").strip(), str(local_version or "").strip(), str(local_sha or "").strip(), str(local_branch or "").strip()
-
-
-def normalize_imagemaid_branch_override(value):
-    branch = str(value or "").strip().lower()
-    return branch if branch in IMAGEMAID_BRANCH_OVERRIDES else ""
-
-
-def resolve_imagemaid_update_branch(branch_override=None):
-    branch = normalize_imagemaid_branch_override(branch_override)
-    if branch:
-        return branch
-    from modules.helpers._git import detect_git_branch
-
-    qs_branch = detect_git_branch(get_app_root())
-    return "master" if qs_branch == "master" else "develop"
-
-
-def get_cached_imagemaid_update(imagemaid_root=None, force_refresh=False, branch_override=None):
-    branch = resolve_imagemaid_update_branch(branch_override)
-    local_version = get_imagemaid_local_version(imagemaid_root)
-    local_sha = get_imagemaid_local_sha(imagemaid_root)
-    local_branch = get_imagemaid_local_branch(imagemaid_root)
-    key = _imagemaid_update_cache_key(imagemaid_root or ".", branch, local_version=local_version, local_sha=local_sha, local_branch=local_branch)
-
-    if not force_refresh:
-        entry = _IMAGEMAID_UPDATE_CACHE.get(key)
-        if entry:
-            age = time.monotonic() - entry.get("created_at", 0)
-            if age <= IMAGEMAID_UPDATE_CACHE_TTL_SECONDS:
-                payload = copy.deepcopy(entry.get("payload") or {})
-                payload["cached"] = True
-                return payload
-            _IMAGEMAID_UPDATE_CACHE.pop(key, None)
-
-    payload = check_imagemaid_update(imagemaid_root, branch_override=branch_override)
-    if isinstance(payload, dict):
-        payload = copy.deepcopy(payload)
-        payload["cached"] = False
-        _IMAGEMAID_UPDATE_CACHE[key] = {
-            "created_at": time.monotonic(),
-            "payload": copy.deepcopy(payload),
-        }
-        return payload
-    return {
-        "local_version": local_version,
-        "local_sha": local_sha,
-        "local_branch": local_branch,
-        "remote_version": None,
-        "remote_sha": None,
-        "branch": branch,
-        "update_available": False,
-        "cached": False,
-    }
-
-
-def invalidate_cached_imagemaid_update(imagemaid_root=None):
-    if imagemaid_root is None:
-        _IMAGEMAID_UPDATE_CACHE.clear()
-        return
-    try:
-        target_root = str(Path(imagemaid_root).resolve())
-    except Exception:
-        target_root = str(imagemaid_root or "")
-    for key in list(_IMAGEMAID_UPDATE_CACHE.keys()):
-        if key[0] == target_root:
-            _IMAGEMAID_UPDATE_CACHE.pop(key, None)
-
-
-def calculate_hash(content):
-    """Compute the SHA256 hash of the given content."""
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-
-def _schema_files_present():
-    return all(os.path.exists(os.path.join(JSON_SCHEMA_DIR, filename)) for filename, _remote_path in JSON_SCHEMA_SYNC_FILES)
-
-
-def load_previous_hashes():
-    """Load the last known hashes of schema files."""
-    if not os.path.exists(HASH_FILE):
-        return {}
-
-    hashes = {}
-    with open(HASH_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            filename, file_hash = line.strip().split(":", 1)
-            hashes[filename] = file_hash
-    return hashes
-
-
-def save_hashes(hashes):
-    """Save updated hashes to the hash file."""
-    with open(HASH_FILE, "w", encoding="utf-8") as f:
-        for filename, file_hash in hashes.items():
-            f.write(f"{filename}:{file_hash}\n")
-
-
 def ensure_json_schema():
     """Ensure json-schema files exist and are up-to-date based on hash checks."""
+    from modules.helpers._schema import _schema_files_present, calculate_hash, load_previous_hashes, save_hashes
+
     global _JSON_SCHEMA_LAST_REFRESH_AT
 
     # branch = get_kometa_branch()
@@ -364,107 +154,6 @@ def ensure_json_schema():
     save_hashes(new_hashes)
     if _schema_files_present():
         _JSON_SCHEMA_LAST_REFRESH_AT = time.monotonic()
-
-
-def get_remote_version(branch):
-    """Fetch the latest VERSION file from the correct GitHub branch."""
-    try:
-        response = requests.get(
-            f"https://raw.githubusercontent.com/Kometa-Team/Quickstart/{branch}/VERSION",
-            timeout=5,
-        )
-        response.raise_for_status()
-        version = response.text.strip()
-    except requests.RequestException:
-        return None  # If request fails, return None
-    try:
-        response = requests.get(
-            f"https://raw.githubusercontent.com/Kometa-Team/Quickstart/{branch}/BUILDNUM",
-            timeout=5,
-        )
-        response.raise_for_status()
-        build_num = response.text.strip()
-    except requests.RequestException:
-        build_num = "0"
-    return version if branch == "master" else f"{version}-build{build_num}"
-
-
-def get_branch():
-    """Determine the current branch with Docker support."""
-    # If running in Docker, use the environment variable
-    if os.getenv("QUICKSTART_DOCKER", "False").lower() in ["true", "1"]:
-        return os.getenv("BRANCH_NAME", "master")  # Use environment variable
-
-    # Otherwise, try GitPython (if available)
-    if Repo:
-        try:
-            return Repo(path=".").head.ref.name  # noqa
-        except Exception:  # noqa
-            pass  # Ignore errors if GitPython fails
-
-    # Fallback: Use BRANCH_NAME from the environment (for non-Docker cases)
-    return os.getenv("BRANCH_NAME", "master")
-
-
-def get_kometa_branch():
-    """Fetch the correct branch (master or nightly)."""
-    version_info = check_for_update()
-    return version_info.get("kometa_branch", "nightly")  # Default to nightly branch
-
-
-def get_version(branch):
-    """Read the local VERSION file"""
-    if os.path.exists(VERSION_FILE):
-        with open(VERSION_FILE, "r", encoding="utf-8") as f:
-            version = f.read().strip()
-            if branch == "master":
-                return version
-            build_num = "0"
-            if os.path.exists(BUILDNUM_FILE):
-                with open(BUILDNUM_FILE, "r", encoding="utf-8") as g:
-                    build_num = g.read().strip()
-            return f"{version}-build{build_num}"
-    return "unknown"
-
-
-def check_for_update():
-    """Compare the local version with the remote version and determine Kometa branch."""
-    branch = get_branch()
-    local_version = get_version(branch)
-    cache_key = (branch, local_version)
-    cached = _QS_UPDATE_CACHE.get(cache_key)
-    if cached:
-        age = time.monotonic() - cached.get("created_at", 0)
-        if age <= QS_UPDATE_CACHE_TTL_SECONDS:
-            return copy.deepcopy(cached.get("payload") or {})
-
-    remote_version = get_remote_version(branch)
-
-    update_available = remote_version and remote_version != local_version
-
-    # Determine Kometa branch
-    # kometa_branch = "master" if branch == "master" else "nightly"
-    kometa_branch = "nightly"
-
-    # Get OS name and correct extension
-    from modules.helpers._os import get_running_os
-
-    os_name, os_ext = get_running_os()
-
-    payload = {
-        "local_version": local_version,
-        "remote_version": remote_version,
-        "branch": branch,
-        "kometa_branch": kometa_branch,
-        "update_available": update_available,
-        "running_on": os_name,
-        "file_ext": os_ext,
-    }
-    _QS_UPDATE_CACHE[cache_key] = {
-        "created_at": time.monotonic(),
-        "payload": copy.deepcopy(payload),
-    }
-    return payload
 
 
 def get_top_imdb_items(library_id, media_type, placeholder_id=None):
@@ -600,10 +289,6 @@ def find_item_by_imdb_id(library_name, imdb_id, media_type, fallback_title=None)
                 return build_match(item, "plex-title")
 
     return None
-
-
-def allowed_extensions_string():
-    return ", ".join(sorted(ALLOWED_EXTENSIONS))
 
 
 def get_plex_summary():
@@ -959,162 +644,6 @@ def save_to_named_config(yaml_text, config_name, font_refs=None):
     return latest_path.name
 
 
-def get_kometa_remote_version(branch="nightly"):
-    url = f"https://raw.githubusercontent.com/Kometa-Team/Kometa/{branch}/VERSION"
-    try:
-        response = requests.get(url, timeout=5)
-        response.raise_for_status()
-        return response.text.strip()
-    except requests.RequestException:
-        return None
-
-
-def get_kometa_local_version(kometa_root=None):
-    if kometa_root is None:
-        kometa_root = Path(app.config.get("KOMETA_ROOT", "."))
-    else:
-        kometa_root = Path(kometa_root)
-
-    version_path = kometa_root / "VERSION"
-    if version_path.exists():
-        return version_path.read_text(encoding="utf-8").strip()
-    return "unknown"
-
-
-def get_kometa_local_sha(kometa_root=None):
-    if kometa_root is None:
-        kometa_root = Path(app.config.get("KOMETA_ROOT", "."))
-    else:
-        kometa_root = Path(kometa_root)
-
-    return _read_text(kometa_root / ".kometa_sha")
-
-
-def get_kometa_local_branch(kometa_root=None):
-    if kometa_root is None:
-        kometa_root = Path(app.config.get("KOMETA_ROOT", "."))
-    else:
-        kometa_root = Path(kometa_root)
-
-    return normalize_kometa_branch_override(_read_text(kometa_root / ".kometa_branch"))
-
-
-def get_kometa_remote_sha(branch="nightly"):
-    return _get_upstream_sha(branch, [])
-
-
-def get_imagemaid_root_path() -> Path:
-    base = None
-    if has_app_context():
-        base = app.config.get("IMAGEMAID_ROOT")
-    if not base and has_request_context():
-        base = session.get("imagemaid_root")
-    if not base:
-        base = os.path.join(CONFIG_DIR, "imagemaid")
-    return Path(os.path.normpath(base)).resolve()
-
-
-def get_imagemaid_local_sha(imagemaid_root=None):
-    if imagemaid_root is None:
-        imagemaid_root = get_imagemaid_root_path()
-    else:
-        imagemaid_root = Path(imagemaid_root)
-    return _read_text(imagemaid_root / ".imagemaid_sha")
-
-
-def get_imagemaid_local_version(imagemaid_root=None):
-    if imagemaid_root is None:
-        imagemaid_root = get_imagemaid_root_path()
-    else:
-        imagemaid_root = Path(imagemaid_root)
-    version_path = imagemaid_root / "VERSION"
-    if version_path.exists():
-        return version_path.read_text(encoding="utf-8").strip()
-    return "unknown"
-
-
-def get_imagemaid_local_branch(imagemaid_root=None):
-    if imagemaid_root is None:
-        imagemaid_root = get_imagemaid_root_path()
-    else:
-        imagemaid_root = Path(imagemaid_root)
-    return normalize_imagemaid_branch_override(_read_text(imagemaid_root / ".imagemaid_branch"))
-
-
-def get_imagemaid_remote_sha(branch="develop"):
-    return _get_upstream_sha(branch, [], api_url_template=IMAGEMAID_GITHUB_API_BRANCH, label="ImageMaid")
-
-
-def get_imagemaid_remote_version(branch="develop"):
-    url = f"{IMAGEMAID_GITHUB_BASE_URL}/{branch}/VERSION"
-    try:
-        response = requests.get(url, timeout=5)
-        response.raise_for_status()
-        return response.text.strip()
-    except requests.RequestException:
-        return None
-
-
-def check_imagemaid_update(imagemaid_root=None, branch_override=None):
-    branch = resolve_imagemaid_update_branch(branch_override)
-    local_version = get_imagemaid_local_version(imagemaid_root)
-    local_sha = get_imagemaid_local_sha(imagemaid_root)
-    local_branch = get_imagemaid_local_branch(imagemaid_root)
-    remote_version = get_imagemaid_remote_version(branch)
-    remote_sha = get_imagemaid_remote_sha(branch)
-    branch_mismatch = bool(local_branch and local_branch != branch)
-
-    if local_sha and remote_sha:
-        update_available = branch_mismatch or (local_sha != remote_sha)
-        comparison_basis = "sha"
-    else:
-        update_available = branch_mismatch or bool(remote_version and remote_version != local_version)
-        comparison_basis = "version"
-
-    return {
-        "local_version": local_version,
-        "local_sha": local_sha,
-        "local_branch": local_branch,
-        "remote_version": remote_version,
-        "remote_sha": remote_sha,
-        "branch": branch,
-        "branch_mismatch": branch_mismatch,
-        "comparison_basis": comparison_basis,
-        "update_available": update_available,
-    }
-
-
-def check_kometa_update(kometa_root=None, branch_override=None):
-    branch = resolve_kometa_update_branch(branch_override)
-    local_version = get_kometa_local_version(kometa_root)
-    local_sha = get_kometa_local_sha(kometa_root)
-    local_branch = get_kometa_local_branch(kometa_root)
-    remote_version = get_kometa_remote_version(branch)
-    remote_sha = get_kometa_remote_sha(branch)
-    branch_mismatch = bool(local_branch and local_branch != branch)
-
-    if local_sha and remote_sha:
-        update_available = local_sha != remote_sha
-        comparison_basis = "sha"
-    else:
-        update_available = bool(remote_version and remote_version != local_version)
-        comparison_basis = "version"
-        if branch_mismatch:
-            update_available = True
-
-    return {
-        "local_version": local_version,
-        "local_sha": local_sha,
-        "local_branch": local_branch,
-        "remote_version": remote_version,
-        "remote_sha": remote_sha,
-        "branch": branch,
-        "branch_mismatch": branch_mismatch,
-        "comparison_basis": comparison_basis,
-        "update_available": update_available,
-    }
-
-
 def perform_kometa_update(kometa_root, branch="master"):
     """
     QS 'master'  -> Kometa 'master'
@@ -1253,11 +782,6 @@ def perform_kometa_update(kometa_root, branch="master"):
         return {"success": False, "log": logs}
 
 
-def get_app_root():
-    # Go up one directory to reach the Quickstart root
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
 def rotate_logs():
     if not os.path.exists(LOG_FILE):
         return
@@ -1357,42 +881,6 @@ def ts_log(*args, level="INFO"):
             f.write(line_file + "\n")
     except Exception:
         pass
-
-
-def handle_remove_readonly(func, path, exc_info):
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
-
-
-def get_kometa_pid_file():
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    return os.path.join(CONFIG_DIR, "kometa.pid")
-
-
-def get_kometa_pid():
-    pid_file = get_kometa_pid_file()
-    if os.path.exists(pid_file):
-        try:
-            with open(pid_file, "r") as f:
-                return int(f.read().strip())
-        except Exception:
-            return None
-    return None
-
-
-def is_kometa_running():
-    pid = get_kometa_pid()
-    if not pid:
-        return False
-    try:
-        proc = psutil.Process(pid)
-        return proc.is_running() and "kometa.py" in " ".join(proc.cmdline())
-    except psutil.NoSuchProcess:
-        try:
-            os.remove(get_kometa_pid_file())
-        except Exception:
-            pass
-        return False
 
 
 def perform_quickstart_update(qs_root, branch="master"):
@@ -2014,6 +1502,8 @@ def get_kometa_root_path() -> Path:
         3) persisted existing-install override for the active config
         4) managed default under <CONFIG_DIR>/kometa
     """
+    from modules.helpers._install_mode import _managed_kometa_root_default, get_kometa_install_mode, _get_persisted_kometa_runtime_section
+
     managed_default = str(_managed_kometa_root_default())
     base = None
     install_mode = get_kometa_install_mode()
@@ -2056,6 +1546,8 @@ def get_kometa_root_path() -> Path:
 
 
 def get_kometa_config_dir() -> Path:
+    from modules.helpers._install_mode import get_kometa_install_mode, _get_persisted_kometa_runtime_section
+
     install_mode = get_kometa_install_mode()
     if install_mode != "external":
         if has_request_context():
@@ -2084,6 +1576,8 @@ def get_kometa_config_dir() -> Path:
 
 
 def get_kometa_log_dir() -> Path:
+    from modules.helpers._install_mode import get_kometa_install_mode, _get_persisted_kometa_runtime_section
+
     install_mode = get_kometa_install_mode()
     if install_mode != "external":
         if has_request_context():
@@ -2117,39 +1611,3 @@ def get_kometa_log_dir() -> Path:
     if configured:
         return Path(os.path.normpath(str(configured))).resolve()
     return get_kometa_config_dir() / "logs"
-
-
-def get_imagemaid_pid_file():
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    return os.path.join(CONFIG_DIR, "imagemaid.pid")
-
-
-def get_imagemaid_launch_log_file():
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    return os.path.join(CONFIG_DIR, "imagemaid-launch.log")
-
-
-def get_imagemaid_pid():
-    pid_file = get_imagemaid_pid_file()
-    if os.path.exists(pid_file):
-        try:
-            with open(pid_file, "r", encoding="utf-8") as f:
-                return int(f.read().strip())
-        except Exception:
-            return None
-    return None
-
-
-def is_imagemaid_running():
-    pid = get_imagemaid_pid()
-    if not pid:
-        return False
-    try:
-        proc = psutil.Process(pid)
-        return proc.is_running() and "imagemaid.py" in " ".join(proc.cmdline())
-    except psutil.NoSuchProcess:
-        try:
-            os.remove(get_imagemaid_pid_file())
-        except Exception:
-            pass
-        return False
