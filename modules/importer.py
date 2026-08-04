@@ -3,106 +3,100 @@ import re
 from typing import Any
 
 from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
 from modules import helpers
 
-SIMPLE_SECTIONS = {
-    "plex",
-    "tmdb",
-    "omdb",
-    "mdblist",
-    "tautulli",
-    "notifiarr",
-    "gotify",
-    "ntfy",
-    "apprise",
-    "github",
-    "radarr",
-    "sonarr",
-    "trakt",
-    "mal",
-    "anidb",
-    "webhooks",
-    "settings",
-    "playlist_files",
-}
-
-LIBRARY_RADARR_IMPORT_FIELDS = {
-    "url": "string",
-    "token": "string",
-    "root_folder_path": "string",
-    "quality_profile": "string",
-    "availability": "string",
-    "tag": "string",
-    "monitor": "bool",
-    "search": "bool",
-    "add_missing": "bool",
-    "add_existing": "bool",
-    "upgrade_existing": "bool",
-    "monitor_existing": "bool",
-    "ignore_cache": "bool",
-    "radarr_path": "string",
-    "plex_path": "string",
-}
-LIBRARY_SONARR_IMPORT_FIELDS = {
-    "url": "string",
-    "token": "string",
-    "root_folder_path": "string",
-    "quality_profile": "string",
-    "language_profile": "string",
-    "series_type": "string",
-    "season_folder": "bool",
-    "monitor": "string",
-    "tag": "string",
-    "search": "bool",
-    "cutoff_search": "bool",
-    "add_missing": "bool",
-    "add_existing": "bool",
-    "upgrade_existing": "bool",
-    "monitor_existing": "bool",
-    "ignore_cache": "bool",
-    "sonarr_path": "string",
-    "plex_path": "string",
-}
-PLAYLIST_SHARED_IMPORT_FIELDS = {
-    "sync_to_users": "string_list",
-    "exclude_users": "string_list",
-    "delete_playlist": "boolean",
-    "ignore_ids": "string_list",
-    "ignore_imdb_ids": "string_list",
-    "item_radarr_tag": "string_list",
-    "item_sonarr_tag": "string_list",
-    "radarr_add_missing": "boolean",
-    "radarr_folder": "string",
-    "radarr_tag": "string_list",
-    "sonarr_add_missing": "boolean",
-    "sonarr_folder": "string",
-    "sonarr_tag": "string_list",
-    "trakt_list": "string_list",
-    "imdb_list": "string_list",
-    "mdblist_list": "string_list",
-}
-PLAYLIST_KEYED_IMPORT_FIELDS = {
-    "use_": "boolean",
-    "name_": "string",
-    "summary_": "string",
-    "url_poster_": "string",
-    "delete_playlist_": "boolean",
-    "exclude_users_": "string_list",
-    "exclude_user_": "string_list",
-    "imdb_list_": "string_list",
-    "item_radarr_tag_": "string_list",
-    "item_sonarr_tag_": "string_list",
-    "mdblist_list_": "string_list",
-    "radarr_add_missing_": "boolean",
-    "radarr_folder_": "string",
-    "radarr_tag_": "string_list",
-    "sonarr_add_missing_": "boolean",
-    "sonarr_folder_": "string",
-    "sonarr_tag_": "string_list",
-    "sync_to_users_": "string_list",
-    "trakt_list_": "string_list",
-}
+# Language codes recognized as `weight_<code>` overlay-source ordering keys.
+# Hoisted out of prepare_import_payload's ~95-line nested comprehension --
+# this is data, not logic, and belongs at module scope where it's easy to
+# review and doesn't rebuild on every import call.
+LANGUAGE_WEIGHT_TEMPLATE_KEYS: frozenset[str] = frozenset(
+    f"weight_{key}"
+    for key in (
+        "en",
+        "de",
+        "fr",
+        "es",
+        "pt",
+        "ja",
+        "ko",
+        "zh",
+        "da",
+        "ru",
+        "it",
+        "hi",
+        "te",
+        "fa",
+        "th",
+        "nl",
+        "no",
+        "is",
+        "sv",
+        "tr",
+        "pl",
+        "cs",
+        "uk",
+        "hu",
+        "ar",
+        "bg",
+        "bn",
+        "bs",
+        "ca",
+        "cy",
+        "el",
+        "et",
+        "eu",
+        "fi",
+        "tl",
+        "fil",
+        "gl",
+        "he",
+        "hr",
+        "id",
+        "ka",
+        "kk",
+        "kn",
+        "la",
+        "lt",
+        "lv",
+        "mk",
+        "ml",
+        "mr",
+        "ms",
+        "nb",
+        "nn",
+        "pa",
+        "ro",
+        "sk",
+        "sl",
+        "sq",
+        "sr",
+        "so",
+        "sw",
+        "ta",
+        "ur",
+        "ay",
+        "ga",
+        "li",
+        "kh",
+        "vi",
+        "mn",
+        "af",
+        "bm",
+        "ln",
+        "wo",
+        "lo",
+        "myn",
+        "iu",
+        "rom",
+        "am",
+        "su",
+        "zu",
+        "lb",
+        "mos",
+    )
+)
 
 
 def sanitize_config_name(raw_name: str | None) -> str:
@@ -111,9 +105,52 @@ def sanitize_config_name(raw_name: str | None) -> str:
     return re.sub(r"[^a-z0-9_]", "", raw_name.strip().lower())
 
 
+def _dealias_yaml_value(value: Any, active_ids: set[int] | None = None) -> Any:
+    """Clone parsed YAML values so aliases cannot share mutable objects.
+
+    ruamel resolves anchors and merge keys for us, but plain aliases can still
+    point at the same Python dict/list.  Import normalization mutates nested
+    values in a few places, so each occurrence needs an independent object.
+    """
+    if active_ids is None:
+        active_ids = set()
+    if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in active_ids:
+            raise ValueError("Recursive YAML aliases are not supported.")
+        active_ids.add(value_id)
+        try:
+            return {_dealias_yaml_value(key, active_ids): _dealias_yaml_value(item, active_ids) for key, item in value.items()}
+        finally:
+            active_ids.remove(value_id)
+    if isinstance(value, list):
+        value_id = id(value)
+        if value_id in active_ids:
+            raise ValueError("Recursive YAML aliases are not supported.")
+        active_ids.add(value_id)
+        try:
+            return [_dealias_yaml_value(item, active_ids) for item in value]
+        finally:
+            active_ids.remove(value_id)
+    if isinstance(value, tuple):
+        value_id = id(value)
+        if value_id in active_ids:
+            raise ValueError("Recursive YAML aliases are not supported.")
+        active_ids.add(value_id)
+        try:
+            return tuple(_dealias_yaml_value(item, active_ids) for item in value)
+        finally:
+            active_ids.remove(value_id)
+    return value
+
+
 def load_yaml_config(raw_text: str) -> dict:
     yaml = YAML(typ="safe", pure=True)
-    loaded = yaml.load(raw_text)
+    try:
+        loaded = yaml.load(raw_text)
+        loaded = _dealias_yaml_value(loaded)
+    except (ValueError, YAMLError):
+        return {}
     return loaded if isinstance(loaded, dict) else {}
 
 
@@ -133,541 +170,114 @@ class ImportReport:
         return dict(self.counts)
 
 
-def _parse_report_details(report_lines: list[str]) -> tuple[dict[str, str], dict[str, str]]:
-    status_map: dict[str, str] = {}
-    reason_map: dict[str, str] = {}
-    if not report_lines:
-        return status_map, reason_map
-    for line in report_lines:
-        if not isinstance(line, str) or ":" not in line:
-            continue
-        status, rest = line.split(":", 1)
-        status = status.strip().lower()
-        if status not in {"imported", "unmapped", "skipped"}:
-            continue
-        path = rest.strip()
-        reason = ""
-        if " :: " in path:
-            path, reason = path.rsplit(" :: ", 1)
-            path = path.strip()
-            reason = reason.strip()
-        elif " - " in path and status != "imported":
-            candidate_path, candidate_reason = path.rsplit(" - ", 1)
-            if " - " not in candidate_path:
-                path = candidate_path.strip()
-                reason = candidate_reason.strip()
-        if not path:
-            continue
-        mapped = "mapped" if status == "imported" else status
-        status_map[path] = mapped
-        if reason:
-            reason_map[path] = reason
-    return status_map, reason_map
+# YAML report-annotation helpers moved to modules/importer_yaml_annotation.py.
+# Re-exported here because external callers (import_config_routes,
+# tests/test_importer_edge_cases) reach them through `importer.X`, and
+# tests/test_template_gap_analyzer monkeypatches `importer._parse_report_details`.
+from modules.importer_yaml_annotation import (  # noqa: E402
+    _append_status_annotation,  # noqa: F401 (kept for test monkeypatch surface)
+    _build_prefix_flags,  # noqa: F401 (kept for test monkeypatch surface)
+    _format_report_status,  # noqa: F401 (kept for test monkeypatch surface)
+    _lookup_report_reason,  # noqa: F401 (kept for test monkeypatch surface)
+    _parse_mapping_key,  # noqa: F401 (kept for test monkeypatch surface)
+    _parse_report_details,  # noqa: F401 (monkeypatched by tests/test_template_gap_analyzer)
+    _parse_report_statuses,  # noqa: F401 (kept for test monkeypatch surface)
+    _split_inline_comment,  # noqa: F401 (kept for test monkeypatch surface)
+    _status_from_flags,  # noqa: F401 (kept for test monkeypatch surface)
+    annotate_yaml_with_report,  # noqa: F401 (public API, called as importer.annotate_yaml_with_report)
+)
 
+# Library-type inference + collection/overlay index builders moved to
+# modules/importer_library_types.py.  Re-exported here because
+# blueprints/import_config_routes.py calls `importer.build_library_type_plan`
+# and the mega prepare_import_payload (which stayed in this module)
+# still calls `_build_collection_index` / `_build_overlay_index`.
+from modules.importer_library_types import (  # noqa: E402
+    _build_collection_index,  # noqa: F401 (used below by prepare_import_payload)
+    _build_overlay_index,  # noqa: F401 (used below by prepare_import_payload)
+    _normalize_library_type,  # noqa: F401 (kept accessible via importer._normalize_library_type)
+    _resolve_collection_id,  # noqa: F401 (kept accessible via importer._resolve_collection_id)
+    _resolve_overlay_id,  # noqa: F401 (kept accessible via importer._resolve_overlay_id)
+    build_library_type_plan,  # noqa: F401 (public API, called as importer.build_library_type_plan)
+    infer_library_types,  # noqa: F401 (public API, called as importer.infer_library_types)
+    normalize_library_type,  # noqa: F401 (public API, called as importer.normalize_library_type)
+)
 
-def _parse_report_statuses(report_lines: list[str]) -> dict[str, str]:
-    status_map, _ = _parse_report_details(report_lines)
-    return status_map
+# Value-coercion and serialization helpers moved to
+# modules/importer_value_coercion.py.  Re-exported here because
+# prepare_import_payload (which stayed in this module) calls all of them,
+# and tests/test_importer_edge_cases monkeypatches importer._coerce_import_bool.
+from modules.importer_value_coercion import (  # noqa: E402
+    _coerce_import_bool,  # noqa: F401 (regression-guarded by tests/test_importer_edge_cases)
+    _coerce_import_bool_text,  # noqa: F401 (kept accessible via importer._coerce_import_bool_text)
+    _coerce_import_int,  # noqa: F401 (kept accessible via importer._coerce_import_int)
+    _coerce_import_string_list,  # noqa: F401 (kept accessible via importer._coerce_import_string_list)
+    _collect_dynamic_child_field_specs,  # noqa: F401 (kept accessible via importer._collect_dynamic_child_field_specs)
+    _collect_overlay_source_override_keys,  # noqa: F401 (kept accessible via importer._collect_overlay_source_override_keys)
+    _collect_template_keys,  # noqa: F401 (kept accessible via importer._collect_template_keys)
+    _has_template_string_list_values,  # noqa: F401 (kept accessible via importer._has_template_string_list_values)
+    _serialize_dynamic_child_mapping_value,  # noqa: F401 (kept accessible via importer._serialize_dynamic_child_mapping_value)
+    _serialize_playlist_import_value,  # noqa: F401 (kept accessible via importer._serialize_playlist_import_value)
+)
 
+# Library-operation dispatch handlers moved to modules/importer_operations.py.
+# Imported as a module (not name-by-name) because the call sites inside
+# prepare_import_payload pass kwargs and the `importer_operations.` prefix
+# makes it obvious these are the operation-handler cluster.
+from modules import importer_operations  # noqa: E402
 
-def _lookup_report_reason(reason_map: dict[str, str], status_path: str | None) -> str | None:
-    if not status_path:
-        return None
-    if status_path in reason_map:
-        return reason_map[status_path]
-    if "[" in status_path:
-        normalized = re.sub(r"\[\d+\]", "", status_path)
-        if normalized in reason_map:
-            return reason_map[normalized]
-    if status_path.endswith(".default"):
-        alt = status_path[: -len(".default")]
-        if alt in reason_map:
-            return reason_map[alt]
-    parts = status_path.split(".")
-    for idx in range(len(parts) - 1, 0, -1):
-        prefix = ".".join(parts[:idx])
-        if prefix in reason_map:
-            return reason_map[prefix]
-    return None
+# Playlist section parser moved to modules/importer_playlists.py.
+# Both PLAYLIST_*_IMPORT_FIELDS constants are re-exported here because:
+#   * scripts/analyze_uploaded_template_gaps.py reads them as
+#     importer.PLAYLIST_SHARED_IMPORT_FIELDS / importer.PLAYLIST_KEYED_IMPORT_FIELDS
+#     (guarded by tests/test_template_gap_analyzer)
+#   * The libraries block downstream still uses PLAYLIST_SHARED_IMPORT_FIELDS
+#     for one type-check on playlist template values.
+from modules import importer_playlists  # noqa: E402
+from modules.importer_playlists import (  # noqa: E402
+    PLAYLIST_KEYED_IMPORT_FIELDS,  # noqa: F401 (scripts/analyze_uploaded_template_gaps.py)
+    PLAYLIST_SHARED_IMPORT_FIELDS,  # noqa: F401 (used by libraries block below + scripts)
+)
 
+# Top-level "simple section" handling (apprise, plex, tmdb, ...) moved to
+# modules/importer_simple_sections.py.  SIMPLE_SECTIONS is re-imported here
+# because the end-of-function unknown-key sweep still uses it to decide
+# which config keys count as "handled" vs. "not supported".
+from modules import importer_simple_sections  # noqa: E402
+from modules.importer_simple_sections import (  # noqa: E402
+    SIMPLE_SECTIONS,  # noqa: F401 (used by tail unknown-key sweep in prepare_import_payload)
+)
 
-def _format_report_status(status: str | None, reason: str | None) -> str | None:
-    if not status:
-        return None
-    if reason:
-        return f"{status} - {reason}"
-    return status
+# Per-library collection_files handling moved to modules/importer_collections.py.
+# Imported as a module (not name-by-name) because the call site inside
+# prepare_import_payload passes kwargs and the `importer_collections.` prefix
+# makes it obvious this is the collection-processing pipeline.
+from modules import importer_collections  # noqa: E402
 
+# Per-library overlay_files handling moved to modules/importer_overlays.py.
+# Same import pattern as importer_collections -- module-level import so the
+# call site inside prepare_import_payload reads as importer_overlays.process_*.
+from modules import importer_overlays  # noqa: E402
 
-def _build_prefix_flags(status_map: dict[str, str]) -> dict[str, dict[str, bool]]:
-    prefix_map: dict[str, dict[str, bool]] = {}
-    for path, status in status_map.items():
-        parts = path.split(".")
-        for idx in range(1, len(parts) + 1):
-            prefix = ".".join(parts[:idx])
-            flags = prefix_map.setdefault(prefix, {"mapped": False, "unmapped": False, "skipped": False})
-            if status in flags:
-                flags[status] = True
-            if "[" in prefix:
-                normalized = re.sub(r"\[\d+\]", "", prefix)
-                if normalized and normalized != prefix:
-                    norm_flags = prefix_map.setdefault(normalized, {"mapped": False, "unmapped": False, "skipped": False})
-                    if status in norm_flags:
-                        norm_flags[status] = True
-    return prefix_map
+# Per-library metadata_files handling moved to modules/importer_metadata.py.
+# Same module-level import pattern as importer_collections.
+from modules import importer_metadata  # noqa: E402
 
+# Per-library settings block handling moved to modules/importer_library_settings.py.
+# Handles asset_directory (list/multiline-string -> stripped list) and
+# prioritize_assets (restricted bool coercion) -- everything else in
+# settings: is currently marked unmapped.
+from modules import importer_library_settings  # noqa: E402
 
-def _status_from_flags(flags: dict[str, bool] | None) -> str | None:
-    if not flags:
-        return None
-    mapped = flags.get("mapped")
-    unmapped = flags.get("unmapped")
-    skipped = flags.get("skipped")
-    if mapped and (unmapped or skipped):
-        return "partial"
-    if mapped:
-        return "mapped"
-    if unmapped:
-        return "unmapped"
-    if skipped:
-        return "skipped"
-    return None
-
-
-def _split_inline_comment(text: str) -> tuple[str, str]:
-    in_single = False
-    in_double = False
-    for idx, char in enumerate(text):
-        if char == "'" and not in_double:
-            in_single = not in_single
-        elif char == '"' and not in_single:
-            in_double = not in_double
-        elif char == "#" and not in_single and not in_double:
-            return text[:idx], text[idx:]
-    return text, ""
-
-
-def _parse_mapping_key(text: str) -> tuple[str | None, str | None]:
-    if ":" not in text:
-        return None, None
-    key, rest = text.split(":", 1)
-    # Treat as mapping only when ":" is followed by space or end-of-line.
-    # This avoids misclassifying plain strings like "C:\Path" or "http://".
-    if rest and not rest.startswith(" "):
-        return None, None
-    key = key.strip()
-    if not key:
-        return None, None
-    if key[0] in {"'", '"'} and key[-1:] == key[:1]:
-        key = key[1:-1]
-    return key, rest
-
-
-def _append_status_annotation(line: str, status: str | None) -> str:
-    if not status:
-        return line
-    if "#" in line:
-        return f"{line} | {status}"
-    return f"{line}  # {status}"
-
-
-def annotate_yaml_with_report(raw_text: str, report_lines: list[str], binary: bool = False) -> str:
-    if not raw_text:
-        return ""
-    status_map, reason_map = _parse_report_details(report_lines)
-    if binary:
-        imported_only = {path: status for path, status in status_map.items() if status == "mapped"}
-        prefix_map = _build_prefix_flags(imported_only)
-    else:
-        prefix_map = _build_prefix_flags(status_map)
-    if not prefix_map and not binary:
-        return raw_text
-
-    lines = raw_text.splitlines()
-    annotated: list[str] = []
-    stack: list[dict[str, str | int]] = []
-    list_counters: dict[tuple[str, int], int] = {}
-    prev_indent = 0
-    block_scalar_indent: int | None = None
-
-    for line in lines:
-        stripped = line.lstrip(" ")
-        indent = len(line) - len(stripped)
-
-        if block_scalar_indent is not None:
-            if not stripped or indent > block_scalar_indent:
-                annotated.append(line)
-                continue
-            block_scalar_indent = None
-
-        if not stripped or stripped.startswith("#"):
-            annotated.append(line)
-            continue
-
-        if indent < prev_indent:
-            list_counters = {k: v for k, v in list_counters.items() if k[1] < indent}
-        prev_indent = indent
-
-        content, _ = _split_inline_comment(stripped)
-        content = content.rstrip()
-        if not content:
-            annotated.append(line)
-            continue
-
-        is_list_line = content.startswith("-")
-        while stack:
-            top = stack[-1]
-            top_indent = top["indent"]
-            top_path = str(top.get("path", ""))
-            if indent < top_indent:
-                stack.pop()
-                continue
-            if is_list_line and indent == top_indent and "[" in top_path:
-                stack.pop()
-                continue
-            if not is_list_line and indent <= top_indent:
-                stack.pop()
-                continue
-            break
-
-        line_path = None
-
-        if content.startswith("-"):
-            item_content = content[1:].lstrip()
-            parent_path = stack[-1]["path"] if stack else ""
-            list_id = (str(parent_path), indent)
-            index = list_counters.get(list_id, -1) + 1
-            list_counters[list_id] = index
-            list_path = f"{parent_path}[{index}]" if parent_path else f"[{index}]"
-            stack.append({"indent": indent, "path": list_path})
-
-            if item_content:
-                item_content, _ = _split_inline_comment(item_content)
-                key, rest = _parse_mapping_key(item_content)
-                if key:
-                    line_path = f"{list_path}.{key}" if list_path else key
-                    rest = rest or ""
-                    rest_text = rest.strip()
-                    if rest_text == "":
-                        stack.append({"indent": indent, "path": line_path})
-                    elif rest_text.startswith(("|", ">")):
-                        block_scalar_indent = indent
-                else:
-                    line_path = list_path
-            else:
-                line_path = list_path
-        else:
-            key, rest = _parse_mapping_key(content)
-            if key:
-                parent_path = stack[-1]["path"] if stack else ""
-                line_path = f"{parent_path}.{key}" if parent_path else key
-                rest_text = (rest or "").strip()
-                if rest_text == "":
-                    stack.append({"indent": indent, "path": line_path})
-                elif rest_text.startswith(("|", ">")):
-                    block_scalar_indent = indent
-
-        status_path = line_path
-        if status_path and status_path not in prefix_map and f"{status_path}.default" in prefix_map:
-            status_path = f"{status_path}.default"
-        flags = prefix_map.get(status_path) if status_path else None
-        if not flags and status_path and "[" in status_path:
-            normalized_path = re.sub(r"\[\d+\]", "", status_path)
-            flags = prefix_map.get(normalized_path)
-        if binary and status_path:
-            status = "imported" if flags and flags.get("mapped") else "not imported"
-            reason = _lookup_report_reason(reason_map, status_path) if status == "not imported" else None
-            if status == "not imported" and not reason:
-                reason = "No matching Quickstart mapping"
-            status_text = _format_report_status(status, reason)
-        else:
-            status = _status_from_flags(flags)
-            reason = _lookup_report_reason(reason_map, status_path) if status and status != "imported" else None
-            status_text = _format_report_status(status, reason)
-        annotated.append(_append_status_annotation(line, status_text))
-
-    return "\n".join(annotated)
-
-
-def _collect_template_keys(template_vars: Any) -> set[str]:
-    keys = set()
-    if isinstance(template_vars, dict):
-        keys.update(str(k) for k in template_vars.keys())
-    elif isinstance(template_vars, list):
-        for item in template_vars:
-            if isinstance(item, dict):
-                key = item.get("key")
-                if key:
-                    keys.add(str(key))
-    return keys
-
-
-def _collect_dynamic_child_field_specs(template_vars: Any) -> list[dict[str, str]]:
-    specs: list[dict[str, str]] = []
-    if not isinstance(template_vars, list):
-        return specs
-
-    for item in template_vars:
-        if not isinstance(item, dict):
-            continue
-        field_key = str(item.get("key") or "").strip()
-        child_prefix = str(item.get("dynamic_child_prefix") or "").strip()
-        if not field_key or not child_prefix:
-            continue
-        specs.append(
-            {
-                "field_key": field_key,
-                "child_prefix": child_prefix,
-                "value_kind": str(item.get("dynamic_child_value_kind") or "string").strip().lower(),
-            }
-        )
-    return specs
-
-
-def _coerce_import_bool(value: Any) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"true", "yes", "1"}:
-            return True
-        if lowered in {"false", "no", "0"}:
-            return False
-    return None
-
-
-def _coerce_import_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
-        return int(value.strip())
-    return None
-
-
-def _coerce_import_string_list(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    text = str(value or "").strip()
-    if not text:
-        return []
-    return [item.strip() for item in text.split(",") if item.strip()]
-
-
-def _serialize_playlist_import_value(value_kind: str, value: Any) -> Any:
-    kind = str(value_kind or "string").strip().lower()
-    if kind == "boolean":
-        bool_value = _coerce_import_bool(value)
-        return None if bool_value is None else ("true" if bool_value else "false")
-    if kind == "integer":
-        int_value = _coerce_import_int(value)
-        return None if int_value is None else str(int_value)
-    if kind == "string_list":
-        values = _coerce_import_string_list(value)
-        return values if values else None
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _collect_overlay_source_override_keys(overlay_meta: Any) -> set[str]:
-    if not isinstance(overlay_meta, dict):
-        return set()
-
-    config = overlay_meta.get("source_overrides")
-    if not isinstance(config, dict):
-        return set()
-
-    raw_types = config.get("source_types")
-    if isinstance(raw_types, list):
-        source_types = [str(item).strip() for item in raw_types if str(item).strip()]
-    else:
-        source_types = ["file", "url", "git", "repo"]
-
-    allowed = set(source_types)
-    key_mode = str(config.get("key_mode") or "").strip().lower()
-    if key_mode == "from_select_options":
-        key_fields = {str(item).strip() for item in (config.get("key_fields") or []) if str(item).strip()}
-        template_variables = overlay_meta.get("template_variables")
-        if isinstance(template_variables, dict):
-            for field_key in key_fields:
-                field_meta = template_variables.get(field_key)
-                if not isinstance(field_meta, dict):
-                    continue
-                options = field_meta.get("options")
-                if not isinstance(options, list):
-                    continue
-                for option in options:
-                    if isinstance(option, dict):
-                        option_value = str(option.get("value") or "").strip()
-                    else:
-                        option_value = str(option).strip()
-                    if not option_value:
-                        continue
-                    for source_type in source_types:
-                        allowed.add(f"{source_type}_{option_value}")
-        return allowed
-
-    if key_mode != "from_use_toggles":
-        return allowed
-
-    excluded_toggle_keys = {str(item).strip() for item in (config.get("exclude_toggle_keys") or []) if str(item).strip()}
-    template_keys = _collect_template_keys(overlay_meta.get("template_variables"))
-    for template_key in template_keys:
-        if not template_key.startswith("use_") or template_key in excluded_toggle_keys:
-            continue
-        child_key = template_key[4:]
-        if not child_key:
-            continue
-        for source_type in source_types:
-            allowed.add(f"{source_type}_{child_key}")
-
-    return allowed
-
-
-def _coerce_import_bool_text(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    lowered = str(value or "").strip().lower()
-    if lowered in {"true", "1", "yes", "on"}:
-        return "true"
-    if lowered in {"false", "0", "no", "off"}:
-        return "false"
-    return str(value or "").strip()
-
-
-def _serialize_dynamic_child_mapping_value(value: Any, value_kind: str) -> str:
-    kind = str(value_kind or "string").strip().lower()
-    if kind == "string_list":
-        if isinstance(value, list):
-            return ",".join(str(item).strip() for item in value if str(item).strip())
-        return str(value or "").strip()
-    if kind == "boolean":
-        return _coerce_import_bool_text(value)
-    return str(value or "").strip()
-
-
-def _has_template_string_list_values(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, list):
-        return any(str(item).strip() for item in value if item is not None)
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return False
-        try:
-            parsed = json.loads(stripped)
-        except Exception:
-            parsed = None
-        if isinstance(parsed, list):
-            return any(str(item).strip() for item in parsed if item is not None)
-        return True
-    return bool(value)
-
-
-def _build_collection_index(collection_config: list[dict]) -> tuple[dict[str, dict], dict[str, str]]:
-    by_id: dict[str, dict] = {}
-    by_alias: dict[str, str] = {}
-    for group in collection_config or []:
-        for collection in group.get("collections", []) if isinstance(group, dict) else []:
-            cid = collection.get("id")
-            if not cid:
-                continue
-            if cid in by_id:
-                existing = by_id[cid]
-                if isinstance(existing, dict):
-                    existing_media = existing.get("media_types")
-                    new_media = collection.get("media_types")
-                    if isinstance(existing_media, list) or isinstance(new_media, list):
-                        merged_media = []
-                        for entry in existing_media or []:
-                            if entry not in merged_media:
-                                merged_media.append(entry)
-                        for entry in new_media or []:
-                            if entry not in merged_media:
-                                merged_media.append(entry)
-                        existing["media_types"] = merged_media
-
-                    existing_templates = existing.get("template_variables")
-                    new_templates = collection.get("template_variables")
-                    if isinstance(existing_templates, list) and isinstance(new_templates, list):
-                        seen_keys = {str(item.get("key")) for item in existing_templates if isinstance(item, dict) and item.get("key")}
-                        for item in new_templates:
-                            if not isinstance(item, dict):
-                                continue
-                            key = str(item.get("key") or "").strip()
-                            if key and key in seen_keys:
-                                continue
-                            existing_templates.append(item)
-                            if key:
-                                seen_keys.add(key)
-                    elif existing.get("template_variables") in (None, [], {}):
-                        existing["template_variables"] = new_templates
-                alias = cid.replace("collection_", "", 1)
-                by_alias[alias] = cid
-                continue
-
-            by_id[cid] = collection
-            alias = cid.replace("collection_", "", 1)
-            by_alias[alias] = cid
-    return by_id, by_alias
-
-
-def _build_overlay_index(overlay_config: list[dict]) -> tuple[dict[str, dict], dict[str, str], dict[str, dict]]:
-    by_id: dict[str, dict] = {}
-    by_alias: dict[str, str] = {}
-    radio_map: dict[str, dict] = {}
-    for group in overlay_config or []:
-        if not isinstance(group, dict):
-            continue
-        input_type = group.get("input_type")
-        radio_group = group.get("radio_group_name")
-        for overlay in group.get("overlays", []):
-            if not isinstance(overlay, dict):
-                continue
-            oid = overlay.get("id")
-            if not oid:
-                continue
-            if oid in by_id:
-                existing = by_id[oid]
-                if isinstance(existing, dict):
-                    existing_media = existing.get("media_types")
-                    new_media = overlay.get("media_types")
-                    if isinstance(existing_media, list) or isinstance(new_media, list):
-                        merged = []
-                        for entry in existing_media or []:
-                            if entry not in merged:
-                                merged.append(entry)
-                        for entry in new_media or []:
-                            if entry not in merged:
-                                merged.append(entry)
-                        existing["media_types"] = merged
-                    existing_templates = existing.get("template_variables")
-                    new_templates = overlay.get("template_variables")
-                    if isinstance(existing_templates, dict) and isinstance(new_templates, dict):
-                        for key, value in new_templates.items():
-                            if key not in existing_templates:
-                                existing_templates[key] = value
-                    elif isinstance(new_templates, dict) and not isinstance(existing_templates, dict):
-                        existing["template_variables"] = new_templates
-            else:
-                by_id[oid] = overlay
-            alias = oid.replace("overlay_", "", 1)
-            by_alias[alias] = oid
-            if input_type == "radio" and radio_group and "value" in overlay:
-                radio_value = overlay.get("value")
-                radio_map[oid] = {
-                    "group_name": str(radio_group),
-                    "value": radio_value,
-                }
-                if isinstance(radio_value, str):
-                    radio_alias = radio_value.strip()
-                    if radio_alias:
-                        by_alias[radio_alias] = oid
-    return by_id, by_alias, radio_map
+# Per-library service-override (radarr / sonarr) handling moved to
+# modules/importer_services.py.  The two field-map dicts are the canonical
+# definitions and re-exported here so external tooling that imports them
+# by name (importer.LIBRARY_RADARR_IMPORT_FIELDS etc.) keeps working.
+from modules import importer_services  # noqa: E402
+from modules.importer_services import (  # noqa: E402
+    LIBRARY_RADARR_IMPORT_FIELDS,  # noqa: F401 (re-export for backward compat)
+    LIBRARY_SONARR_IMPORT_FIELDS,  # noqa: F401 (re-export for backward compat)
+)
 
 
 def _build_attribute_sets(
@@ -750,219 +360,6 @@ def _build_attribute_sets(
     )
 
 
-def _normalize_library_type(value: Any) -> tuple[str | None, str | None]:
-    if value is None:
-        return None, None
-    text = str(value).strip().lower()
-    if text in {"movie", "mov"}:
-        return "mov", "movie"
-    if text in {"show", "sho", "series"}:
-        return "sho", "show"
-    return None, None
-
-
-def normalize_library_type(value: Any) -> str | None:
-    _, label = _normalize_library_type(value)
-    return label
-
-
-def _resolve_collection_id(raw_default: str, collection_by_id: dict, collection_by_alias: dict) -> str | None:
-    if raw_default.startswith("collection_") and raw_default in collection_by_id:
-        return raw_default
-    return collection_by_alias.get(raw_default)
-
-
-def _resolve_overlay_id(raw_default: str, overlay_by_id: dict, overlay_by_alias: dict) -> str | None:
-    if raw_default.startswith("overlay_") and raw_default in overlay_by_id:
-        return raw_default
-    if raw_default.startswith("content_rating_"):
-        candidate = f"overlay_{raw_default}"
-        return candidate if candidate in overlay_by_id else None
-    return overlay_by_alias.get(raw_default)
-
-
-def infer_library_types(config_data: dict) -> tuple[dict[str, str], list[dict]]:
-    collection_config = helpers.load_quickstart_config("quickstart_collections.json") or []
-    overlay_config = helpers.load_quickstart_overlay_config() or []
-    collection_by_id, collection_by_alias = _build_collection_index(collection_config)
-    overlay_by_id, overlay_by_alias, _ = _build_overlay_index(overlay_config)
-
-    inferred_types: dict[str, str] = {}
-    details: list[dict] = []
-
-    libraries_payload = config_data.get("libraries")
-    if not isinstance(libraries_payload, dict):
-        return inferred_types, details
-
-    for lib_name, lib_cfg in libraries_payload.items():
-        if not isinstance(lib_cfg, dict):
-            continue
-        movie_score = 0
-        show_score = 0
-
-        collection_files = lib_cfg.get("collection_files")
-        if isinstance(collection_files, list):
-            for entry in collection_files:
-                default_value = None
-                if isinstance(entry, dict):
-                    default_value = entry.get("default")
-                elif isinstance(entry, str):
-                    default_value = entry
-                if not default_value:
-                    continue
-                raw_default = str(default_value)
-                collection_id = _resolve_collection_id(raw_default, collection_by_id, collection_by_alias)
-                if not collection_id:
-                    continue
-                media_types = collection_by_id.get(collection_id, {}).get("media_types") or []
-                is_movie = "movie" in media_types
-                is_show = "show" in media_types
-                if is_movie and not is_show:
-                    movie_score += 2
-                elif is_show and not is_movie:
-                    show_score += 2
-                elif is_movie and is_show:
-                    movie_score += 1
-                    show_score += 1
-
-        overlay_files = lib_cfg.get("overlay_files")
-        if isinstance(overlay_files, list):
-            for entry in overlay_files:
-                default_value = None
-                template_values = None
-                if isinstance(entry, dict):
-                    default_value = entry.get("default")
-                    template_values = entry.get("template_variables")
-                elif isinstance(entry, str):
-                    default_value = entry
-                if not default_value:
-                    continue
-                if isinstance(template_values, dict):
-                    builder_level = template_values.get("builder_level")
-                    if builder_level in {"show", "season", "episode"}:
-                        show_score += 2
-                    elif builder_level == "movie":
-                        movie_score += 2
-
-                raw_default = str(default_value)
-                overlay_id = _resolve_overlay_id(raw_default, overlay_by_id, overlay_by_alias)
-                if not overlay_id:
-                    continue
-                media_types = overlay_by_id.get(overlay_id, {}).get("media_types") or []
-                movie_types = "movie" in media_types
-                show_types = any(t in {"show", "season", "episode"} for t in media_types)
-                if movie_types and not show_types:
-                    movie_score += 1
-                elif show_types and not movie_types:
-                    show_score += 1
-                elif movie_types and show_types:
-                    movie_score += 1
-                    show_score += 1
-
-        inferred = None
-        if show_score > movie_score:
-            inferred = "show"
-        elif movie_score > show_score:
-            inferred = "movie"
-
-        if movie_score == 0 and show_score == 0:
-            confidence = "unknown"
-        else:
-            confidence = "high" if abs(movie_score - show_score) >= 2 else "low"
-
-        if inferred:
-            inferred_types[str(lib_name)] = inferred
-
-        details.append(
-            {
-                "name": str(lib_name),
-                "inferred_type": inferred,
-                "movie_score": movie_score,
-                "show_score": show_score,
-                "confidence": confidence,
-            }
-        )
-
-    return inferred_types, details
-
-
-def build_library_type_plan(
-    config_data: dict,
-    plex_movie_names: set[str],
-    plex_show_names: set[str],
-) -> tuple[dict[str, str], list[dict], bool]:
-    inferred_types, details = infer_library_types(config_data)
-    detail_map = {d.get("name"): d for d in details}
-    library_types: dict[str, str] = {}
-    inference_list: list[dict] = []
-    libraries_payload = config_data.get("libraries")
-    if not isinstance(libraries_payload, dict):
-        return library_types, inference_list, False
-
-    for lib_name in libraries_payload.keys():
-        name = str(lib_name)
-        if name in plex_movie_names:
-            inferred_type = "movie"
-            source = "plex"
-            confidence = "confirmed"
-        elif name in plex_show_names:
-            inferred_type = "show"
-            source = "plex"
-            confidence = "confirmed"
-        else:
-            inferred_type = inferred_types.get(name)
-            source = "inferred" if inferred_type else "unknown"
-            confidence = detail_map.get(name, {}).get("confidence", "unknown")
-        if inferred_type:
-            library_types[name] = inferred_type
-        detail = detail_map.get(name, {})
-        inference_list.append(
-            {
-                "name": name,
-                "source": source,
-                "type": inferred_type,
-                "confidence": confidence,
-                "movie_score": detail.get("movie_score", 0),
-                "show_score": detail.get("show_score", 0),
-            }
-        )
-
-    needs_confirmation = any(item.get("source") != "plex" for item in inference_list)
-    return library_types, inference_list, needs_confirmation
-
-
-def _flatten_dict(base: str, payload: Any, report: ImportReport, max_depth: int = 3) -> None:
-    if max_depth <= 0:
-        report.add("imported", base)
-        return
-    if isinstance(payload, dict):
-        for key, value in payload.items():
-            child = f"{base}.{key}"
-            _flatten_dict(child, value, report, max_depth - 1)
-        if not payload:
-            report.add("imported", base)
-    elif isinstance(payload, list):
-        for idx, value in enumerate(payload):
-            child = f"{base}[{idx}]"
-            _flatten_dict(child, value, report, max_depth - 1)
-        if not payload:
-            report.add("imported", base)
-    else:
-        report.add("imported", base)
-
-
-def _coerce_import_bool(value: Any) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"true", "yes", "1", "on"}:
-            return True
-        if lowered in {"false", "no", "0", "off"}:
-            return False
-    return None
-
-
 def prepare_import_payload(
     config_data: dict,
     plex_movie_names: set[str],
@@ -979,92 +376,6 @@ def prepare_import_payload(
 
     collection_by_id, collection_by_alias = _build_collection_index(collection_config)
     overlay_by_id, overlay_by_alias, overlay_radio = _build_overlay_index(overlay_config)
-    language_weight_template_keys = {
-        f"weight_{key}"
-        for key in {
-            "en",
-            "de",
-            "fr",
-            "es",
-            "pt",
-            "ja",
-            "ko",
-            "zh",
-            "da",
-            "ru",
-            "it",
-            "hi",
-            "te",
-            "fa",
-            "th",
-            "nl",
-            "no",
-            "is",
-            "sv",
-            "tr",
-            "pl",
-            "cs",
-            "uk",
-            "hu",
-            "ar",
-            "bg",
-            "bn",
-            "bs",
-            "ca",
-            "cy",
-            "el",
-            "et",
-            "eu",
-            "fi",
-            "tl",
-            "fil",
-            "gl",
-            "he",
-            "hr",
-            "id",
-            "ka",
-            "kk",
-            "kn",
-            "la",
-            "lt",
-            "lv",
-            "mk",
-            "ml",
-            "mr",
-            "ms",
-            "nb",
-            "nn",
-            "pa",
-            "ro",
-            "sk",
-            "sl",
-            "sq",
-            "sr",
-            "so",
-            "sw",
-            "ta",
-            "ur",
-            "ay",
-            "ga",
-            "li",
-            "kh",
-            "vi",
-            "mn",
-            "af",
-            "bm",
-            "ln",
-            "wo",
-            "lo",
-            "myn",
-            "iu",
-            "rom",
-            "am",
-            "su",
-            "zu",
-            "lb",
-            "mos",
-        }
-    }
     (
         template_vars,
         simple_attrs,
@@ -1074,409 +385,13 @@ def prepare_import_payload(
         toggle_select_defs,
     ) = _build_attribute_sets(attribute_config)
 
-    def _encode_json(values: list) -> str:
-        return json.dumps(values, ensure_ascii=True)
+    _playlist_state = importer_playlists.parse_playlist_config(config_data, report)
+    playlist_libraries = _playlist_state.libraries
+    playlist_file_entries = _playlist_state.file_entries
+    playlist_template_field_values = _playlist_state.template_field_values
+    playlist_keyed_template_field_values = _playlist_state.keyed_template_field_values
 
-    def _clean_custom_value(value: Any) -> Any | None:
-        if value is None or value is False:
-            return None
-        if isinstance(value, (int, float)):
-            return value
-        text = str(value).strip()
-        return text if text else None
-
-    def _normalize_op_items(value: Any) -> list:
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return value
-        return [value]
-
-    def _handle_mass_update_operation(
-        lib_id: str,
-        lib_name: str,
-        op_key: str,
-        op_value: Any,
-    ) -> tuple[bool, bool]:
-        definition = mass_update_defs.get(op_key)
-        if not definition:
-            return False, False
-
-        sources = definition.get("sources", set())
-        has_custom = definition.get("has_custom_string")
-        custom_behavior = definition.get("custom_string_behavior") or "string"
-        order: list[str] = []
-        custom_values: list[Any] = []
-        items = _normalize_op_items(op_value)
-
-        for idx, item in enumerate(items):
-            item_path = f"libraries.{lib_name}.operations.{op_key}[{idx}]" if isinstance(op_value, list) else f"libraries.{lib_name}.operations.{op_key}"
-            if isinstance(item, list):
-                for entry in item:
-                    custom_value = _clean_custom_value(entry)
-                    if custom_value is not None:
-                        custom_values.append(custom_value)
-                if has_custom and item:
-                    report.add("imported", item_path)
-                else:
-                    report.add("unmapped", item_path, "Unsupported mass update list entry.")
-                continue
-            if isinstance(item, dict):
-                report.add("unmapped", item_path, "Unsupported mass update format.")
-                continue
-
-            if isinstance(item, (int, float)):
-                if has_custom:
-                    custom_values.append(item)
-                    report.add("imported", item_path)
-                else:
-                    report.add("unmapped", item_path, "Custom values are not supported.")
-                continue
-
-            text = str(item).strip()
-            if not text:
-                continue
-            if text in sources:
-                if text not in order:
-                    order.append(text)
-                libraries_data[f"{lib_id}-attribute_{op_key}_{text}"] = True
-                report.add("imported", item_path)
-            elif has_custom:
-                custom_values.append(text)
-                report.add("imported", item_path)
-            else:
-                report.add("unmapped", item_path, "Custom values are not supported.")
-
-        if order:
-            libraries_data[f"{lib_id}-attribute_{op_key}_order"] = _encode_json(order)
-
-        if custom_values:
-            if custom_behavior == "list":
-                libraries_data[f"{lib_id}-attribute_{op_key}_custom"] = _encode_json(custom_values)
-            else:
-                libraries_data[f"{lib_id}-attribute_{op_key}_custom_string"] = _clean_custom_value(custom_values[0])
-                if len(custom_values) > 1:
-                    libraries_data[f"{lib_id}-attribute_{op_key}_custom"] = _encode_json(custom_values[1:])
-
-        if order or custom_values:
-            report.add("imported", f"libraries.{lib_name}.operations.{op_key}")
-            return True, True
-
-        report.add("unmapped", f"libraries.{lib_name}.operations.{op_key}", "No importable values found.")
-        return True, False
-
-    def _handle_toggle_select_operation(
-        lib_id: str,
-        lib_name: str,
-        op_key: str,
-        op_value: Any,
-    ) -> tuple[bool, bool]:
-        definition = toggle_select_defs.get(op_key)
-        if not definition:
-            return False, False
-
-        select_key = definition.get("select_key")
-        select_options = set(definition.get("select_options") or [])
-        toggle_keys = set(definition.get("toggle_keys") or [])
-        toggle_aliases = {}
-        for key in toggle_keys:
-            toggle_aliases[key] = key
-            if key.startswith(f"{op_key}_"):
-                toggle_aliases[key.replace(f"{op_key}_", "", 1)] = key
-
-        def resolve_toggle_key(raw_key: str) -> str | None:
-            return toggle_aliases.get(raw_key)
-
-        source = None
-        imported_any = False
-
-        if isinstance(op_value, dict):
-            for raw_key, raw_value in op_value.items():
-                key = str(raw_key)
-                if key == "source":
-                    candidate = str(raw_value).strip()
-                    if candidate in select_options:
-                        source = candidate
-                        report.add("imported", f"libraries.{lib_name}.operations.{op_key}.source")
-                        imported_any = True
-                    else:
-                        report.add("unmapped", f"libraries.{lib_name}.operations.{op_key}.source")
-                    continue
-                resolved = resolve_toggle_key(key)
-                if resolved:
-                    if helpers.booler(raw_value):
-                        libraries_data[f"{lib_id}-attribute_{resolved}"] = True
-                    report.add("imported", f"libraries.{lib_name}.operations.{op_key}.{key}")
-                    imported_any = True
-                else:
-                    report.add("unmapped", f"libraries.{lib_name}.operations.{op_key}.{key}")
-            if source and select_key:
-                libraries_data[f"{lib_id}-attribute_{select_key}"] = source
-            return True, imported_any
-
-        if isinstance(op_value, list):
-            for idx, item in enumerate(op_value):
-                item_path = f"libraries.{lib_name}.operations.{op_key}[{idx}]"
-                if isinstance(item, str):
-                    text = item.strip()
-                    if text in select_options:
-                        source = text
-                        report.add("imported", item_path)
-                        imported_any = True
-                        continue
-                    resolved = resolve_toggle_key(text)
-                    if resolved:
-                        libraries_data[f"{lib_id}-attribute_{resolved}"] = True
-                        report.add("imported", item_path)
-                        imported_any = True
-                        continue
-                report.add("unmapped", item_path, "Unsupported option.")
-            if source and select_key:
-                libraries_data[f"{lib_id}-attribute_{select_key}"] = source
-            if imported_any:
-                report.add("imported", f"libraries.{lib_name}.operations.{op_key}")
-            return True, imported_any
-
-        if isinstance(op_value, str):
-            candidate = op_value.strip()
-            if candidate in select_options and select_key:
-                libraries_data[f"{lib_id}-attribute_{select_key}"] = candidate
-                report.add("imported", f"libraries.{lib_name}.operations.{op_key}")
-                return True, True
-            else:
-                report.add("unmapped", f"libraries.{lib_name}.operations.{op_key}", "Unsupported option.")
-                return True, False
-
-        report.add("unmapped", f"libraries.{lib_name}.operations.{op_key}", "Unsupported operation format.")
-        return True, False
-
-    def _handle_delete_collections_operation(
-        lib_id: str,
-        lib_name: str,
-        op_key: str,
-        op_value: Any,
-    ) -> tuple[bool, bool]:
-        if op_key != "delete_collections":
-            return False, False
-        if not isinstance(op_value, dict):
-            report.add(
-                "unmapped",
-                f"libraries.{lib_name}.operations.{op_key}",
-                "Unsupported delete_collections format.",
-            )
-            return True, False
-
-        mapping = {
-            "configured": "delete_collections_configured",
-            "managed": "delete_collections_managed",
-            "ignore_empty_smart_collections": "delete_collections_ignore_empty_smart_collections",
-            "less": "delete_collections_less",
-        }
-        imported_any = False
-
-        for raw_key, raw_value in op_value.items():
-            key = str(raw_key)
-            target = mapping.get(key)
-            if not target:
-                report.add("unmapped", f"libraries.{lib_name}.operations.{op_key}.{key}")
-                continue
-            if key == "less":
-                try:
-                    if raw_value is None or raw_value == "":
-                        report.add(
-                            "unmapped",
-                            f"libraries.{lib_name}.operations.{op_key}.{key}",
-                            "Missing numeric value.",
-                        )
-                        continue
-                    libraries_data[f"{lib_id}-attribute_{target}"] = int(raw_value)
-                    report.add("imported", f"libraries.{lib_name}.operations.{op_key}.{key}")
-                    imported_any = True
-                except Exception:
-                    report.add(
-                        "unmapped",
-                        f"libraries.{lib_name}.operations.{op_key}.{key}",
-                        "Invalid numeric value.",
-                    )
-                continue
-            bool_value = None
-            if isinstance(raw_value, bool):
-                bool_value = raw_value
-            elif isinstance(raw_value, str):
-                lowered = raw_value.strip().lower()
-                if lowered in {"true", "yes", "1"}:
-                    bool_value = True
-                elif lowered in {"false", "no", "0"}:
-                    bool_value = False
-            if bool_value is None:
-                report.add(
-                    "unmapped",
-                    f"libraries.{lib_name}.operations.{op_key}.{key}",
-                    "Invalid boolean value.",
-                )
-                continue
-            libraries_data[f"{lib_id}-attribute_{target}"] = bool_value
-            report.add("imported", f"libraries.{lib_name}.operations.{op_key}.{key}")
-            imported_any = True
-
-        if imported_any:
-            report.add("imported", f"libraries.{lib_name}.operations.{op_key}")
-        else:
-            report.add("unmapped", f"libraries.{lib_name}.operations.{op_key}", "No importable values found.")
-        return True, imported_any
-
-    playlist_libraries: set[str] = set()
-    playlist_file_entries: list[dict[str, str]] = []
-    playlist_template_field_values: dict[str, Any] = {}
-    playlist_keyed_template_field_values: dict[str, dict[str, Any]] = {}
-    playlist_payload = config_data.get("playlist_files")
-    if playlist_payload is not None:
-        if isinstance(playlist_payload, list):
-            for idx, entry in enumerate(playlist_payload):
-                if not isinstance(entry, dict):
-                    report.add("unmapped", f"playlist_files[{idx}]", "Unsupported playlist entry format.")
-                    continue
-                raw_entry_type = None
-                raw_entry_location = None
-                for candidate in ("file", "url", "git", "repo"):
-                    location = entry.get(candidate)
-                    if location:
-                        raw_entry_type = candidate
-                        raw_entry_location = str(location).strip()
-                        break
-                if raw_entry_type and raw_entry_location:
-                    playlist_file_entries.append({"type": raw_entry_type, "location": raw_entry_location})
-                    report.add("imported", f"playlist_files[{idx}]")
-                    report.add("imported", f"playlist_files[{idx}].{raw_entry_type}")
-                    if entry.get("template_variables") not in (None, {}):
-                        report.add("unmapped", f"playlist_files[{idx}].template_variables", "Template variables for direct playlist file entries are not supported in Quickstart.")
-                    continue
-                tv = entry.get("template_variables", {})
-                if not isinstance(tv, dict):
-                    report.add("unmapped", f"playlist_files[{idx}].template_variables", "Unsupported template_variables format.")
-                    continue
-                libs = tv.get("libraries")
-                if not isinstance(libs, list):
-                    report.add("unmapped", f"playlist_files[{idx}].template_variables.libraries", "Missing playlist library entries.")
-                    continue
-                entry_libs = [str(lib).strip() for lib in libs if str(lib).strip()]
-                if not entry_libs:
-                    report.add("unmapped", f"playlist_files[{idx}].template_variables.libraries", "Missing playlist library entries.")
-                    continue
-
-                playlist_libraries.update(entry_libs)
-                report.add("imported", f"playlist_files[{idx}]")
-                default_value = entry.get("default")
-                if default_value == "playlist":
-                    report.add("imported", f"playlist_files[{idx}].default")
-                elif default_value is not None:
-                    report.add("unmapped", f"playlist_files[{idx}].default", "Unsupported playlist default.")
-                report.add("imported", f"playlist_files[{idx}].template_variables")
-                report.add("imported", f"playlist_files[{idx}].template_variables.libraries")
-                for lib_idx in range(len(entry_libs)):
-                    report.add("imported", f"playlist_files[{idx}].template_variables.libraries[{lib_idx}]")
-                for key, value in tv.items():
-                    if key == "libraries":
-                        continue
-
-                    if key == "exclude_user":
-                        key = "exclude_users"
-                    if key == "exclude_user_":
-                        key = "exclude_users_"
-
-                    if key in PLAYLIST_SHARED_IMPORT_FIELDS:
-                        value_kind = PLAYLIST_SHARED_IMPORT_FIELDS[key]
-                        if value_kind == "boolean":
-                            normalized_value = _coerce_import_bool(value)
-                        elif value_kind == "integer":
-                            normalized_value = _coerce_import_int(value)
-                        elif value_kind == "string_list":
-                            values = _coerce_import_string_list(value)
-                            normalized_value = values if values else None
-                        else:
-                            text = str(value).strip() if value is not None else ""
-                            normalized_value = text or None
-
-                        if normalized_value is None:
-                            report.add("unmapped", f"playlist_files[{idx}].template_variables.{key}", "Unsupported playlist template variable value.")
-                            continue
-
-                        playlist_template_field_values[key] = normalized_value
-                        report.add("imported", f"playlist_files[{idx}].template_variables.{key}")
-                        continue
-
-                    matched_prefix = next((prefix for prefix in PLAYLIST_KEYED_IMPORT_FIELDS if key.startswith(prefix)), None)
-                    if matched_prefix:
-                        suffix = str(key[len(matched_prefix) :] or "").strip()
-                        if not suffix:
-                            report.add("unmapped", f"playlist_files[{idx}].template_variables.{key}", "Missing playlist key suffix.")
-                            continue
-                        serialized_value = _serialize_playlist_import_value(PLAYLIST_KEYED_IMPORT_FIELDS[matched_prefix], value)
-                        if serialized_value is None:
-                            report.add("unmapped", f"playlist_files[{idx}].template_variables.{key}", "Unsupported playlist keyed template variable value.")
-                            continue
-                        playlist_keyed_template_field_values.setdefault(matched_prefix, {})[suffix] = serialized_value
-                        report.add("imported", f"playlist_files[{idx}].template_variables.{key}")
-                        continue
-
-                    report.add("unmapped", f"playlist_files[{idx}].template_variables.{key}", "Playlist template variable not available in Quickstart.")
-            if playlist_libraries or playlist_file_entries:
-                report.add("imported", "playlist_files")
-        else:
-            report.add("unmapped", "playlist_files", "Unsupported playlist_files format.")
-
-    for section in SIMPLE_SECTIONS:
-        if section not in config_data:
-            continue
-        section_payload = config_data.get(section)
-        if section == "playlist_files":
-            continue
-
-        if section == "apprise":
-            apprise_location = None
-            if isinstance(section_payload, dict):
-                if "config" in section_payload:
-                    apprise_location = section_payload.get("config")
-                elif "location" in section_payload:
-                    apprise_location = section_payload.get("location")
-                elif "apprise" in section_payload:
-                    nested_apprise = section_payload.get("apprise")
-                    if isinstance(nested_apprise, dict):
-                        apprise_location = nested_apprise.get("config") or nested_apprise.get("location")
-                    else:
-                        apprise_location = nested_apprise
-            elif isinstance(section_payload, str):
-                apprise_location = section_payload
-
-            apprise_location = str(apprise_location).strip() if apprise_location is not None else ""
-            if apprise_location:
-                normalized_apprise = {"location": apprise_location}
-                payload[section] = {section: normalized_apprise}
-                _flatten_dict(section, normalized_apprise, report)
-            else:
-                report.add("unmapped", section, "Unsupported section format.")
-            continue
-
-        if isinstance(section_payload, dict):
-            if section == "settings":
-                asset_directory = section_payload.get("asset_directory")
-                if isinstance(asset_directory, (str, list)):
-                    normalized = (
-                        [line.strip() for line in str(asset_directory).splitlines()] if isinstance(asset_directory, str) else [str(item).strip() for item in asset_directory]
-                    )
-                    normalized = [entry for entry in normalized if entry]
-                    section_payload = dict(section_payload)
-                    section_payload["asset_directory"] = normalized
-            if section == "anidb":
-                if "enable" not in section_payload:
-                    has_values = any(value not in [None, "", [], {}] for value in section_payload.values())
-                    if has_values:
-                        section_payload = dict(section_payload)
-                        section_payload["enable"] = True
-            payload[section] = {section: section_payload}
-            _flatten_dict(section, section_payload, report)
-        else:
-            report.add("unmapped", section, "Unsupported section format.")
+    importer_simple_sections.process_simple_sections(config_data, payload=payload, report=report)
 
     libraries_payload = config_data.get("libraries")
     if isinstance(libraries_payload, dict):
@@ -1558,424 +473,63 @@ def prepare_import_payload(
             elif lib_template_vars is not None:
                 report.add("unmapped", f"libraries.{lib_name}.template_variables", "Unsupported template_variables format.")
 
-            # Collections
-            collection_files = lib_cfg.get("collection_files")
-            if isinstance(collection_files, list):
-                imported_collection_files = []
-                for idx, entry in enumerate(collection_files):
-                    default_value = None
-                    template_values = None
-                    raw_entry_type = None
-                    raw_entry_location = None
-                    if isinstance(entry, dict):
-                        default_value = entry.get("default")
-                        template_values = entry.get("template_variables")
-                        for candidate in ("file", "folder", "url", "git", "repo"):
-                            location = entry.get(candidate)
-                            if location:
-                                raw_entry_type = candidate
-                                raw_entry_location = str(location)
-                                break
-                    elif isinstance(entry, str):
-                        default_value = entry
-                    if raw_entry_type and raw_entry_location:
-                        imported_collection_files.append({"type": raw_entry_type, "location": raw_entry_location})
-                        report.add("imported", f"libraries.{lib_name}.collection_files[{idx}].{raw_entry_type}")
-                        continue
-                    if not default_value:
-                        report.add("unmapped", f"libraries.{lib_name}.collection_files[{idx}]", "Missing default.")
-                        continue
+            importer_collections.process_collection_files(
+                lib_id,
+                str(lib_name),
+                lib_cfg,
+                libraries_data=libraries_data,
+                report=report,
+                collection_by_id=collection_by_id,
+                collection_by_alias=collection_by_alias,
+            )
 
-                    raw_default = str(default_value)
-                    collection_id = _resolve_collection_id(raw_default, collection_by_id, collection_by_alias)
-                    if not collection_id or collection_id not in collection_by_id:
-                        report.add(
-                            "unmapped",
-                            f"libraries.{lib_name}.collection_files[{idx}].default",
-                            "Collection not found in Quickstart.",
-                        )
-                        continue
+            importer_overlays.process_overlay_files(
+                lib_id,
+                str(lib_name),
+                lib_cfg,
+                builder_default,
+                libraries_data=libraries_data,
+                report=report,
+                overlay_by_id=overlay_by_id,
+                overlay_by_alias=overlay_by_alias,
+                overlay_radio=overlay_radio,
+                language_weight_template_keys=LANGUAGE_WEIGHT_TEMPLATE_KEYS,
+            )
 
-                    libraries_data[f"{lib_id}-{collection_id}"] = True
-                    report.add("imported", f"libraries.{lib_name}.collection_files[{idx}].default")
+            importer_metadata.process_metadata_files(
+                lib_id,
+                str(lib_name),
+                lib_cfg,
+                libraries_data=libraries_data,
+                report=report,
+            )
 
-                    if isinstance(template_values, dict):
-                        allowed = _collect_template_keys(collection_by_id[collection_id].get("template_variables"))
-                        dynamic_child_fields = _collect_dynamic_child_field_specs(collection_by_id[collection_id].get("template_variables"))
-                        clean_id = collection_id.replace("collection_", "", 1)
-                        expanded_template_values = dict(template_values)
-                        data_block = expanded_template_values.get("data")
-                        data_reported = set()
-                        pending_dynamic_child_maps: dict[str, dict[str, str]] = {}
-                        if isinstance(data_block, dict):
-                            for subkey, subval in data_block.items():
-                                flat_key = f"data_{subkey}"
-                                if flat_key in allowed and flat_key not in expanded_template_values:
-                                    expanded_template_values[flat_key] = subval
-                                if flat_key in allowed:
-                                    report.add(
-                                        "imported",
-                                        f"libraries.{lib_name}.collection_files[{idx}].template_variables.data.{subkey}",
-                                    )
-                                    data_reported.add(subkey)
-                            if "data" in expanded_template_values and "data" not in allowed:
-                                expanded_template_values.pop("data", None)
-                            if data_reported:
-                                report.add(
-                                    "imported",
-                                    f"libraries.{lib_name}.collection_files[{idx}].template_variables.data",
-                                )
-                        if _has_template_string_list_values(expanded_template_values.get("include")) and _has_template_string_list_values(expanded_template_values.get("exclude")):
-                            report.add(
-                                "skipped",
-                                f"libraries.{lib_name}.collection_files[{idx}].template_variables.include_exclude_warning",
-                                "Warning - include and exclude were both imported. Kometa code allows this, but the wiki says not to combine them.",
-                            )
-                        for key, value in expanded_template_values.items():
-                            if key in allowed:
-                                child_name = f"{lib_id}-template_collection_{clean_id}_{key}"
-                                if isinstance(value, list):
-                                    libraries_data[child_name] = json.dumps(value, ensure_ascii=True)
-                                else:
-                                    libraries_data[child_name] = value
-                                report.add(
-                                    "imported",
-                                    f"libraries.{lib_name}.collection_files[{idx}].template_variables.{key}",
-                                )
-                            else:
-                                matched_dynamic_child = next(
-                                    (spec for spec in dynamic_child_fields if key.startswith(spec["child_prefix"]) and key != spec["child_prefix"]),
-                                    None,
-                                )
-                                if matched_dynamic_child:
-                                    suffix = key[len(matched_dynamic_child["child_prefix"]) :].strip()
-                                    serialized_value = _serialize_dynamic_child_mapping_value(
-                                        value,
-                                        matched_dynamic_child["value_kind"],
-                                    )
-                                    if suffix and serialized_value:
-                                        pending_dynamic_child_maps.setdefault(
-                                            matched_dynamic_child["field_key"],
-                                            {},
-                                        )[suffix] = serialized_value
-                                        report.add(
-                                            "imported",
-                                            f"libraries.{lib_name}.collection_files[{idx}].template_variables.{key}",
-                                        )
-                                        continue
-                                report.add(
-                                    "unmapped",
-                                    f"libraries.{lib_name}.collection_files[{idx}].template_variables.{key}",
-                                    "Template variable not available in Quickstart.",
-                                )
+            importer_library_settings.process_library_settings(
+                lib_id,
+                str(lib_name),
+                lib_cfg,
+                libraries_data=libraries_data,
+                report=report,
+            )
 
-                        for field_key, field_map in pending_dynamic_child_maps.items():
-                            if not field_map:
-                                continue
-                            libraries_data[f"{lib_id}-template_collection_{clean_id}_{field_key}"] = json.dumps(field_map, ensure_ascii=True)
+            importer_services.process_service_overrides(
+                lib_id,
+                str(lib_name),
+                lib_cfg,
+                libraries_data=libraries_data,
+                report=report,
+            )
 
-                if imported_collection_files:
-                    libraries_data[f"{lib_id}-collection_files"] = json.dumps(imported_collection_files, ensure_ascii=True)
-                    report.add("imported", f"libraries.{lib_name}.collection_files")
-
-            elif collection_files is not None:
-                report.add("unmapped", f"libraries.{lib_name}.collection_files", "Unsupported collection_files format.")
-
-            # Overlays
-            overlay_files = lib_cfg.get("overlay_files")
-            if isinstance(overlay_files, list):
-                imported_overlay_files = []
-                for idx, entry in enumerate(overlay_files):
-                    default_value = None
-                    template_values = None
-                    builder_level = builder_default
-                    raw_entry_type = None
-                    raw_entry_location = None
-                    if isinstance(entry, dict):
-                        default_value = entry.get("default")
-                        template_values = entry.get("template_variables")
-                        for candidate in ("file", "folder", "url", "git", "repo"):
-                            location = entry.get(candidate)
-                            if location:
-                                raw_entry_type = candidate
-                                raw_entry_location = str(location)
-                                break
-                        if isinstance(template_values, dict) and "builder_level" in template_values:
-                            level = template_values.get("builder_level")
-                            if level in {"show", "season", "episode"}:
-                                builder_level = level
-                    elif isinstance(entry, str):
-                        default_value = entry
-
-                    if raw_entry_type and raw_entry_location:
-                        imported_overlay_files.append({"type": raw_entry_type, "location": raw_entry_location})
-                        report.add("imported", f"libraries.{lib_name}.overlay_files[{idx}].{raw_entry_type}")
-                        continue
-
-                    if not default_value:
-                        report.add("unmapped", f"libraries.{lib_name}.overlay_files[{idx}]", "Missing default.")
-                        continue
-
-                    raw_default = str(default_value)
-                    overlay_id = _resolve_overlay_id(raw_default, overlay_by_id, overlay_by_alias)
-                    if overlay_id not in overlay_by_id:
-                        report.add(
-                            "unmapped",
-                            f"libraries.{lib_name}.overlay_files[{idx}].default",
-                            "Overlay not found in Quickstart.",
-                        )
-                        continue
-
-                    overlay_meta = overlay_by_id.get(overlay_id, {})
-                    if overlay_id == "overlay_languages" and isinstance(template_values, dict) and str(template_values.get("use_subtitles", "")).strip().lower() == "true":
-                        subtitles_id = overlay_by_alias.get("languages_subtitles")
-                        if subtitles_id:
-                            overlay_id = subtitles_id
-                            overlay_meta = overlay_by_id.get(overlay_id, {})
-                            template_values = dict(template_values)
-                            template_values.pop("use_subtitles", None)
-                            report.add(
-                                "imported",
-                                f"libraries.{lib_name}.overlay_files[{idx}].template_variables.use_subtitles",
-                            )
-                    media_types = overlay_meta.get("media_types") or []
-                    if builder_level == "movie" and media_types and "movie" not in media_types:
-                        report.add(
-                            "unmapped",
-                            f"libraries.{lib_name}.overlay_files[{idx}].default",
-                            "Overlay not available for movie libraries.",
-                        )
-                        continue
-                    if builder_level not in media_types and builder_level != "movie":
-                        if "show" in media_types:
-                            builder_level = "show"
-                        elif media_types:
-                            builder_level = media_types[0]
-
-                    radio_info = overlay_radio.get(overlay_id)
-                    if radio_info:
-                        radio_key = f"{lib_id}-{builder_level}-{radio_info['group_name']}"
-                        libraries_data[radio_key] = radio_info.get("value")
-                    else:
-                        libraries_data[f"{lib_id}-{builder_level}-{overlay_id}"] = True
-                    report.add("imported", f"libraries.{lib_name}.overlay_files[{idx}].default")
-
-                    if isinstance(template_values, dict):
-                        allowed = _collect_template_keys(overlay_meta.get("template_variables"))
-                        allowed.update(_collect_overlay_source_override_keys(overlay_meta))
-                        if overlay_id in {"overlay_languages", "overlay_languages_subtitles"}:
-                            allowed = set(allowed)
-                            allowed.update(language_weight_template_keys)
-                        for key, value in template_values.items():
-                            if key not in allowed:
-                                if key == "builder_level":
-                                    continue
-                                report.add(
-                                    "unmapped",
-                                    f"libraries.{lib_name}.overlay_files[{idx}].template_variables.{key}",
-                                    "Template variable not available in Quickstart.",
-                                )
-                                continue
-                            child_name = f"{lib_id}-{builder_level}-template_{overlay_id}[{key}]"
-                            libraries_data[child_name] = value
-                            report.add(
-                                "imported",
-                                f"libraries.{lib_name}.overlay_files[{idx}].template_variables.{key}",
-                            )
-
-                if imported_overlay_files:
-                    libraries_data[f"{lib_id}-overlay_files"] = json.dumps(imported_overlay_files, ensure_ascii=True)
-                    report.add("imported", f"libraries.{lib_name}.overlay_files")
-
-            elif overlay_files is not None:
-                report.add("unmapped", f"libraries.{lib_name}.overlay_files", "Unsupported overlay_files format.")
-
-            metadata_files = lib_cfg.get("metadata_files")
-            if isinstance(metadata_files, list):
-                imported_metadata_files = []
-                for idx, entry in enumerate(metadata_files):
-                    entry_type = None
-                    location = None
-                    if isinstance(entry, dict):
-                        if "file" in entry:
-                            entry_type = "file"
-                            location = entry.get("file")
-                        elif "folder" in entry:
-                            entry_type = "folder"
-                            location = entry.get("folder")
-                        elif "git" in entry:
-                            entry_type = "git"
-                            location = entry.get("git")
-                        elif "repo" in entry:
-                            entry_type = "repo"
-                            location = entry.get("repo")
-                        elif "url" in entry:
-                            entry_type = "url"
-                            location = entry.get("url")
-                    if entry_type not in {"file", "folder", "url", "git", "repo"}:
-                        report.add(
-                            "unmapped",
-                            f"libraries.{lib_name}.metadata_files[{idx}]",
-                            "Only file, folder, url, git, and repo metadata files are supported.",
-                        )
-                        continue
-                    location = str(location or "").strip()
-                    if not location:
-                        report.add(
-                            "unmapped",
-                            f"libraries.{lib_name}.metadata_files[{idx}]",
-                            "Metadata file location is required.",
-                        )
-                        continue
-                    imported_metadata_files.append({"type": entry_type, "location": location})
-                    report.add("imported", f"libraries.{lib_name}.metadata_files[{idx}].{entry_type}")
-
-                if imported_metadata_files:
-                    libraries_data[f"{lib_id}-metadata_files"] = json.dumps(imported_metadata_files, ensure_ascii=True)
-                    report.add("imported", f"libraries.{lib_name}.metadata_files")
-            elif metadata_files is not None:
-                report.add("unmapped", f"libraries.{lib_name}.metadata_files", "Unsupported metadata_files format.")
-
-            # Library settings
-            settings_section = lib_cfg.get("settings")
-            if isinstance(settings_section, dict):
-                imported_settings = False
-                for key, value in settings_section.items():
-                    if key == "asset_directory":
-                        if isinstance(value, list):
-                            normalized = [str(item).strip() for item in value if str(item).strip()]
-                        elif isinstance(value, str):
-                            normalized = [line.strip() for line in value.splitlines() if line.strip()]
-                        else:
-                            normalized = []
-
-                        if normalized:
-                            libraries_data[f"{lib_id}-attribute_{key}"] = normalized
-                            report.add("imported", f"libraries.{lib_name}.settings.{key}")
-                            imported_settings = True
-                        else:
-                            report.add(
-                                "unmapped",
-                                f"libraries.{lib_name}.settings.{key}",
-                                "No importable asset directory entries found.",
-                            )
-                        continue
-
-                    if key == "prioritize_assets" and not isinstance(value, (dict, list)):
-                        bool_value = None
-                        if isinstance(value, bool):
-                            bool_value = value
-                        elif isinstance(value, str):
-                            lowered = value.strip().lower()
-                            if lowered in {"true", "yes", "1"}:
-                                bool_value = True
-                            elif lowered in {"false", "no", "0"}:
-                                bool_value = False
-
-                        if bool_value is None:
-                            report.add(
-                                "unmapped",
-                                f"libraries.{lib_name}.settings.{key}",
-                                "Invalid boolean value.",
-                            )
-                        else:
-                            libraries_data[f"{lib_id}-attribute_{key}"] = bool_value
-                            report.add("imported", f"libraries.{lib_name}.settings.{key}")
-                            imported_settings = True
-                        continue
-
-                    report.add(
-                        "unmapped",
-                        f"libraries.{lib_name}.settings.{key}",
-                        "Library setting not supported for import.",
-                    )
-
-                if imported_settings:
-                    report.add("imported", f"libraries.{lib_name}.settings")
-            elif settings_section is not None:
-                report.add("unmapped", f"libraries.{lib_name}.settings", "Unsupported settings format.")
-
-            for service_name, field_map in (
-                ("radarr", LIBRARY_RADARR_IMPORT_FIELDS),
-                ("sonarr", LIBRARY_SONARR_IMPORT_FIELDS),
-            ):
-                service_section = lib_cfg.get(service_name)
-                if not isinstance(service_section, dict):
-                    if service_section is not None:
-                        report.add("unmapped", f"libraries.{lib_name}.{service_name}", "Unsupported service override format.")
-                    continue
-
-                imported_service = False
-                if service_name == "radarr" and not str(lib_id).startswith("mov-library_"):
-                    report.add("unmapped", f"libraries.{lib_name}.radarr", "Radarr overrides are only supported on movie libraries.")
-                    continue
-                if service_name == "sonarr" and not str(lib_id).startswith("sho-library_"):
-                    report.add("unmapped", f"libraries.{lib_name}.sonarr", "Sonarr overrides are only supported on show libraries.")
-                    continue
-
-                for key, value in service_section.items():
-                    field_type = field_map.get(str(key))
-                    if not field_type:
-                        report.add("unmapped", f"libraries.{lib_name}.{service_name}.{key}", "Library service override not supported for import.")
-                        continue
-
-                    target_key = f"{lib_id}-attribute_{service_name}_{key}"
-                    if field_type == "bool":
-                        bool_value = _coerce_import_bool(value)
-                        if bool_value is None:
-                            report.add("unmapped", f"libraries.{lib_name}.{service_name}.{key}", "Invalid boolean value.")
-                            continue
-                        libraries_data[target_key] = "true" if bool_value else "false"
-                    else:
-                        if isinstance(value, (dict, list)):
-                            report.add("unmapped", f"libraries.{lib_name}.{service_name}.{key}", "Unsupported override value format.")
-                            continue
-                        text_value = str(value).strip()
-                        if not text_value:
-                            report.add("unmapped", f"libraries.{lib_name}.{service_name}.{key}", "Override value is empty.")
-                            continue
-                        libraries_data[target_key] = text_value
-
-                    report.add("imported", f"libraries.{lib_name}.{service_name}.{key}")
-                    imported_service = True
-
-                if imported_service:
-                    report.add("imported", f"libraries.{lib_name}.{service_name}")
-
-            # Operations
-            operations = lib_cfg.get("operations")
-            if isinstance(operations, dict):
-                imported_ops = False
-                for key, value in operations.items():
-                    if key in simple_attrs and not isinstance(value, (dict, list)):
-                        libraries_data[f"{lib_id}-attribute_{key}"] = value
-                        report.add("imported", f"libraries.{lib_name}.operations.{key}")
-                        imported_ops = True
-                        continue
-
-                    handled, imported = _handle_delete_collections_operation(lib_id, str(lib_name), key, value)
-                    if handled:
-                        imported_ops = imported_ops or imported
-                        continue
-
-                    handled, imported = _handle_mass_update_operation(lib_id, str(lib_name), key, value)
-                    if handled:
-                        imported_ops = imported_ops or imported
-                        continue
-
-                    handled, imported = _handle_toggle_select_operation(lib_id, str(lib_name), key, value)
-                    if handled:
-                        imported_ops = imported_ops or imported
-                        continue
-                    report.add(
-                        "unmapped",
-                        f"libraries.{lib_name}.operations.{key}",
-                        "Complex operation not supported for import.",
-                    )
-                if imported_ops:
-                    report.add("imported", f"libraries.{lib_name}.operations")
-            elif operations is not None:
-                report.add("unmapped", f"libraries.{lib_name}.operations", "Unsupported operations format.")
+            importer_operations.process_operations_block(
+                lib_id,
+                str(lib_name),
+                lib_cfg,
+                libraries_data=libraries_data,
+                report=report,
+                simple_attrs=simple_attrs,
+                mass_update_defs=mass_update_defs,
+                toggle_select_defs=toggle_select_defs,
+            )
 
             handled_keys = {"collection_files", "overlay_files", "metadata_files", "template_variables", "settings", "operations", "radarr", "sonarr"}
             handled_keys.update(top_level_map.keys())

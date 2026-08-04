@@ -8,11 +8,11 @@ via ``from modules import helpers``.  Submodules are loaded on demand;
 
 from __future__ import annotations
 
-# Import everything from the legacy module first (backward compat).
-from ._legacy import *  # noqa: F403
+# Foundational constants (paths, TTLs, cache dicts, extension sets).
+from ._constants import *  # noqa: F403
 
 # Private helpers used by tests and other modules.
-from ._legacy import (  # noqa: F401
+from ._zip_update import (  # noqa: F401
     _get_upstream_sha,
     _download_zip,
     _extract_zip_bytes,
@@ -50,3 +50,9 @@ from ._install_mode import *  # noqa: F403
 from ._kometa_version import *  # noqa: F403
 from ._pid import *  # noqa: F403
 from ._paths import *  # noqa: F403
+from ._kometa_paths import *  # noqa: F403
+from ._named_config import *  # noqa: F403
+from ._zip_update import *  # noqa: F403
+from ._logging import *  # noqa: F403
+from ._plex import *  # noqa: F403
+from ._vite_manifest import *  # noqa: F403

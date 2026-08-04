@@ -1,4 +1,4 @@
-"""Kometa install mode utilities extracted from _legacy.py."""
+"""Kometa install mode utilities extracted from the original helpers.py monolith."""
 
 import os
 
@@ -8,7 +8,7 @@ from flask import current_app as app
 from flask import has_app_context, has_request_context, session
 
 from modules import persistence
-from modules.helpers._legacy import CONFIG_DIR
+from modules.helpers._constants import CONFIG_DIR
 
 
 def _managed_kometa_root_default() -> Path:
@@ -26,12 +26,14 @@ def _get_persisted_kometa_runtime_section() -> dict:
 
 def get_kometa_install_mode() -> str:
     mode = None
-    if has_app_context():
-        mode = app.config.get("KOMETA_INSTALL_MODE")
+    if not mode and has_request_context():
+        # The active config owns this setting. app.config is process-global and
+        # can be stale after another request/config rebuilds Kometa context.
+        mode = _get_persisted_kometa_runtime_section().get("install_mode")
     if not mode and has_request_context():
         mode = session.get("kometa_install_mode")
-    if not mode and has_request_context():
-        mode = _get_persisted_kometa_runtime_section().get("install_mode")
+    if not mode and has_app_context():
+        mode = app.config.get("KOMETA_INSTALL_MODE")
     normalized = str(mode or "").strip().lower()
     if normalized in {"existing", "external"}:
         return normalized

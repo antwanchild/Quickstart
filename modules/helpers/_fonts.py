@@ -1,4 +1,4 @@
-"""Font management utilities extracted from _legacy.py."""
+"""Font management utilities extracted from the original helpers.py monolith."""
 
 import os
 import shutil
@@ -6,7 +6,7 @@ import sys
 
 from pathlib import Path
 
-from modules.helpers._legacy import CONFIG_DIR, FONT_EXTENSIONS, MEIPASS_DIR, BASE_DIR, WORKING_DIR
+from modules.helpers._constants import CONFIG_DIR, FONT_EXTENSIONS, MEIPASS_DIR, BASE_DIR, WORKING_DIR
 
 
 def get_pyfiglet_fonts():
@@ -48,7 +48,7 @@ def get_custom_fonts_dir(config_name: str | None = None) -> Path:
 def get_kometa_fonts_dir(kometa_root: Path | None = None) -> Path:
     if kometa_root is not None:
         return Path(kometa_root) / "config" / "fonts"
-    from modules.helpers._legacy import get_kometa_config_dir
+    from modules.helpers._kometa_paths import get_kometa_config_dir
 
     return get_kometa_config_dir() / "fonts"
 

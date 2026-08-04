@@ -7,6 +7,7 @@
 
     <h4 class="mb-0 text-white">
       <i class="bi bi-film text-muted me-2" title="Movie"></i>{{ library.name }}
+      <span class="small accordion-override-summary ms-2 d-none" data-library-total-summary></span>
     </h4>
     {% set include_checked = data.get('libraries', {}).get(library.id ~ '-library') %}
     {% set playlist_checked = data.get('libraries', {}).get(library.id ~ '-playlist') or (legacy_playlist_libraries is defined and library.name in legacy_playlist_libraries) %}
@@ -18,7 +19,7 @@
           data-target-input="{{ library.id }}-library-value" value="{{ library.name }}"
           {% if include_checked %}checked{% endif %}>
         <label class="form-check-label small text-white-50 mb-0" for="{{ library.id }}-include"
-          title="Controls whether this library is written to the YAML output and validated.">Include in YAML</label>
+          title="Controls whether this library is written to the final config and validated.">Include in config</label>
       </div>
       <span class="badge include-status bg-secondary" data-include-status></span>
       <button type="button" class="btn btn-outline-secondary btn-sm btn-overlay copy-library-btn" data-library-id="{{ library.id }}"
@@ -48,6 +49,7 @@
 
     <h4 class="mb-0 text-white">
       <i class="bi bi-tv text-muted me-2" title="TV Show"></i>{{ library.name }}
+      <span class="small accordion-override-summary ms-2 d-none" data-library-total-summary></span>
     </h4>
     {% set include_checked = data.get('libraries', {}).get(library.id ~ '-library') %}
     {% set playlist_checked = data.get('libraries', {}).get(library.id ~ '-playlist') or (legacy_playlist_libraries is defined and library.name in legacy_playlist_libraries) %}
@@ -59,7 +61,7 @@
           data-target-input="{{ library.id }}-library-value" value="{{ library.name }}"
           {% if include_checked %}checked{% endif %}>
         <label class="form-check-label small text-white-50 mb-0" for="{{ library.id }}-include"
-          title="Controls whether this library is written to the YAML output and validated.">Include in YAML</label>
+          title="Controls whether this library is written to the final config and validated.">Include in config</label>
       </div>
       <span class="badge include-status bg-secondary" data-include-status></span>
       <button type="button" class="btn btn-outline-secondary btn-sm btn-overlay copy-library-btn" data-library-id="{{ library.id }}"

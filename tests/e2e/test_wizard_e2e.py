@@ -18,6 +18,21 @@ def _seed_config(name):
     )
 
 
+def _activate_config(page, live_server, name):
+    page.goto(f"{live_server}/step/001-start", wait_until="domcontentloaded")
+    page.evaluate(
+        """async (configName) => {
+          const res = await fetch('/switch-config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: configName })
+          })
+          if (!res.ok) throw new Error('failed to activate config')
+        }""",
+        name,
+    )
+
+
 def _ordered_stems():
     import modules.helpers as helpers
     import quickstart
@@ -518,6 +533,154 @@ def test_radarr_revalidate_on_load_repopulates_dropdowns(page, live_server):
     dropdown_values = page.locator("#radarr_root_folder_path").evaluate("el => Array.from(el.options).map(o => o.value)")
     assert "NO_MATCH_REVAL_FOLDER" in dropdown_values, f"expected revalidateOnLoad to repopulate dropdown; got {dropdown_values}"
     assert fetch_count["n"] >= 1, f"expected at least one silent fetch; got count={fetch_count['n']}"
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "stem, section, endpoint, saved_section, response_data, expected_values",
+    [
+        (
+            "110-radarr",
+            "radarr",
+            "validate_radarr",
+            {
+                "url": "http://radarr.local",
+                "token": "saved-radarr-token",
+                "root_folder_path": "/movies",
+                "quality_profile": "HD-1080p",
+            },
+            {
+                "valid": True,
+                "root_folders": [{"path": "/movies"}, {"path": "/four-k"}],
+                "quality_profiles": [{"name": "HD-1080p"}, {"name": "4K"}],
+            },
+            {
+                "radarr_root_folder_path": "/movies",
+                "radarr_quality_profile": "HD-1080p",
+            },
+        ),
+        (
+            "120-sonarr",
+            "sonarr",
+            "validate_sonarr",
+            {
+                "url": "http://sonarr.local",
+                "token": "saved-sonarr-token",
+                "root_folder_path": "/tv",
+                "quality_profile": "HD-720p",
+                "language_profile": "English",
+            },
+            {
+                "valid": True,
+                "root_folders": [{"path": "/tv"}, {"path": "/anime"}],
+                "quality_profiles": [{"name": "HD-720p"}, {"name": "HD-1080p"}],
+                "language_profiles": [{"name": "English"}, {"name": "Japanese"}],
+            },
+            {
+                "sonarr_root_folder_path": "/tv",
+                "sonarr_quality_profile": "HD-720p",
+                "sonarr_language_profile": "English",
+            },
+        ),
+    ],
+)
+def test_arr_page_return_restores_saved_dropdown_selection(
+    page,
+    live_server,
+    app,
+    stem,
+    section,
+    endpoint,
+    saved_section,
+    response_data,
+    expected_values,
+):
+    """Returning to a validated Arr page should silently revalidate,
+    repopulate the dynamic dropdowns, and re-select the values saved in
+    the config. The earlier regression coverage only asserted that the
+    OPTIONS reappeared, which missed the broken saved-selection restore.
+    """
+
+    import modules.database as database
+    import quickstart
+
+    config_name = f"pytest_{section}_return_persisted_dropdowns"
+    _seed_config(config_name)
+    with app.app_context():
+        database.save_section_data(
+            name=config_name,
+            section=section,
+            validated=True,
+            user_entered=True,
+            data={section: saved_section, "validated_at": quickstart.utc_now_iso()},
+        )
+
+    fetch_count = {"n": 0}
+
+    def handle_validate(route):
+        fetch_count["n"] += 1
+        route.fulfill(status=200, json=response_data)
+
+    page.route(f"**/{endpoint}", handle_validate)
+    _activate_config(page, live_server, config_name)
+    page.goto(f"{live_server}/step/{stem}", wait_until="domcontentloaded")
+    page.wait_for_timeout(500)
+
+    assert fetch_count["n"] >= 1, "expected silent revalidate on page return"
+    for element_id, expected_value in expected_values.items():
+        expect(page.locator(f"#{element_id}")).to_have_value(expected_value)
+
+
+@pytest.mark.e2e
+def test_sonarr_allows_skip_when_unvalidated(page, live_server):
+    """Regression test for #1584.
+
+    An unvalidated Sonarr user should be able to navigate away from
+    the page without any path or dropdown check blocking them --
+    matching Radarr's behavior.
+
+    Historically Sonarr's onPreSubmit ran the path check unconditionally,
+    so a user who had NOT validated Sonarr but had any invalid path
+    field elsewhere was stranded. The fix flips arrPageBase's
+    `skipWhenUnvalidated` to true for Sonarr, matching Radarr.
+
+    This test loads the Sonarr page WITHOUT validating, then dispatches
+    a form submit. The submit must NOT be preventDefault-blocked.
+    """
+    page.goto(f"{live_server}/step/120-sonarr", wait_until="domcontentloaded")
+
+    # Precondition: sonarr is NOT validated. Rendered value may be
+    # 'false' or 'False' depending on how Jinja stringified the bool;
+    # the wizard code lowercases before comparing, so either is fine.
+    initial_validated = page.locator("#sonarr_validated").input_value()
+    assert initial_validated.lower() != "true", f"precondition: sonarr_validated should not be true; got {initial_validated!r}"
+
+    # Force PathValidation.validateAll to return false. This is the
+    # exact condition that used to strand unvalidated Sonarr users:
+    # some path field elsewhere on the page failed validation. Stub
+    # it out to guarantee the failing branch is exercised regardless
+    # of what path fields the Sonarr template happens to render.
+    page.evaluate("""
+        () => {
+            window.PathValidation = {
+                validateAll: () => false,
+                attach: () => {}
+            }
+        }
+    """)
+
+    # Dispatch a real form submit; the gate should return true and NOT
+    # preventDefault. In the buggy pre-fix code, the path check ran and
+    # returned false because at least one path field was invalid.
+    blocked = page.evaluate("""
+        () => {
+            const form = document.getElementById('configForm');
+            const evt = new Event('submit', { cancelable: true });
+            form.dispatchEvent(evt);
+            return evt.defaultPrevented;
+        }
+    """)
+    assert blocked is False, "expected an unvalidated Sonarr page to allow navigation " "(regression #1584); form submit was blocked instead"
 
 
 @pytest.mark.e2e
@@ -1106,6 +1269,68 @@ def test_config_workspace_modal_changing_selector_shows_new_config_input(page, l
         assert "d-none" in classes_after_other, f"expected d-none ADDED after switching away from add_config; got class='{classes_after_other}'"
 
 
+@pytest.mark.e2e
+def test_config_workspace_reset_dispatches_to_clear_session(page, live_server):
+    """Clicking the Reset button in the config workspace modal, then
+    confirming, should POST to /clear_session with the selected config
+    name. Regression test for the jQuery-to-fetch conversion of the
+    $.post(...) call in 001-start.js.
+
+    Extra teeth: this test explicitly asserts the fetch works even
+    WITHOUT jQuery on window -- proving the reset flow is jQuery-free.
+    (jQuery is still loaded via 000-base.html today; when it's removed
+    in a follow-up PR, this test guards that this specific code path
+    doesn't regress.)
+    """
+    captured = {"url": None, "body": None, "content_type": None}
+
+    def handle_clear(route, request):
+        captured["url"] = request.url
+        captured["body"] = request.post_data
+        captured["content_type"] = request.headers.get("content-type", "")
+        route.fulfill(status=200, json={"status": "success", "message": "Session cleared for 'pytest_cfg'."})
+
+    page.route("**/clear_session", handle_clear)
+    page.goto(f"{live_server}/step/001-start", wait_until="domcontentloaded")
+
+    # Delete window.jQuery / window.$ to prove the reset flow doesn't
+    # rely on them anymore. Any hidden jQuery reference in this code
+    # path would now throw.
+    page.evaluate("() => { delete window.jQuery; delete window.$ }")
+
+    # Directly simulate the flow that triggers the fetch: pick a real
+    # config, click the reset button (setting currentAction='reset'
+    # inside the closure), and click the confirm button. This avoids
+    # the bootstrap modal choreography which isn't the code under test.
+    page.evaluate("""() => {
+        const sel = document.getElementById('configSelector')
+        if (sel) {
+            const opt = document.createElement('option')
+            opt.value = 'pytest_cfg'
+            opt.textContent = 'pytest_cfg'
+            sel.appendChild(opt)
+            sel.value = 'pytest_cfg'
+            sel.dispatchEvent(new Event('change', { bubbles: true }))
+        }
+        const resetBtn = document.querySelector('[data-action="reset"]')
+        if (resetBtn) {
+            resetBtn.disabled = false
+            resetBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+        }
+        document.getElementById('confirmConfigAction').click()
+    }""")
+
+    # Give the fetch a moment to fly.
+    page.wait_for_timeout(500)
+
+    assert captured["url"] is not None, "expected /clear_session to be hit"
+    assert "clear_session" in captured["url"]
+    # Body should be form-urlencoded 'name=pytest_cfg' (matches what Flask's
+    # request.values expects; $.post historically sent this too).
+    assert captured["content_type"].startswith("application/x-www-form-urlencoded"), f"expected form-urlencoded content-type, got: {captured['content_type']!r}"
+    assert captured["body"] == "name=pytest_cfg", f"expected body='name=pytest_cfg', got: {captured['body']!r}"
+
+
 # Navigation inline-handler cleanup (Group A). Previously the templates
 # had onclick="jumpTo('...')" and onclick='loading("prev", "...")' inline.
 # Now elements carry data-jumpto-page (+optional data-jumpto-label) and
@@ -1364,11 +1589,9 @@ def test_validation_handler_show_message_textcontent_by_default(page, live_serve
     # Pick a page that includes #validation-messages in its template.
     # 900-kometa has it (templates/900-kometa.html:272).
     page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
-    page.add_script_tag(path="static/local-js/validationHandler.js")
-    # Need jQuery for the existing $('#plex_valid') call -- 900-kometa
-    # already loads it as part of the base layout.
+    page.evaluate("""() => import(`/static/local-js/validationHandler.js?validation-handler-test=${Date.now()}`)""")
     page.evaluate("""
-        ValidationHandler.showValidationMessage(
+        window.ValidationHandler.showValidationMessage(
             'Plain <strong>text</strong> message', 'danger'
         )
     """)
@@ -1386,9 +1609,9 @@ def test_validation_handler_show_message_html_opt_in_renders_html(page, live_ser
     A link inside the message becomes a real anchor.
     """
     page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
-    page.add_script_tag(path="static/local-js/validationHandler.js")
+    page.evaluate("""() => import(`/static/local-js/validationHandler.js?validation-handler-test=${Date.now()}`)""")
     page.evaluate("""
-        ValidationHandler.showValidationMessage(
+        window.ValidationHandler.showValidationMessage(
             'Please <a href=\"javascript:void(0);\" data-jumpto-page=\"010-plex\">click here</a>.',
             'danger',
             { html: true }
@@ -1728,9 +1951,13 @@ def test_analytics_page_loads_as_module(page, live_server):
     """The Analytics page must render and its script must be loaded as type='module'."""
     page.goto(f"{live_server}/step/905-analytics", wait_until="domcontentloaded")
     page.wait_for_timeout(500)
-    state = page.evaluate("""() => {
+    # Match either the raw source path (/905-analytics.js) or the Vite-hashed
+    # build output (/905-analytics-<hash>.js under /static/dist/). The template
+    # picks between them via the asset_url() Jinja global -- see
+    # modules/helpers/_vite_manifest.py.
+    state = page.evaluate(r"""() => {
             const scripts = Array.from(document.scripts)
-            const analyticsScript = scripts.find(s => (s.src || '').endsWith('/905-analytics.js'))
+            const analyticsScript = scripts.find(s => /\/905-analytics(-[A-Za-z0-9_-]+)?\.js$/.test(s.src || ''))
             return {
                 pageMeta: !!document.querySelector('#logscan-trends-table'),
                 scriptFound: !!analyticsScript,
@@ -1738,7 +1965,7 @@ def test_analytics_page_loads_as_module(page, live_server):
             }
         }""")
     assert state["pageMeta"], "expected the Analytics page to render (precondition)"
-    assert state["scriptFound"], "expected /905-analytics.js to be referenced from the page"
+    assert state["scriptFound"], "expected 905-analytics.js (raw or hashed) to be referenced from the page"
     assert state["scriptType"] == "module", f"expected the Analytics script to load as type='module' after conversion; got type={state['scriptType']!r}"
 
 
@@ -1881,9 +2108,9 @@ def test_kometa_page_loads_as_module(page, live_server):
     """The Kometa page must render and its script must be loaded as type='module'."""
     page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
     page.wait_for_timeout(500)
-    state = page.evaluate("""() => {
+    state = page.evaluate(r"""() => {
             const scripts = Array.from(document.scripts)
-            const kometaScript = scripts.find(s => (s.src || '').endsWith('/900-kometa.js'))
+            const kometaScript = scripts.find(s => /\/900-kometa(-[A-Za-z0-9_-]+)?\.js$/.test(s.src || ''))
             return {
                 pageMeta: !!document.querySelector('#stop-kometa-modal'),
                 scriptFound: !!kometaScript,
@@ -1964,20 +2191,24 @@ def test_imagehandler_module_loads_via_import(page, live_server):
 @pytest.mark.e2e
 def test_eventhandler_module_loads_via_import(page, live_server):
     """eventHandler.js is now loaded via import() by 025-libraries.js.
-    Verify window.EventHandler is available with expected methods.
+    Verify window.EventHandler is available with its expected surface.
+
+    Historical note: this test also used to assert on
+    EventHandler.updateAccordionHighlights, but that method (along with
+    the other accordion-highlight helpers) was extracted to
+    modules/accordionHighlights.js in #1346 step 2f and the compat shim
+    was removed. Direct-import verification of that module lives in
+    tests/js/modules/accordionHighlights.test.js.
     """
     page.goto(f"{live_server}/step/025-libraries", wait_until="domcontentloaded")
     page.wait_for_timeout(2000)
     state = page.evaluate("""() => ({
             hasEventHandler: typeof window.EventHandler !== 'undefined',
             hasAttach: typeof window.EventHandler === 'object'
-                && typeof window.EventHandler.attachLibraryListeners === 'function',
-            hasHighlights: typeof window.EventHandler === 'object'
-                && typeof window.EventHandler.updateAccordionHighlights === 'function'
+                && typeof window.EventHandler.attachLibraryListeners === 'function'
         })""")
     assert state["hasEventHandler"], "window.EventHandler must exist after import()"
     assert state["hasAttach"], "EventHandler.attachLibraryListeners must be a function"
-    assert state["hasHighlights"], "EventHandler.updateAccordionHighlights must be a function"
 
 
 # ES module conversion of overlayHandler.js (chore/convert-overlayhandler-to-module).
@@ -2004,3 +2235,78 @@ def test_overlayhandler_module_loads_via_import(page, live_server):
     assert state["hasBoards"], "OverlayHandler.initializeOverlayBoards must be a function"
     assert state["hasJumpBtns"], "OverlayHandler.initializeJumpButtons must be a function"
     assert state["hasToggleSync"], "window.setupParentChildToggleSync must be a function"
+
+
+# Regression test for the jQuery straggler `runRecovery.removeAttr('title')`
+# fixed in fix/900-kometa-removeattr-regression.
+#
+# Original bug: syncIncompleteRunActions() called runRecovery.removeAttr('title')
+# — a jQuery method. On the vanilla DOM node returned by
+# document.getElementById(), that throws TypeError, breaking the whole
+# updateValidationGate() chain.
+#
+# The bug fires only when recoveryRunnable === true, which requires
+# (a) #run-recovery-command exists, (b) #incomplete-run-alert visible,
+# (c) #recovery-command-output has non-empty text, (d) no in-progress flags.
+# In the natural /step/900-kometa render these elements only appear when
+# an incomplete resume hint exists — the existing generic console-error
+# smoke test misses this code path entirely.
+#
+# We use `page.add_init_script` to install those elements BEFORE the
+# module bootstraps, then assert no TypeError fired.
+
+
+@pytest.mark.e2e
+def test_900_kometa_sync_incomplete_run_actions_no_jquery(page, live_server):
+    errors: list[str] = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    page.on(
+        "console",
+        lambda msg: errors.append(f"{msg.type}: {msg.text}") if msg.type == "error" else None,
+    )
+
+    # Inject the incomplete-run DOM at DOMContentLoaded, before 900-kometa.js
+    # runs its bootstrap chain (updateValidationGate -> updateRunNowState ->
+    # syncIncompleteRunActions). This puts us into the recoveryRunnable=true
+    # branch that hits the removeAttribute() call.
+    page.add_init_script("""
+        document.addEventListener('DOMContentLoaded', function () {
+            if (!document.getElementById('incomplete-run-alert')) {
+                const alert = document.createElement('div')
+                alert.id = 'incomplete-run-alert'
+                alert.className = 'alert alert-warning'
+                document.body.appendChild(alert)
+            }
+            if (!document.getElementById('recovery-command-output')) {
+                const cmd = document.createElement('code')
+                cmd.id = 'recovery-command-output'
+                cmd.textContent = 'kometa --run something'
+                document.body.appendChild(cmd)
+            }
+            if (!document.getElementById('run-recovery-command')) {
+                const btn = document.createElement('button')
+                btn.id = 'run-recovery-command'
+                btn.setAttribute('title', 'stale placeholder title')
+                document.body.appendChild(btn)
+            }
+        }, { once: true })
+    """)
+
+    page.goto(f"{live_server}/step/900-kometa", wait_until="domcontentloaded")
+    # Let the module fully bootstrap.
+    page.wait_for_timeout(500)
+
+    # 1) No TypeError from a jQuery-shaped call.
+    remove_attr_errors = [e for e in errors if "removeAttr" in e or "is not a function" in e]
+    assert not remove_attr_errors, f"900-kometa.js hit a jQuery-shaped method on a vanilla DOM element: " f"{remove_attr_errors}"
+
+    # 2) The button's stale placeholder title should be gone — proof that
+    #    removeAttribute() ran successfully in the recoveryRunnable=true
+    #    branch. (If the call had thrown, the title would still be there.)
+    button_title = page.evaluate("""() => {
+        const btn = document.getElementById('run-recovery-command')
+        return btn ? btn.getAttribute('title') : '__missing__'
+    }""")
+    assert button_title != "stale placeholder title", (
+        f"syncIncompleteRunActions didn't update the title (got: " f"'{button_title}'). Suggests the function threw before reaching " f"the title-setting branch."
+    )

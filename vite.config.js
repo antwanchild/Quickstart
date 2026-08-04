@@ -1,11 +1,11 @@
-// Vite scaffolding for Quickstart frontend (PR for #1334 Step 4).
+// Vite scaffolding for Quickstart frontend (#1334 Step 4).
 //
 // This config is intentionally dormant: nothing in production currently
 // references the build output. Flask still loads JS directly from
 // static/local-js/ via <script> tags in templates/000-base.html. The
-// purpose of this PR is to establish the toolchain so subsequent PRs
-// (Vitest, the validation widget consolidation, Alpine, etc.) have a
-// place to plug into.
+// purpose of this config is to establish the toolchain so future PRs
+// (Alpine widgets for Step 6, Svelte islands for Step 9) can plug into
+// it.
 //
 // What this config does today:
 //   - npm run dev      starts the Vite dev server on http://localhost:5173
@@ -18,17 +18,25 @@
 //   - change Dockerfile or quickstart.spec
 //   - replace the existing ESLint or pre-commit pipelines
 //
-// Multi-entry strategy: every file in static/local-js/*.js that is already
-// served as an ES module (per MODULE_PAGE_SCRIPTS in quickstart.py:410)
-// is registered as a Vite entry point. We discover the set from disk by
-// detecting top-level `import` statements rather than maintaining a
-// duplicate list here — that way the entry set stays in sync with the
-// actual module conversions without manual upkeep.
+// CI enforcement: `npm run build` runs as the `vite-build` job in
+// .github/workflows/lint.yml, so the build stays green even while
+// nothing consumes its output. When a downstream PR flips a template
+// switch, the bundle already works.
+//
+// Multi-entry strategy: every file in static/local-js/*.js whose first
+// non-comment/non-whitespace token is `import` or `export` is registered
+// as a Vite entry point. We discover the set from disk rather than
+// duplicating MODULE_PAGE_SCRIPTS in this file -- the entry set stays
+// in sync with the actual module conversions without manual upkeep.
+// The exact detection logic (which correctly skips leading docstrings
+// and block comments) lives in ./vite.detectModuleEntry.mjs and is
+// unit-tested under tests/js/detectModuleEntry.test.js.
 
 import { defineConfig } from 'vite'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { isModuleSource } from './vite.detectModuleEntry.mjs'
 
 const rootDir = fileURLToPath(new URL('.', import.meta.url))
 const sourceDir = resolve(rootDir, 'static/local-js')
@@ -36,17 +44,31 @@ const outputDir = resolve(rootDir, 'static/dist')
 
 function discoverModuleEntries (dir) {
   // A file is treated as a module entry iff it lives directly in
-  // static/local-js/ AND begins with an `import` or `export` statement.
-  // Files in static/local-js/modules/ are not entry points — they are
+  // static/local-js/ AND its first non-comment/non-whitespace token is
+  // `import` or `export` (see vite.detectModuleEntry.mjs). This matches
+  // the browser's own definition of a module: source that syntactically
+  // declares import/export at the top level.
+  //
+  // Files in static/local-js/modules/ are NOT entry points -- they are
   // dependencies imported by other modules.
+  //
+  // Files that MODULE_PAGE_SCRIPTS lists but which don't actually use
+  // import/export (100-anidb.js, 915-imagemaid.js) are skipped -- Vite
+  // building them would produce a byte-for-byte copy of the source,
+  // providing no value while cluttering static/dist/.
+  //
+  // As of #1346 finish, imageHandler.js, pathValidation.js,
+  // urlValidation.js, and validationHandler.js DO use `export` and
+  // therefore are entry points. They also keep their `window.*` shims
+  // for backward compat with classic-script consumers (see
+  // 915-imagemaid.js) and consumers not yet migrated to `import`.
   const entries = {}
   for (const name of readdirSync(dir)) {
     const fullPath = join(dir, name)
     if (!statSync(fullPath).isFile()) continue
     if (!name.endsWith('.js')) continue
-    const head = readFileSync(fullPath, 'utf8').slice(0, 200).trimStart()
-    if (head.startsWith('import ') || head.startsWith('import{') ||
-        head.startsWith('export ') || head.startsWith('export{')) {
+    const source = readFileSync(fullPath, 'utf8')
+    if (isModuleSource(source)) {
       const entryName = name.replace(/\.js$/, '')
       entries[entryName] = fullPath
     }
@@ -56,6 +78,10 @@ function discoverModuleEntries (dir) {
 
 export default defineConfig({
   root: rootDir,
+  // Flask serves Vite output from /static/dist/. Without this, built entry
+  // modules import chunks from the site root (e.g. /chunks/foo.js), which
+  // 404s behind Quickstart's Flask static route.
+  base: '/static/dist/',
   // Tell Vite where to resolve bare specifiers relative to. Today everything
   // is relative-path imports, but once we add npm packages (Alpine for
   // Step 6) this will matter.
@@ -69,21 +95,35 @@ export default defineConfig({
     // Don't wipe static/dist between builds; only files we own. Vite already
     // scopes cleaning to its own output, but being explicit costs nothing.
     emptyOutDir: true,
-    // No hash in filenames yet. When templates start referencing the build
-    // output (a later PR) we'll switch to manifest-based lookups and turn
-    // hashing back on for cache busting.
+    // Emit static/dist/.vite/manifest.json so Flask can look up the hashed
+    // filename for each source entry at request time. This is the
+    // production analogue of the dev server's on-the-fly resolution and
+    // is the pattern all mainstream server-side frameworks (Rails asset
+    // pipeline, Django whitenoise, Laravel Mix) use for cache busting.
+    //
+    // Format: { "static/local-js/000-base.js": { "file": "000-base-<hash>.js", ... } }
+    // See modules/vite_manifest.py for the Python-side lookup.
+    manifest: true,
     rollupOptions: {
       input: discoverModuleEntries(sourceDir),
       output: {
-        entryFileNames: '[name].js',
-        chunkFileNames: 'chunks/[name].js',
-        assetFileNames: 'assets/[name][extname]'
+        // Hash entry and chunk filenames for cache busting. Templates
+        // reference these via the asset_url() Jinja global, which reads
+        // manifest.json and resolves the source name to the hashed name.
+        // Assets (fonts, images if we ever bundle them) keep their
+        // extension in the hash so mime-type detection stays sane.
+        entryFileNames: '[name]-[hash].js',
+        chunkFileNames: 'chunks/[name]-[hash].js',
+        assetFileNames: 'assets/[name]-[hash][extname]'
       }
     },
     // Modern browsers only — matches what the rest of the codebase already
     // assumes (the project already uses `<script type="module">`).
     target: 'esnext',
-    minify: false,
+    // Minify with esbuild (Vite's default) for smaller production bundles.
+    // Keeps sourcemaps enabled so stack traces in bug reports map back
+    // to the original source.
+    minify: 'esbuild',
     sourcemap: true
   },
   server: {

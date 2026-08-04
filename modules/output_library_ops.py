@@ -1,0 +1,847 @@
+"""Per-library builders for build_libraries_section.
+
+Extracted incrementally from the giant ``add_entry`` closure inside
+``modules/output.py``.  Each function here takes the raw form-input
+dict (``attr_group``, ``top_group``, or ``template_data``) plus a
+couple of identity keys, and returns the operation / entry-field
+value ready for YAML serialization (or an empty container when the
+input is disabled/absent).
+
+Naming conventions:
+  * ``build_<operation_name>_operation`` -- goes under ``entry.operations``
+  * ``build_<field_group>_fields``       -- merged into ``entry`` directly
+  * ``build_template_variables``         -- goes under ``entry.template_variables``
+
+Public surface: none.  These helpers are called from the
+``build_libraries_section`` orchestrator; ``output.py`` imports each
+name without underscore because they're consumed inside the same
+package.
+"""
+
+from __future__ import annotations
+
+import json
+
+from ruamel.yaml.comments import CommentedSeq
+
+from modules import helpers
+from modules.output_collections import _LOOKUP_LABELS_SUFFIX, _TEMPLATE_VARIABLE_COMMENTS_KEY, _parse_template_lookup_labels
+from modules.output_values import _coerce_bool, _normalize_asset_directory_values
+
+# Values that we treat as "no override provided" for the numeric-ish
+# knobs inside operation blocks.  Users can wipe a field by clearing
+# the form input, which arrives as one of these placeholders.
+_EMPTY_OVERRIDE_VALUES = frozenset({None, "", "None", "none"})
+
+
+def _attr_key(library_type, lib_id, suffix):
+    """Compose the per-library attribute lookup key.
+
+    Consolidates the ``f"{library_type}-library_{lib_id}-attribute_{...}"``
+    string builder that appears literally dozens of times inside
+    ``add_entry``.  Not exported for now -- callers stay within this
+    module.
+    """
+    return f"{library_type}-library_{lib_id}-attribute_{suffix}"
+
+
+def _parse_json_list(raw_value, context_label):
+    """Best-effort ``json.loads`` returning a list, or ``None`` on failure.
+
+    ``context_label`` is used purely for the debug/error log message so
+    callers can distinguish which input misbehaved.
+    """
+    if not raw_value:
+        return None
+    try:
+        parsed = json.loads(raw_value)
+    except Exception as e:
+        helpers.ts_log(f"Skipping invalid JSON in {context_label}: {raw_value} - {e}", level="ERROR")
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def build_delete_collections_operation(attr_group, library_type, lib_id):
+    """Return the ``delete_collections`` operations dict, or an empty dict.
+
+    Reads four attribute inputs off ``attr_group``:
+
+    * ``delete_collections_configured`` -- bool
+    * ``delete_collections_managed`` -- bool
+    * ``delete_collections_ignore_empty_smart_collections`` -- bool
+    * ``delete_collections_less`` -- int (or empty)
+
+    Returns an empty dict when none of the four are actually set --
+    callers should treat that as "don't emit a delete_collections
+    block".  When at least one input is set, returns a dict shaped
+    like the Kometa ``operations.delete_collections`` schema:
+
+        {
+            "configured": bool,
+            "managed": bool,
+            "less": int,                              # if provided
+            "ignore_empty_smart_collections": True,   # if enabled
+        }
+    """
+    configured_value = _coerce_bool(attr_group.get(_attr_key(library_type, lib_id, "delete_collections_configured")))
+    managed_value = _coerce_bool(attr_group.get(_attr_key(library_type, lib_id, "delete_collections_managed")))
+    ignore_value = _coerce_bool(attr_group.get(_attr_key(library_type, lib_id, "delete_collections_ignore_empty_smart_collections")))
+
+    less_value = None
+    raw_less = attr_group.get(_attr_key(library_type, lib_id, "delete_collections_less"))
+    if raw_less not in _EMPTY_OVERRIDE_VALUES:
+        try:
+            less_value = int(raw_less)
+        except Exception:
+            helpers.ts_log(f"Skipping invalid delete_collections_less value: {raw_less}", level="DEBUG")
+
+    enabled = configured_value is True or managed_value is True or ignore_value is True or less_value is not None
+    if not enabled:
+        return {}
+
+    result = {
+        "configured": configured_value if configured_value is not None else False,
+        "managed": managed_value if managed_value is not None else False,
+    }
+    if less_value is not None:
+        result["less"] = less_value
+    if ignore_value is True:
+        result["ignore_empty_smart_collections"] = True
+    return result
+
+
+def build_mass_genre_update_operation(attr_group, library_type, lib_id):
+    """Return the ``mass_genre_update`` operations value, or an empty list.
+
+    Two attribute inputs feed this operation:
+
+    * ``mass_genre_update_order``  -- JSON list of sortable source strings.
+      Each string becomes a top-level entry.  Items shaped like
+      ``"[foo]"`` are treated as malformed UI leftovers and skipped.
+      Nested-list items get flattened.
+    * ``mass_genre_update_custom`` -- JSON list of custom genre strings
+      (e.g. ``["Thriller", "Action"]``).  The whole list is appended as
+      a single nested flow-style sequence so the emitted YAML reads
+      ``- [Thriller, Action]``.
+
+    Returns the assembled list (order + optional nested-custom).  An
+    empty list means the operation is disabled and shouldn't be emitted.
+    """
+    result = []
+
+    order_items = _parse_json_list(
+        attr_group.get(_attr_key(library_type, lib_id, "mass_genre_update_order")),
+        "custom genre",
+    )
+    if order_items is not None:
+        for item in order_items:
+            if isinstance(item, str) and item.startswith("[") and item.endswith("]"):
+                # Probably malformed nested list -- skip
+                continue
+            if isinstance(item, str):
+                result.append(item)
+            elif isinstance(item, list):  # rare case: nested list, flatten
+                result.extend(item)
+
+    custom_items = _parse_json_list(
+        attr_group.get(_attr_key(library_type, lib_id, "mass_genre_update_custom")),
+        "custom genre strings",
+    )
+    if custom_items:  # non-empty list only
+        # Wrap in a flow-style CommentedSeq so YAML emits `[a, b]` inline.
+        custom_flow_list = CommentedSeq(custom_items)
+        custom_flow_list.fa.set_flow_style()
+        result.append(custom_flow_list)
+
+    return result
+
+
+# Keys read from attr_group for each mass image operation.  Poster has
+# show-level toggles and ignore_overlays, background has show-level
+# toggles, logo/square_art are item-level only in Kometa.
+_MASS_POSTER_UPDATE_KEYS = ("seasons", "episodes", "ignore_locked", "ignore_overlays", "source")
+_MASS_BACKGROUND_UPDATE_KEYS = ("seasons", "episodes", "ignore_locked", "source")
+_MASS_LOGO_UPDATE_KEYS = ("ignore_locked", "ignore_overlays", "source")
+_MASS_SQUARE_ART_UPDATE_KEYS = ("ignore_locked", "ignore_overlays", "source")
+
+# Values that the mass_poster/background 'empty' check considers
+# 'user hasn't set this field' -- distinct from _EMPTY_OVERRIDE_VALUES
+# because these two operations skip 'False' (boolean off) rather than
+# only string placeholders.
+_MASS_MEDIA_EMPTY_VALUES = frozenset({None, False, ""})
+
+
+def _build_mass_media_update_operation(attr_group, library_type, lib_id, media_kind, keys):
+    """Shared builder for the two mass_<media>_update operations.
+
+    ``media_kind`` is ``"poster"`` or ``"background"`` -- used to compose
+    the ``mass_<media>_<key>`` attribute lookup keys.  ``keys`` is the
+    tuple of subfields to check (see ``_MASS_POSTER_UPDATE_KEYS`` /
+    ``_MASS_BACKGROUND_UPDATE_KEYS``).
+
+    Returns a dict of the subfields whose value is non-empty, or an
+    empty dict when the whole operation should be skipped.
+    """
+    result = {}
+    for key in keys:
+        val = attr_group.get(_attr_key(library_type, lib_id, f"mass_{media_kind}_{key}"))
+        if val not in _MASS_MEDIA_EMPTY_VALUES:
+            result[key] = val
+    return result
+
+
+def build_mass_poster_update_operation(attr_group, library_type, lib_id):
+    """Return the ``mass_poster_update`` operations dict, or empty.
+
+    Reads five per-library attribute inputs:
+    ``mass_poster_seasons``, ``mass_poster_episodes``,
+    ``mass_poster_ignore_locked``, ``mass_poster_ignore_overlays``,
+    ``mass_poster_source``.  Any subfield with a truthy-ish value
+    (i.e. not ``None``, ``False``, or the empty string) is included.
+    """
+    return _build_mass_media_update_operation(attr_group, library_type, lib_id, "poster", _MASS_POSTER_UPDATE_KEYS)
+
+
+def build_mass_background_update_operation(attr_group, library_type, lib_id):
+    """Return the ``mass_background_update`` operations dict, or empty.
+
+    Same shape as :func:`build_mass_poster_update_operation` but reads
+    four inputs (no ``ignore_overlays``): ``mass_background_seasons``,
+    ``mass_background_episodes``, ``mass_background_ignore_locked``,
+    ``mass_background_source``.
+    """
+    return _build_mass_media_update_operation(attr_group, library_type, lib_id, "background", _MASS_BACKGROUND_UPDATE_KEYS)
+
+
+def build_mass_logo_update_operation(attr_group, library_type, lib_id):
+    """Return the ``mass_logo_update`` operations dict, or empty."""
+    return _build_mass_media_update_operation(attr_group, library_type, lib_id, "logo", _MASS_LOGO_UPDATE_KEYS)
+
+
+def build_mass_square_art_update_operation(attr_group, library_type, lib_id):
+    """Return the ``mass_square_art_update`` operations dict, or empty."""
+    return _build_mass_media_update_operation(attr_group, library_type, lib_id, "square_art", _MASS_SQUARE_ART_UPDATE_KEYS)
+
+
+def build_mapper_operations(attr_group, library_type, lib_id):
+    """Return a dict of the enabled mapper operations.
+
+    Reads ``genre_mapper`` and ``content_rating_mapper`` attribute
+    inputs.  Each value is expected to be a JSON-encoded dict; when
+    valid and non-empty, it's copied into the returned dict under
+    the matching key.
+
+    Returns an empty dict if neither mapper is set (or both are
+    invalid/empty).  Callers should merge the result into their
+    ``operations`` dict.
+    """
+    result = {}
+    for mapper_key in ("genre_mapper", "content_rating_mapper"):
+        raw_value = attr_group.get(_attr_key(library_type, lib_id, mapper_key))
+        if not raw_value:
+            continue
+        try:
+            parsed = json.loads(raw_value)
+        except Exception as e:
+            helpers.ts_log(f"Skipping invalid JSON for {mapper_key}: {raw_value} - {e}", level="ERROR")
+            continue
+        if isinstance(parsed, dict) and parsed:
+            result[mapper_key] = parsed
+    return result
+
+
+def build_metadata_backup_operation(attr_group, library_type, lib_id):
+    """Return the ``metadata_backup`` operations dict, or empty.
+
+    Reads four attribute inputs:
+
+    * ``metadata_backup_path`` -- filesystem path (string).
+    * ``metadata_backup_exclude`` -- JSON list; only included when it
+      parses to a non-empty list.
+    * ``sync_tags`` -- included only when literally ``True``.
+    * ``add_blank_entries`` -- included only when literally ``True``.
+
+    Returns an empty dict when none of the four are set; callers
+    should treat that as 'don't emit a metadata_backup block'.
+    """
+    result = {}
+
+    path_value = attr_group.get(_attr_key(library_type, lib_id, "metadata_backup_path"))
+    if path_value:
+        result["path"] = path_value
+
+    exclude_raw = attr_group.get(_attr_key(library_type, lib_id, "metadata_backup_exclude"))
+    if exclude_raw:
+        try:
+            parsed = json.loads(exclude_raw) if isinstance(exclude_raw, str) else exclude_raw
+        except Exception as e:
+            helpers.ts_log(f"Skipping invalid exclude value: {exclude_raw} - {e}", level="ERROR")
+            parsed = None
+        if isinstance(parsed, list) and parsed:  # non-empty list only
+            result["exclude"] = parsed
+
+    if attr_group.get(_attr_key(library_type, lib_id, "sync_tags")) is True:
+        result["sync_tags"] = True
+    if attr_group.get(_attr_key(library_type, lib_id, "add_blank_entries")) is True:
+        result["add_blank_entries"] = True
+
+    return result
+
+
+# The five 'top_level' fields whose emptiness rule is 'None or empty
+# string means user didn't set it'.  ``remove_overlays`` uses a
+# truthy check and ``reset_overlays`` also filters the literal
+# string 'None' (UI leftover), so they're handled inline below.
+_TOP_LEVEL_SIMPLE_FIELDS = (
+    "report_path",
+    "schedule",
+    "auto_sort_hubs",
+    "schedule_overlays",
+)
+
+
+def _top_level_key(library_type, lib_id, suffix):
+    """Compose a ``top_level_<suffix>`` lookup key.
+
+    Mirrors :func:`_attr_key` but for the ``top_level`` namespace so
+    ``top_group.get(_top_level_key(...))`` reads clean.
+    """
+    return f"{library_type}-library_{lib_id}-top_level_{suffix}"
+
+
+def build_top_level_fields(top_group, library_type, lib_id):
+    """Return the top-level fields dict to merge into a library's entry.
+
+    Reads six top-level inputs off ``top_group``:
+
+    * ``report_path``, ``schedule``, ``auto_sort_hubs``, ``schedule_overlays``
+      -- included when the value isn't ``None`` or empty string.
+    * ``remove_overlays`` -- included as literal ``True`` when the raw
+      value is truthy.  (The stored value is always emitted as ``True``
+      per the Kometa schema; we only care whether it was set.)
+    * ``reset_overlays`` -- included when the value isn't ``None``,
+      empty string, or the literal string ``"None"`` (a UI leftover).
+
+    Returns an empty dict when none of the six are set.  Callers merge
+    the result into their per-library entry dict via ``entry.update(...)``.
+    """
+    result = {}
+
+    for field in _TOP_LEVEL_SIMPLE_FIELDS:
+        value = top_group.get(_top_level_key(library_type, lib_id, field))
+        if value not in (None, ""):
+            result[field] = value
+
+    if top_group.get(_top_level_key(library_type, lib_id, "remove_overlays")):
+        result["remove_overlays"] = True
+
+    reset_overlays = top_group.get(_top_level_key(library_type, lib_id, "reset_overlays"))
+    if reset_overlays not in (None, "None", ""):
+        result["reset_overlays"] = reset_overlays
+
+    return result
+
+
+# Suffix -> template_variables output key.  We iterate template_data
+# looking for keys ending in one of these six suffixes with the
+# matching library prefix, and stash the value under the mapped key.
+# The prefix is checked so a movie library doesn't accidentally pick
+# up template variables meant for a show library with the same lib_id.
+_TEMPLATE_VAR_SUFFIXES = {
+    "-template_variables[use_separator]": "use_separator",
+    "-attribute_template_variables[placeholder_imdb_id]": "placeholder_imdb_id",
+    "-attribute_template_variables[placeholder_tmdb_movie]": "placeholder_tmdb_movie",
+    "-attribute_template_variables[placeholder_tvdb_show]": "placeholder_tvdb_show",
+    "-template_variables[language]": "language",
+    "-template_variables[collection_mode]": "collection_mode",
+}
+
+
+def _discover_template_variables(template_data, library_type, template_key):
+    """Walk ``template_data`` and pull out the six known template-variable inputs.
+
+    Returns a dict keyed by the output name (``use_separator``,
+    ``placeholder_imdb_id``, ...).  Missing inputs are simply absent
+    from the returned dict.
+    """
+    prefix = f"{library_type}-library_{template_key}"
+    discovered = {}
+    lookup_labels = {}
+    for key, value in template_data.items():
+        if not key.startswith(prefix):
+            continue
+        for suffix, output_name in _TEMPLATE_VAR_SUFFIXES.items():
+            if key.endswith(f"{suffix}{_LOOKUP_LABELS_SUFFIX}"):
+                labels = _parse_template_lookup_labels(value)
+                if labels:
+                    lookup_labels[output_name] = labels
+                break
+            if key.endswith(suffix):
+                discovered[output_name] = value
+                break
+    return discovered, lookup_labels
+
+
+def build_template_variables(templates, library_type, library_key, has_collectionless):
+    """Return the ``template_variables`` dict for a library entry.
+
+    Extracts the template-key from ``library_key`` (via
+    :func:`helpers.extract_library_name`), looks up the matching
+    template-data dict in ``templates``, and walks it for the six
+    known template-variable inputs.  Assembles the result into the
+    shape Kometa expects.
+
+    Rules:
+      * ``use_separator`` is always emitted (defaults ``False``).
+      * ``sep_style`` is emitted only when a separator color is set --
+        the raw value from the form doubles as the style.
+      * For movie libraries (``library_type == "mov"``), the
+        ``placeholder_tmdb_movie`` input wins over ``placeholder_imdb_id``.
+        For show libraries, ``placeholder_tvdb_show`` wins.
+      * ``language`` and ``collection_mode`` are passed through when set.
+      * If the library has a collectionless entry (``has_collectionless``),
+        ``collection_mode`` is forced to ``"hide"`` (overriding any
+        user-set value).
+    """
+    template_key = helpers.extract_library_name(library_key)
+    template_data = templates.get(template_key, {})
+    discovered, lookup_labels = _discover_template_variables(template_data, library_type, template_key)
+
+    sep_color = discovered.get("use_separator")
+    template_vars = {"use_separator": bool(sep_color)}
+    if sep_color:
+        template_vars["sep_style"] = sep_color
+
+    # Placeholder selection: media-specific placeholder wins over the
+    # generic IMDB fallback.
+    imdb_fallback = discovered.get("placeholder_imdb_id")
+    if library_type == "mov":
+        primary = discovered.get("placeholder_tmdb_movie")
+        primary_key = "placeholder_tmdb_movie"
+    else:
+        primary = discovered.get("placeholder_tvdb_show")
+        primary_key = "placeholder_tvdb_show"
+    if primary:
+        template_vars[primary_key] = primary
+    elif imdb_fallback:
+        template_vars["placeholder_imdb_id"] = imdb_fallback
+
+    for optional_key in ("language", "collection_mode"):
+        value = discovered.get(optional_key)
+        if value:
+            template_vars[optional_key] = value
+
+    if has_collectionless:
+        template_vars["collection_mode"] = "hide"
+
+    if lookup_labels:
+        template_vars[_TEMPLATE_VARIABLE_COMMENTS_KEY] = lookup_labels
+
+    return template_vars
+
+
+# The 17 operations that share the same order/custom/custom_string
+# tri-input shape.  Each one is emitted as a block-style YAML list of
+# strings / numbers.  mass_genre_update is deliberately excluded --
+# its custom-list is wrapped in a nested flow-style sequence and its
+# builder lives in build_mass_genre_update_operation.
+_GROUPED_OPERATIONS = (
+    "mass_content_rating_update",
+    "mass_original_title_update",
+    "mass_studio_update",
+    "mass_tagline_update",
+    "mass_originally_available_update",
+    "mass_added_at_update",
+    "mass_audience_rating_update",
+    "mass_critic_rating_update",
+    "mass_user_rating_update",
+    "mass_episode_audience_rating_update",
+    "mass_episode_critic_rating_update",
+    "mass_episode_user_rating_update",
+    "mass_background_update",
+    "mass_poster_update",
+    "radarr_remove_by_tag",
+    "sonarr_remove_by_tag",
+)
+
+_MASS_METADATA_GROUPED_OPERATIONS = frozenset(
+    {
+        "mass_content_rating_update",
+        "mass_original_title_update",
+        "mass_studio_update",
+        "mass_originally_available_update",
+        "mass_added_at_update",
+        "mass_audience_rating_update",
+        "mass_critic_rating_update",
+        "mass_user_rating_update",
+        "mass_episode_audience_rating_update",
+        "mass_episode_critic_rating_update",
+        "mass_episode_user_rating_update",
+        "mass_background_update",
+        "mass_poster_update",
+    }
+)
+
+# Rating operations whose ``custom_string`` fallback must be coerced
+# to float instead of string.  Frozen so callers can't mutate it.
+_RATING_OPERATIONS_FLOAT_COERCE = frozenset(
+    {
+        "mass_critic_rating_update",
+        "mass_user_rating_update",
+        "mass_audience_rating_update",
+        "mass_episode_critic_rating_update",
+        "mass_episode_user_rating_update",
+        "mass_episode_audience_rating_update",
+    }
+)
+
+
+def _collect_grouped_op_items(parsed_list, values):
+    """Append valid items from ``parsed_list`` to ``values`` in place.
+
+    Numeric items pass through untouched; strings get whitespace-
+    stripped and skipped if empty.  Anything else is ignored.
+    Shared by the ``_order`` and ``_custom`` list handlers so both
+    apply identical filtering.
+    """
+    for item in parsed_list:
+        if isinstance(item, (int, float)):
+            values.append(item)
+        elif isinstance(item, str) and item.strip():
+            values.append(item.strip())
+
+
+def _coerce_custom_string_fallback(raw_value, op):
+    """Convert the single-value ``custom_string`` fallback to a list item.
+
+    * Rating operations (see ``_RATING_OPERATIONS_FLOAT_COERCE``) get
+      float-coerced; a ``ValueError`` yields no item.
+    * Everything else keeps the string (whitespace-stripped).
+    * Numeric inputs pass through directly.
+
+    Returns a single-element list, or an empty list if the raw value
+    couldn't be turned into anything useful.
+    """
+    if isinstance(raw_value, (int, float)):
+        return [raw_value]
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return []
+    stripped = raw_value.strip()
+    if op in _RATING_OPERATIONS_FLOAT_COERCE:
+        try:
+            return [float(stripped)]
+        except ValueError:
+            return []
+    return [stripped]
+
+
+def _format_grouped_op_sequence(values):
+    """Wrap ``values`` in a block-style CommentedSeq for YAML emission.
+
+    Float values that happen to be whole numbers (e.g. ``5.0``) get
+    re-rendered as ``5.0`` explicitly (via ``f"{v:.1f}"``) so ruamel.yaml
+    doesn't drop the decimal point.  This preserves the visual hint
+    that the field is a rating, not a count.
+    """
+    seq = CommentedSeq(values)
+    seq.fa.set_block_style()
+    for i, v in enumerate(seq):
+        if isinstance(v, float) and v.is_integer():
+            seq[i] = float(f"{v:.1f}")
+    return seq
+
+
+def build_grouped_mass_update_operations(attr_group, library_type, lib_id, *, include_mass_metadata_legacy=True):
+    """Return a dict of the 17 grouped mass_update operations.
+
+    For each operation name in ``_GROUPED_OPERATIONS``, reads three
+    attribute inputs:
+
+    1. ``<op>_order``          -- JSON list of sortable source strings
+    2. ``<op>_custom``         -- JSON list of custom values
+    3. ``<op>_custom_string``  -- single fallback value used when
+                                  no ``_custom`` list was provided
+
+    Combines the order + (custom OR custom_string) into one list.
+    Rating operations coerce the custom_string fallback to float;
+    everything else preserves the string.  Non-empty results are
+    wrapped in a block-style ``CommentedSeq``.
+
+    Returns a dict that the caller merges into ``operations`` via
+    ``operations.update(result)``.  Empty when none of the 17 have
+    any input.
+    """
+    result = {}
+    for op in _GROUPED_OPERATIONS:
+        if not include_mass_metadata_legacy and op in _MASS_METADATA_GROUPED_OPERATIONS:
+            continue
+        values = []
+
+        # 1. Ordered source list (sortable)
+        order_items = _parse_json_list(
+            attr_group.get(_attr_key(library_type, lib_id, f"{op}_order")),
+            f"{op}_order",
+        )
+        if order_items is not None:
+            _collect_grouped_op_items(order_items, values)
+
+        # 2. Custom list (JSON array from UI) -- takes precedence over
+        #    the single-value custom_string fallback.
+        custom_list_key = _attr_key(library_type, lib_id, f"{op}_custom")
+        custom_list_raw = attr_group.get(custom_list_key)
+        if custom_list_raw:
+            custom_items = _parse_json_list(custom_list_raw, f"{op}_custom")
+            if custom_items is not None:
+                _collect_grouped_op_items(custom_items, values)
+        elif _attr_key(library_type, lib_id, f"{op}_custom_string") in attr_group:
+            # 3. Fallback to single custom_string when _custom is absent.
+            raw_value = attr_group.get(_attr_key(library_type, lib_id, f"{op}_custom_string"))
+            values.extend(_coerce_custom_string_fallback(raw_value, op))
+
+        if values:
+            result[op] = _format_grouped_op_sequence(values)
+
+    return result
+
+
+def _single_or_sequence(value):
+    """Use scalar YAML for one source and block sequence for multiple."""
+    if isinstance(value, CommentedSeq):
+        items = list(value)
+    elif isinstance(value, list):
+        items = value
+    else:
+        return value
+    if len(items) == 1:
+        return items[0]
+    seq = CommentedSeq(items)
+    seq.fa.set_block_style()
+    return seq
+
+
+_MASS_METADATA_DIRECT_ALIASES = (
+    ("mass_original_title_update", "original_title"),
+    ("mass_studio_update", "studio"),
+    ("mass_originally_available_update", "originally_available"),
+    ("mass_added_at_update", "added_at"),
+)
+
+_MASS_METADATA_RATING_ALIASES = (
+    ("mass_audience_rating_update", "audience"),
+    ("mass_critic_rating_update", "critic"),
+    ("mass_user_rating_update", "user"),
+    ("mass_episode_audience_rating_update", "episode_audience"),
+    ("mass_episode_critic_rating_update", "episode_critic"),
+    ("mass_episode_user_rating_update", "episode_user"),
+)
+
+
+def build_mass_metadata_update_operation(attr_group, library_type, lib_id):
+    """Return Kometa's grouped ``mass_metadata_update`` operation.
+
+    Quickstart stores/edit these controls as flat legacy operation
+    fields.  Kometa does the same internally after parsing the grouped
+    key, so this builder only canonicalizes final YAML output.
+    """
+    result = {}
+    grouped_ops = build_grouped_mass_update_operations(attr_group, library_type, lib_id)
+
+    genre = {}
+    genre_update = build_mass_genre_update_operation(attr_group, library_type, lib_id)
+    if genre_update:
+        genre["source"] = _single_or_sequence(genre_update)
+    mappers = build_mapper_operations(attr_group, library_type, lib_id)
+    if mappers.get("genre_mapper"):
+        genre["mappings"] = mappers["genre_mapper"]
+    if genre:
+        result["genre"] = genre
+
+    content_rating = {}
+    if grouped_ops.get("mass_content_rating_update"):
+        content_rating["source"] = _single_or_sequence(grouped_ops["mass_content_rating_update"])
+    if mappers.get("content_rating_mapper"):
+        content_rating["mappings"] = mappers["content_rating_mapper"]
+    if content_rating:
+        result["content_rating"] = content_rating
+
+    for old_key, new_key in _MASS_METADATA_DIRECT_ALIASES:
+        value = grouped_ops.get(old_key)
+        if value:
+            result[new_key] = _single_or_sequence(value)
+
+    labels = attr_group.get(_attr_key(library_type, lib_id, "mass_imdb_parental_labels"))
+    if labels not in _SETTINGS_EMPTY_VALUES:
+        result["labels"] = labels
+
+    collection_mode = attr_group.get(_attr_key(library_type, lib_id, "mass_collection_mode"))
+    if collection_mode not in _SETTINGS_EMPTY_VALUES:
+        result["collections"] = {"mode": collection_mode}
+
+    ratings = {}
+    for old_key, new_key in _MASS_METADATA_RATING_ALIASES:
+        value = grouped_ops.get(old_key)
+        if value:
+            ratings[new_key] = _single_or_sequence(value)
+    if ratings:
+        result["ratings"] = ratings
+
+    images = (
+        ("poster", build_mass_poster_update_operation(attr_group, library_type, lib_id)),
+        ("background", build_mass_background_update_operation(attr_group, library_type, lib_id)),
+        ("logo", build_mass_logo_update_operation(attr_group, library_type, lib_id)),
+        ("square_art", build_mass_square_art_update_operation(attr_group, library_type, lib_id)),
+    )
+    for image_key, image_value in images:
+        if image_value:
+            result[image_key] = image_value
+
+    backup = build_metadata_backup_operation(attr_group, library_type, lib_id)
+    if backup:
+        result["backup"] = backup
+
+    return result
+
+
+# The two per-library-type Radarr/Sonarr field maps.  Values are
+# either "string" (pass-through if non-empty) or "bool" (coerce via
+# _coerce_bool, include only if the coercion yielded a real bool).
+_LIBRARY_RADARR_FIELDS = {
+    "url": "string",
+    "token": "string",
+    "root_folder_path": "string",
+    "quality_profile": "string",
+    "availability": "string",
+    "tag": "string",
+    "monitor": "bool",
+    "search": "bool",
+    "add_missing": "bool",
+    "add_existing": "bool",
+    "upgrade_existing": "bool",
+    "monitor_existing": "bool",
+    "ignore_cache": "bool",
+    "radarr_path": "string",
+    "plex_path": "string",
+}
+
+_LIBRARY_SONARR_FIELDS = {
+    "url": "string",
+    "token": "string",
+    "root_folder_path": "string",
+    "quality_profile": "string",
+    "language_profile": "string",
+    "series_type": "string",
+    "season_folder": "bool",
+    "monitor": "string",
+    "tag": "string",
+    "search": "bool",
+    "cutoff_search": "bool",
+    "add_missing": "bool",
+    "add_existing": "bool",
+    "upgrade_existing": "bool",
+    "monitor_existing": "bool",
+    "ignore_cache": "bool",
+    "sonarr_path": "string",
+    "plex_path": "string",
+}
+
+# Values treated as 'user did not set this' for the simple field
+# walkers.  Broader than _EMPTY_OVERRIDE_VALUES because ``False`` is
+# also considered empty here (boolean toggle turned off).
+_SETTINGS_EMPTY_VALUES = frozenset({None, "", False})
+
+# Simple pass-through operation fields on ``entry.operations``.
+_LIBRARY_OPERATIONS_FIELDS = (
+    "assets_for_all",
+    "assets_for_all_collections",
+    "update_blank_track_titles",
+    "remove_title_parentheses",
+    "split_duplicates",
+    "radarr_add_all",
+    "sonarr_add_all",
+)
+
+
+def build_library_settings(attr_group, library_type, lib_id):
+    """Return the ``entry.settings`` dict for a library.
+
+    Reads the two per-library settings fields:
+
+    * ``asset_directory`` -- normalized via
+      :func:`output_values._normalize_asset_directory_values` and
+      wrapped in a block-style ``CommentedSeq``.  Also falls back to
+      the legacy ``<type>-library_<id>-asset_directory`` key (without
+      the ``attribute_`` prefix) when the primary key is empty --
+      preserves compatibility with older form submissions.
+    * ``prioritize_assets`` -- coerced via :func:`_coerce_bool`.
+
+    Returns an empty dict when neither field is set.
+    """
+    result = {}
+
+    # asset_directory (with legacy-key fallback)
+    value = attr_group.get(_attr_key(library_type, lib_id, "asset_directory"))
+    if value in (None, ""):
+        legacy_key = f"{library_type}-library_{lib_id}-asset_directory"
+        value = attr_group.get(legacy_key)
+    normalized = _normalize_asset_directory_values(value)
+    if normalized:
+        asset_dirs = CommentedSeq(normalized)
+        asset_dirs.fa.set_block_style()
+        result["asset_directory"] = asset_dirs
+
+    # prioritize_assets (bool coerce)
+    prioritize_raw = attr_group.get(_attr_key(library_type, lib_id, "prioritize_assets"))
+    prioritize_bool = _coerce_bool(prioritize_raw)
+    if prioritize_bool is not None:
+        result["prioritize_assets"] = prioritize_bool
+
+    return result
+
+
+def build_library_operations(attr_group, library_type, lib_id):
+    """Return the pass-through library operations dict.
+
+    Reads each field in :data:`_LIBRARY_OPERATIONS_FIELDS` and
+    passes the raw value through when it's not in
+    :data:`_SETTINGS_EMPTY_VALUES`.  Callers merge into
+    ``operations`` via ``operations.update(result)``.
+    """
+    result = {}
+    for field in _LIBRARY_OPERATIONS_FIELDS:
+        value = attr_group.get(_attr_key(library_type, lib_id, field))
+        if value not in _SETTINGS_EMPTY_VALUES:
+            result[field] = value
+    return result
+
+
+def build_service_overrides(attr_group, library_type, lib_id):
+    """Return ``(service_name, overrides_dict)`` for the library type.
+
+    Movie libraries get Radarr overrides, show libraries get Sonarr.
+    Fields marked ``"bool"`` in the field-map are coerced via
+    :func:`_coerce_bool` (included only when the coercion yields a
+    real bool -- not for missing/blank inputs).  String fields are
+    passed through unless empty.
+
+    Returns ``(name, {})`` when the user set no overrides; callers
+    should treat the empty dict as "don't emit a service block".
+    """
+    if library_type == "mov":
+        field_map = _LIBRARY_RADARR_FIELDS
+        service_name = "radarr"
+    else:
+        field_map = _LIBRARY_SONARR_FIELDS
+        service_name = "sonarr"
+
+    overrides = {}
+    for field, field_type in field_map.items():
+        value = attr_group.get(_attr_key(library_type, lib_id, f"{service_name}_{field}"))
+        if field_type == "bool":
+            bool_value = _coerce_bool(value)
+            if bool_value is not None:
+                overrides[field] = bool_value
+            continue
+        if value not in _SETTINGS_EMPTY_VALUES:
+            overrides[field] = value
+
+    return service_name, overrides

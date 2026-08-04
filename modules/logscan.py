@@ -1,10 +1,19 @@
 import hashlib
 import logging
-import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from modules import logscan_command, logscan_people
+from modules import (
+    logscan_command,
+    logscan_content_extractors,
+    logscan_finished_runs,
+    logscan_library_stats,
+    logscan_maintenance,
+    logscan_people,
+    logscan_progress_engine,
+    logscan_recommendations,
+    logscan_recommendations_engine,
+)
 
 # Re-exported for back-compat with tests / quickstart imports.
 from modules.logscan_people import (  # noqa: F401
@@ -19,32 +28,6 @@ from modules.logscan_people import (  # noqa: F401
 # Create logger
 mylogger = logging.getLogger("logscan")
 mylogger.setLevel(logging.INFO)
-
-
-# --- PMS security vulnerability helpers (non-invasive; keep existing checks as-is) ---
-
-
-def _parse_pms_version_tuple(ver: str):
-    """Return a 4-int tuple for PMS versions like '1.41.7.9100' (trims any '-xyz')."""
-    ver = ver.split("-", 1)[0].strip()  # drop any '-whatever' suffix if present
-    parts = ver.split(".")
-    nums = []
-    for i in range(4):
-        try:
-            nums.append(int(parts[i]))
-        except Exception:
-            nums.append(0)
-    return tuple(nums[:4])
-
-
-def _version_in_inclusive_range(ver: str, low: tuple, high: tuple) -> bool:
-    v = _parse_pms_version_tuple(ver)
-    return low <= v <= high
-
-
-# Vulnerable range you want to flag (adjust as needed)
-_PMS_VULN_LOW = (1, 41, 7, 0)  # 1.41.7.x
-_PMS_VULN_HIGH = (1, 42, 0, 99999)  # through 1.42.0.x
 
 
 class LogscanAnalyzer:
@@ -62,21 +45,14 @@ class LogscanAnalyzer:
         self.server_versions = []
         self.people_index_available = False
         self._people_index = None
+        self.validation_summary = {}
 
     def reset_server_versions(self):
         """Reset the server_versions list to an empty list."""
         self.server_versions = []
 
     def remove_repeated_dividers(self, line):
-        divider = self.global_divider
-
-        # Ensure that line is a string
-        line = str(line)
-
-        # Use regular expression to find and replace repeated dividers
-        line = re.sub(f"({re.escape(divider)}){{10,}}", "", line)
-
-        return line
+        return logscan_content_extractors.remove_repeated_dividers(line, self.global_divider)
 
     async def parse_attachment_content(self, content_bytes):
         try:
@@ -96,294 +72,55 @@ class LogscanAnalyzer:
         return cleaned_content
 
     def set_global_divider(self, content):
-        """
-        Search for the divider string in the content and set the global divider.
-        """
-        # Define the patterns to search for
-        patterns = [
-            r'--divider \(KOMETA_DIVIDER\): ?["\']?([^"\']{1})["\']?',  # KOMETA_DIVIDER pattern
-            r'--divider \(PMM_DIVIDER\): ?["\']?([^"\']{1})["\']?',  # PMM_DIVIDER pattern
-        ]
-
-        # Try each pattern and set global_divider if a match is found
-        for pattern in patterns:
-            divider_match = re.search(pattern, content)
-            if divider_match:
-                divider = divider_match.group(1)
-                self.global_divider = divider
-                mylogger.debug(f"Divider found and set to: {divider}")
-                return  # Exit the function once a divider is found
-
-        # If no match is found for any pattern, keep existing divider or fallback
-        if not getattr(self, "global_divider", None):
-            self.global_divider = "="
-            mylogger.debug(f"Divider not found, using default divider: {self.global_divider}")
+        """Search *content* for a KOMETA/PMM divider and store it on self."""
+        divider = logscan_content_extractors.extract_divider(content, fallback=getattr(self, "global_divider", None) or logscan_content_extractors.DEFAULT_DIVIDER)
+        self.global_divider = divider
 
     def extract_memory_value(self, content):
-        """
-        Extract the memory value from the given content.
-        """
-        # Regular expression to match the memory value
-        memory_match = re.search(r"Memory:\s*([\d.]+)\s*(\w+)", content)
-
-        if memory_match:
-            value = float(memory_match.group(1))
-            unit = memory_match.group(2).lower()
-
-            # Convert value to gigabytes (GB)
-            if unit == "gb":
-                return value
-            elif unit == "mb":
-                return value / 1024  # Convert MB to GB
-            elif unit == "tb":
-                return value * 1024  # Convert TB to GB
-
-        return None  # Return None if no valid memory value is found
+        return logscan_content_extractors.extract_memory_value(content)
 
     def extract_db_cache_value(self, content):
-        """
-        Extract the db_cache value from the given content.
-        """
-        # Regular expression to match the memory value
-        memory_match = re.search(r"Plex DB cache setting:\s*([\d.]+)\s*(\w+)", content)
-
-        if memory_match:
-            value = float(memory_match.group(1))
-            unit = memory_match.group(2).lower()
-
-            # Convert value to gigabytes (GB)
-            if unit == "gb":
-                return value
-            elif unit == "mb":
-                return value / 1024  # Convert MB to GB
-            elif unit == "tb":
-                return value * 1024  # Convert TB to GB
-
-        return None  # Return None if no valid memory value is found
+        return logscan_content_extractors.extract_db_cache_value(content)
 
     def extract_scheduled_run_time(self, content):
-        """
-        Extract the scheduled run time from the content.
-        """
-        # Define the patterns to search for
-        patterns = [
-            r'--times? \((KOMETA_TIMES?)\): ?["\']?(\d{1,2}:\d{2})["\']?',  # KOMETA_TIMES pattern
-            r'--times? \((PMM_TIMES?)\): ?["\']?(\d{1,2}:\d{2})["\']?',  # PMM_TIMES pattern
-        ]
-
-        # Try each pattern and return the first match found
-        for pattern in patterns:
-            scheduled_run_time_match = re.search(pattern, content)
-            if scheduled_run_time_match:
-                scheduled_run_time = scheduled_run_time_match.group(2)
-                mylogger.debug(f"Scheduled run time found: {scheduled_run_time}")
-                return scheduled_run_time
-
-        # If no match is found
-        mylogger.debug("Scheduled run time not found in content.")
-        return None
+        return logscan_content_extractors.extract_scheduled_run_time(content)
 
     def extract_maintenance_times(self, content):
-        """
-        Extract the start and end times of the maintenance from the content.
-        """
-        maintenance_times_match = re.search(r"Scheduled maintenance running between (\d+:\d+) and (\d+:\d+)", content)
-
-        if maintenance_times_match:
-            start_time = maintenance_times_match.group(1)
-            end_time = maintenance_times_match.group(2)
-            mylogger.debug(f"Scheduled maintenance times found: Start time: {start_time}, End time: {end_time}")
-            return start_time, end_time
-        else:
-            mylogger.debug("Scheduled maintenance times not found in content.")
-            return None, None
+        return logscan_content_extractors.extract_maintenance_times(content)
 
     def contains_overlay_path(self, content):
-        # Regular expression to search for overlay_path
-        return bool(re.search(r"\boverlay_path:\s*", content, re.IGNORECASE))
+        return logscan_content_extractors.contains_overlay_path(content)
 
     def contains_overlay_files(self, content):
-        # Regular expression to search for overlay_files
-        return bool(re.search(r"\boverlay_files:\s*", content, re.IGNORECASE))
+        return logscan_content_extractors.contains_overlay_files(content)
 
     def detect_wsl_and_recommendation(self, content):
-        # Regular expression to check if the content contains information about WSL platform
-        wsl_pattern = r"Platform: .*-WSL"
-
-        if re.search(wsl_pattern, content):
-            recommendation = (
-                "💬🪟🐧 **WSL MEMORY RECOMMENDATION**\n"
-                "According to Microsoft’s documentation, the amount of system memory (RAM) that gets allocated to WSL is limited to "
-                "either 50% of your total memory or 8GB, whichever happens to be smaller.\n\n"
-                "It is possible to override the maximum RAM allocation, we suggest googling 'WSL memory limit' to learn more otherwise the following may work for you:"
-                "To override the maximum RAM allocation when running Windows Subsystem for Linux (WSL), you need to modify the configuration settings. Here are the steps to do this:\n"
-                "1. Open a PowerShell window as an administrator.\n"
-                "2. Run the command: `wsl --set-default-version 2` to set WSL version to 2 (WSL 2).\n"
-                "3. Run the command: `wsl --set-memory <your_memory_limit>` to set the maximum memory limit for WSL (replace `<your_memory_limit>` with the desired memory limit, e.g., `4GB`).\n"
-                "4. Restart WSL by running the command: `wsl --shutdown`.\n\n"
-                "It is important to note that modifying these settings may require a reboot of your system."
-            )
-            return recommendation
-
-        return None  # Return None if WSL is not detected in the content
+        return logscan_content_extractors.detect_wsl_recommendation(content)
 
     def make_db_cache_recommendations(self, parsed_content):
-        disclaimer = (
-            "**NOTE**:The number you choose can vary wildly based on a number of factors "
-            "(such as the size and number of libraries, and the amount of files/operations/overlays that are being utilized)."
+        return logscan_recommendations.db_cache_recommendation(
+            self.extract_db_cache_value(parsed_content),
+            self.extract_memory_value(parsed_content),
         )
-        url_info = "https://kometa.wiki/en/latest/config/plex#plex-attributes"
-
-        # Extract db_cache value and total memory value
-        db_cache_value = self.extract_db_cache_value(parsed_content)
-        total_memory_value = self.extract_memory_value(parsed_content)
-
-        if db_cache_value is None or total_memory_value is None:
-            return None  # Unable to determine recommendations due to missing data
-
-        if db_cache_value >= total_memory_value:
-            # db_cache should not be greater than or equal to total memory
-            return (
-                f"❌ **PLEX DB CACHE ISSUE**\n"
-                f"The Plex DB cache setting (**{db_cache_value:.2f} GB**) is equal to or greater than the total memory "
-                f"(**{total_memory_value:.2f} GB**). Consider adjusting the Plex DB cache setting to a value **below** the total memory.\n"
-                f"For more info on this setting: {url_info}\n"
-                f"{disclaimer}"
-            )
-
-        elif db_cache_value < 1:
-            # db_cache is less than 1 GB, recommend updating based on total memory
-            return (
-                f"💬💡️ **PLEX DB CACHE ADVICE**\n"
-                f"Consider updating the Plex DB cache setting from **{db_cache_value:.2f} GB**, to a value **greater** than **1 GB** based on the total memory of **{total_memory_value:.2f} GB**.\nSetting `db_cache: 1024` within the plex settings in your config.yml is effectively 1024MB which is 1GB. "
-                f"For more info on this setting: {url_info}\n"
-                f"{disclaimer}"
-            )
-
-        return None  # No issues or recommendations
 
     def calculate_memory_recommendation(self, content):
-        disclaimer = (
-            "These numbers are purely estimates and can vary wildly based on a number of factors "
-            "(such as the size and number of libraries, and the amount of files/operations/overlays that are being utilized)."
-        )
-
-        # Extract memory value from the content
         memory_value = self.extract_memory_value(content)
-        overlay_value = self.contains_overlay_path(content)
-
-        # Check if overlay_value is still empty before updating it the second time
-        if not overlay_value:
-            overlay_value = self.contains_overlay_files(content)
-
-        if memory_value is None:
-            return "Error: Memory value not found in content."
-
-        if memory_value < 4:
-            if overlay_value:
-                return (
-                    f"⚠️ **MEMORY RECOMMENDATION**\n"
-                    f"The memory value is {memory_value:.2f} GB, which is less than 4 GB. "
-                    f"We advise having at least 8GB of RAM when running Kometa with overlays (we have detected overlays) to avoid potential out-of-memory issues.\n\n"
-                    f"{disclaimer}"
-                )
-            else:
-                return (
-                    f"⚠️ **MEMORY RECOMMENDATION**\n"
-                    f"The memory value is {memory_value:.2f} GB, which is less than 4 GB. "
-                    f"We advise having at least 4GB of RAM when running Kometa without overlays (we have NOT detected overlays) to avoid potential out-of-memory issues.\n\n"
-                    f"{disclaimer}"
-                )
-
-        elif memory_value < 8:
-            if overlay_value:
-                return (
-                    f"⚠️ **MEMORY RECOMMENDATION**\n"
-                    f"The memory value is {memory_value:.2f} GB, which is less than 8 GB. "
-                    f"We advise having at least 8GB of RAM when running Kometa with overlays (we have detected overlays) for optimal performance.\n\n"
-                    f"{disclaimer}"
-                )
-            else:
-                return None  # No specific recommendation for memory < 8GB without overlays
-
-        return None  # No specific recommendation for memory >= 8GB
+        has_overlays = bool(self.contains_overlay_path(content) or self.contains_overlay_files(content))
+        return logscan_recommendations.memory_recommendation(memory_value, has_overlays)
 
     def calculate_recommendation(self, kometa_scheduled_time, maintenance_start_time=None, maintenance_end_time=None):
-        if not kometa_scheduled_time:
-            return "Error: Plex scheduled time is missing."
-
-        kometa_scheduled_time = datetime.strptime(kometa_scheduled_time, "%H:%M").time()
-
-        # Check if maintenance times are provided
-        if maintenance_start_time is None or maintenance_end_time is None:
-            return None  # Cannot provide recommendations without maintenance times
-
-        maintenance_start_time = datetime.strptime(maintenance_start_time, "%H:%M").time()
-        maintenance_end_time = datetime.strptime(maintenance_end_time, "%H:%M").time()
-
-        plex_scheduled_datetime = datetime.combine(datetime.today(), kometa_scheduled_time)
-        maintenance_start_datetime = datetime.combine(datetime.today(), maintenance_start_time)
-        maintenance_end_datetime = datetime.combine(datetime.today(), maintenance_end_time)
-
-        if maintenance_start_datetime > plex_scheduled_datetime:
-            # Plex maintenance period starts on the next day
-            time_before_plex_maintenance = (maintenance_start_datetime - plex_scheduled_datetime).seconds // 60
-        else:
-            # Plex maintenance period starts on the same day
-            time_before_plex_maintenance = (maintenance_start_datetime - plex_scheduled_datetime).seconds // 60
-        # Calculate the buffer until the next plex maintenance in minutes
-        buffer_until_next_plex_maintenance = ((24 + maintenance_start_time.hour - maintenance_end_time.hour) * 60) % 1440  # 1440 minutes in a day
-
-        run_time_in_minutes = self.run_time.total_seconds() / 60
-        time_buffer = timedelta(minutes=buffer_until_next_plex_maintenance)
-        mylogger.info(f"time_before_plex_maintenance: {time_before_plex_maintenance}")
-        mylogger.info(f"buffer_until_next_plex_maintenance: {buffer_until_next_plex_maintenance}")
-        mylogger.info(f"time_buffer until next Plex maintenance: {time_buffer}")
-        mylogger.info(f"run_time_in_minutes: {run_time_in_minutes}")
-        plex_maint_url = "https://support.plex.tv/articles/202197488-scheduled-server-maintenance/"
-
-        if run_time_in_minutes > 1440:
-            return f"❌⏰ **KOMETA RUN TIME > 24 HOURS**\nThis Run took: `{self.run_time}`\nTime between Kometa scheduled time and Plex Maintenance start: `{time_buffer}`\nKometa scheduled start time: `{self._format_time_value(kometa_scheduled_time)}`\nPlex Scheduled Maintenance start time: `{self._format_time_value(maintenance_start_time)}`\nPlex Scheduled Maintenance end time: `{self._format_time_value(maintenance_end_time)}`\nIf your Kometa runs typically take this long [this run took `{self.run_time}`], your Kometa run time will coincide with the next Plex maintenance period as this run is greater than 24 hours.\n\nThe suggestion we can make at this point is to find ways to break down your run into smaller chunks and schedule them on different days.\nFor more information on Plex Maintenance, see {plex_maint_url}"
-
-        if run_time_in_minutes > buffer_until_next_plex_maintenance:
-            return f"❌⏰ **KOMETA RUN TIME > BUFFER BEFORE MAINTENANCE**\nThis Run took: `{self.run_time}`\nTime between Kometa Scheduled time and Plex Maintenance start: `{time_buffer}`\nKometa scheduled start time: `{self._format_time_value(kometa_scheduled_time)}`\nPlex Scheduled Maintenance start time: `{self._format_time_value(maintenance_start_time)}`\nPlex Scheduled Maintenance end time: `{self._format_time_value(maintenance_end_time)}`\nIf your Kometa runs typically take this long [this run took `{self.run_time}`], your Kometa run time will coincide with the next Plex maintenance period. Adjust the Kometa Scheduled start time to `{self._format_time_value(maintenance_end_time)}` (if needed) AND adjust the Plex Scheduled Maintenance start time to be later.\nFor more information on Plex Maintenance, see {plex_maint_url}"
-
-        if maintenance_start_datetime <= plex_scheduled_datetime < maintenance_end_datetime:
-            # Provide a message for the case when kometa_scheduled_time is between maintenance start and end times
-            return f"❌⏰ **KOMETA SCHEDULED TIME CONFLICT**\nThis Run took: `{self.run_time}`\nTime between Kometa Scheduled time and Plex Maintenance start: `{time_buffer}`\nKometa scheduled start time: `{self._format_time_value(kometa_scheduled_time)}`\nPlex Scheduled Maintenance start time: `{self._format_time_value(maintenance_start_time)}`\nPlex Scheduled Maintenance end time: `{self._format_time_value(maintenance_end_time)}`\nYou are within the maintenance window between Plex maintenance start time: `{self._format_time_value(maintenance_start_time)}` and end time: `{self._format_time_value(maintenance_end_time)}`. Adjust the Kometa Scheduled start time to `{self._format_time_value(maintenance_end_time)}` or adjust the Plex Scheduled Maintenance times to end prior to the Kometa Scheduled run time.\nFor more information on Plex Maintenance, see {plex_maint_url}"
-
-        if run_time_in_minutes > time_before_plex_maintenance:
-            return f"❌⏰ **KOMETA RUN TIME > TIME BEFORE MAINTENANCE**\nThis Run took: `{self.run_time}`\nTime between Kometa Scheduled time and Plex Maintenance start: `{time_buffer}`\nKometa scheduled start time: `{self._format_time_value(kometa_scheduled_time)}`\nPlex Scheduled Maintenance start time: `{self._format_time_value(maintenance_start_time)}`\nPlex Scheduled Maintenance end time: `{self._format_time_value(maintenance_end_time)}`\nIf your Kometa runs typically take this long [this run took `{self.run_time}`], your Kometa run time will coincide with the next Plex maintenance period. Consider moving the Kometa scheduled start time to `{self._format_time_value(maintenance_end_time)}` or adjust the Plex Scheduled Maintenance times to end prior to the Kometa Scheduled run time.\nFor more information on Plex Maintenance, see {plex_maint_url}"
-
-        return None
+        return logscan_recommendations.maintenance_time_recommendation(
+            kometa_scheduled_time,
+            maintenance_start_time,
+            maintenance_end_time,
+            run_time=self.run_time,
+        )
 
     def _format_time_value(self, time_value):
-        if not time_value:
-            return "N/A"
-        formatted = time_value.strftime("%H:%M")
-        return formatted[1:] if formatted.startswith("0") else formatted
+        return logscan_recommendations.format_time_value(time_value)
 
     def cleanup_content(self, content):
-        """
-        Clean up the content by removing unnecessary lines and trailing characters.
-        """
-        cleanup_regex = r"\[(202[0-9])-\d+-\d+ \d+:\d+:\d+,\d+\] \[.*\.py:\d+\] +\[[INFODEBUGWARCTL]*\] +\||^[ ]{65}\|"
-        cleaned_content = re.sub(cleanup_regex, "", content)
-
-        # mylogger.info(f"content:\n{content}")
-        # mylogger.info(f"cleaned_content:\n{cleaned_content}")
-
-        # Second pass to remove trailing '|'
-        lines = cleaned_content.splitlines()
-        cleaned_lines = [line.rstrip("|") if line.rstrip().endswith("|") else line for line in lines]
-        cleaned_content = "\n".join(cleaned_lines)
-
-        # Third pass to remove trailing spaces
-        cleaned_lines = [line.rstrip() for line in cleaned_content.splitlines()]
-        cleaned_content = "\n".join(cleaned_lines)
-        # mylogger.info(f"cleaned_content3rdpass:\n{cleaned_content}")
-
-        return cleaned_content
+        return logscan_content_extractors.cleanup_content(content)
 
     def extract_filename_from_url(self, url):
         return logscan_people.extract_filename_from_url(url)
@@ -469,1276 +206,41 @@ class LogscanAnalyzer:
         return sorted(names, key=str.lower)
 
     def extract_finished_runs(self, content):
-        lines = content.splitlines()
-        finished_runs = []
+        return logscan_finished_runs.extract_finished_runs(content)
 
-        # Iterate through lines to find pairs
-        for i in range(len(lines) - 1):
-            line = lines[i]
-            next_line = lines[i + 1]
+    def extract_validation_summary(self, content):
+        return logscan_finished_runs.extract_validation_summary(content)
 
-            if "Finished " in line and " Run Time: " in next_line:
-                # mylogger.info(f"Pair Found L1: {line}")
-                # mylogger.info(f"Pair Found L2: {next_line}")
-                finished_match = re.search(r".*Finished\s+(.*?)\s*$", line)
-                run_time_match = re.search(r".*Run Time:(.*?)\s*$", next_line)
-
-                finished_text = finished_match.group(1).strip() if finished_match else "N/A"
-                run_time_text = run_time_match.group(1).strip() if run_time_match else "N/A"
-                # mylogger.info(f"finished_text L1: {finished_text}")
-                # mylogger.info(f"run_time_text L2: {run_time_text}")
-
-                # Join the pair into one line
-                combined_line = f"{finished_text} - {run_time_text}"
-                # mylogger.info(f"combined_line: {combined_line}")
-                finished_runs.append(combined_line)
-
-            # Check if there's a line with "Finished:" and "Run Time:" at the end
-            if "Finished: " in line and " Run Time: " in line:
-                finished_match = re.search(r".*Finished:\s+(.*?)\s*$", line)
-                run_time_match = re.search(r".*Run Time:(.*?)\s*$", line)
-
-                finished_text = finished_match.group(1).strip() if finished_match else "N/A"
-                run_time_text = run_time_match.group(1).strip() if run_time_match else "N/A"
-                # Join the pair into one line
-                combined_line = f"Finished at:{finished_text} - {run_time_text}"
-                # mylogger.info(f"FINAL:combined_line: {combined_line}")
-                # Add the line to the result
-                finished_runs.append(combined_line)
-
-        return finished_runs
+    def extract_log_timestamp_bounds(self, content):
+        return logscan_finished_runs.extract_log_timestamp_bounds(content)
 
     def _parse_run_time_from_line(self, line):
-        if not line:
-            return None
-        match = re.search(
-            r"Run Time:\s*(?:(\d+)\s+day(?:s)?(?:,\s*|\s+))?(\d+):(\d{1,2}):(\d{1,2})",
-            line,
-            re.IGNORECASE,
-        )
-        if not match:
-            return None
-        try:
-            days = int(match.group(1) or 0)
-            hours = int(match.group(2))
-            minutes = int(match.group(3))
-            seconds = int(match.group(4))
-        except ValueError:
-            return None
-        return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+        return logscan_finished_runs.parse_run_time_from_line(line)
 
     def extract_last_lines(self, content):
-        lines = content.splitlines()
-
-        run_time_index = None
-        run_time_is_final = False
-        fallback_index = None
-        for idx in range(len(lines) - 1, -1, -1):
-            line = lines[idx]
-            if "Run Time:" not in line:
-                continue
-            if fallback_index is None:
-                fallback_index = idx
-            previous_line = lines[idx - 1] if idx > 0 else ""
-            previous_is_finished_run = re.search(r"\bFinished\s+Run\b", previous_line, re.IGNORECASE)
-            if "Finished:" in line or "Start Time:" in line or previous_is_finished_run:
-                run_time_index = idx
-                run_time_is_final = True
-                break
-
-        if run_time_index is None:
-            run_time_index = fallback_index
-
-        if run_time_index is None:
-            return None
-
-        start_index = max(0, run_time_index - 5)
-        extracted_lines = [line.lstrip() for line in lines[start_index:]]
-        run_time_line = lines[run_time_index]
-        parsed_run_time = self._parse_run_time_from_line(run_time_line)
-        if parsed_run_time and run_time_is_final:
-            self.run_time = parsed_run_time
-            start_match = re.search(r"Start Time:\s*(.*?)\s+Finished:", run_time_line)
-            if start_match:
-                self.started_at = start_match.group(1).strip()
-            timestamp_match = re.search(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),", run_time_line)
-            if timestamp_match:
-                self.finished_at = timestamp_match.group(1).strip()
-            else:
-                finished_match = re.search(r"Finished:\s*(.*?)\s+Run Time:", run_time_line)
-                if not finished_match:
-                    finished_match = re.search(r"Finished:\s*(.*?)\s*$", run_time_line)
-                if finished_match:
-                    self.finished_at = finished_match.group(1).strip()
-        return "\n".join(extracted_lines)
+        tail_text, metadata = logscan_finished_runs.extract_last_lines(content)
+        if metadata:
+            # Persist final-run metadata onto the analyzer; interim
+            # Run Time: lines return metadata=None and leave state alone.
+            if "run_time" in metadata:
+                self.run_time = metadata["run_time"]
+            if "started_at" in metadata:
+                self.started_at = metadata["started_at"]
+            if "finished_at" in metadata:
+                self.finished_at = metadata["finished_at"]
+        return tail_text
 
     def format_contiguous_lines(self, line_numbers):
-        formatted_ranges = []
-        start_range = line_numbers[0]
-        end_range = line_numbers[0]
-
-        for i in range(1, len(line_numbers)):
-            if line_numbers[i] == line_numbers[i - 1] + 1:
-                end_range = line_numbers[i]
-            else:
-                if start_range == end_range:
-                    formatted_ranges.append(str(start_range))
-                else:
-                    formatted_ranges.append(f"{start_range}-{end_range}")
-                start_range = end_range = line_numbers[i]
-
-        if start_range == end_range:
-            formatted_ranges.append(str(start_range))
-        else:
-            formatted_ranges.append(f"{start_range}-{end_range}")
-
-        return ", ".join(formatted_ranges)
+        return logscan_finished_runs.format_contiguous_lines(line_numbers)
 
     def make_recommendations(self, content, incomplete_message):
-        self.checkfiles_flg = None
-        lines = content.splitlines()
-        special_check_lines = []
-        anidb69_errors = []
-        anidb_auth_errors = []
-        api_blank_errors = []
-        bad_version_found_errors = []
-        cache_false = []
-        checkFiles = []
-        current_year = []
-        other_award = []
-        convert_errors = []
-        corrupt_image_errors = []
-        critical_errors = []
-        error_errors = []
-        warning_errors = []
-        delete_unmanaged_collections_errors = []
-        flixpatrol_errors = []
-        flixpatrol_paywall = []
-        git_kometa_errors = []
-        pmm_legacy_errors = []
-        image_size = []
-        internal_server_errors = []
-        lsio_errors = []
-        mal_connection_errors = []
-        mass_update_errors = []
-        mdblist_attr_errors = []
-        mdblist_errors = []
-        mdblist_api_limit_errors = []
-        metadata_attribute_errors = []
-        metadata_load_errors = []
-        missing_path_errors = []
-        new_version_found_errors = []
-        new_plexapi_version_found_errors = []
-        no_items_found_errors = []
-        omdb_errors = []
-        omdb_api_limit_errors = []
-        overlays_bloat = []
-        overlay_font_missing = []
-        overlay_apply_errors = []
-        overlay_image_missing = []
-        overlay_level_errors = []
-        overlay_load_errors = []
-        playlist_load_errors = []
-        playlist_errors = []
-        plex_lib_errors = []
-        plex_regex_errors = []
-        plex_url_errors = []
-        rounding_errors = []
-        ruamel_errors = []
-        run_order_errors = []
-        security_vuln_hits = []
-        traceback_errors = []
-        tautulli_url_errors = []
-        tautulli_apikey_errors = []
-        timeout_errors = []
-        to_be_configured_errors = []
-        tmdb_api_errors = []
-        tmdb_fail_errors = []
-        trakt_connection_errors = []
-
-        for idx, line in enumerate(lines, start=1):
-            if "run_order:" in line:
-                next_line = lines[idx] if idx < len(lines) else None
-                if next_line and "- operations" not in next_line:
-                    run_order_errors.append(idx)
-            if "No Anime Found for AniDB ID: 69" in line:
-                anidb69_errors.append(idx)
-            if re.search(r"\bcache: false\b", line):
-                cache_false.append(idx)
-            if self.server_versions and ("mass_user_rating_update" in line or "mass_episode_user_ratings_update" in line):
-
-                # Set to keep track of unique (server_name, server_version, idx) combinations
-                unique_entries = set()
-
-                # Iterate through each (server_name, server_version) tuple in self.server_versions
-                for server_name, server_version in self.server_versions:
-
-                    # Create a unique identifier for the tuple
-                    identifier = (server_name, server_version, idx)
-
-                    # Check if the identifier is not in unique_entries (i.e., it's a new entry)
-                    if identifier not in unique_entries:
-                        # Append server info to rounding_errors
-                        rounding_errors.append((server_name, server_version, idx))
-                        # Add the identifier to unique_entries set to mark it as processed
-                        unique_entries.add(identifier)
-
-            # Detect PMS versions in "Connected to server ..." lines and flag the vulnerable range
-            m = re.search(r"Connected to server\s+(.+?)\s+(?:\(?\s*(?:version|Version:)\s+)(\d+\.\d+\.\d+\.\d+(?:-[A-Za-z0-9]+)?)", line)
-            if m:
-                sn = m.group(1).strip()
-                ver = m.group(2).strip()
-                if _version_in_inclusive_range(ver, _PMS_VULN_LOW, _PMS_VULN_HIGH):
-                    security_vuln_hits.append((sn, ver, idx))
-
-            if "Config Error: anidb sub-attribute" in line or "AniDB Error: Login failed" in line:
-                anidb_auth_errors.append(idx)
-            elif "apikey is blank" in line:
-                api_blank_errors.append(idx)
-            elif "1.32.7" in line and "Connected to server " in line:
-                bad_version_found_errors.append(idx)
-            elif "Convert Warning: No " in line and "ID Found for" in line:
-                convert_errors.append(idx)
-            elif "PIL.UnidentifiedImageError: cannot" in line:
-                corrupt_image_errors.append(idx)
-            elif "checkFiles=1" in line:
-                checkFiles.append(idx)
-            elif "current_year" in line:
-                current_year.append(idx)
-            elif "other_award" in line:
-                other_award.append(idx)
-            elif "delete_unmanaged_collections" in line:
-                delete_unmanaged_collections_errors.append(idx)
-            elif "internal_server_error" in line:
-                internal_server_errors.append(idx)
-            elif "FlixPatrol Error: " in line and "failed to parse" in line:
-                flixpatrol_errors.append(idx)
-            elif "flixpatrol" in line and "- pmm:" in line:
-                flixpatrol_paywall.append(idx)
-            elif "- git: PMM" in line:
-                git_kometa_errors.append(idx)
-            elif "- pmm: " in line:
-                pmm_legacy_errors.append(idx)
-            elif ", in _upload_image" in line:
-                image_size.append(idx)
-            elif "(Linuxserver" in line and "Version:" in line:
-                lsio_errors.append(idx)
-            elif "My Anime List Connection Failed" in line:
-                mal_connection_errors.append(idx)
-            elif "Config Error: Operation mass_" in line and "without a successful" in line:
-                mass_update_errors.append(idx)
-            elif "mdblist_list attribute not allowed with Collection Level: Season" in line:
-                mdblist_attr_errors.append(idx)
-            elif "MdbList Error: Invalid API key" in line:
-                mdblist_errors.append(idx)
-            elif "MDBList Error: API Limit Reached" in line or "MDBList Error: API Rate Limit Reached" in line:
-                mdblist_api_limit_errors.append(idx)
-            elif "metadata attribute is required" in line:
-                metadata_attribute_errors.append(idx)
-            elif "Metadata File Failed To Load" in line:
-                metadata_load_errors.append(idx)
-            elif "Overlay File Failed To Load" in line:
-                overlay_load_errors.append(idx)
-            elif "Playlist File Failed To Load" in line:
-                playlist_load_errors.append(idx)
-            elif "missing_path" in line or "save_missing" in line:
-                missing_path_errors.append(idx)
-            elif "Newest Version: " in line:
-                new_version_found_errors.append(idx)
-            elif "requires an update to:" in line:
-                new_plexapi_version_found_errors.append(idx)
-            elif "OMDb Error: Invalid API key" in line:
-                omdb_errors.append(idx)
-            elif "OMDb Error: Request limit reached" in line:
-                omdb_api_limit_errors.append(idx)
-            elif "Overlay Error: Poster already has an Overlay" in line:
-                overlay_apply_errors.append(idx)
-            elif "| Overlay Error: Overlay Image not found" in line:
-                overlay_image_missing.append(idx)
-            elif "overlay_level:" in line:
-                overlay_level_errors.append(idx)
-            elif "Plex Error: No Items found in Plex" in line:
-                no_items_found_errors.append(idx)
-            elif "Overlay Error: font:" in line:
-                overlay_font_missing.append(idx)
-            elif "Reapply Overlays: True" in line or "Reset Overlays: [" in line:
-                overlays_bloat.append(idx)
-            elif "Playlist Error: Library: " in line and "not defined" in line:
-                playlist_errors.append(idx)
-            elif "Plex Error: Plex Library " in line and "not found" in line:
-                plex_lib_errors.append(idx)
-            elif "Plex Error: " in line and "No matches found with regex pattern" in line:
-                plex_regex_errors.append(idx)
-            elif "Plex Error: Plex url is invalid" in line:
-                plex_url_errors.append(idx)
-            elif "ruamel.yaml." in line:
-                ruamel_errors.append(idx)
-            elif "TMDb Error: Invalid API key" in line:
-                tmdb_api_errors.append(idx)
-            elif "Traceback (most recent call last):" in line:
-                traceback_errors.append(idx)
-            elif "Tautulli Error: Invalid apikey" in line:
-                tautulli_apikey_errors.append(idx)
-            elif "Tautulli Error: Invalid URL" in line:
-                tautulli_url_errors.append(idx)
-            elif "timed out." in line:
-                timeout_errors.append(idx)
-            elif "Failed to Connect to https://api.themoviedb.org/3" in line:
-                tmdb_fail_errors.append(idx)
-            elif "Error: " in line and " requires " in line and " to be configured" in line:
-                to_be_configured_errors.append(idx)
-            elif "Trakt Connection Failed" in line:
-                trakt_connection_errors.append(idx)
-            elif "[CRITICAL]" in line:
-                critical_errors.append(idx)
-            elif "[ERROR]" in line:
-                error_errors.append(idx)
-            elif "[WARNING]" in line:
-                warning_errors.append(idx)
-
-        if anidb69_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/anidb]"
-            formatted_errors = self.format_contiguous_lines(anidb69_errors)
-            anidb69_error_message = (
-                "❌ **ANIDB69 ERROR**\n"
-                "Kometa uses AniDB ID 69 to test that it can connect to AniDB.\n"
-                "This error indicates that the test request sent to AniDB failed and AniDB could not be reached.\n"
-                f"For more information on configuring AniDB, {url_line}\n"
-                f"{len(anidb69_errors)} line(s) with ANIDB69 errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(anidb69_error_message)
-
-        if anidb_auth_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/anidb]"
-            formatted_errors = self.format_contiguous_lines(anidb_auth_errors)
-            anidb_auth_errors_message = (
-                "❌ **ANIDB AUTH ERRORS**\n"
-                "Kometa uses AniDB settings to connect to AniDB.\n"
-                "This error indicates that the setting is not correctly setup in config.yml.\n"
-                f"For more information on configuring AniDB, {url_line}\n"
-                f"{len(anidb_auth_errors)} line(s) with ANIDB AUTH errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(anidb_auth_errors_message)
-
-        if api_blank_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/trakt/?q=api]"
-            formatted_errors = self.format_contiguous_lines(api_blank_errors)
-            api_blank_error_message = (
-                "❌🔒 **BLANK API KEY ERROR**\n"
-                "An API key is required for certain services, and it appears to be blank in your configuration.\n"
-                "Make sure to provide the required API key to enable proper functionality.\n"
-                f"For more information on configuring API keys, {url_line}\n"
-                "In the Kometa discord thread, type `!wiki` for more information and search for the service with the missing apikey \n"
-                f"{len(api_blank_errors)} line(s) with BLANK API KEY errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(api_blank_error_message)
-
-        if bad_version_found_errors:
-            url_line = "[https://forums.plex.tv/t/refresh-endpoint-put-post-requests-started-throwing-404s-in-version-1-32-7-7484/853588]"
-            formatted_errors = self.format_contiguous_lines(bad_version_found_errors)
-            bad_version_found_errors_message = (
-                "💥 **BAD PLEX VERSION ERROR**\n"
-                "You are running a version of Plex that is known to have issues with Kometa.\n"
-                "You should downgrade/upgrade to a version that is not `1.32.7.*`.\n"
-                f"For more information on this issue, {url_line}\n"
-                f"{len(bad_version_found_errors)} line(s) with Plex Version 1.32.7.*. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(bad_version_found_errors_message)
-
-        if cache_false:
-            url_line = "[https://kometa.wiki/en/latest/config/settings#cache]"
-            formatted_errors = self.format_contiguous_lines(cache_false)
-            cache_false_message = (
-                "💬 **Kometa CACHE**\n"
-                "Kometa cache setting is set to false(`cache: false`). Normally, you would want this set to true to improve performance.\n"
-                f"For more information on handling this, {url_line}\n"
-                f"{len(cache_false)} line(s) with `cache: false`. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(cache_false_message)
-
-        if checkFiles:
-            formatted_errors = self.format_contiguous_lines(checkFiles)
-            checkFiles_message = (
-                "⚠️ **CHECKFILES=1 DETECTED**\n"
-                "`checkFiles=1` detected. Notifying Kometa staff.\n"
-                f"{len(checkFiles)} line(s) with `checkFiles=1` messages. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(checkFiles_message)
-
-        # if current_year:
-        #     url_line = "[https://kometa.wiki/en/latest/files/dynamic_types/?h=latest#imdb-awards]"
-        #     formatted_errors = self.format_contiguous_lines(current_year)
-        #     current_year_message = (
-        #             "⚠️ **LEGACY SCHEMA DETECTED**\n"
-        #             "As of 1.20 `current_year` is no longer used and should be replaced with `latest`.\n"
-        #             f"For more information on handling these, {url_line}\n"
-        #             f"{len(current_year)} line(s) with `current_year` issues. Line number(s): {formatted_errors}"
-        #     )
-        #     special_check_lines.append(current_year_message)
-
-        if other_award:
-            url_line = "[https://kometa.wiki/en/latest/kometa/faqs/?h=other_award#pmm-120-release-changes]"
-            formatted_errors = self.format_contiguous_lines(other_award)
-            other_award_message = (
-                "⚠️ **LEGACY SCHEMA DETECTED**\n"
-                "As of 1.20 `other_award` is no longer used and should be removed. All of those awards now have their own individual files.\n"
-                f"For more information on handling these, {url_line}\n"
-                f"{len(other_award)} line(s) with `other_award` issues. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(other_award_message)
-
-        if critical_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/logs/?h=%5Bcritical%5D#critical]"
-            formatted_errors = self.format_contiguous_lines(critical_errors)
-            critical_error_message = (
-                "💥 **[CRITICAL]**\n"
-                f"Critical messages found in your attached log.\n"
-                f"There is a very strong likelihood that Kometa aborted the run or part of the run early thus not all of what you wanted was applied.\n"
-                f"For more information on handling these, {url_line}\n"
-                f"{len(critical_errors)} line(s) with [CRITICAL] messages. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(critical_error_message)
-
-        if error_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/logs/?h=%5Berror%5D#error]"
-            formatted_errors = self.format_contiguous_lines(error_errors)
-            error_error_message = (
-                "❌ **[ERROR]**\n"
-                f"Error messages found in your attached log.\n"
-                f"There is a very strong likelihood that Kometa did not complete all of what you wanted. Some [ERROR] lines can be ignored.\n"
-                f"For more information on handling these, {url_line}\n"
-                f"{len(error_errors)} line(s) with [ERROR] messages. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(error_error_message)
-
-        if warning_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/logs/?h=%5Bwarning%5D#warning]"
-            formatted_errors = self.format_contiguous_lines(warning_errors)
-            warning_error_message = (
-                f"⚠️ **[WARNING]**\n"
-                f"Warning messages found in your attached log.\n"
-                f"This is a Kometa warning and usually does not require any immediate action. Most [WARNING] lines can be ignored.\n"
-                f"For more information on handling these, {url_line}\n"
-                f"{len(warning_errors)} line(s) with [WARNING] messages. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(warning_error_message)
-
-        if convert_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/logs/#warning]"
-            formatted_errors = self.format_contiguous_lines(convert_errors)
-            convert_error_message = (
-                "💬 **CONVERT WARNING**\n"
-                "Convert Warning: No * ID Found for * ID.\n"
-                "These sorts of errors indicate that the thing can't be cross-referenced between sites.  For example:\n\n"
-                "Convert Warning: No TVDb ID Found for TMDb ID: 15733\n\n"
-                "In the above scenario, the TMDB record for `The Two Mrs. Grenvilles` `ID 15733` didn't contain a TVDB ID. This could be because the record just hasn't been updated, or because `The Two Mrs. Grenvilles` isn't listed on TVDB.\n\n"
-                "The fix is for someone `like you, perhaps` to go to the relevant site and fill in the missing data.\n"
-                f"For more information on handling these, {url_line}\n"
-                f"{len(convert_errors)} line(s) with Convert Warnings. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(convert_error_message)
-
-        if corrupt_image_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/logs/#error]"
-            formatted_errors = self.format_contiguous_lines(corrupt_image_errors)
-            corrupt_image_message = (
-                "❌ **CORRUPT FILE ERROR**\n"
-                "Likely, when processing overlays, Kometa encountered a file that it could not process because it was corrupt.\n"
-                "Review the lines in your log file and based on the lines shown here and determine if those files are ok or not with your favorite image editor.\n"
-                f"For more information on handling these, {url_line}\n"
-                f"{len(corrupt_image_errors)} line(s) with `PIL.UnidentifiedImageError` reported. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(corrupt_image_message)
-
-        if delete_unmanaged_collections_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/operations/#delete-collections]"
-            formatted_errors = self.format_contiguous_lines(delete_unmanaged_collections_errors)
-            delete_unmanaged_collections_errors_message = (
-                "⚠️ **LEGACY SCHEMA DETECTED**\n"
-                "`delete_unmanaged_collections` is a Library operation and should be adjusted in your config file accordingly.\n"
-                f"For more information on handling these, {url_line}\n"
-                f"{len(delete_unmanaged_collections_errors)} line(s) with `delete_unmanaged_collections` errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(delete_unmanaged_collections_errors_message)
-
-        if flixpatrol_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/faqs/?h=flixpatrol#flixpatrol]"
-            formatted_errors = self.format_contiguous_lines(flixpatrol_errors)
-            flixpatrol_error_message = (
-                "❌ **FLIXPATROL ERROR**\n"
-                "There was an issue with FlixPatrol data.\n"
-                "This is a known issue with Kometa 1.19.0 (master/latest branch).\n"
-                "Switch to the 1.19.1 nightly21 or greater Kometa release for a fix.\n"
-                "In the Kometa discord thread, for more information on how to switch branches, type `!branch`.\n"
-                f"For more information on handling FlixPatrol errors, {url_line}\n"
-                "If the problem persists, your IP address might be banned by FlixPatrol. Contact their support to have it unbanned.\n"
-                f"{len(flixpatrol_errors)} line(s) with FlixPatrol errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(flixpatrol_error_message)
-
-        if flixpatrol_paywall:
-            url_line = "[https://flixpatrol.com/about/premium/]"
-            url_line2 = "[https://discord.com/channels/822460010649878528/1099773891733377065/1214929432754651176]"
-            formatted_errors = self.format_contiguous_lines(flixpatrol_paywall)
-            flixpatrol_paywall_message = (
-                "❌💰 **FLIXPATROL PAYWALL ERROR**\n"
-                "FlixPatrol decided to implement a Paywall which causes Kometa to no longer gather data from them.\n"
-                "Even if you pay, this will not work with Kometa.\n"
-                f"For more information on the FlixPatrol paywall, {url_line}\n"
-                f"As of Kometa 1.20.0-nightly34 (you are on {self.current_kometa_version}), we have eliminated FlixPatrol. See this announcement: {url_line2}\n"
-                f"{len(flixpatrol_paywall)} line(s) with `- pmm: flixpatrol` detected. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(flixpatrol_paywall_message)
-
-        if git_kometa_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/overview/?h=configuration]"
-            formatted_errors = self.format_contiguous_lines(git_kometa_errors)
-            git_kometa_error_message = (
-                "💬 **OLD Kometa YAML**\n"
-                "You are using an old config.yml with references to metadata files that date to a version of Kometa that is pre 1.18\n"
-                "In the Kometa discord thread, type `!118` for more information.\n"
-                f"For more information on handling this, {url_line}\n"
-                f"{len(git_kometa_errors)} line(s) with OLD Kometa YAML. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(git_kometa_error_message)
-
-        if pmm_legacy_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/overview/?h=configuration]"
-            formatted_errors = self.format_contiguous_lines(pmm_legacy_errors)
-            pmm_legacy_error_message = (
-                "💬 **PRE KOMETA YAML**\n"
-                "You are using an old config.yml with references to metadata files that date to a version of this script that is pre Kometa\n"
-                "In your config.yml, search for `- pmm: ` and replace with `- default: ` .\n"
-                f"For more information on handling this, {url_line}\n"
-                f"{len(pmm_legacy_errors)} line(s) with PRE Kometa YAML. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(pmm_legacy_error_message)
-
-        if image_size:
-            url_line = "[https://www.google.com]"
-            formatted_errors = self.format_contiguous_lines(image_size)
-            image_size_message = (
-                "❌ **IMAGE SIZE ERRORS**\n"
-                "It seems that you are attempting to upload or apply artwork and it's greater than the maximum `10MB`.\n"
-                f"This usually means that you have internal server errors (500) as well in this log. Change the image to one that is less than 10MB. For more information on handling this, {url_line}\n"
-                f"{len(image_size)} line(s) with IMAGE SIZE errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(image_size_message)
-
-        if incomplete_message:
-            url_line = "[https://kometa.wiki/en/latest/kometa/logs/#providing-log-files-on-discord]"
-            incomplete_errors_message = (
-                "❌🛠️ **INCOMPLETE LOGS**\n"
-                f"{incomplete_message}\n"
-                "**The attached file seems incomplete. Without a complete log file troubleshooting is limited as we might be missing valuable information!**\n"
-                "Type `!logs` for more information about providing logs."
-                f"For more information on providing logs, {url_line}\n"
-            )
-            special_check_lines.append(incomplete_errors_message)
-
-        if internal_server_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/faqs/?h=errors+issues#errors-issues]"
-            formatted_errors = self.format_contiguous_lines(internal_server_errors)
-            internal_server_error_message = (
-                "💥 **INTERNAL SERVER ERROR**\n"
-                "An internal server error has occurred. This could be due to an issue with the service's server.\n"
-                "In the Kometa discord thread, type `!500` for more information.\n"
-                f"For more information on handling internal server errors, {url_line}\n"
-                f"{len(internal_server_errors)} line(s) with INTERNAL SERVER errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(internal_server_error_message)
-
-        if lsio_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/install/images/?h=linuxserver#linuxserver]"
-            formatted_errors = self.format_contiguous_lines(lsio_errors)
-            lsio_error_message = (
-                "⚠️🖥️ **LINUXSERVER IMAGE DETECTED**\n"
-                "You are not using the official Kometa container image.\n"
-                "In the Kometa discord thread, type `!lsio` for more information.\n"
-                f"For more information on this, {url_line}\n"
-                f"{len(lsio_errors)} line(s) with LINUXSERVER IMAGE issues. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(lsio_error_message)
-
-        if mal_connection_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/myanimelist]"
-            formatted_errors = self.format_contiguous_lines(mal_connection_errors)
-            mal_connection_error_message = (
-                "❌ **MY ANIME LIST CONNECTION ERROR**\n"
-                "There was an issue connecting to My Anime List (MAL) service.\n"
-                "This will affect any functionality that relies on MAL data.\n"
-                "In the Kometa discord thread, type `!mal` for more information\n"
-                f"For more information on configuring the My Anime List (MAL) service, {url_line}\n"
-                f"{len(mal_connection_errors)} line(s) with MY ANIME LIST CONNECTION errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(mal_connection_error_message)
-
-        if mass_update_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/operations]"
-            formatted_errors = self.format_contiguous_lines(mass_update_errors)
-            mass_update_errors_message = (
-                "❌ **MASS_*_UPDATE ERROR**\n"
-                "You have specified a `mass_*_update` operation in your config file however you have not configured the corresponding service so this will never work.\n"
-                "Review each of the lines mentioned in this message to understand what all the config issues are.\n"
-                "In the Kometa discord thread, type `!wiki` for more information and search.\n"
-                f"For more information on `mass_*_update` operations, {url_line}\n"
-                f"{len(mass_update_errors)} line(s) with `mass_*_update` config errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(mass_update_errors_message)
-
-        if mdblist_attr_errors:
-            url_line = "[https://kometa.wiki/en/latest/files/builders/mdblist/?h=mdblist+builders]"
-            formatted_errors = self.format_contiguous_lines(mdblist_attr_errors)
-            mdblist_attr_error_message = (
-                f"❌ **MDBLIST ATTRIBUTE ERROR**\n"
-                f"MDBList functionality does not currently support season-level collections.\n"
-                f"In the Kometa discord thread, type `!wiki` for more information and search.\n"
-                f"For more information on MDBList configuration, {url_line}\n"
-                f"{len(mdblist_attr_errors)} line(s) with MDBList attribute errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(mdblist_attr_error_message)
-
-        if mdblist_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/mdblist/?h=mdblist+attributes#mdblist-attributes]"
-            formatted_errors = self.format_contiguous_lines(mdblist_errors)
-            mdblist_error_message = (
-                f"❌ **MDBLIST ERROR**\n"
-                f"Your configuration contains an invalid API key for MdbList.\n"
-                f"This will cause any services that rely on MdbList to fail.\n"
-                f"In the Kometa discord thread, type `!wiki` for more information and search.\n"
-                f"For more information on configuring MdbList, {url_line}\n"
-                f"{len(mdblist_errors)} line(s) with MDBLIST errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(mdblist_error_message)
-
-        if mdblist_api_limit_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/mdblist/?h=mdblist+attributes#mdblist-attributes]"
-            formatted_errors = self.format_contiguous_lines(mdblist_api_limit_errors)
-            mdblist_api_limit_error_message = (
-                f"❌ **MDBLIST API LIMIT ERROR**\n"
-                f"You have hit the MDBLIST API LIMIT. The free apikey is limited to 1000 requests per day so if you hit your limit Kometa should be able to pick up where it left off the next day as long as the Kometa cache setting is enabled in yur config.yml file.\n"
-                f"This will cause any metadata updates that rely on MdbList to fail until the limit is reset (usually daily).\n"
-                f"For more information on configuring MdbList, {url_line}\n"
-                f"{len(mdblist_api_limit_errors)} line(s) with MDBLIST API Limit errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(mdblist_api_limit_error_message)
-
-        if metadata_attribute_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/files/#example]"
-            formatted_errors = self.format_contiguous_lines(metadata_attribute_errors)
-            metadata_attribute_errors_message = (
-                f"❌ **METADATA ATTRIBUTE ERRORS**\n"
-                f"If you are using Kometa nightly48 or newer, this is expected behaviour.\n"
-                f"`metadata_path` and `overlay_path` are now legacy attributes, and using them will cause the `YAML Error: metadata attribute is required` error.\n"
-                f"The error can be ignored as it won't cause any issues, or you can update your config.yml to use the new `collection_files`, `overlay_files` and `metadata_files` attributes.\n\n"
-                f"The steps to take are:\n"
-                f":one: - Look at every file referred to within your config.yml and see what the first level indentation yaml file attributes are. They should be one of these(`collections:, dynamic_collections:, overlays:, metadata:, playlists:, templates:, external_templates:`) and can contain more than 1. For now, ignore the `templates:` and `external_templates:` attributes.\n"
-                f":two: - if it's `metadata:`, file it under the `metadata_file:` section of your config.yml\n"
-                f":three: - if it's `collections:` or `dynamic_collections:`, file it under the `collection_files:` section of your config.yml\n"
-                f":four: - if it's `playlists:`,  file it under the `playlist_files:` section of your config.yml\n"
-                f":five: - if it's `overlays:`,  file it under the `overlay_files:` section of your config.yml\n\n"
-                f"`*NOTE:` If you only see `templates:` or `external_templates:`, this is a special case and you typically would not be referring to it directly in your config.yml file.\n\n"
-                f"Within the attached log file, go to the indicated line(s) for more details on the exact issue and take actions to fix.\n"
-                f"For more information on this, {url_line}\n"
-                f"{len(metadata_attribute_errors)} line(s) with METADATA ATTRIBUTE errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(metadata_attribute_errors_message)
-
-        if metadata_load_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/overview/?h=configuration]"
-            formatted_errors = self.format_contiguous_lines(metadata_load_errors)
-            metadata_load_errors_message = (
-                f"❌ **METADATA LOAD ERRORS**\n"
-                f"Kometa is trying to load a file from your config file.\n"
-                f"This error indicates that the setting is not correctly setup in config.yml. Usually wrong path to the file, or a badly formatted yml file.\n"
-                f"Within the attached log file, go to the indicated line(s) for more details on the exact issue and take actions to fix.\n"
-                f"For more information on this, {url_line}\n"
-                f"{len(metadata_load_errors)} line(s) with METADATA LOAD errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(metadata_load_errors_message)
-
-        if overlay_load_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/overview/?h=configuration]"
-            formatted_errors = self.format_contiguous_lines(overlay_load_errors)
-            overlay_load_errors_message = (
-                "❌ **OVERLAY LOAD ERRORS**\n"
-                "Kometa is trying to load a file from your config file.\n"
-                "This error indicates that the setting is not correctly setup in config.yml. Usually wrong path to the file, or a badly formatted yml file.\n"
-                "Within the attached log file, go to the indicated line(s) for more details on the exact issue and take actions to fix.\n"
-                f"For more information on this, {url_line}\n"
-                f"{len(overlay_load_errors)} line(s) with OVERLAY LOAD errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(overlay_load_errors_message)
-
-        if playlist_load_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/overview/?h=configuration]"
-            formatted_errors = self.format_contiguous_lines(playlist_load_errors)
-            playlist_load_errors_message = (
-                "❌ **PLAYLIST LOAD ERRORS**\n"
-                "Kometa is trying to load a file from your config file.\n"
-                "This error indicates that the setting is not correctly setup in config.yml. Usually wrong path to the file, or a badly formatted yml file.\n"
-                "Within the attached log file, go to the indicated line(s) for more details on the exact issue and take actions to fix.\n"
-                f"For more information on this, {url_line}\n"
-                f"{len(playlist_load_errors)} line(s) with PLAYLIST LOAD errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(playlist_load_errors_message)
-
-        if missing_path_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/libraries/?h=report_path#attributes]"
-            formatted_errors = self.format_contiguous_lines(missing_path_errors)
-            missing_path_errors_message = (
-                "⚠️ **LEGACY SCHEMA DETECTED**\n"
-                "`missing_path` or `save_missing` is no longer used and should be replaced/removed. Use `report_path` instead.\n"
-                f"For more information on handling these, {url_line}\n"
-                f"{len(missing_path_errors)} line(s) with `missing_path` or `save_missing` errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(missing_path_errors_message)
-
-        if new_plexapi_version_found_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/logs/#checking-kometa-version]"
-            formatted_errors = self.format_contiguous_lines(new_plexapi_version_found_errors)
-            new_plexapi_version_found_errors_message = (
-                "🚀 **PYTHON MODULE UPDATE NEEDED**\n"
-                # f"PlexAPI: {self.current_plexapi_version}\n\n"
-                "In the Kometa discord thread, type `!update` for instructions on how to update your requirements.\n"
-                f"For more information on updating, {url_line}\n"
-                f"{len(new_plexapi_version_found_errors)} line(s) with New Python Module Updates. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(new_plexapi_version_found_errors_message)
-
-        if new_version_found_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/logs/#checking-kometa-version]"
-            formatted_errors = self.format_contiguous_lines(new_version_found_errors)
-            new_version_found_errors_message = (
-                "🚀 **VERSION UPDATE AVAILABLE**\n"
-                f"**Current Version:** {self.current_kometa_version}\n"
-                f"**Newest Version (at the time of this log):** {self.kometa_newest_version}\n\n"
-                "In the Kometa discord thread, type `!update` for instructions on how to update.\n"
-                f"For more information on updating, {url_line}\n"
-                f"{len(new_version_found_errors)} line(s) with New Version errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(new_version_found_errors_message)
-
-        if no_items_found_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/logs/?h=%5Berror%5D#error]"
-            formatted_errors = self.format_contiguous_lines(no_items_found_errors)
-            no_items_error_message = (
-                "⚠️ **NO ITEMS FOUND IN PLEX**\n"
-                "The criteria defined by a search/filter returned 0 results.\n"
-                "This is often expected - for example, if you try to apply a 1080P overlay to a 4K library then no items will get the overlay since no items have a 1080P resolution.\n"
-                "It is worth noting that search and filters are case-sensitive, so `1080P` and `1080p` are treated as two separate things.\n"
-                f"For more information on this error, {url_line}\n"
-                f"{len(no_items_found_errors)} line(s) with 'No Items found in Plex' errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(no_items_error_message)
-
-        if omdb_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/omdb/#omdb-attributes]"
-            formatted_errors = self.format_contiguous_lines(omdb_errors)
-            omdb_error_message = (
-                "❌ **OMDB ERROR**\n"
-                "Your configuration contains an invalid API key for OMDb.\n"
-                "This will cause any services that rely on OMDb to fail.\n"
-                "In the Kometa discord thread, type `!wiki` for more information and search.\n"
-                f"For more information on configuring OMDb, {url_line}\n"
-                f"{len(omdb_errors)} line(s) with OMDb errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(omdb_error_message)
-
-        if omdb_api_limit_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/omdb/?h=omdb#omdb-attributes]"
-            formatted_errors = self.format_contiguous_lines(omdb_api_limit_errors)
-            omdb_api_limit_error_message = (
-                f"❌ **OMDB API LIMIT ERROR**\n"
-                f"You have hit the OMDB API LIMIT. The free apikey is limited to 1000 requests per day so if you hit your limit Kometa should be able to pick up where it left off the next day as long as the Kometa cache setting is enabled in yur config.yml file.\n"
-                f"This will cause any metadata updates that rely on OMDB to fail until the limit is reset (usually daily).\n"
-                f"For more information on configuring OMDB, {url_line}\n"
-                f"{len(omdb_api_limit_errors)} line(s) with OMDB API Limit errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(omdb_api_limit_error_message)
-
-        if overlay_font_missing:
-            url_line = "[https://kometa.wiki/en/latest/showcase/overlays/?h=font#example-2]"
-            formatted_errors = self.format_contiguous_lines(overlay_font_missing)
-            overlay_font_missing_message = (
-                "❌ **OVERLAY FONT MISSING**\n"
-                "We detected that you are referencing a font that Kometa cannot find.\n"
-                "This can lead to overlays not being applied when a font is required.\n"
-                f"In the Kometa discord thread, type `!wiki` for more information or follow this link: {url_line}\n"
-                f"{len(overlay_font_missing)} line(s) with `Overlay Error: font:` errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(overlay_font_missing_message)
-
-        if overlays_bloat:
-            url_line = "[https://kometa.wiki/en/latest/kometa/scripts/imagemaid]"
-            formatted_errors = self.format_contiguous_lines(overlays_bloat)
-            overlays_bloat_message = (
-                "⚠️ **REAPPLY / RESET OVERLAYS**\n\n"
-                "We detected that you are using either reapply_overlays OR reset_overlays within your config.\n\n"
-                "**You should NOT be using reapply_overlays unless you have a specific reason to. If you are not sure do NOT enable it.**\n\n"
-                "This can lead to your system creating additional posters within Plex causing bloat\n\n"
-                "Typically these config lines are only used for very specific cases so if this is your case, then you can ignore this recommendation\n\n"
-                f"In the Kometa discord thread, type `!bloat` for more information or follow this link: {url_line}\n\n"
-                f"{len(overlays_bloat)} line(s) with reapply_overlays or reset_overlays. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(overlays_bloat_message)
-
-        if overlay_apply_errors:
-            url_line = "[https://kometa.wiki/en/latest/defaults/overlays]"
-            url_line2 = "[https://kometa.wiki/en/latest/kometa/guides/assets]"
-            formatted_errors = self.format_contiguous_lines(overlay_apply_errors)
-            overlay_apply_errors_message = (
-                "⚠️ **OVERLAY APPLY ERROR**\n"
-                "Kometa attempts to apply an overlay to things, but finds that the art on the item is already an overlaid poster from Kometa with an EXIF tag:\n"
-                "```Abraham Season 1\n  Overlay Error: Poster already has an Overlay\nArchie Bunker''s Place S03E14\n  Overlay Error: Poster already has an Overlay\nAs Time Goes By Season 10\n  Overlay Error: Poster already has an Overlay\nCHiPs Season 3\n  Overlay Error: Poster already has an Overlay```\n\n"
-                "For `Season` posters, this is often because Plex has assigned higher-level art [like the show poster to a season that has no art of its own].\n"
-                "For `Movies`, `Show`, and `Episode` posters, this is often because an art item was selected or part of the assets pipeline that already had an overlay image on it.\n\n"
-                "You can fix this by going to each item in Plex, hitting the pencil icon, selecting Poster, and choosing art that does not have an overlay.\n"
-                "Alternatively if you are using the asset pipeline in Kometa, updating your asset pipeline with the art that does not have an overlay.\n"
-                "In the Kometa discord thread, type `!overlaylabel` for more information.\n\n"
-                f"For more information on overlays, {url_line}\n"
-                f"For more information on the asset pipeline, {url_line2}\n"
-                f"{len(overlay_apply_errors)} line(s) with OVERLAY APPLY errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(overlay_apply_errors_message)
-
-        if overlay_image_missing:
-            url_line = "[https://kometa.wiki/en/latest/defaults/overlays]"
-            formatted_errors = self.format_contiguous_lines(overlay_image_missing)
-            overlay_image_missing_message = (
-                "❌ **OVERLAY IMAGE MISSING ERROR**\n"
-                "Kometa attempts to apply an overlay to things, but finds that the overlay itself is not found and thus cannot be applied to the art.\n"
-                "Validate the path and also ensure that the case of the file(i.e. `4K.png` is NOT the same as `4k.png`) is the same as found in the line within the log.\n"
-                f"For more information on overlays, {url_line}\n"
-                f"{len(overlay_image_missing)} line(s) with OVERLAY IMAGE MISSING errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(overlay_image_missing_message)
-
-        if overlay_level_errors:
-            url_line = "[https://kometa.wiki/en/latest/files/settings/?h=builder_level]"
-            formatted_errors = self.format_contiguous_lines(overlay_level_errors)
-            overlay_level_errors_message = (
-                "⚠️ **LEGACY SCHEMA DETECTED**\n"
-                "`overlay_level:` is no longer used and should be replaced by `builder_level:`.\n"
-                f"For more information on handling these, {url_line}\n"
-                f"{len(overlay_level_errors)} line(s) with `overlay_level` errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(overlay_level_errors_message)
-
-        if playlist_errors:
-            url_line = "[https://kometa.wiki/en/latest/defaults/playlist/?h=playlist]"
-            formatted_errors = self.format_contiguous_lines(playlist_errors)
-            playlist_error_message = (
-                "❌ **PLAYLIST ERROR**\n"
-                "A playlist is trying to use a library that does not exist in Plex.\n"
-                "Ensure that all libraries being defined actually exist.\n"
-                "The Kometa Defaults `playlist` file expects libraries called `Movies` and `TV Shows`, template variables can be used to change this.\n"
-                f"For more information: {url_line}\n"
-                f"{len(playlist_errors)} line(s) with playlist errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(playlist_error_message)
-
-        # Extract scheduled run time
-        kometa_scheduled_time = self.extract_scheduled_run_time(content)
-        maintenance_start_time, maintenance_end_time = self.extract_maintenance_times(content)
-        kometa_time_recommendation = None
-        if isinstance(self.run_time, timedelta):
-            kometa_time_recommendation = self.calculate_recommendation(
-                kometa_scheduled_time,
-                maintenance_start_time,
-                maintenance_end_time,
-            )
-        if kometa_time_recommendation:
-            special_check_lines.append(kometa_time_recommendation)
-
-        # Extract Memory value:
-        kometa_mem_recommendation = self.calculate_memory_recommendation(content)
-        if kometa_mem_recommendation:
-            special_check_lines.append(kometa_mem_recommendation)
-
-        # Extract DB Cache value:
-        kometa_db_cache_recommendation = self.make_db_cache_recommendations(content)
-        if kometa_db_cache_recommendation:
-            special_check_lines.append(kometa_db_cache_recommendation)
-
-        # Extract WSL information
-        wsl_recommendation = self.detect_wsl_and_recommendation(content)
-        if wsl_recommendation:
-            special_check_lines.append(wsl_recommendation)
-
-        if plex_regex_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/logs/?h=%5Berror%5D#error]"
-            formatted_errors = self.format_contiguous_lines(plex_regex_errors)
-            plex_regex_error_message = (
-                "⚠️ **PLEX REGEX ERROR**\n"
-                "Kometa is trying to perform a regex search, and 0 items match the regex pattern.\n"
-                "This is often an expected error and can be ignored in most cases.\n"
-                "If you need assistance with this error, raise a support thread in `#kometa-help`.\n"
-                f"For more information on handling regex issues, {url_line}\n"
-                f"{len(plex_regex_errors)} line(s) with Plex regex errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(plex_regex_error_message)
-
-        if plex_lib_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/settings/?h=show_options#show-options]"
-            formatted_errors = self.format_contiguous_lines(plex_lib_errors)
-            plex_lib_error_message = (
-                "❌ **PLEX LIBRARY ERROR**\n"
-                "Your configuration contains an invalid Plex Library Name.\n"
-                "Kometa will not be able to update a library that does not exist.\n"
-                "Check for spelling `case sensitive` and ensure that you have `show_options: true` within your settings within config.yml\n"
-                f"For more information on configuring the show_options, {url_line}\n"
-                f"{len(plex_lib_errors)} line(s) with PLEX LIBRARY errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(plex_lib_error_message)
-
-        if plex_url_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/install/wt/wt-01-basic-config/#getting-a-plex-url-and-token]"
-            formatted_errors = self.format_contiguous_lines(plex_url_errors)
-            plex_url_error_message = (
-                "❌ **PLEX URL ERROR**\n"
-                "Your configuration contains an invalid Plex URL.\n"
-                "This will cause any services that rely on this URL to fail.\n"
-                "In the Kometa discord thread, type `!wiki` for more information and search.\n"
-                f"For more information on configuring the Plex URL, {url_line}\n"
-                f"{len(plex_url_errors)} line(s) with PLEX URL errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(plex_url_error_message)
-
-        if rounding_errors:
-            url_line = "[https://forums.plex.tv/t/plex-rounding-down-user-ratings-when-set-via-api/875806/8]"
-
-            # Construct the message with server names and versions
-            rounding_errors_message = (
-                "⚠️ **USER RATINGS ROUNDING ISSUE**\n"
-                "We have detected that you are running `mass_user_rating_update` or `mass_episode_user_ratings_update` with Plex versions that will cause rounding issues with user ratings. To avoid this, downgrade your Plex Media server to `1.40.0.7998` or upgrade it to `1.40.3.8555` or later.\n"
-                f"For more information on this issue, {url_line}\n"
-                f"Detected issues on the following servers:\n"
-            )
-            # Append server names, versions, and line numbers to the message
-            for server_name, server_version, line_num in rounding_errors:
-                rounding_errors_message += f"- Server: {server_name}, Version: {server_version}, Line: {line_num}\n"
-
-            special_check_lines.append(rounding_errors_message)
-
-        if ruamel_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/yaml/]"
-            formatted_errors = self.format_contiguous_lines(ruamel_errors)
-            ruamel_error_message = (
-                "💥 **YAML ERROR**\n"
-                "YAML is very sensitive with regards to spaces and indentation.\n"
-                "Search for `ruamel.yaml.` in your log file to get hints as to where the problem lies.\n"
-                "In the Kometa discord thread, type `!yaml` and `!editors` for more information.\n"
-                f"For more information on handling YAML issues, {url_line}\n"
-                f"{len(ruamel_errors)} line(s) with YAML errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(ruamel_error_message)
-
-        if run_order_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/settings/?h=run_order#run-order]"
-            formatted_errors = self.format_contiguous_lines(run_order_errors)
-            run_order_error_message = (
-                "⚠️ **RUN_ORDER WARNING**\n"
-                f"Typically, and in almost EVERY situation, you want ` - operations` to precede both metadata and overlays processing. To fix this, place `- operations` first in the `run_order` section of the config.yml file\n"
-                f"For more information on this, {url_line}\n"
-                f"{len(run_order_errors)} line(s) with RUN_ORDER warnings. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(run_order_error_message)
-
-        if security_vuln_hits:
-            seen = set()
-            items = []
-            for sn, ver, ln in security_vuln_hits:
-                key = (sn, ver, ln)
-                if key not in seen:
-                    seen.add(key)
-                    items.append((sn, ver, ln))
-
-            vuln_low_str = ".".join(map(str, _PMS_VULN_LOW))
-            vuln_high_str = ".".join(map(str, _PMS_VULN_HIGH))
-            url_line = "[https://forums.plex.tv/t/plex-media-server-security-update/928341]"
-
-            msg = (
-                "🚀 **PMS SECURITY ALERT**\n"
-                "A Plex Media Server version in a **known vulnerable range** was detected.\n"
-                f"**Affected range:** `{vuln_low_str}` **through** `{vuln_high_str}`\n"
-                "Please **upgrade Plex Media Server** to a safe release as soon as possible.\n"
-                "Until then, Plex will block access from others reaching your server.\n"
-                "UPGRADE IMMEDIATELY!\n"
-                f"For more information on this see url: {url_line}\n"
-                f"{len(security_vuln_hits)} line(s) with these errors."
-                "Detected on:\n"
-            )
-            for sn, ver, ln in items:
-                msg += f"- Server: {sn}, Version: `{ver}`, Line: {ln}\n"
-
-            special_check_lines.append(msg)
-
-        if traceback_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/tautulli]"
-            formatted_errors = self.format_contiguous_lines(traceback_errors)
-            traceback_errors_message = (
-                "💥 **TRACEBACK ERROR**\n"
-                "Your KOMETA run contains traceback errors.\n"
-                "This likely means that the run ended prematurely or did not complete certain tasks (i.e. overlays ended early or did not apply).\n"
-                "In the Kometa discord thread, type `!wiki` for more information and search.\n"
-                f"{len(traceback_errors)} line(s) with Traceback errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(traceback_errors_message)
-
-        if tautulli_apikey_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/tautulli]"
-            formatted_errors = self.format_contiguous_lines(tautulli_apikey_errors)
-            tautulli_apikey_errors_message = (
-                "❌ **TAUTULLI API ERROR**\n"
-                "Your configuration contains an invalid API key for Tautulli.\n"
-                "This will cause any services that rely on Tautulli to fail.\n"
-                "In the Kometa discord thread, type `!wiki` for more information and search.\n"
-                f"For more information on configuring Tautulli, {url_line}\n"
-                f"{len(tautulli_apikey_errors)} line(s) with Tautulli errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(tautulli_apikey_errors_message)
-
-        if tautulli_url_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/tautulli#tautulli-attributes]"
-            formatted_errors = self.format_contiguous_lines(tautulli_url_errors)
-            tautulli_url_error_message = (
-                "❌ **TAUTULLI URL ERROR**\n"
-                "Your configuration contains an invalid Tautulli URL.\n"
-                "This will cause any services that rely on this URL to fail.\n"
-                "In the Kometa discord thread, type `!wiki` for more information and search.\n"
-                f"For more information on configuring the Tautulli URL, {url_line}\n"
-                f"{len(tautulli_url_errors)} line(s) with TAUTULLI URL errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(tautulli_url_error_message)
-
-        if tmdb_api_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/install/wt/wt-01-basic-config/#getting-a-tmdb-api-key]"
-            formatted_errors = self.format_contiguous_lines(tmdb_api_errors)
-            tmdb_api_errors_message = (
-                "❌ **TMDB API ERROR**\n"
-                "Your configuration contains an invalid API key for TMDb.\n"
-                "This will cause any services that rely on TMDb to fail.\n"
-                "In the Kometa discord thread, type `!wiki` for more information and search.\n"
-                f"For more information on configuring TMDb, {url_line}\n"
-                f"{len(tmdb_api_errors)} line(s) with TMDb errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(tmdb_api_errors_message)
-
-        if timeout_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/install/overview/]"
-            formatted_errors = self.format_contiguous_lines(timeout_errors)
-            timeout_error_message = (
-                "❌⏱️ **TIMEOUT ERROR**\n"
-                "There were timeout issues while trying to connect to different services.\n"
-                "Ensure that your network configuration allows Kometa to make internet calls.\n"
-                f"Typically this is your Plex server timing out when Kometa tries to connect to it. There's nothing Kometa can do about this directly. Currently your timeout for plex is set to: `{self.plex_timeout}` seconds. You can try increasing the connection timeout in `config.yml`:\n"
-                "```plex:\n  url: http://bing.bang.boing\n  token: REDACTED\n  timeout: 360   <<< right here```\n"
-                "But that's not a guarantee.\n\nEffectively what's happening here is that you're ringing the doorbell and no one's answering. You can't do anything about that aside from waiting longer. You can't ring the doorbell differently.\n\n"
-                "This seems to happen most often in an Appbox context, so perhaps contact your appbox provider to discuss it.\n\n"
-                "In the Kometa discord thread, type `!timeout` for more information.\n"
-                f"For more information on network configuration, {url_line}\n"
-                f"{len(timeout_errors)} line(s) with timeout errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(timeout_error_message)
-
-        if tmdb_fail_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/install/wt/wt-01-basic-config/]"
-            formatted_errors = self.format_contiguous_lines(tmdb_fail_errors)
-            tmdb_fail_error_message = (
-                "❌ **TMDB ERROR**\n"
-                "This error appears when your host machine is unable to connect to TMDb.\n"
-                "Ensure that your networking (particularly docker container) is configured to allow Kometa to make internet calls.\n"
-                f"For more information on network configuration, {url_line}\n"
-                f"{len(tmdb_fail_errors)} line(s) with TMDB errors. Line number location. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(tmdb_fail_error_message)
-
-        if to_be_configured_errors:
-            url_line = "[https://kometa.wiki/en/latest/kometa/logs/?h=%5Berror%5D#error]"
-            formatted_errors = self.format_contiguous_lines(to_be_configured_errors)
-            to_be_configured_errors_message = (
-                "❌ **TO BE CONFIGURED ERROR**\n"
-                "You are using a builder that has not been configured yet.\n"
-                "This will affect any functionality that relies on these connections. Review all lines below and resolve.\n"
-                "In the Kometa discord thread, type `!wiki` and search for more information\n"
-                f"For more information on configuring services, {url_line}\n"
-                f"{len(to_be_configured_errors)} line(s) with `to be configured` errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(to_be_configured_errors_message)
-
-        if trakt_connection_errors:
-            url_line = "[https://kometa.wiki/en/latest/config/trakt/#trakt-attributes]"
-            formatted_errors = self.format_contiguous_lines(trakt_connection_errors)
-            trakt_connection_error_message = (
-                "❌ **TRAKT CONNECTION ERROR**\n"
-                "There was an issue connecting to the Trakt service.\n"
-                "This will affect any functionality that relies on Trakt data.\n"
-                "In the Kometa discord thread, type `!trakt` for more information\n"
-                f"For more information on configuring the Trakt service, {url_line}\n"
-                f"{len(trakt_connection_errors)} line(s) with TRAKT CONNECTION errors. Line number(s): {formatted_errors}"
-            )
-            special_check_lines.append(trakt_connection_error_message)
-
-        if checkFiles:
-            self.checkfiles_flg = 1
-
-        # Initialize a list to store both the first line and full recommendation message
-        recommendation_messages = []
-
-        for idx, message in enumerate(special_check_lines, start=1):
-            # Split the message into lines and log the first line with a label
-            lines = message.split("\n")
-            first_line = lines[0] if lines else ""
-            mylogger.debug(f"Kometa Recommendation {idx}: {first_line}")
-
-            # Append both the first line and the full recommendation message to the list
-            recommendation_messages.append({"first_line": first_line, "message": message})
-
-        issue_counts = {
-            "service_connectivity": (
-                len(tmdb_api_errors)
-                + len(tmdb_fail_errors)
-                + len(trakt_connection_errors)
-                + len(omdb_errors)
-                + len(omdb_api_limit_errors)
-                + len(mdblist_errors)
-                + len(mdblist_api_limit_errors)
-                + len(mdblist_attr_errors)
-                + len(mal_connection_errors)
-                + len(tautulli_url_errors)
-                + len(tautulli_apikey_errors)
-                + len(flixpatrol_errors)
-                + len(flixpatrol_paywall)
-                + len(lsio_errors)
-            ),
-            "config_setup": (
-                len(to_be_configured_errors)
-                + len(api_blank_errors)
-                + len(bad_version_found_errors)
-                + len(missing_path_errors)
-                + len(cache_false)
-                + len(mass_update_errors)
-                + len(other_award)
-                + len(delete_unmanaged_collections_errors)
-            ),
-            "plex_issues": len(plex_url_errors) + len(plex_regex_errors) + len(plex_lib_errors) + len(rounding_errors),
-            "metadata_overlay_playlist": (
-                len(metadata_attribute_errors)
-                + len(metadata_load_errors)
-                + len(overlay_load_errors)
-                + len(overlay_apply_errors)
-                + len(overlay_level_errors)
-                + len(overlay_font_missing)
-                + len(overlay_image_missing)
-                + len(playlist_load_errors)
-                + len(playlist_errors)
-                + len(overlays_bloat)
-            ),
-            "convert_issues": len(convert_errors),
-            "image_issues": len(corrupt_image_errors) + len(image_size),
-            "runtime_behavior": len(run_order_errors) + len(checkFiles) + len(timeout_errors),
-            "update_version": len(new_version_found_errors) + len(new_plexapi_version_found_errors) + len(git_kometa_errors),
-            "platform_system": (
-                (1 if wsl_recommendation else 0) + (1 if kometa_time_recommendation else 0) + (1 if kometa_mem_recommendation else 0) + (1 if kometa_db_cache_recommendation else 0)
-            ),
-            "anidb_issues": len(anidb69_errors) + len(anidb_auth_errors),
-            "misc": len(internal_server_errors) + len(no_items_found_errors) + len(pmm_legacy_errors),
-            "tmdb_api_errors": len(tmdb_api_errors),
-            "tmdb_fail_errors": len(tmdb_fail_errors),
-            "trakt_connection_errors": len(trakt_connection_errors),
-            "omdb_errors": len(omdb_errors),
-            "omdb_api_limit_errors": len(omdb_api_limit_errors),
-            "mdblist_errors": len(mdblist_errors),
-            "mdblist_api_limit_errors": len(mdblist_api_limit_errors),
-            "mdblist_attr_errors": len(mdblist_attr_errors),
-            "mal_connection_errors": len(mal_connection_errors),
-            "tautulli_url_errors": len(tautulli_url_errors),
-            "tautulli_apikey_errors": len(tautulli_apikey_errors),
-            "flixpatrol_errors": len(flixpatrol_errors),
-            "flixpatrol_paywall": len(flixpatrol_paywall),
-            "lsio_errors": len(lsio_errors),
-            "config_to_be_configured": len(to_be_configured_errors),
-            "config_api_blank": len(api_blank_errors),
-            "config_bad_version": len(bad_version_found_errors),
-            "config_missing_path": len(missing_path_errors),
-            "config_cache_false": len(cache_false),
-            "config_mass_update": len(mass_update_errors),
-            "config_other_award": len(other_award),
-            "config_delete_unmanaged": len(delete_unmanaged_collections_errors),
-            "plex_url_errors": len(plex_url_errors),
-            "plex_regex_errors": len(plex_regex_errors),
-            "plex_library_errors": len(plex_lib_errors),
-            "plex_rounding_errors": len(rounding_errors),
-            "metadata_attribute_errors": len(metadata_attribute_errors),
-            "metadata_load_errors": len(metadata_load_errors),
-            "overlay_load_errors": len(overlay_load_errors),
-            "overlay_apply_errors": len(overlay_apply_errors),
-            "overlay_level_errors": len(overlay_level_errors),
-            "overlay_font_missing": len(overlay_font_missing),
-            "overlay_image_missing": len(overlay_image_missing),
-            "playlist_load_errors": len(playlist_load_errors),
-            "playlist_errors": len(playlist_errors),
-            "overlays_bloat": len(overlays_bloat),
-            "image_corrupt": len(corrupt_image_errors),
-            "image_size": len(image_size),
-            "runtime_run_order": len(run_order_errors),
-            "runtime_checkfiles": len(checkFiles),
-            "runtime_timeout": len(timeout_errors),
-            "update_kometa": len(new_version_found_errors),
-            "update_plexapi": len(new_plexapi_version_found_errors),
-            "update_git": len(git_kometa_errors),
-            "platform_wsl": 1 if wsl_recommendation else 0,
-            "platform_kometa_time": 1 if kometa_time_recommendation else 0,
-            "platform_memory": 1 if kometa_mem_recommendation else 0,
-            "platform_db_cache": 1 if kometa_db_cache_recommendation else 0,
-            "anidb_69": len(anidb69_errors),
-            "anidb_auth": len(anidb_auth_errors),
-            "misc_internal_server": len(internal_server_errors),
-            "misc_no_items": len(no_items_found_errors),
-            "misc_pmm_legacy": len(pmm_legacy_errors),
-        }
-
-        return recommendation_messages, issue_counts
+        return logscan_recommendations_engine.make_recommendations(self, content, incomplete_message)
 
     def _ensure_recommendation_icons(self, recommendations):
-        priority_icons = {"🚀", "💥", "❌", "⚠", "💬", "ℹ"}
-        for rec in recommendations:
-            first_line = rec.get("first_line", "") or ""
-            trimmed = first_line.lstrip()
-            if not trimmed:
-                rec["first_line"] = "💬 Recommendation"
-                continue
-            first_symbol = trimmed[0].rstrip("\ufe0f")
-            if first_symbol not in priority_icons:
-                rec["first_line"] = f"💬 {trimmed}"
+        logscan_recommendations_engine.ensure_recommendation_icons(recommendations)
 
     def reorder_recommendations(self, recommendations):
-        # Define the priority order of symbols
-        priority_order = {"🚀": 1, "💥": 2, "❌": 3, "⚠": 4, "💬": 5, "ℹ": 5}
-
-        def sort_key(recommendation):
-            # Get the first symbol in the message
-            first_symbol = recommendation.get("first_line", "No first line available")[0]
-
-            # Remove variation selector if present
-            first_symbol = first_symbol.rstrip("\ufe0f")
-
-            # Check if the first symbol is in the priority_order dictionary
-            if first_symbol in priority_order:
-                priority = priority_order[first_symbol]
-                # mylogger.info(f"Original Message: {recommendation.get('first_line', 'No first line available')}")
-                # mylogger.info(f"First Symbol: {first_symbol}")
-                # mylogger.info(f"Priority: {priority}")
-                return priority
-            else:
-                # mylogger.info(f"Priority not found for symbol {first_symbol}, using default priority")
-                return float("inf")
-
-        # Sort recommendations based on the custom key
-        sorted_recommendations = sorted(recommendations, key=sort_key)
-
-        return sorted_recommendations
+        return logscan_recommendations_engine.reorder_recommendations(recommendations)
 
     def extract_plex_config(self, content):
         """Extract Plex configuration sections from ``content``.
@@ -1788,1305 +290,85 @@ class LogscanAnalyzer:
         return logscan_command.hash_file(path)
 
     def _parse_finished_datetime(self, value):
-        if not value:
-            return None
-        text = str(value).strip()
-        match = re.search(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})", text)
-        if match:
-            try:
-                return datetime.strptime(f"{match.group(1)} {match.group(2)}", "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                return None
-        match = re.search(r"(\d{2}:\d{2}:\d{2})\s+(\d{4}-\d{2}-\d{2})", text)
-        if match:
-            try:
-                return datetime.strptime(f"{match.group(2)} {match.group(1)}", "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                return None
-        return None
+        return logscan_finished_runs.parse_finished_datetime(value)
 
     def _normalize_finished_at(self, finished_at, log_mtime):
-        parsed = self._parse_finished_datetime(finished_at)
-        now = datetime.now()
-        if parsed and parsed > now + timedelta(days=1):
-            parsed = None
-        if not parsed and log_mtime:
-            try:
-                parsed = datetime.fromtimestamp(log_mtime)
-            except Exception:
-                parsed = None
-        if parsed:
-            return parsed.strftime("%Y-%m-%d %H:%M:%S")
-        return finished_at
+        return logscan_finished_runs.normalize_finished_at(finished_at, log_mtime)
 
     def _normalize_started_at(self, started_at):
-        parsed = self._parse_finished_datetime(started_at)
-        now = datetime.now()
-        if parsed and parsed > now + timedelta(days=1):
-            parsed = None
-        if parsed:
-            return parsed.strftime("%Y-%m-%d %H:%M:%S")
-        return started_at
+        return logscan_finished_runs.normalize_started_at(started_at)
 
     def _parse_hms_to_seconds(self, value):
-        if not value:
-            return None
-        parts = value.split(":")
-        try:
-            if len(parts) == 3:
-                hours = int(parts[0])
-                minutes = int(parts[1])
-                seconds = int(parts[2])
-                return hours * 3600 + minutes * 60 + seconds
-            if len(parts) == 2:
-                minutes = int(parts[0])
-                seconds = int(parts[1])
-                return minutes * 60 + seconds
-        except ValueError:
-            return None
-        return None
+        return logscan_library_stats.parse_hms_to_seconds(value)
 
     def extract_section_runtimes(self, content):
-        section_times = {}
-        if not content:
-            return section_times
-        inline_pattern = re.compile(r"Finished (?P<section>.+?) in (?P<time>\d+:\d{2}:\d{2})")
-        finished_pattern = re.compile(r"Finished (?P<section>.+?)\s*$")
-        runtime_pattern = re.compile(r"^\s*(?P<label>[A-Za-z][A-Za-z ]+?) Run Time:\s*(?P<time>\d+:\d{2}:\d{2})\s*$")
-        last_section = None
-        last_section_index = None
-        lines = content.splitlines()
-        for idx, line in enumerate(lines):
-            if not line:
-                continue
-            inline_match = inline_pattern.search(line)
-            if inline_match:
-                section = inline_match.group("section").strip()
-                if section.lower().startswith("at:"):
-                    continue
-                seconds = self._parse_hms_to_seconds(inline_match.group("time"))
-                if seconds is not None:
-                    section_times[section] = section_times.get(section, 0) + seconds
-                continue
-            finished_match = finished_pattern.search(line)
-            if finished_match:
-                section = finished_match.group("section").strip()
-                lowered = section.lower()
-                if lowered in ("run",) or lowered.startswith("run "):
-                    continue
-                last_section = section
-                last_section_index = idx
-                continue
-            runtime_match = runtime_pattern.search(line)
-            if not runtime_match:
-                continue
-            seconds = self._parse_hms_to_seconds(runtime_match.group("time"))
-            if seconds is None:
-                continue
-            section = None
-            if last_section and last_section_index is not None and (idx - last_section_index) <= 3:
-                section = last_section
-            else:
-                label = runtime_match.group("label").strip()
-                if label and label.lower() != "run":
-                    section = label
-            if section:
-                section_times[section] = section_times.get(section, 0) + seconds
-            last_section = None
-            last_section_index = None
-        return section_times
+        return logscan_library_stats.extract_section_runtimes(content)
 
     def count_log_levels(self, content):
-        counts = {
-            "debug": 0,
-            "info": 0,
-            "warning": 0,
-            "error": 0,
-            "critical": 0,
-            "trace": 0,
-        }
-        if not content:
-            return counts
-        for line in content.splitlines():
-            upper = line.upper()
-            if "[DEBUG]" in upper:
-                counts["debug"] += 1
-            if "[INFO]" in upper:
-                counts["info"] += 1
-            if "[WARNING]" in upper:
-                counts["warning"] += 1
-            if "[ERROR]" in upper:
-                counts["error"] += 1
-            if "[CRITICAL]" in upper:
-                counts["critical"] += 1
-            if "TRACEBACK" in upper:
-                counts["trace"] += 1
-        return counts
+        return logscan_library_stats.count_log_levels(content)
 
     def _normalize_library_name(self, value):
-        if not value:
-            return ""
-        text = str(value).lower()
-        text = text.replace("_", " ").replace("-", " ")
-        cleaned = []
-        for ch in text:
-            if ch.isalnum() or ch.isspace():
-                cleaned.append(ch)
-        normalized = " ".join("".join(cleaned).split())
-        return normalized
+        return logscan_library_stats.normalize_library_name(value)
 
     def _match_library_name(self, raw_name, library_entries):
-        if not raw_name:
-            return None
-        needle = self._normalize_library_name(raw_name)
-        if not needle:
-            return None
-        exact = None
-        candidates = []
-        for entry in library_entries:
-            name = entry.get("name")
-            if not name:
-                continue
-            normalized = self._normalize_library_name(name)
-            if not normalized:
-                continue
-            if needle == normalized:
-                exact = name
-                break
-            if needle in normalized or normalized in needle:
-                candidates.append((len(normalized), name))
-        if exact:
-            return exact
-        if candidates:
-            candidates.sort(reverse=True)
-            return candidates[0][1]
-        return None
+        return logscan_library_stats.match_library_name(raw_name, library_entries)
 
     def _strip_divider_wrappers(self, message):
-        if not message:
-            return message
-        cleaned = self.remove_repeated_dividers(message)
-        divider = self.global_divider or ""
-        cleaned = cleaned.strip()
-        if divider:
-            cleaned = cleaned.strip(divider).strip()
-        return cleaned.strip("|").strip()
+        return logscan_progress_engine.strip_divider_wrappers(self, message)
 
     def _extract_mapping_library(self, message):
-        if not message:
-            return None
-        match = re.search(r"\bMapping\s+(.+?)\s+Library\b", message, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        return None
+        return logscan_progress_engine.extract_mapping_library(message)
 
     def _map_section_to_phase(self, section_name):
-        if not section_name:
-            return None
-        lowered = str(section_name).lower()
-        if "operation" in lowered:
-            return "operations"
-        if "overlay" in lowered:
-            return "overlays"
-        if "collection" in lowered:
-            return "collections"
-        if "metadata" in lowered:
-            return "metadata"
-        return None
+        return logscan_progress_engine.map_section_to_phase(section_name)
 
-    def extract_progress(self, content, library_list=None, selected_libraries=None, previous=None, run_started_at=None, now_ts=None, is_running=False):
-        def _coerce_local_naive_datetime(value):
-            if value in (None, ""):
-                return None
-            if isinstance(value, datetime):
-                try:
-                    if value.tzinfo is not None:
-                        return value.astimezone().replace(tzinfo=None)
-                except Exception:
-                    pass
-                return value
-            try:
-                ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-                if ts.tzinfo is not None:
-                    ts = ts.astimezone().replace(tzinfo=None)
-                return ts
-            except Exception:
-                return None
-
-        library_entries = []
-        if library_list:
-            for entry in library_list:
-                name = entry.get("name")
-                if not name:
-                    continue
-                library_entries.append(
-                    {
-                        "name": name,
-                        "type": entry.get("type"),
-                    }
-                )
-        selected_norm = None
-        if selected_libraries:
-            selected_norm = {self._normalize_library_name(name) for name in selected_libraries if name}
-
-        def is_selected(name):
-            if not selected_norm:
-                return True
-            return self._normalize_library_name(name) in selected_norm
-
-        statuses = {}
-        for entry in library_entries:
-            name = entry["name"]
-            if selected_norm and not is_selected(name):
-                statuses[name] = "Skipped"
-            else:
-                statuses[name] = "Pending"
-        current_library = None
-        library_hint = None
-        library_durations = {}
-        phase_start = {}
-        phase_last_seen = {}
-        phase_open = {}
-        phase_start_from_previous = set()
-        processing_started_at = None
-        finished_run_seen = False
-        preparation_seconds = None
-        preparation_locked = False
-        preparation_elapsed_seconds = None
-        first_log_ts = None
-        playlists_detected = False
-        playlist_running = False
-        playlist_started_at = None
-        playlist_total_seconds = 0
-        if isinstance(previous, dict):
-            prev_current = previous.get("current_library")
-            if prev_current and prev_current in statuses and statuses[prev_current] == "Pending":
-                statuses[prev_current] = "In progress"
-                current_library = prev_current
-            prev_libs = previous.get("libraries")
-            if isinstance(prev_libs, list):
-                for entry in prev_libs:
-                    name = entry.get("name")
-                    status = entry.get("status")
-                    if name in statuses and status in ("Done", "In progress") and statuses[name] != "Skipped":
-                        statuses[name] = status
-                    durations = entry.get("durations")
-                    if name and isinstance(durations, dict) and durations:
-                        library_durations[name] = dict(durations)
-            prev_phase_starts = previous.get("phase_starts")
-            if isinstance(prev_phase_starts, dict):
-                for key, value in prev_phase_starts.items():
-                    if not key or not value:
-                        continue
-                    parts = str(key).split("||", 1)
-                    if len(parts) != 2:
-                        continue
-                    lib_name, phase_key = parts
-                    if not lib_name or not phase_key:
-                        continue
-                    if lib_name not in statuses or statuses.get(lib_name) == "Skipped":
-                        continue
-                    try:
-                        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-                        if ts.tzinfo is not None:
-                            ts = ts.astimezone().replace(tzinfo=None)
-                    except Exception:
-                        continue
-                    phase_start[(lib_name, phase_key)] = ts
-                    phase_last_seen[(lib_name, phase_key)] = ts
-                    phase_open[lib_name] = phase_key
-                    phase_start_from_previous.add((lib_name, phase_key))
-            if isinstance(previous.get("playlist_total_seconds"), (int, float)):
-                playlist_total_seconds = int(previous.get("playlist_total_seconds") or 0)
-            playlist_running = bool(previous.get("playlist_running"))
-            prev_playlist_started_at = previous.get("playlist_started_at")
-            if prev_playlist_started_at:
-                try:
-                    ts = datetime.fromisoformat(str(prev_playlist_started_at).replace("Z", "+00:00"))
-                    if ts.tzinfo is not None:
-                        ts = ts.astimezone().replace(tzinfo=None)
-                    playlist_started_at = ts
-                except Exception:
-                    playlist_started_at = None
-            prev_last_log_at = previous.get("last_log_at")
-            if isinstance(previous.get("preparation_seconds"), (int, float)):
-                preparation_seconds = int(previous.get("preparation_seconds") or 0)
-                preparation_locked = True
-        else:
-            prev_last_log_at = None
-
-        last_log_cutoff = None
-        if prev_last_log_at:
-            try:
-                last_log_cutoff = datetime.fromisoformat(str(prev_last_log_at).replace("Z", "+00:00"))
-                if last_log_cutoff.tzinfo is not None:
-                    last_log_cutoff = last_log_cutoff.astimezone().replace(tzinfo=None)
-            except Exception:
-                last_log_cutoff = None
-
-        if not content:
-            return {
-                "phase_current": None,
-                "phases_completed": [],
-                "libraries": [
-                    {
-                        "name": entry["name"],
-                        "type": entry.get("type"),
-                        "status": statuses.get(entry["name"], "Pending"),
-                    }
-                    for entry in library_entries
-                ],
-                "current_library": None,
-                "completed_count": 0,
-                "total_count": len(library_entries),
-            }
-
-        self.set_global_divider(content)
-        lines = content.splitlines()
-
-        effective_started_at = _coerce_local_naive_datetime(run_started_at)
-        effective_now = _coerce_local_naive_datetime(now_ts)
-        if effective_started_at is None:
-            marker_re = re.compile(r"\[Quickstart\]\s+Run marker:\s+started=([^\s]+)")
-            for line in lines:
-                match = marker_re.search(line)
-                if not match:
-                    continue
-                raw_ts = match.group(1)
-                try:
-                    ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
-                    if ts.tzinfo is not None:
-                        ts = ts.astimezone().replace(tzinfo=None)
-                    effective_started_at = ts
-                    break
-                except Exception:
-                    continue
-
-        def parse_log_timestamp(line):
-            if not line or not line.startswith("["):
-                return None
-            match = re.match(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d{3}\]", line)
-            if not match:
-                return None
-            try:
-                return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                return None
-
-        start_patterns = [
-            re.compile(r"Processing Library:\s*(.+)", re.IGNORECASE),
-            re.compile(r"Library:\s*(.+)", re.IGNORECASE),
-            re.compile(r"Information on library:\s*(.+)", re.IGNORECASE),
-        ]
-        activity_patterns = [
-            re.compile(r"Caching\s+(.+?)\s+Library Items", re.IGNORECASE),
-            re.compile(r"Loading .* from Library:\s*(.+)", re.IGNORECASE),
-        ]
-        overlays_start_re = re.compile(r"^\s*(.+?)\s+Library\s+Overlays\b", re.IGNORECASE)
-        overlays_end_re = re.compile(r"^Finished\s+(.+?)\s+Library\s+Overlays\b", re.IGNORECASE)
-        operations_start_re = re.compile(r"^\s*(.+?)\s+Library\s+Operations\b", re.IGNORECASE)
-        operations_end_re = re.compile(r"^Finished\s+(.+?)\s+Library\s+Operations\b", re.IGNORECASE)
-        collections_start_re = re.compile(r"^Running\s+(.+?)\s+Collection\s+File\b", re.IGNORECASE)
-        collections_end_re = re.compile(r"^Finished\s+(.+?)\s+Collection\b", re.IGNORECASE)
-        metadata_start_re = re.compile(r"^Running\s+(.+?)\s+Metadata\s+File\b", re.IGNORECASE)
-        playlists_header_re = re.compile(r"^Playlists$", re.IGNORECASE)
-        playlist_runtime_re = re.compile(r"Playlist\s+Run\s+Time:\s*(\d+:\d{2}:\d{2})", re.IGNORECASE)
-        playlist_finished_re = re.compile(r"^Finished\s+.+?\s+Playlist\b", re.IGNORECASE)
-        library_done_re = re.compile(r"^Finished\s+(.+?)\s+Library\b(?!\s+Overlays|\s+Operations)", re.IGNORECASE)
-        allow_unknown = not library_entries
-        last_ts = None
-
-        def _ensure_duration_entry(name):
-            if name not in library_durations:
-                library_durations[name] = {}
-
-        def _apply_cutoff_delta(start_ts, end_ts):
-            if not start_ts or not end_ts:
-                return None
-            if last_log_cutoff and end_ts <= last_log_cutoff:
-                return None
-            if last_log_cutoff and start_ts < last_log_cutoff < end_ts:
-                return max(0, int((end_ts - last_log_cutoff).total_seconds()))
-            return max(0, int((end_ts - start_ts).total_seconds()))
-
-        def _finish_phase(name, phase_key, end_ts):
-            key = (name, phase_key)
-            start_ts = phase_start.get(key)
-            if not start_ts:
-                return
-            if end_ts is None:
-                end_ts = phase_last_seen.get(key) or last_ts
-            if end_ts:
-                if key in phase_start_from_previous:
-                    duration = max(0, int((end_ts - start_ts).total_seconds()))
-                else:
-                    duration = _apply_cutoff_delta(start_ts, end_ts)
-                if duration is not None:
-                    _ensure_duration_entry(name)
-                    existing = library_durations[name].get(phase_key, 0)
-                    library_durations[name][phase_key] = existing + duration
-            phase_start.pop(key, None)
-            phase_last_seen.pop(key, None)
-            if key in phase_start_from_previous:
-                phase_start_from_previous.discard(key)
-            if phase_open.get(name) == phase_key:
-                phase_open.pop(name, None)
-
-        def _start_phase(name, phase_key, start_ts):
-            if not name or start_ts is None:
-                return
-            _ensure_duration_entry(name)
-            prior_phase = phase_open.get(name)
-            if prior_phase and prior_phase != phase_key:
-                _finish_phase(name, prior_phase, start_ts)
-            elif prior_phase == phase_key and phase_key in ("collections", "metadata"):
-                _finish_phase(name, phase_key, start_ts)
-            key = (name, phase_key)
-            if key not in phase_start:
-                phase_start[key] = start_ts
-            phase_last_seen[key] = start_ts
-            phase_open[name] = phase_key
-
-        def _set_current_library(name, ts):
-            nonlocal current_library, library_hint, processing_started_at
-            if not name:
-                return
-            library_hint = name
-            if current_library and current_library != name:
-                prior_phase = phase_open.get(current_library)
-                if prior_phase:
-                    _finish_phase(current_library, prior_phase, ts)
-            current_library = name
-            if ts and processing_started_at is None:
-                processing_started_at = ts
-
-        for raw_line in lines:
-            if not raw_line:
-                continue
-            line_ts = parse_log_timestamp(raw_line)
-            if line_ts and first_log_ts is None:
-                first_log_ts = line_ts
-            if line_ts and (last_ts is None or line_ts > last_ts):
-                last_ts = line_ts
-            if effective_started_at and line_ts and line_ts < effective_started_at:
-                continue
-            if last_log_cutoff and line_ts and line_ts <= last_log_cutoff:
-                continue
-            msg = raw_line.split("|", 1)[1].strip() if "|" in raw_line else raw_line.strip()
-            msg = self._strip_divider_wrappers(msg)
-
-            if playlists_header_re.match(msg):
-                playlists_detected = True
-                playlist_running = True
-                if playlist_started_at is None and line_ts:
-                    playlist_started_at = line_ts
-                if processing_started_at is None and line_ts:
-                    processing_started_at = line_ts
-                continue
-
-            if playlist_runtime_re.search(msg):
-                playlists_detected = True
-                match = playlist_runtime_re.search(msg)
-                if match:
-                    seconds = self._parse_hms_to_seconds(match.group(1))
-                    if seconds is not None:
-                        playlist_total_seconds += int(seconds)
-                continue
-
-            if playlist_finished_re.search(msg):
-                playlists_detected = True
-                if playlist_started_at is None and line_ts:
-                    playlist_started_at = line_ts
-                continue
-
-            if "overlays.py" in raw_line and re.search(r"\bLibrary\s+Overlays\b", msg, re.IGNORECASE):
-                match = overlays_start_re.search(msg)
-                if match:
-                    name = match.group(1).strip()
-                    matched = self._match_library_name(name, library_entries)
-                    if not matched:
-                        if selected_norm or not allow_unknown:
-                            continue
-                        library_entries.append({"name": name, "type": None})
-                        statuses.setdefault(name, "Pending")
-                        matched = name
-                    if statuses.get(matched) not in ("Done", "Skipped"):
-                        if current_library and current_library in statuses and current_library != matched and statuses[current_library] != "Skipped":
-                            statuses[current_library] = "Done"
-                        statuses[matched] = "In progress"
-                        _set_current_library(matched, line_ts)
-                        _start_phase(matched, "overlays", line_ts)
-                continue
-
-            if "overlays.py" in raw_line and overlays_end_re.search(msg):
-                match = overlays_end_re.search(msg)
-                if match:
-                    name = match.group(1).strip()
-                    matched = self._match_library_name(name, library_entries)
-                    if matched:
-                        _finish_phase(matched, "overlays", line_ts)
-                continue
-
-            if "operations.py" in raw_line and operations_start_re.search(msg):
-                match = operations_start_re.search(msg)
-                if match:
-                    name = match.group(1).strip()
-                    matched = self._match_library_name(name, library_entries)
-                    if not matched:
-                        if selected_norm or not allow_unknown:
-                            continue
-                        library_entries.append({"name": name, "type": None})
-                        statuses.setdefault(name, "Pending")
-                        matched = name
-                    if statuses.get(matched) not in ("Done", "Skipped"):
-                        if current_library and current_library in statuses and current_library != matched and statuses[current_library] != "Skipped":
-                            statuses[current_library] = "Done"
-                        statuses[matched] = "In progress"
-                        _set_current_library(matched, line_ts)
-                        _start_phase(matched, "operations", line_ts)
-                continue
-
-            if "operations.py" in raw_line and operations_end_re.search(msg):
-                match = operations_end_re.search(msg)
-                if match:
-                    name = match.group(1).strip()
-                    matched = self._match_library_name(name, library_entries)
-                    if matched and statuses.get(matched) != "Skipped":
-                        statuses[matched] = "Done"
-                        if current_library == matched:
-                            current_library = None
-                        _finish_phase(matched, "operations", line_ts)
-                continue
-
-            if "kometa.py" in raw_line and collections_start_re.search(msg):
-                if current_library:
-                    if statuses.get(current_library) not in ("Done", "Skipped"):
-                        statuses[current_library] = "In progress"
-                    _start_phase(current_library, "collections", line_ts)
-                continue
-
-            if "kometa.py" in raw_line and collections_end_re.search(msg):
-                continue
-
-            if "kometa.py" in raw_line and metadata_start_re.search(msg):
-                if current_library:
-                    if statuses.get(current_library) not in ("Done", "Skipped"):
-                        statuses[current_library] = "In progress"
-                    _start_phase(current_library, "metadata", line_ts)
-                continue
-
-            if "kometa.py" in raw_line and re.search(r"\bMapping\b", msg, re.IGNORECASE):
-                name = self._extract_mapping_library(msg)
-                if name:
-                    matched = self._match_library_name(name, library_entries)
-                    if not matched:
-                        if selected_norm or not allow_unknown:
-                            continue
-                        library_entries.append({"name": name, "type": None})
-                        statuses.setdefault(name, "Pending")
-                        matched = name
-                    if current_library and current_library in statuses and statuses[current_library] != "Skipped":
-                        statuses[current_library] = "Done"
-                    statuses[matched] = "In progress"
-                    _set_current_library(matched, line_ts)
-                    if processing_started_at is None and line_ts:
-                        processing_started_at = line_ts
-                continue
-
-            finished_match = library_done_re.search(msg)
-            if finished_match:
-                name = finished_match.group(1).strip()
-                matched = self._match_library_name(name, library_entries)
-                if matched and statuses.get(matched) != "Skipped":
-                    statuses[matched] = "Done"
-                    if current_library == matched:
-                        current_library = None
-                continue
-
-            if "Finished Libraries Run" in msg:
-                finished_run_seen = True
-                if current_library and current_library in statuses and statuses[current_library] != "Skipped":
-                    statuses[current_library] = "Done"
-                current_library = None
-                playlist_running = False
-                continue
-
-            if "Finished Run" in msg:
-                if current_library and current_library in statuses and statuses[current_library] != "Skipped":
-                    statuses[current_library] = "Done"
-                current_library = None
-                finished_run_seen = True
-                playlist_running = False
-                continue
-
-            for pattern in start_patterns:
-                match = pattern.search(msg)
-                if not match:
-                    continue
-                name = match.group(1).strip()
-                matched = self._match_library_name(name, library_entries)
-                if not matched:
-                    if selected_norm or not allow_unknown:
-                        continue
-                    library_entries.append({"name": name, "type": None})
-                    statuses.setdefault(name, "Pending")
-                    matched = name
-                library_hint = matched
-                break
-
-            for pattern in activity_patterns:
-                match = pattern.search(msg)
-                if not match:
-                    continue
-                name = match.group(1).strip()
-                matched = self._match_library_name(name, library_entries)
-                if not matched:
-                    if selected_norm or not allow_unknown:
-                        continue
-                    library_entries.append({"name": name, "type": None})
-                    statuses.setdefault(name, "Pending")
-                    matched = name
-                library_hint = matched
-                break
-
-        section_runtimes = self.extract_section_runtimes(content)
-        # Fallback for playlist timing when runtime lines do not match the
-        # stricter live parser patterns (for example continuation lines).
-        if playlist_total_seconds <= 0 and isinstance(section_runtimes, dict):
-            playlist_runtime_total = 0
-            for section_name, seconds in section_runtimes.items():
-                if not isinstance(section_name, str):
-                    continue
-                if "playlist" not in section_name.lower():
-                    continue
-                if isinstance(seconds, (int, float)):
-                    playlist_runtime_total += int(seconds)
-            if playlist_runtime_total > 0:
-                playlist_total_seconds = playlist_runtime_total
-                playlists_detected = True
-        phases_completed = []
-        for section_name in section_runtimes.keys():
-            phase = self._map_section_to_phase(section_name)
-            if phase and phase not in phases_completed:
-                phases_completed.append(phase)
-
-        phase_patterns = [
-            ("operations", re.compile(r"\bLibrary\s+Operations\b|\boperations\.py\b", re.IGNORECASE)),
-            ("metadata", re.compile(r"\bMetadata\s+File\b|\bmeta\.py\b", re.IGNORECASE)),
-            ("collections", re.compile(r"\bCollection\s+File\b|\bBuilding\s+.+\s+Collections\b", re.IGNORECASE)),
-            ("overlays", re.compile(r"\bLibrary\s+Overlays\b|\boverlays\.py\b", re.IGNORECASE)),
-            ("playlists", re.compile(r"^Playlists$|\bPlaylist\b", re.IGNORECASE)),
-        ]
-        phase_current = None
-        phase_sequence = []
-        for raw_line in lines:
-            msg = raw_line.split("|", 1)[1].strip() if "|" in raw_line else raw_line.strip()
-            msg = self._strip_divider_wrappers(msg)
-            line_ts = parse_log_timestamp(raw_line)
-            if last_log_cutoff and line_ts and line_ts <= last_log_cutoff:
-                continue
-            if processing_started_at is not None and line_ts and line_ts < processing_started_at:
-                continue
-            for phase_key, pattern in phase_patterns:
-                if pattern.search(msg):
-                    phase_current = phase_key
-                    phase_sequence.append(phase_key)
-                    break
-        if processing_started_at is None:
-            phase_current = None
-            phase_sequence = []
-
-        summary_header_re = re.compile(r"=+\s*(.+?)\s+Summary\s*=+", re.IGNORECASE)
-        summary_runtime_re = re.compile(r"^(Library\s+.+?)\s*\|\s*(\d+:\d{2}:\d{2})", re.IGNORECASE)
-        summary_library = None
-        for raw_line in lines:
-            msg = raw_line.split("|", 1)[1].strip() if "|" in raw_line else raw_line.strip()
-            msg = self._strip_divider_wrappers(msg)
-            header_match = summary_header_re.search(msg)
-            if header_match:
-                name = header_match.group(1).strip()
-                matched = self._match_library_name(name, library_entries)
-                summary_library = matched
-                continue
-            if not summary_library:
-                continue
-            runtime_match = summary_runtime_re.search(msg)
-            if not runtime_match:
-                continue
-            label = runtime_match.group(1).strip().lower()
-            seconds = self._parse_hms_to_seconds(runtime_match.group(2))
-            if seconds is None:
-                continue
-            phase_key = None
-            if "operations" in label:
-                phase_key = "operations"
-            elif "collections" in label:
-                phase_key = "collections"
-            elif "metadata" in label:
-                phase_key = "metadata"
-            elif "overlays" in label:
-                phase_key = "overlays"
-            if phase_key:
-                _ensure_duration_entry(summary_library)
-                existing = library_durations[summary_library].get(phase_key, 0)
-                library_durations[summary_library][phase_key] = max(existing, int(seconds))
-        if phase_sequence:
-            completed_from_sequence = set()
-            last_phase = phase_sequence[-1]
-            for phase in phase_sequence:
-                if phase != last_phase:
-                    completed_from_sequence.add(phase)
-            for phase in completed_from_sequence:
-                if phase not in phases_completed:
-                    phases_completed.append(phase)
-        if "Finished Run" in content and phase_current and phase_current not in phases_completed:
-            phases_completed.append(phase_current)
-
-        if finished_run_seen and phase_start:
-            for name, phase_key in list(phase_start.keys()):
-                _finish_phase(name, phase_key, last_ts)
-
-        current_phase_elapsed = None
-        live_reference_ts = effective_now if is_running and effective_now is not None else last_ts
-        if current_library and live_reference_ts:
-            open_phase = phase_open.get(current_library)
-            if open_phase:
-                start_ts = phase_start.get((current_library, open_phase))
-                if start_ts:
-                    effective_start = start_ts
-                    if last_log_cutoff and start_ts < last_log_cutoff and live_reference_ts > last_log_cutoff:
-                        effective_start = last_log_cutoff
-                    delta = max(0, int((live_reference_ts - effective_start).total_seconds()))
-                    base = 0
-                    if current_library in library_durations:
-                        base = int(library_durations[current_library].get(open_phase, 0) or 0)
-                    current_phase_elapsed = base + delta
-
-        if not preparation_locked and processing_started_at:
-            prep_start = effective_started_at or first_log_ts
-            if prep_start and processing_started_at > prep_start:
-                preparation_seconds = max(0, int((processing_started_at - prep_start).total_seconds()))
-                preparation_locked = True
-        elif not preparation_locked and preparation_seconds is None:
-            prep_start = effective_started_at or first_log_ts
-            prep_reference_ts = effective_now if is_running and effective_now is not None else last_ts
-            if prep_start and prep_reference_ts and prep_reference_ts > prep_start:
-                preparation_elapsed_seconds = max(0, int((prep_reference_ts - prep_start).total_seconds()))
-
-        playlist_elapsed_seconds = None
-        playlist_reference_ts = effective_now if is_running and effective_now is not None else last_ts
-        if playlist_running and playlist_reference_ts and playlist_started_at:
-            effective_start = playlist_started_at
-            if last_log_cutoff and playlist_started_at < last_log_cutoff and playlist_reference_ts > last_log_cutoff:
-                effective_start = last_log_cutoff
-            delta = max(0, int((playlist_reference_ts - effective_start).total_seconds()))
-            playlist_elapsed_seconds = playlist_total_seconds + delta
-
-        if finished_run_seen:
-            for name, status in list(statuses.items()):
-                if status in ("Pending", "In progress"):
-                    if selected_norm and not is_selected(name):
-                        continue
-                    statuses[name] = "Done"
-
-        libraries_payload = []
-        completed_count = 0
-        total_count = 0
-        for entry in library_entries:
-            name = entry["name"]
-            status = statuses.get(name, "Pending")
-            if is_selected(name):
-                total_count += 1
-                if status == "Done":
-                    completed_count += 1
-            libraries_payload.append(
-                {
-                    "name": name,
-                    "type": entry.get("type"),
-                    "status": status,
-                    "durations": library_durations.get(name, {}),
-                }
-            )
-
-        phase_starts_payload = {}
-        for (lib_name, phase_key), start_ts in phase_start.items():
-            if not lib_name or not phase_key or not start_ts:
-                continue
-            phase_starts_payload[f"{lib_name}||{phase_key}"] = start_ts.isoformat()
-
-        return {
-            "phase_current": phase_current,
-            "phases_completed": phases_completed,
-            "libraries": libraries_payload,
-            "current_library": current_library,
-            "completed_count": completed_count,
-            "total_count": total_count if selected_norm else len(library_entries),
-            "current_phase_elapsed_seconds": current_phase_elapsed,
-            "phase_starts": phase_starts_payload,
-            "playlist_total_seconds": playlist_total_seconds,
-            "playlist_running": playlist_running,
-            "playlist_started_at": playlist_started_at.isoformat() if playlist_started_at else None,
-            "playlist_elapsed_seconds": playlist_elapsed_seconds,
-            "playlists_detected": playlists_detected,
-            "run_finished": finished_run_seen,
-            "preparation_seconds": preparation_seconds,
-            "preparation_elapsed_seconds": preparation_elapsed_seconds,
-        }
+    def extract_progress(
+        self,
+        content,
+        library_list=None,
+        selected_libraries=None,
+        previous=None,
+        run_started_at=None,
+        now_ts=None,
+        is_running=False,
+    ):
+        return logscan_progress_engine.extract_progress(
+            self,
+            content,
+            library_list=library_list,
+            selected_libraries=selected_libraries,
+            previous=previous,
+            run_started_at=run_started_at,
+            now_ts=now_ts,
+            is_running=is_running,
+        )
 
     def extract_analyze_issue_counts(self, content):
-        patterns = {
-            "analyze_convert": re.compile(r"\bconvert\s+(warning|error)\b", re.IGNORECASE),
-            "analyze_anidb": re.compile(r"\banidb\b.*\b(error|warning|failed)\b", re.IGNORECASE),
-            "analyze_regex": re.compile(r"\bregex\b.*\b(error|warning|invalid|failed)\b", re.IGNORECASE),
-        }
-        counts = {key: 0 for key in patterns}
-        if not content:
-            counts["convert"] = 0
-            counts["anidb"] = 0
-            counts["regex"] = 0
-            return counts
-        for line in content.splitlines():
-            for key, pattern in patterns.items():
-                if pattern.search(line):
-                    counts[key] += 1
-        counts["convert"] = counts["analyze_convert"]
-        counts["anidb"] = counts["analyze_anidb"]
-        counts["regex"] = counts["analyze_regex"]
-        return counts
+        return logscan_recommendations_engine.extract_analyze_issue_counts(content)
 
     def extract_quickstart_marker(self, content):
-        if not content:
-            return None
-        match = re.search(r"\[Quickstart\]\s+Run marker:.*", content)
-        return match.group(0) if match else None
+        return logscan_maintenance.extract_quickstart_marker(content)
 
     def extract_quickstart_marker_fields(self, content):
-        marker = self.extract_quickstart_marker(content)
-        if not marker:
-            return {}
-        fields = {}
-        for match in re.finditer(r"(\w+)=([^\s]+)", marker):
-            key = str(match.group(1) or "").strip().lower()
-            value = str(match.group(2) or "").strip()
-            if key:
-                fields[key] = value
-        start_mode = str(fields.get("start_mode") or "").strip().lower()
-        if start_mode not in {"current", "recovery", "logged"}:
-            fields["start_mode"] = ""
-        else:
-            fields["start_mode"] = start_mode
-        return fields
+        return logscan_maintenance.extract_quickstart_marker_fields(content)
 
     def extract_quickstart_marker_capabilities(self, content):
-        capabilities = {"maintenance_markers": False}
-        marker = self.extract_quickstart_marker(content)
-        if not marker:
-            return capabilities
-        if re.search(r"\bmaintenance_markers=1\b", marker):
-            capabilities["maintenance_markers"] = True
-        return capabilities
+        return logscan_maintenance.extract_quickstart_marker_capabilities(content)
 
     def _parse_log_timestamp(self, line):
-        if not line or not line.startswith("["):
-            return None
-        match = re.match(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d{3}\]", line)
-        if not match:
-            return None
-        try:
-            return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return None
+        return logscan_maintenance.parse_log_timestamp(line)
 
     def extract_maintenance_summary(self, content):
-        summary = {
-            "had_pause": False,
-            "pause_count": 0,
-            "pause_seconds": 0,
-            "open_pause": False,
-            "window": None,
-            "events": [],
-        }
-        if not content:
-            return summary
-
-        marker_re = re.compile(
-            r"\[Quickstart\]\s+Maintenance marker:\s+event=(paused|resumed)\s+at=([^\s]+)" r"(?:\s+local_at=([^\s]+))?(?:\s+window=([^\s]+))?(?:\s+paused_seconds=(\d+))?",
-            re.IGNORECASE,
-        )
-        open_pause_at = None
-        open_pause_window = None
-        open_pause_local_at = None
-
-        for line in content.splitlines():
-            match = marker_re.search(line)
-            if not match:
-                continue
-            event = str(match.group(1) or "").strip().lower()
-            raw_ts = str(match.group(2) or "").strip()
-            local_at = str(match.group(3) or "").strip() or None
-            window = str(match.group(4) or "").strip() or None
-            paused_seconds_raw = match.group(5)
-            event_ts = None
-            try:
-                event_ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
-                if event_ts.tzinfo is not None:
-                    event_ts = event_ts.astimezone(timezone.utc)
-            except Exception:
-                event_ts = None
-            paused_seconds = None
-            if paused_seconds_raw is not None:
-                try:
-                    paused_seconds = max(0, int(paused_seconds_raw))
-                except Exception:
-                    paused_seconds = None
-
-            summary["events"].append(
-                {
-                    "event": event,
-                    "at": raw_ts,
-                    "local_at": local_at,
-                    "window": window,
-                    "paused_seconds": paused_seconds,
-                }
-            )
-            if window:
-                summary["window"] = window
-
-            if event == "paused":
-                summary["had_pause"] = True
-                summary["pause_count"] += 1
-                open_pause_at = event_ts
-                open_pause_window = window
-                open_pause_local_at = local_at
-                continue
-
-            if event == "resumed":
-                summary["had_pause"] = True
-                if paused_seconds is None and open_pause_at and event_ts:
-                    try:
-                        paused_seconds = max(0, int((event_ts - open_pause_at).total_seconds()))
-                    except Exception:
-                        paused_seconds = None
-                if paused_seconds is not None:
-                    summary["pause_seconds"] += paused_seconds
-                open_pause_at = None
-                open_pause_window = None
-                open_pause_local_at = None
-
-        if open_pause_at is not None:
-            summary["open_pause"] = True
-            summary["had_pause"] = True
-            if not summary["window"] and open_pause_window:
-                summary["window"] = open_pause_window
-            if summary["events"] and not summary["events"][-1].get("local_at") and open_pause_local_at:
-                summary["events"][-1]["local_at"] = open_pause_local_at
-
-        return summary
+        return logscan_maintenance.extract_maintenance_summary(content)
 
     def extract_quiet_period_summary(self, content, maintenance_summary=None):
-        summary = {
-            "longest_gap_seconds": 0,
-            "longest_gap_started_at": None,
-            "longest_gap_ended_at": None,
-            "longest_gap_start_line": None,
-            "longest_gap_end_line": None,
-            "longest_gap_last_line": None,
-            "longest_gap_first_line": None,
-            "gaps_over_300": 0,
-            "gaps_over_900": 0,
-            "gaps_over_1800": 0,
-            "longest_gap_maintenance_overlap": "unknown",
-            "longest_unexplained_gap_seconds": 0,
-            "longest_unexplained_gap_started_at": None,
-            "longest_unexplained_gap_ended_at": None,
-            "longest_unexplained_gap_start_line": None,
-            "longest_unexplained_gap_end_line": None,
-            "longest_unexplained_gap_last_line": None,
-            "longest_unexplained_gap_first_line": None,
-            "longest_unexplained_gap_maintenance_overlap": "unknown",
-            "confirmed_maintenance_gaps_over_300": 0,
-            "unexplained_gaps_over_300": 0,
-            "notable_gaps": [],
-        }
-        if not content:
-            return summary
-
-        capabilities = self.extract_quickstart_marker_capabilities(content)
-        maintenance_supported = bool(capabilities.get("maintenance_markers"))
-        timestamp_entries = []
-        for line_number, line in enumerate(content.splitlines(), start=1):
-            line_ts = self._parse_log_timestamp(line)
-            if line_ts is not None:
-                timestamp_entries.append(
-                    {
-                        "timestamp": line_ts,
-                        "line_number": line_number,
-                        "line": line.strip(),
-                    }
-                )
-        if len(timestamp_entries) < 2:
-            if maintenance_supported:
-                summary["longest_gap_maintenance_overlap"] = "none"
-            return summary
-
-        maintenance_summary = maintenance_summary if isinstance(maintenance_summary, dict) else {}
-        maintenance_intervals = []
-        open_start = None
-        for event in maintenance_summary.get("events") or []:
-            if not isinstance(event, dict):
-                continue
-            local_at = str(event.get("local_at") or "").strip()
-            event_name = str(event.get("event") or "").strip().lower()
-            event_ts = None
-            if local_at:
-                try:
-                    event_ts = datetime.fromisoformat(local_at)
-                except Exception:
-                    event_ts = None
-            if event_ts is None:
-                continue
-            if event_name == "paused":
-                open_start = event_ts
-            elif event_name == "resumed" and open_start is not None:
-                maintenance_intervals.append((open_start, event_ts))
-                open_start = None
-        if open_start is not None:
-            maintenance_intervals.append((open_start, None))
-
-        def _get_gap_overlap(start_ts, end_ts):
-            overlap = False
-            for interval_start, interval_end in maintenance_intervals:
-                if interval_end is None:
-                    if end_ts > interval_start:
-                        overlap = True
-                        break
-                    continue
-                if start_ts < interval_end and end_ts > interval_start:
-                    overlap = True
-                    break
-            if overlap:
-                return "confirmed"
-            if maintenance_supported:
-                return "none"
-            return "unknown"
-
-        longest_start = None
-        longest_end = None
-        longest_previous_entry = None
-        longest_current_entry = None
-        longest_unexplained_start = None
-        longest_unexplained_end = None
-        longest_unexplained_previous_entry = None
-        longest_unexplained_current_entry = None
-        for previous_entry, current_entry in zip(timestamp_entries, timestamp_entries[1:]):
-            previous_ts = previous_entry["timestamp"]
-            current_ts = current_entry["timestamp"]
-            gap_seconds = max(0, int((current_ts - previous_ts).total_seconds()))
-            if gap_seconds <= 0:
-                continue
-            if gap_seconds >= 300:
-                summary["gaps_over_300"] += 1
-            if gap_seconds >= 900:
-                summary["gaps_over_900"] += 1
-            if gap_seconds >= 1800:
-                summary["gaps_over_1800"] += 1
-            overlap_label = _get_gap_overlap(previous_ts, current_ts)
-            gap_detail = {
-                "gap_seconds": gap_seconds,
-                "started_at": previous_ts.isoformat(),
-                "ended_at": current_ts.isoformat(),
-                "start_line": previous_entry.get("line_number"),
-                "end_line": current_entry.get("line_number"),
-                "last_line": previous_entry.get("line"),
-                "first_line": current_entry.get("line"),
-                "maintenance_overlap": overlap_label,
-            }
-            if gap_seconds >= 300:
-                summary["notable_gaps"].append(gap_detail)
-                if overlap_label == "confirmed":
-                    summary["confirmed_maintenance_gaps_over_300"] += 1
-                else:
-                    summary["unexplained_gaps_over_300"] += 1
-            if gap_seconds > summary["longest_gap_seconds"]:
-                summary["longest_gap_seconds"] = gap_seconds
-                longest_start = previous_ts
-                longest_end = current_ts
-                longest_previous_entry = previous_entry
-                longest_current_entry = current_entry
-            if overlap_label != "confirmed" and gap_seconds > summary["longest_unexplained_gap_seconds"]:
-                summary["longest_unexplained_gap_seconds"] = gap_seconds
-                longest_unexplained_start = previous_ts
-                longest_unexplained_end = current_ts
-                longest_unexplained_previous_entry = previous_entry
-                longest_unexplained_current_entry = current_entry
-
-        if longest_start is not None and longest_end is not None:
-            summary["longest_gap_started_at"] = longest_start.isoformat()
-            summary["longest_gap_ended_at"] = longest_end.isoformat()
-            if longest_previous_entry:
-                summary["longest_gap_start_line"] = longest_previous_entry.get("line_number")
-                summary["longest_gap_last_line"] = longest_previous_entry.get("line")
-            if longest_current_entry:
-                summary["longest_gap_end_line"] = longest_current_entry.get("line_number")
-                summary["longest_gap_first_line"] = longest_current_entry.get("line")
-            summary["longest_gap_maintenance_overlap"] = _get_gap_overlap(longest_start, longest_end)
-
-        if longest_unexplained_start is not None and longest_unexplained_end is not None:
-            summary["longest_unexplained_gap_started_at"] = longest_unexplained_start.isoformat()
-            summary["longest_unexplained_gap_ended_at"] = longest_unexplained_end.isoformat()
-            if longest_unexplained_previous_entry:
-                summary["longest_unexplained_gap_start_line"] = longest_unexplained_previous_entry.get("line_number")
-                summary["longest_unexplained_gap_last_line"] = longest_unexplained_previous_entry.get("line")
-            if longest_unexplained_current_entry:
-                summary["longest_unexplained_gap_end_line"] = longest_unexplained_current_entry.get("line_number")
-                summary["longest_unexplained_gap_first_line"] = longest_unexplained_current_entry.get("line")
-            summary["longest_unexplained_gap_maintenance_overlap"] = _get_gap_overlap(longest_unexplained_start, longest_unexplained_end)
-        elif maintenance_supported and summary["longest_gap_seconds"] > 0:
-            summary["longest_unexplained_gap_maintenance_overlap"] = "none"
-
-        return summary
+        return logscan_maintenance.extract_quiet_period_summary(content, maintenance_summary)
 
     def extract_config_line_count(self, content):
-        if not content:
-            return 0
-        lines = content.splitlines()
-        in_block = False
-        count = 0
-        for raw_line in lines:
-            line = raw_line.strip()
-            if not in_block:
-                if "Redacted Config" in line:
-                    in_block = True
-                continue
-            if "config.py:" not in line:
-                break
-            message = line.split("|", 1)[1].strip() if "|" in line else line
-            if not message:
-                continue
-            if "Quickstart run marker" in message:
-                break
-            if message.startswith("#"):
-                continue
-            if set(message.strip()) <= {"="}:
-                continue
-            count += 1
-        return count
+        return logscan_library_stats.extract_config_line_count(content)
 
     def extract_library_counts(self, content):
-        if not content:
-            return {}
-        lines = content.splitlines()
-        library_counts = {}
-        library_sources = {}
-        current_library = None
-        current_type = None
-
-        header_patterns = [
-            re.compile(r"Processing Library:\s*(.+)", re.IGNORECASE),
-            re.compile(r"Library:\s*(.+)", re.IGNORECASE),
-            re.compile(r"Information on library:\s*(.+)", re.IGNORECASE),
-        ]
-        type_pattern = re.compile(r"\b(Movie|Show)\b", re.IGNORECASE)
-        items_pattern = re.compile(r"Items Found:\s*(\d+)", re.IGNORECASE)
-        movies_pattern = re.compile(r"Movies Found:\s*(\d+)", re.IGNORECASE)
-        shows_pattern = re.compile(r"Shows Found:\s*(\d+)", re.IGNORECASE)
-        episodes_pattern = re.compile(r"Episodes Found:\s*(\d+)", re.IGNORECASE)
-        content_movies_pattern = re.compile(r"Content Count:\s*(\d+)\s+movies?", re.IGNORECASE)
-        content_shows_pattern = re.compile(r"Content Count:\s*(\d+)\s+shows?\s*/\s*(\d+)\s+episodes", re.IGNORECASE)
-        library_items_pattern = re.compile(r"Library\s+(.+?)\s+has\s+(\d+)\s+items", re.IGNORECASE)
-
-        for raw_line in lines:
-            line = raw_line.strip()
-            if line.startswith("#"):
-                line = line.lstrip("#").strip()
-            if not line:
-                continue
-            for pattern in header_patterns:
-                match = pattern.search(line)
-                if match:
-                    name = match.group(1).strip()
-                    if "->" in name:
-                        name = name.split("->", 1)[-1].strip()
-                    name = name.strip("- ").strip()
-                    if name:
-                        current_library = name
-                        current_type = None
-                        type_match = type_pattern.search(line)
-                        if type_match:
-                            current_type = type_match.group(1).lower()
-                    break
-
-            direct_match = library_items_pattern.search(line)
-            if direct_match:
-                name = direct_match.group(1).strip()
-                count = int(direct_match.group(2))
-                library_counts[name] = {
-                    "items": count,
-                }
-                continue
-
-            if not current_library:
-                continue
-
-            content_match = content_movies_pattern.search(line)
-            if content_match:
-                library_counts[current_library] = {
-                    "items": int(content_match.group(1)),
-                    "type": "movie",
-                }
-                library_sources[current_library] = "content_count"
-                continue
-
-            content_match = content_shows_pattern.search(line)
-            if content_match:
-                library_counts[current_library] = {
-                    "items": int(content_match.group(1)),
-                    "episodes": int(content_match.group(2)),
-                    "type": "show",
-                }
-                library_sources[current_library] = "content_count"
-                continue
-
-            items_match = items_pattern.search(line)
-            if items_match:
-                if library_sources.get(current_library) == "content_count":
-                    continue
-                library_counts[current_library] = {
-                    "items": int(items_match.group(1)),
-                    "type": current_type,
-                }
-                continue
-
-            movies_match = movies_pattern.search(line)
-            if movies_match:
-                if library_sources.get(current_library) == "content_count":
-                    continue
-                library_counts[current_library] = {
-                    "items": int(movies_match.group(1)),
-                    "type": "movie",
-                }
-                continue
-
-            shows_match = shows_pattern.search(line)
-            if shows_match:
-                if library_sources.get(current_library) == "content_count":
-                    continue
-                entry = library_counts.get(current_library, {})
-                entry["items"] = int(shows_match.group(1))
-                entry["type"] = entry.get("type") or "show"
-                library_counts[current_library] = entry
-                continue
-
-            episodes_match = episodes_pattern.search(line)
-            if episodes_match:
-                if library_sources.get(current_library) == "content_count":
-                    continue
-                entry = library_counts.get(current_library, {})
-                entry["episodes"] = int(episodes_match.group(1))
-                entry["type"] = entry.get("type") or "show"
-                library_counts[current_library] = entry
-
-        return library_counts
+        return logscan_library_stats.extract_library_counts(content)
 
     def _build_summary(
         self,
@@ -3098,9 +380,20 @@ class LogscanAnalyzer:
         run_command=None,
         command_signature=None,
         section_runtimes=None,
+        validation_summary=None,
+        timestamp_bounds=None,
     ):
         started_at = self._normalize_started_at(self.started_at)
         finished_at = self.finished_at
+        validation_summary = validation_summary if isinstance(validation_summary, dict) else {}
+        timestamp_bounds = timestamp_bounds if isinstance(timestamp_bounds, dict) else {}
+        validation_run = bool(validation_summary.get("validation_run"))
+        validation_result = validation_summary.get("validation_result")
+        validation_complete = validation_run and bool(validation_result)
+        if not started_at and timestamp_bounds.get("started_at"):
+            started_at = timestamp_bounds.get("started_at")
+        if not finished_at and validation_summary.get("finished_at"):
+            finished_at = validation_summary.get("finished_at")
         if not finished_at and finished_runs:
             last_run = finished_runs[-1]
             if " - " in last_run:
@@ -3111,9 +404,16 @@ class LogscanAnalyzer:
                 finished_at = finished_at.split(":", 1)[1].strip()
 
         run_time_seconds = None
+        run_time_source = None
         if isinstance(self.run_time, timedelta):
             run_time_seconds = int(self.run_time.total_seconds())
-        run_complete = run_time_seconds is not None
+            run_time_source = "kometa"
+        if not finished_at and timestamp_bounds.get("finished_at"):
+            finished_at = timestamp_bounds.get("finished_at")
+        run_complete = run_time_source == "kometa" or validation_complete
+        if run_time_seconds is None and isinstance(timestamp_bounds.get("elapsed_seconds"), int):
+            run_time_seconds = timestamp_bounds.get("elapsed_seconds")
+            run_time_source = "log_timestamps"
         section_total_seconds = None
         section_delta_seconds = None
         if section_runtimes:
@@ -3145,11 +445,12 @@ class LogscanAnalyzer:
             run_key_seed = "|".join(run_key_parts)
             run_key = hashlib.sha256(run_key_seed.encode("utf-8")).hexdigest()
 
-        return {
+        summary = {
             "run_key": run_key,
             "started_at": started_at,
             "finished_at": finished_at,
             "run_time_seconds": run_time_seconds,
+            "run_time_source": run_time_source,
             "run_complete": run_complete,
             "section_runtime_total_seconds": section_total_seconds,
             "section_runtime_delta_seconds": section_delta_seconds,
@@ -3165,6 +466,11 @@ class LogscanAnalyzer:
             "log_counts": counts,
             "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
+        if validation_run:
+            summary["validation_run"] = True
+            summary["validation_level"] = validation_summary.get("validation_level")
+            summary["validation_result"] = validation_result
+        return summary
 
     def analyze_content(self, content, log_path=None, config_name=None, config_path=None, include_people_scan=True):
         self.reset_server_versions()
@@ -3176,6 +482,7 @@ class LogscanAnalyzer:
         self.current_kometa_version = None
         self.kometa_newest_version = None
         self.people_index_available = False
+        self.validation_summary = {}
 
         raw_content = content or ""
         self._raw_content = raw_content
@@ -3185,6 +492,9 @@ class LogscanAnalyzer:
         header_lines = self.extract_header_lines(cleaned_content)
         finished_lines = self.extract_last_lines(cleaned_content)
         finished_runs = self.extract_finished_runs(cleaned_content)
+        validation_summary = self.extract_validation_summary(raw_content)
+        self.validation_summary = validation_summary if isinstance(validation_summary, dict) else {}
+        timestamp_bounds = self.extract_log_timestamp_bounds(raw_content)
         self.extract_plex_config(cleaned_content)
         run_command_raw = self.extract_run_command(cleaned_content)
         command_signature = self.compute_command_signature(run_command_raw)
@@ -3243,10 +553,14 @@ class LogscanAnalyzer:
             run_command=run_command,
             command_signature=command_signature,
             section_runtimes=section_runtimes,
+            validation_summary=validation_summary,
+            timestamp_bounds=timestamp_bounds,
         )
         if summary:
             summary["analysis_counts"] = analysis_counts
             summary["quickstart_run_marker"] = bool(quickstart_marker)
+            summary["quickstart_version"] = quickstart_marker_fields.get("quickstart") or None
+            summary["quickstart_branch"] = quickstart_marker_fields.get("branch") or None
             summary["start_mode"] = quickstart_marker_fields.get("start_mode") or None
             summary["library_counts"] = library_counts
             summary["maintenance_summary"] = maintenance_summary

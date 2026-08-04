@@ -1,3 +1,6 @@
+import builtins
+import json
+import os
 import re
 
 import pytest
@@ -145,6 +148,47 @@ def test_settings_page_enables_auto_sort_hubs_with_plex_pass(client, monkeypatch
     assert 'value="configured.desc" selected' in html
 
 
+def test_mal_page_preserves_distinct_authorization_hidden_fields(client, monkeypatch, qs_module):
+    original_retrieve_settings = qs_module.persistence.retrieve_settings
+
+    def fake_retrieve_settings(target):
+        if target == "140-mal":
+            return {
+                "validated": True,
+                "validated_at": "2026-07-20T00:00:00Z",
+                "user_entered": True,
+                "code_verifier": "verifier",
+                "mal": {
+                    "client_id": "client-id",
+                    "client_secret": "client-secret",
+                    "cache_expiration": 60,
+                    "authorization": {
+                        "access_token": "MAL-AT",
+                        "token_type": "Bearer",
+                        "expires_in": 2592000,
+                        "refresh_token": "MAL-RT",
+                    },
+                },
+            }
+        return original_retrieve_settings(target)
+
+    monkeypatch.setattr(qs_module.persistence, "retrieve_settings", fake_retrieve_settings)
+
+    resp = client.get("/step/140-mal")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+
+    for field_id, expected in {
+        "access_token": "MAL-AT",
+        "token_type": "Bearer",
+        "expires_in": "2592000",
+        "refresh_token": "MAL-RT",
+    }.items():
+        match = re.search(rf'id="{field_id}"[^>]+value="([^"]*)"', html)
+        assert match is not None
+        assert match.group(1) == expected
+
+
 def test_validate_library_auto_sort_hubs_rejects_invalid_value(qs_module):
     errors = qs_module._validate_library_auto_sort_hubs(
         {
@@ -186,6 +230,354 @@ def test_library_fragment_disables_auto_sort_hubs_without_plex_pass(client, monk
     assert 'name="mov-library_movies-top_level_auto_sort_hubs"' not in attrs
     assert 'name="mov-library_movies-top_level_auto_sort_hubs" value="alpha"' in html
     assert "Requires Plex Pass. Validate Plex first if this should be available." in html
+
+
+def test_library_fragment_defers_heavy_collection_and_overlay_sections(client, monkeypatch, qs_module, library_routes_module):
+    monkeypatch.setattr(
+        library_routes_module,
+        "_build_library_lists",
+        lambda: ([{"id": "mov-library_movies", "name": "Movies", "type": "movie"}], [], {"plex_pass": True}),
+    )
+    monkeypatch.setattr(library_routes_module, "_migrate_legacy_playlist_libraries_to_library_toggles", lambda *_args: set())
+    monkeypatch.setattr(
+        library_routes_module.helpers,
+        "load_quickstart_config",
+        lambda filename: (
+            [
+                {
+                    "accordion": "Award Collections",
+                    "collections": [
+                        {
+                            "id": "collection_award",
+                            "media_types": ["movie"],
+                            "template_variables": [
+                                {"key": "style", "type": "text_input", "default": "default"},
+                            ],
+                        }
+                    ],
+                }
+            ]
+            if filename == "quickstart_collections.json"
+            else {}
+        ),
+    )
+    monkeypatch.setattr(
+        library_routes_module.helpers,
+        "load_quickstart_overlay_config",
+        lambda: [
+            {
+                "accordion": "Media Overlays",
+                "overlays": [
+                    {
+                        "id": "overlay_resolution",
+                        "media_types": ["movie"],
+                        "template_variables": {
+                            "style": {"input_type": "select", "default": "default"},
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        library_routes_module,
+        "_build_preview_image_data",
+        lambda: (_ for _ in ()).throw(AssertionError("Initial library fragment should defer preview image data")),
+    )
+
+    original_retrieve_settings = qs_module.persistence.retrieve_settings
+
+    def fake_retrieve_settings(target):
+        if target == "025-libraries":
+            return {
+                "libraries": {
+                    "mov-library_movies-library": "Movies",
+                    "mov-library_movies-template_collection_award_style": "custom",
+                    "mov-library_movies-movie-overlay_resolution": "true",
+                    "mov-library_movies-movie-template_overlay_resolution[style]": "custom",
+                }
+            }
+        return original_retrieve_settings(target)
+
+    monkeypatch.setattr(qs_module.persistence, "retrieve_settings", fake_retrieve_settings)
+
+    resp = client.get("/library_fragment/mov-library_movies")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+
+    assert 'data-library-lazy-section="collections"' in html
+    assert 'data-library-lazy-section="overlays"' in html
+    assert html.count('data-lazy-override-count="1"') == 2
+    assert "Open this section to load collection settings." in html
+    assert "Open this section to load overlay settings." in html
+
+
+def test_library_fragment_lazy_overlay_count_ignores_inactive_overlay_values(client, monkeypatch, qs_module, library_routes_module):
+    monkeypatch.setattr(
+        library_routes_module,
+        "_build_library_lists",
+        lambda: ([{"id": "mov-library_movies", "name": "Movies", "type": "movie"}], [], {"plex_pass": True}),
+    )
+    monkeypatch.setattr(library_routes_module, "_migrate_legacy_playlist_libraries_to_library_toggles", lambda *_args: set())
+    monkeypatch.setattr(library_routes_module.helpers, "load_quickstart_config", lambda _filename: [])
+    monkeypatch.setattr(
+        library_routes_module.helpers,
+        "load_quickstart_overlay_config",
+        lambda: [
+            {
+                "accordion": "Media Overlays",
+                "overlays": [
+                    {
+                        "id": "overlay_content_rating_commonsense",
+                        "media_types": ["movie"],
+                        "template_variables": {
+                            "style": {"input_type": "select", "default": "default"},
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        library_routes_module,
+        "_build_preview_image_data",
+        lambda: (_ for _ in ()).throw(AssertionError("Initial library fragment should defer preview image data")),
+    )
+
+    original_retrieve_settings = qs_module.persistence.retrieve_settings
+
+    def fake_retrieve_settings(target):
+        if target == "025-libraries":
+            return {
+                "libraries": {
+                    "mov-library_movies-library": "Movies",
+                    "mov-library_movies-movie-overlay_content_rating_commonsense": "false",
+                    "mov-library_movies-movie-template_overlay_content_rating_commonsense[style]": "custom",
+                }
+            }
+        return original_retrieve_settings(target)
+
+    monkeypatch.setattr(qs_module.persistence, "retrieve_settings", fake_retrieve_settings)
+
+    resp = client.get("/library_fragment/mov-library_movies")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+
+    assert 'data-library-lazy-section="overlays"' in html
+    assert 'data-lazy-override-count="0"' in html
+
+
+def test_lazy_overlay_count_uses_rendered_ratings_defaults(library_routes_module):
+    library = {"id": "mov-library_movies", "name": "Movies", "type": "movie"}
+    libraries_data = {
+        "mov-library_movies-movie-overlay_ratings": "true",
+        "mov-library_movies-movie-template_overlay_ratings[rating1]": "user",
+        "mov-library_movies-movie-template_overlay_ratings[rating1_image]": "rt_tomato",
+        "mov-library_movies-movie-template_overlay_ratings[rating1_font]": "LibreFranklin-Bold.ttf",
+        "mov-library_movies-movie-template_overlay_ratings[rating1_horizontal_offset]": "-30",
+        "mov-library_movies-movie-template_overlay_ratings[rating1_vertical_offset]": "-205",
+        "mov-library_movies-movie-template_overlay_ratings[rating2]": "critic",
+        "mov-library_movies-movie-template_overlay_ratings[rating2_image]": "imdb",
+        "mov-library_movies-movie-template_overlay_ratings[rating2_font]": "Roboto-Medium.ttf",
+        "mov-library_movies-movie-template_overlay_ratings[rating2_horizontal_offset]": "-30",
+        "mov-library_movies-movie-template_overlay_ratings[rating2_vertical_offset]": "0",
+        "mov-library_movies-movie-template_overlay_ratings[rating3]": "audience",
+        "mov-library_movies-movie-template_overlay_ratings[rating3_image]": "tmdb",
+        "mov-library_movies-movie-template_overlay_ratings[rating3_font]": "Consensus-SemiBold.otf",
+        "mov-library_movies-movie-template_overlay_ratings[rating3_horizontal_offset]": "-30",
+        "mov-library_movies-movie-template_overlay_ratings[rating3_vertical_offset]": "205",
+        "mov-library_movies-movie-template_overlay_ratings[horizontal_position]": "right",
+        "mov-library_movies-movie-template_overlay_ratings[vertical_position]": "center",
+        "mov-library_movies-movie-template_overlay_ratings[rating_alignment]": "vertical",
+        "mov-library_movies-movie-overlay_aspect": "true",
+        "mov-library_movies-movie-template_overlay_aspect[text]": "1.78",
+        "mov-library_movies-movie-template_overlay_aspect[horizontal_offset]": "-332",
+        "mov-library_movies-movie-template_overlay_aspect[vertical_offset]": "510",
+        "mov-library_movies-movie-overlay_languages_subtitles": "true",
+        "mov-library_movies-movie-template_overlay_languages_subtitles[use_subtitles]": True,
+    }
+    overlay_config = [
+        {
+            "accordion": "Media Overlays",
+            "overlays": [
+                {
+                    "id": "overlay_ratings",
+                    "media_types": ["movie"],
+                    "template_variables": {
+                        "rating1": {"input_type": "select", "default": "user"},
+                        "rating1_image": {"input_type": "select", "default": "rt_tomato"},
+                        "rating1_font": {"input_type": "text", "default": "Inter-Medium.ttf"},
+                        "rating1_horizontal_offset": {"input_type": "number", "default": 15},
+                        "rating1_vertical_offset": {"input_type": "number", "default": 0},
+                        "rating2": {"input_type": "select", "default": "critic"},
+                        "rating2_image": {"input_type": "select", "default": "imdb"},
+                        "rating2_font": {"input_type": "text", "default": "Inter-Medium.ttf"},
+                        "rating2_horizontal_offset": {"input_type": "number", "default": 15},
+                        "rating2_vertical_offset": {"input_type": "number", "default": 0},
+                        "rating3": {"input_type": "select", "default": "audience"},
+                        "rating3_image": {"input_type": "select", "default": "tmdb"},
+                        "rating3_font": {"input_type": "text", "default": "Inter-Medium.ttf"},
+                        "rating3_horizontal_offset": {"input_type": "number", "default": 15},
+                        "rating3_vertical_offset": {"input_type": "number", "default": 0},
+                        "horizontal_position": {"input_type": "select", "default": "left"},
+                        "vertical_position": {"input_type": "select", "default": "center"},
+                        "rating_alignment": {"input_type": "select", "default": "vertical"},
+                    },
+                },
+                {
+                    "id": "overlay_aspect",
+                    "media_types": ["movie"],
+                    "template_variables": [
+                        {"key": "text", "input_type": "text"},
+                        {"key": "horizontal_offset", "input_type": "number", "default": 0},
+                        {"key": "vertical_offset", "input_type": "number", "default": 150},
+                    ],
+                },
+                {
+                    "id": "overlay_languages_subtitles",
+                    "media_types": ["movie"],
+                    "template_variables": {
+                        "use_subtitles": {"input_type": "hidden", "default": True},
+                    },
+                },
+            ],
+        }
+    ]
+
+    assert library_routes_module._count_overlay_overrides_for_library(library, libraries_data, overlay_config) == 6
+
+
+def test_library_fragment_section_renders_requested_heavy_section(client, monkeypatch, qs_module, library_routes_module):
+    monkeypatch.setattr(
+        library_routes_module,
+        "_build_library_lists",
+        lambda: ([{"id": "mov-library_movies", "name": "Movies", "type": "movie"}], [], {"plex_pass": True}),
+    )
+    monkeypatch.setattr(library_routes_module, "_migrate_legacy_playlist_libraries_to_library_toggles", lambda *_args: set())
+    monkeypatch.setattr(library_routes_module, "_build_preview_image_data", lambda: {"movie": [], "show": [], "season": [], "episode": []})
+
+    original_load_quickstart_config = library_routes_module.helpers.load_quickstart_config
+
+    def fake_load_quickstart_config(filename):
+        if filename == "quickstart_collections.json":
+            return [
+                {
+                    "accordion": "Award Collections",
+                    "collections": [
+                        {
+                            "id": "collection_award",
+                            "label": "Awards Default Row",
+                            "url": "https://example.com/award",
+                            "media_types": ["movie"],
+                            "template_variables": [
+                                {"key": "style", "label": "Style", "type": "text_input", "default": ""},
+                            ],
+                        }
+                    ],
+                }
+            ]
+        return original_load_quickstart_config(filename)
+
+    monkeypatch.setattr(library_routes_module.helpers, "load_quickstart_config", fake_load_quickstart_config)
+    monkeypatch.setattr(library_routes_module.helpers, "load_quickstart_overlay_config", lambda: [])
+
+    original_retrieve_settings = qs_module.persistence.retrieve_settings
+
+    def fake_retrieve_settings(target):
+        if target == "025-libraries":
+            return {"libraries": {"mov-library_movies-library": "Movies"}}
+        return original_retrieve_settings(target)
+
+    monkeypatch.setattr(qs_module.persistence, "retrieve_settings", fake_retrieve_settings)
+
+    collections = client.get("/library_fragment/mov-library_movies/section/collections")
+    collection_group = client.get("/library_fragment/mov-library_movies/section/collections/group/0")
+    overlays = client.get("/library_fragment/mov-library_movies/section/overlays")
+
+    assert collections.status_code == 200
+    assert "Reorder Collection Sections" in collections.get_data(as_text=True)
+    assert "data-collection-group-lazy-collapse" in collections.get_data(as_text=True)
+    assert "Awards Default Row" not in collections.get_data(as_text=True)
+    assert collection_group.status_code == 200
+    assert "Awards Default Row" in collection_group.get_data(as_text=True)
+    assert 'data-template-variable-key="style"' in collection_group.get_data(as_text=True)
+    assert overlays.status_code == 200
+    assert "Preview Overlays" in overlays.get_data(as_text=True)
+
+
+def test_libraries_step_initial_render_skips_heavy_lazy_card_payload(client, monkeypatch, qs_module):
+    original_load_quickstart_config = qs_module.helpers.load_quickstart_config
+
+    def fail_on_lazy_card_payload(filename):
+        if filename in {
+            "quickstart_attributes.json",
+            "quickstart_collections.json",
+            "quickstart_overlays.json",
+        }:
+            raise AssertionError(f"{filename} should only load from library fragments")
+        return original_load_quickstart_config(filename)
+
+    monkeypatch.setattr(qs_module.helpers, "load_quickstart_config", fail_on_lazy_card_payload)
+    monkeypatch.setattr(
+        qs_module.helpers,
+        "load_quickstart_overlay_config",
+        lambda: (_ for _ in ()).throw(AssertionError("quickstart_overlays.json should only load from library fragments")),
+    )
+    monkeypatch.setattr(
+        qs_module,
+        "_build_preview_image_data",
+        lambda: (_ for _ in ()).throw(AssertionError("preview image data should only load from library fragments")),
+    )
+    resp = client.get("/step/025-libraries")
+
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    assert 'id="libraryPicker"' in html
+    assert 'id="library-form-container"' in html
+
+
+def test_quickstart_json_config_cache_reuses_file_reads_and_isolates_callers(tmp_path, monkeypatch):
+    from modules.helpers import _overlays
+
+    json_dir = tmp_path / "json"
+    json_dir.mkdir()
+    config_file = json_dir / "sample.json"
+    config_file.write_text(json.dumps({"items": [{"name": "one"}]}), encoding="utf-8")
+    monkeypatch.setattr(_overlays, "JSON_SETTINGS", str(json_dir))
+    _overlays._QUICKSTART_CONFIG_CACHE.clear()
+
+    first = _overlays.load_quickstart_config("sample.json")
+    first["items"][0]["name"] = "mutated"
+
+    original_open = builtins.open
+
+    def fail_open(*args, **kwargs):
+        raise AssertionError("cached config should not reopen the JSON file")
+
+    monkeypatch.setattr(builtins, "open", fail_open)
+    second = _overlays.load_quickstart_config("sample.json")
+    monkeypatch.setattr(builtins, "open", original_open)
+
+    assert second == {"items": [{"name": "one"}]}
+
+
+def test_quickstart_json_config_cache_invalidates_when_file_changes(tmp_path, monkeypatch):
+    from modules.helpers import _overlays
+
+    json_dir = tmp_path / "json"
+    json_dir.mkdir()
+    config_file = json_dir / "sample.json"
+    config_file.write_text(json.dumps({"value": "old"}), encoding="utf-8")
+    monkeypatch.setattr(_overlays, "JSON_SETTINGS", str(json_dir))
+    _overlays._QUICKSTART_CONFIG_CACHE.clear()
+
+    assert _overlays.load_quickstart_config("sample.json") == {"value": "old"}
+
+    config_file.write_text(json.dumps({"value": "new"}), encoding="utf-8")
+    stat = config_file.stat()
+    os.utime(config_file, ns=(stat.st_atime_ns + 1_000_000_000, stat.st_mtime_ns + 1_000_000_000))
+
+    assert _overlays.load_quickstart_config("sample.json") == {"value": "new"}
 
 
 def test_validate_apprise_rejects_bad_url(client):
@@ -311,6 +703,137 @@ def test_validate_apprise_rejects_empty_remote_yaml(client, monkeypatch, qs_modu
     payload = resp.get_json()
     assert payload["valid"] is False
     assert "must not be empty" in payload["error"]
+
+
+def test_validate_yamtrack_returns_version_from_about_page(client, monkeypatch, qs_module):
+    class _Resp:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.reason = "OK"
+            self.text = text
+
+    class _Session:
+        def __init__(self):
+            self.cookies = {}
+
+        def get(self, url, timeout=10):
+            if url.endswith("/accounts/login/"):
+                return _Resp(200, '<input name="csrfmiddlewaretoken" value="token"><input name="login"><input name="password">')
+            if url.endswith("/settings/about/"):
+                return _Resp(
+                    200,
+                    """
+                    <p class="text-gray-400 text-sm">
+                      Version: <span class="font-mono">v0.25.3-15-g6a240cc2</span>
+                    </p>
+                    """,
+                )
+            return _Resp(404, "")
+
+        def post(self, *_args, **kwargs):
+            data = kwargs.get("data") or {}
+            if data.get("login") != "kometa" or data.get("password") != "secret":
+                return _Resp(200, '<form><input name="login"><input name="password"></form>')
+            return _Resp(200, "<html><body>Dashboard</body></html>")
+
+    monkeypatch.setattr(qs_module.validations.requests, "Session", _Session)
+
+    resp = client.post(
+        "/validate_yamtrack",
+        json={
+            "yamtrack_url": "http://yamtrack.local:8000",
+            "yamtrack_username": "kometa",
+            "yamtrack_password": "secret",
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["valid"] is True
+    assert payload["version"] == "v0.25.3-15-g6a240cc2"
+
+
+def test_validate_yamtrack_rejects_public_about_with_failed_login(client, monkeypatch, qs_module):
+    class _Resp:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.reason = "OK"
+            self.text = text
+
+    class _Session:
+        def __init__(self):
+            self.cookies = {}
+
+        def get(self, url, timeout=10):
+            if url.endswith("/accounts/login/"):
+                return _Resp(200, '<input name="csrfmiddlewaretoken" value="token"><input name="login"><input name="password">')
+            if url.endswith("/settings/about/"):
+                return _Resp(
+                    200,
+                    """
+                    <p class="text-gray-400 text-sm">
+                      Version: <span class="font-mono">v0.25.3-15-g6a240cc2</span>
+                    </p>
+                    """,
+                )
+            return _Resp(404, "")
+
+        def post(self, *_args, **_kwargs):
+            return _Resp(200, '<form><input name="login"><input name="password"></form><p>Please enter a correct username and password.</p>')
+
+    monkeypatch.setattr(qs_module.validations.requests, "Session", _Session)
+
+    resp = client.post(
+        "/validate_yamtrack",
+        json={
+            "yamtrack_url": "http://yamtrack.local:8000",
+            "yamtrack_username": "fake-user",
+            "yamtrack_password": "wrong",
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["valid"] is False
+    assert "Unable to validate Yamtrack credentials" in payload["error"]
+
+
+def test_validate_yamtrack_rejects_login_without_about_version(client, monkeypatch, qs_module):
+    class _Resp:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.reason = "OK"
+            self.text = text
+
+    class _Session:
+        def __init__(self):
+            self.cookies = {}
+
+        def get(self, url, timeout=10):
+            if url.endswith("/accounts/login/"):
+                return _Resp(200, '<input name="csrfmiddlewaretoken" value="token"><input name="login"><input name="password">')
+            if url.endswith("/settings/about/"):
+                return _Resp(200, "<html><body>About Yamtrack</body></html>")
+            return _Resp(404, "")
+
+        def post(self, *_args, **_kwargs):
+            return _Resp(200, "<html><body>Dashboard</body></html>")
+
+    monkeypatch.setattr(qs_module.validations.requests, "Session", _Session)
+
+    resp = client.post(
+        "/validate_yamtrack",
+        json={
+            "yamtrack_url": "http://yamtrack.local:8000",
+            "yamtrack_username": "kometa",
+            "yamtrack_password": "secret",
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["valid"] is False
+    assert "settings/about did not return a version" in payload["error"]
 
 
 def test_validate_metadata_file_accepts_existing_local_file(client, tmp_path):
@@ -1483,6 +2006,30 @@ def test_validate_collection_folder_accepts_managed_relative_folder_path(client,
     assert payload["organized"] is True
 
 
+def test_validate_overlay_folder_accepts_imported_managed_config_path(client, isolated_config_dir):
+    config_name = "pytest_imported_overlay_folder"
+    managed_dir = isolated_config_dir / config_name / "overlay_files" / "mov-library_movies" / "config_overlay_files_abc123"
+    managed_dir.mkdir(parents=True, exist_ok=True)
+    (managed_dir / "ratings.yml").write_text("overlays:\n  test:\n    overlay:\n      name: test\n", encoding="utf-8")
+
+    resp = client.post(
+        "/validate_overlay_file",
+        json={
+            "config_name": config_name,
+            "library_id": "mov-library_movies",
+            "overlay_file_type": "folder",
+            "overlay_file_location": f"config/{config_name}/overlay_files/mov-library_movies/config_overlay_files_abc123",
+        },
+    )
+
+    assert resp.status_code == 200, resp.get_json()
+    payload = resp.get_json()
+    assert payload["valid"] is True
+    assert payload["validated_files"] == 1
+    assert payload["files"] == ["ratings.yml"]
+    assert payload["organized"] is False
+
+
 def test_validate_metadata_folder_rejects_empty_folder(client, tmp_path):
     metadata_dir = tmp_path / "metadata"
     metadata_dir.mkdir()
@@ -1929,17 +2476,8 @@ def test_build_libraries_section_emits_metadata_files(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_metadata_files={
                 "movies": {
                     "mov-library_movies-metadata_files": json.dumps(
                         [
@@ -1952,11 +2490,6 @@ def test_build_libraries_section_emits_metadata_files(app):
                     )
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
         assert libraries_section["libraries"]["Movies"]["metadata_files"] == [
@@ -1976,13 +2509,8 @@ def test_build_libraries_section_emits_raw_overlay_files(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_overlays={
                 "movies": {
                     "mov-library_movies-overlay_files": json.dumps(
                         [
@@ -1995,15 +2523,6 @@ def test_build_libraries_section_emits_raw_overlay_files(app):
                     )
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
         assert libraries_section["libraries"]["Movies"]["overlay_files"] == [
@@ -2023,11 +2542,9 @@ def test_build_libraries_section_emits_collection_files(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {"movies": {"mov-library_movies-collection_collectionless": True}},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_collections={"movies": {"mov-library_movies-collection_collectionless": True}},
+            movie_collection_files={
                 "movies": {
                     "mov-library_movies-collection_files": json.dumps(
                         [
@@ -2040,17 +2557,6 @@ def test_build_libraries_section_emits_collection_files(app):
                     )
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
         assert libraries_section["libraries"]["Movies"]["collection_files"] == [
@@ -2068,28 +2574,14 @@ def test_build_libraries_section_preserves_collection_include_and_exclude(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_collections={
                 "movies": {
                     "mov-library_movies-collection_actor": True,
                     "mov-library_movies-template_collection_actor_include": ["Tom Hanks"],
                     "mov-library_movies-template_collection_actor_exclude": ["Morgan Freeman"],
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     actor_entry = next(
@@ -2106,45 +2598,102 @@ def test_build_libraries_section_preserves_chart_builder_size_template_variables
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_collections={
                 "movies": {
                     "mov-library_movies-collection_tautulli": True,
                     "mov-library_movies-template_collection_tautulli_list_days": "14",
                     "mov-library_movies-template_collection_tautulli_list_size": "50",
                     "mov-library_movies-template_collection_tautulli_list_days_popular": "7",
                     "mov-library_movies-template_collection_tautulli_list_size_watched": "25",
+                    "mov-library_movies-template_collection_tautulli_image": "chart/color/plex",
+                    "mov-library_movies-template_collection_tautulli_url_logo_popular": "https://example.com/plex-popular.png",
+                    "mov-library_movies-template_collection_tautulli_sync_mode_watched": "append",
+                    "mov-library_movies-template_collection_tautulli_cache_builders_popular": "0",
+                    "mov-library_movies-template_collection_tautulli_collection_order_popular": "custom",
                     "mov-library_movies-collection_trakt": True,
                     "mov-library_movies-template_collection_trakt_limit": "75",
                     "mov-library_movies-template_collection_trakt_limit_popular": "50",
                     "mov-library_movies-template_collection_trakt_limit_recommended": "30",
+                    "mov-library_movies-template_collection_trakt_image": "chart/color/trakt",
+                    "mov-library_movies-template_collection_trakt_url_logo_collected": "https://example.com/trakt-collected.png",
+                    "mov-library_movies-template_collection_trakt_sync_mode_recommended": "append",
+                    "mov-library_movies-template_collection_trakt_cache_builders_trending": "0",
+                    "mov-library_movies-template_collection_trakt_collection_order_watched": "custom",
+                    "mov-library_movies-template_collection_trakt_radarr_folder_collected": r"C:\Media\Movies",
+                    "mov-library_movies-template_collection_trakt_sonarr_search_watched": "false",
                     "mov-library_movies-collection_tmdb": True,
                     "mov-library_movies-template_collection_tmdb_limit": "60",
                     "mov-library_movies-template_collection_tmdb_limit_airing": "20",
                     "mov-library_movies-template_collection_tmdb_limit_trending": "40",
+                    "mov-library_movies-template_collection_tmdb_allowed_libraries": "show",
+                    "mov-library_movies-template_collection_tmdb_image": "chart/color/tmdb",
+                    "mov-library_movies-template_collection_tmdb_url_logo_airing": "https://example.com/tmdb-airing.png",
+                    "mov-library_movies-template_collection_tmdb_collection_order_air": "custom",
+                    "mov-library_movies-template_collection_tmdb_radarr_folder_top": r"C:\Media\Movies",
+                    "mov-library_movies-template_collection_tmdb_sonarr_search_air": "false",
                     "mov-library_movies-collection_simkl": True,
+                    "mov-library_movies-template_collection_simkl_period": "week",
                     "mov-library_movies-template_collection_simkl_limit_trending_today": "15",
                     "mov-library_movies-template_collection_simkl_limit_dvd": "10",
+                    "mov-library_movies-template_collection_simkl_image": "chart/color/simkl",
+                    "mov-library_movies-template_collection_simkl_url_logo_trending_week": "https://example.com/simkl-week.png",
+                    "mov-library_movies-template_collection_simkl_collection_order_dvd": "custom",
+                    "mov-library_movies-template_collection_simkl_radarr_folder_dvd": r"C:\Media\Movies",
+                    "mov-library_movies-template_collection_simkl_sonarr_search_trending_week": "false",
                     "mov-library_movies-collection_anilist": True,
                     "mov-library_movies-template_collection_anilist_limit": "80",
                     "mov-library_movies-template_collection_anilist_limit_popular": "40",
                     "mov-library_movies-template_collection_anilist_limit_season": "25",
+                    "mov-library_movies-template_collection_anilist_image": "chart/color/anilist",
+                    "mov-library_movies-template_collection_anilist_url_logo_season": "https://example.com/anilist-season.png",
+                    "mov-library_movies-template_collection_anilist_sync_mode_trending": "append",
+                    "mov-library_movies-template_collection_anilist_cache_builders_season": "0",
+                    "mov-library_movies-template_collection_anilist_collection_order_top": "custom",
+                    "mov-library_movies-template_collection_anilist_radarr_folder_popular": r"C:\Media\Movies",
+                    "mov-library_movies-template_collection_anilist_sonarr_search_season": "false",
                     "mov-library_movies-collection_myanimelist": True,
                     "mov-library_movies-template_collection_myanimelist_limit": "90",
                     "mov-library_movies-template_collection_myanimelist_limit_favorited": "45",
                     "mov-library_movies-template_collection_myanimelist_limit_airing": "12",
+                    "mov-library_movies-template_collection_myanimelist_starting_only": "true",
+                    "mov-library_movies-template_collection_myanimelist_starting_only_season": "false",
+                    "mov-library_movies-template_collection_myanimelist_image": "chart/color/mal",
+                    "mov-library_movies-template_collection_myanimelist_url_logo_favorited": "https://example.com/mal-favorited.png",
+                    "mov-library_movies-template_collection_myanimelist_sync_mode_season": "append",
+                    "mov-library_movies-template_collection_myanimelist_cache_builders_airing": "0",
+                    "mov-library_movies-template_collection_myanimelist_collection_order_top": "custom",
+                    "mov-library_movies-template_collection_myanimelist_radarr_folder_favorited": r"C:\Media\Movies",
+                    "mov-library_movies-template_collection_myanimelist_sonarr_search_season": "false",
                     "mov-library_movies-collection_basic": True,
                     "mov-library_movies-template_collection_basic_limit": "20",
                     "mov-library_movies-template_collection_basic_limit_released": "10",
                     "mov-library_movies-template_collection_basic_limit_episodes": "5",
+                    "mov-library_movies-template_collection_basic_allowed_libraries": "show",
+                    "mov-library_movies-template_collection_basic_schedule": "weekly(sunday)",
+                    "mov-library_movies-template_collection_basic_url_logo_released": "https://example.com/released.png",
+                    "mov-library_movies-template_collection_basic_sort_by_episodes": "episode_air_date.asc",
                     "mov-library_movies-collection_letterboxd": True,
                     "mov-library_movies-template_collection_letterboxd_limit": "120",
                     "mov-library_movies-template_collection_letterboxd_limit_1001_movies": "80",
                     "mov-library_movies-template_collection_letterboxd_limit_top_500": "60",
                     "mov-library_movies-template_collection_letterboxd_limit_women_directors": "40",
+                    "mov-library_movies-template_collection_letterboxd_allowed_libraries": "movie",
+                    "mov-library_movies-template_collection_letterboxd_image": "chart/color/letterboxd",
+                    "mov-library_movies-template_collection_letterboxd_url_logo_top_500": "https://example.com/letterboxd-top-500.png",
+                    "mov-library_movies-template_collection_letterboxd_url_logo_cannes": "https://example.com/letterboxd-cannes.png",
+                    "mov-library_movies-template_collection_letterboxd_sync_mode_oscars": "append",
+                    "mov-library_movies-template_collection_letterboxd_cache_builders_black_directors": "0",
+                    "mov-library_movies-template_collection_letterboxd_collection_order_cannes": "custom",
+                    "mov-library_movies-template_collection_letterboxd_radarr_folder_women_directors": r"C:\Media\Movies",
+                    "mov-library_movies-template_collection_letterboxd_sonarr_search_imdb_top_250": "false",
                     "mov-library_movies-collection_imdb": True,
                     "mov-library_movies-template_collection_imdb_limit": "250",
+                    "mov-library_movies-template_collection_imdb_allowed_libraries": "movie",
+                    "mov-library_movies-template_collection_imdb_url_logo_lowest": "https://example.com/lowest.png",
+                    "mov-library_movies-template_collection_imdb_collection_order_top": "custom",
+                    "mov-library_movies-template_collection_imdb_radarr_folder_top": r"C:\Media\Movies",
+                    "mov-library_movies-template_collection_imdb_sonarr_search_popular": "false",
                     "mov-library_movies-collection_other_chart": True,
                     "mov-library_movies-template_collection_other_chart_limit": "125",
                     "mov-library_movies-collection_streaming": True,
@@ -2156,23 +2705,17 @@ def test_build_libraries_section_preserves_chart_builder_size_template_variables
                     "mov-library_movies-collection_year": True,
                     "mov-library_movies-template_collection_year_limit": "8",
                     "mov-library_movies-collection_content_rating_us": True,
+                    "mov-library_movies-template_collection_content_rating_us_search_term": "content_rating",
+                    "mov-library_movies-template_collection_content_rating_us_image": "content_rating/us/<<key_name>>",
+                    "mov-library_movies-template_collection_content_rating_us_translation_key": "content_rating",
                     "mov-library_movies-template_collection_content_rating_us_limit": "40",
                     "mov-library_movies-template_collection_content_rating_us_limit_other": "5",
+                    "mov-library_movies-template_collection_content_rating_us_child_visible_home_overrides": '{"PG-13": "true"}',
+                    "mov-library_movies-template_collection_content_rating_us_child_hub_priority_overrides": '{"PG-13": "1"}',
+                    "mov-library_movies-template_collection_content_rating_us_child_image_overrides": '{"PG-13": "content_rating/us/PG-13-custom"}',
+                    "mov-library_movies-template_collection_content_rating_us_child_item_radarr_tag_overrides": '{"R": "rating,r"}',
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     collection_entries = libraries_section["libraries"]["Movies"]["collection_files"]
@@ -2196,36 +2739,101 @@ def test_build_libraries_section_preserves_chart_builder_size_template_variables
     assert tautulli_entry["template_variables"]["list_size"] == "50"
     assert tautulli_entry["template_variables"]["list_days_popular"] == "7"
     assert tautulli_entry["template_variables"]["list_size_watched"] == "25"
+    assert tautulli_entry["template_variables"]["image"] == "chart/color/plex"
+    assert tautulli_entry["template_variables"]["url_logo_popular"] == "https://example.com/plex-popular.png"
+    assert tautulli_entry["template_variables"]["sync_mode_watched"] == "append"
+    assert tautulli_entry["template_variables"]["cache_builders_popular"] == "0"
+    assert tautulli_entry["template_variables"]["collection_order_popular"] == "custom"
     assert trakt_entry["template_variables"]["limit"] == "75"
     assert trakt_entry["template_variables"]["limit_popular"] == "50"
     assert trakt_entry["template_variables"]["limit_recommended"] == "30"
+    assert trakt_entry["template_variables"]["image"] == "chart/color/trakt"
+    assert trakt_entry["template_variables"]["url_logo_collected"] == "https://example.com/trakt-collected.png"
+    assert trakt_entry["template_variables"]["sync_mode_recommended"] == "append"
+    assert trakt_entry["template_variables"]["cache_builders_trending"] == "0"
+    assert trakt_entry["template_variables"]["collection_order_watched"] == "custom"
+    assert trakt_entry["template_variables"]["radarr_folder_collected"] == r"C:\Media\Movies"
+    assert trakt_entry["template_variables"]["sonarr_search_watched"] is False
     assert tmdb_entry["template_variables"]["limit"] == "60"
     assert tmdb_entry["template_variables"]["limit_airing"] == "20"
     assert tmdb_entry["template_variables"]["limit_trending"] == "40"
+    assert tmdb_entry["template_variables"]["allowed_libraries"] == "show"
+    assert tmdb_entry["template_variables"]["image"] == "chart/color/tmdb"
+    assert tmdb_entry["template_variables"]["url_logo_airing"] == "https://example.com/tmdb-airing.png"
+    assert tmdb_entry["template_variables"]["collection_order_air"] == "custom"
+    assert tmdb_entry["template_variables"]["radarr_folder_top"] == r"C:\Media\Movies"
+    assert tmdb_entry["template_variables"]["sonarr_search_air"] is False
+    assert simkl_entry["template_variables"]["period"] == "week"
     assert simkl_entry["template_variables"]["limit_trending_today"] == "15"
     assert simkl_entry["template_variables"]["limit_dvd"] == "10"
+    assert simkl_entry["template_variables"]["image"] == "chart/color/simkl"
+    assert simkl_entry["template_variables"]["url_logo_trending_week"] == "https://example.com/simkl-week.png"
+    assert simkl_entry["template_variables"]["collection_order_dvd"] == "custom"
+    assert simkl_entry["template_variables"]["radarr_folder_dvd"] == r"C:\Media\Movies"
+    assert simkl_entry["template_variables"]["sonarr_search_trending_week"] is False
     assert anilist_entry["template_variables"]["limit"] == "80"
     assert anilist_entry["template_variables"]["limit_popular"] == "40"
     assert anilist_entry["template_variables"]["limit_season"] == "25"
+    assert anilist_entry["template_variables"]["image"] == "chart/color/anilist"
+    assert anilist_entry["template_variables"]["url_logo_season"] == "https://example.com/anilist-season.png"
+    assert anilist_entry["template_variables"]["sync_mode_trending"] == "append"
+    assert anilist_entry["template_variables"]["cache_builders_season"] == "0"
+    assert anilist_entry["template_variables"]["collection_order_top"] == "custom"
+    assert anilist_entry["template_variables"]["radarr_folder_popular"] == r"C:\Media\Movies"
+    assert anilist_entry["template_variables"]["sonarr_search_season"] is False
     assert myanimelist_entry["template_variables"]["limit"] == "90"
     assert myanimelist_entry["template_variables"]["limit_favorited"] == "45"
     assert myanimelist_entry["template_variables"]["limit_airing"] == "12"
+    assert myanimelist_entry["template_variables"]["starting_only"] is True
+    assert myanimelist_entry["template_variables"]["starting_only_season"] is False
+    assert myanimelist_entry["template_variables"]["image"] == "chart/color/mal"
+    assert myanimelist_entry["template_variables"]["url_logo_favorited"] == "https://example.com/mal-favorited.png"
+    assert myanimelist_entry["template_variables"]["sync_mode_season"] == "append"
+    assert myanimelist_entry["template_variables"]["cache_builders_airing"] == "0"
+    assert myanimelist_entry["template_variables"]["collection_order_top"] == "custom"
+    assert myanimelist_entry["template_variables"]["radarr_folder_favorited"] == r"C:\Media\Movies"
+    assert myanimelist_entry["template_variables"]["sonarr_search_season"] is False
     assert basic_entry["template_variables"]["limit"] == "20"
     assert basic_entry["template_variables"]["limit_released"] == "10"
     assert basic_entry["template_variables"]["limit_episodes"] == "5"
+    assert basic_entry["template_variables"]["allowed_libraries"] == "show"
+    assert basic_entry["template_variables"]["schedule"] == "weekly(sunday)"
+    assert basic_entry["template_variables"]["url_logo_released"] == "https://example.com/released.png"
+    assert basic_entry["template_variables"]["sort_by_episodes"] == "episode_air_date.asc"
     assert letterboxd_entry["template_variables"]["limit"] == "120"
     assert letterboxd_entry["template_variables"]["limit_1001_movies"] == "80"
     assert letterboxd_entry["template_variables"]["limit_top_500"] == "60"
     assert letterboxd_entry["template_variables"]["limit_women_directors"] == "40"
+    assert letterboxd_entry["template_variables"]["allowed_libraries"] == "movie"
+    assert letterboxd_entry["template_variables"]["image"] == "chart/color/letterboxd"
+    assert letterboxd_entry["template_variables"]["url_logo_top_500"] == "https://example.com/letterboxd-top-500.png"
+    assert letterboxd_entry["template_variables"]["url_logo_cannes"] == "https://example.com/letterboxd-cannes.png"
+    assert letterboxd_entry["template_variables"]["sync_mode_oscars"] == "append"
+    assert letterboxd_entry["template_variables"]["cache_builders_black_directors"] == "0"
+    assert letterboxd_entry["template_variables"]["collection_order_cannes"] == "custom"
+    assert letterboxd_entry["template_variables"]["radarr_folder_women_directors"] == r"C:\Media\Movies"
+    assert letterboxd_entry["template_variables"]["sonarr_search_imdb_top_250"] is False
     assert imdb_entry["template_variables"]["limit"] == "250"
+    assert imdb_entry["template_variables"]["allowed_libraries"] == "movie"
+    assert imdb_entry["template_variables"]["url_logo_lowest"] == "https://example.com/lowest.png"
+    assert imdb_entry["template_variables"]["collection_order_top"] == "custom"
+    assert imdb_entry["template_variables"]["radarr_folder_top"] == r"C:\Media\Movies"
+    assert imdb_entry["template_variables"]["sonarr_search_popular"] is False
     assert other_chart_entry["template_variables"]["limit"] == "125"
     assert streaming_entry["template_variables"]["limit"] == "500"
     assert streaming_entry["template_variables"]["discover_limit"] == "150"
     assert seasonal_entry["template_variables"]["limit"] == "30"
     assert seasonal_entry["template_variables"]["limit_halloween"] == "12"
     assert year_entry["template_variables"]["limit"] == "8"
+    assert content_rating_us_entry["template_variables"]["search_term"] == "content_rating"
+    assert content_rating_us_entry["template_variables"]["image"] == "content_rating/us/<<key_name>>"
+    assert content_rating_us_entry["template_variables"]["translation_key"] == "content_rating"
     assert content_rating_us_entry["template_variables"]["limit"] == "40"
     assert content_rating_us_entry["template_variables"]["limit_other"] == "5"
+    assert content_rating_us_entry["template_variables"]["visible_home_PG-13"] is True
+    assert content_rating_us_entry["template_variables"]["hub_priority_PG-13"] == "1"
+    assert content_rating_us_entry["template_variables"]["image_PG-13"] == "content_rating/us/PG-13-custom"
+    assert content_rating_us_entry["template_variables"]["item_radarr_tag_R"] == ["rating", "r"]
 
 
 def test_build_libraries_section_normalizes_collection_arr_tag_lists(app):
@@ -2233,9 +2841,9 @@ def test_build_libraries_section_normalizes_collection_arr_tag_lists(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {"sho-library_shows-library": "Shows"},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            show_libraries={"sho-library_shows-library": "Shows"},
+            movie_collections={
                 "movies": {
                     "mov-library_movies-collection_franchise": True,
                     "mov-library_movies-template_collection_franchise_build_collection": False,
@@ -2245,7 +2853,7 @@ def test_build_libraries_section_normalizes_collection_arr_tag_lists(app):
                     "mov-library_movies-template_collection_franchise_title_override": '{"10": "Star Wars: Skywalker Saga"}',
                 }
             },
-            {
+            show_collections={
                 "shows": {
                     "sho-library_shows-collection_franchise": True,
                     "sho-library_shows-template_collection_franchise_build_collection": False,
@@ -2255,18 +2863,6 @@ def test_build_libraries_section_normalizes_collection_arr_tag_lists(app):
                     "sho-library_shows-template_collection_franchise_item_sonarr_tag": '["watched", "tracked"]',
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     movie_entry = next(
@@ -2353,9 +2949,8 @@ def test_build_libraries_section_emits_collection_hub_priority(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_collections={
                 "movies": {
                     "mov-library_movies-collection_content_rating_uk": True,
                     "mov-library_movies-template_collection_content_rating_uk_visible_home": "true",
@@ -2364,19 +2959,6 @@ def test_build_libraries_section_emits_collection_hub_priority(app):
                     "mov-library_movies-template_collection_content_rating_uk_hub_priority_12A": "1",
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     movie_entry = next(
@@ -2396,38 +2978,35 @@ def test_build_libraries_section_expands_franchise_dynamic_child_override_maps(a
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {"sho-library_shows-library": "Shows"},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            show_libraries={"sho-library_shows-library": "Shows"},
+            movie_collections={
                 "movies": {
                     "mov-library_movies-collection_franchise": True,
                     "mov-library_movies-template_collection_franchise_child_name_overrides": '{"10": "Skywalker Saga"}',
                     "mov-library_movies-template_collection_franchise_child_sync_mode_overrides": '{"10": "append"}',
+                    "mov-library_movies-template_collection_franchise_child_name_mapping_overrides": '{"10": "Star Wars Skywalker Saga"}',
+                    "mov-library_movies-template_collection_franchise_child_order_overrides": '{"10": "01"}',
+                    "mov-library_movies-template_collection_franchise_child_movie_overrides": '{"10": ["1891", "1892"]}',
                     "mov-library_movies-template_collection_franchise_child_radarr_tag_overrides": '{"10": "4k,franchise"}',
                     "mov-library_movies-template_collection_franchise_child_radarr_add_missing_overrides": '{"10": "true"}',
+                    "mov-library_movies-template_collection_franchise_child_file_poster_overrides": '{"10": "C:\\\\Posters\\\\star-wars.jpg"}',
+                    "mov-library_movies-template_collection_franchise_child_url_background_overrides": '{"10": "https://example.com/star-wars-bg.jpg"}',
+                    "mov-library_movies-template_collection_franchise_child_url_logo_overrides": '{"10": "https://example.com/star-wars-logo.png"}',
                 }
             },
-            {
+            show_collections={
                 "shows": {
                     "sho-library_shows-collection_franchise": True,
                     "sho-library_shows-template_collection_franchise_child_summary_overrides": '{"1399": "Dragons and dynasties"}',
+                    "sho-library_shows-template_collection_franchise_child_name_mapping_overrides": '{"1399": "Game of Thrones"}',
+                    "sho-library_shows-template_collection_franchise_child_order_overrides": '{"1399": "02"}',
+                    "sho-library_shows-template_collection_franchise_child_url_poster_overrides": '{"1399": "https://example.com/got.jpg"}',
                     "sho-library_shows-template_collection_franchise_child_collection_order_overrides": '{"1399": "custom"}',
                     "sho-library_shows-template_collection_franchise_child_sonarr_monitor_overrides": '{"1399": "future"}',
                     "sho-library_shows-template_collection_franchise_child_item_sonarr_tag_overrides": '{"1399": "tracked,priority"}',
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     movie_entry = next(
@@ -2443,12 +3022,297 @@ def test_build_libraries_section_expands_franchise_dynamic_child_override_maps(a
     assert show_entry is not None
     assert movie_entry["template_variables"]["name_10"] == "Skywalker Saga"
     assert movie_entry["template_variables"]["sync_mode_10"] == "append"
+    assert movie_entry["template_variables"]["name_mapping_10"] == "Star Wars Skywalker Saga"
+    assert movie_entry["template_variables"]["order_10"] == "01"
+    assert movie_entry["template_variables"]["movie_10"] == ["1891", "1892"]
     assert movie_entry["template_variables"]["radarr_tag_10"] == ["4k", "franchise"]
     assert movie_entry["template_variables"]["radarr_add_missing_10"] is True
+    assert movie_entry["template_variables"]["file_poster_10"] == r"C:\Posters\star-wars.jpg"
+    assert movie_entry["template_variables"]["url_background_10"] == "https://example.com/star-wars-bg.jpg"
+    assert movie_entry["template_variables"]["url_logo_10"] == "https://example.com/star-wars-logo.png"
     assert show_entry["template_variables"]["summary_1399"] == "Dragons and dynasties"
+    assert show_entry["template_variables"]["name_mapping_1399"] == "Game of Thrones"
+    assert show_entry["template_variables"]["order_1399"] == "02"
+    assert show_entry["template_variables"]["url_poster_1399"] == "https://example.com/got.jpg"
     assert show_entry["template_variables"]["collection_order_1399"] == "custom"
     assert show_entry["template_variables"]["sonarr_monitor_1399"] == "future"
     assert show_entry["template_variables"]["item_sonarr_tag_1399"] == ["tracked", "priority"]
+
+
+def test_build_libraries_section_preserves_based_template_variables(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_collections={
+                "movies": {
+                    "mov-library_movies-collection_based": True,
+                    "mov-library_movies-template_collection_based_translation_key": "based",
+                    "mov-library_movies-template_collection_based_schedule": "weekly(sunday)",
+                    "mov-library_movies-template_collection_based_delete_collections_named": '["Old Based Collection"]',
+                    "mov-library_movies-template_collection_based_keywords_books": '["based on book", "based on novel"]',
+                    "mov-library_movies-template_collection_based_image_comics": "based/comics",
+                    "mov-library_movies-template_collection_based_limit_true_story": "25",
+                    "mov-library_movies-template_collection_based_sort_by_video_games": "release.desc",
+                    "mov-library_movies-template_collection_based_url_poster_true_story": "https://example.com/true-story.jpg",
+                    "mov-library_movies-template_collection_based_radarr_folder_books": r"C:\Media\Movies",
+                    "mov-library_movies-template_collection_based_sonarr_search_video_games": "false",
+                }
+            },
+        )
+
+    based_entry = next(
+        (entry for entry in libraries_section["libraries"]["Movies"]["collection_files"] if entry.get("default") == "based"),
+        None,
+    )
+
+    assert based_entry is not None
+    template_vars = based_entry["template_variables"]
+    assert template_vars["translation_key"] == "based"
+    assert template_vars["schedule"] == "weekly(sunday)"
+    assert template_vars["delete_collections_named"] == ["Old Based Collection"]
+    assert template_vars["keywords_books"] == ["based on book", "based on novel"]
+    assert template_vars["image_comics"] == "based/comics"
+    assert template_vars["limit_true_story"] == "25"
+    assert template_vars["sort_by_video_games"] == "release.desc"
+    assert template_vars["url_poster_true_story"] == "https://example.com/true-story.jpg"
+    assert template_vars["radarr_folder_books"] == r"C:\Media\Movies"
+    assert template_vars["sonarr_search_video_games"] is False
+
+
+def test_build_libraries_section_preserves_collectionless_template_variables(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_collections={
+                "movies": {
+                    "mov-library_movies-collection_collectionless": True,
+                    "mov-library_movies-template_collection_collectionless_collection_mode": "hide",
+                    "mov-library_movies-template_collection_collectionless_name_collectionless": "No Collections",
+                    "mov-library_movies-template_collection_collectionless_summary_collectionless": "Items not assigned to a collection.",
+                    "mov-library_movies-template_collection_collectionless_url_poster": "https://example.com/collectionless.jpg",
+                    "mov-library_movies-template_collection_collectionless_tmdb_movie": "603, 604",
+                    "mov-library_movies-template_collection_collectionless_tmdb_show": '["1399"]',
+                    "mov-library_movies-template_collection_collectionless_imdb_id": "tt1234567, tt7654321",
+                    "mov-library_movies-template_collection_collectionless_imdb_list": "ls123456789",
+                    "mov-library_movies-template_collection_collectionless_plex_search": '{"all": {"title": "Example"}}',
+                    "mov-library_movies-template_collection_collectionless_mdblist_list": "https://mdblist.com/lists/example/list",
+                    "mov-library_movies-template_collection_collectionless_trakt_list": "https://trakt.tv/users/example/lists/list",
+                    "mov-library_movies-template_collection_collectionless_exclude": "Marvel Cinematic Universe",
+                    "mov-library_movies-template_collection_collectionless_exclude_prefix": '["!", "~"]',
+                }
+            },
+        )
+
+    collectionless_entry = next(
+        (entry for entry in libraries_section["libraries"]["Movies"]["collection_files"] if entry.get("default") == "collectionless"),
+        None,
+    )
+
+    assert collectionless_entry is not None
+    template_vars = collectionless_entry["template_variables"]
+    assert template_vars["collection_mode"] == "hide"
+    assert template_vars["name_collectionless"] == "No Collections"
+    assert template_vars["summary_collectionless"] == "Items not assigned to a collection."
+    assert template_vars["url_poster"] == "https://example.com/collectionless.jpg"
+    assert template_vars["tmdb_movie"] == ["603", "604"]
+    assert template_vars["tmdb_show"] == ["1399"]
+    assert template_vars["imdb_id"] == ["tt1234567", "tt7654321"]
+    assert template_vars["imdb_list"] == ["ls123456789"]
+    assert template_vars["plex_search"] == {"all": {"title": "Example"}}
+    assert template_vars["mdblist_list"] == ["https://mdblist.com/lists/example/list"]
+    assert template_vars["trakt_list"] == ["https://trakt.tv/users/example/lists/list"]
+    assert template_vars["exclude"] == ["Marvel Cinematic Universe"]
+    assert template_vars["exclude_prefix"] == ["!", "~"]
+
+
+def test_build_libraries_section_expands_geography_dynamic_child_override_maps(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            show_libraries={"sho-library_shows-library": "Shows"},
+            movie_collections={
+                "movies": {
+                    "mov-library_movies-collection_country": True,
+                    "mov-library_movies-template_collection_country_trakt_list": '["https://trakt.tv/users/example/lists/france"]',
+                    "mov-library_movies-template_collection_country_child_name_overrides": '{"France": "French Cinema"}',
+                    "mov-library_movies-template_collection_country_child_schedule_overrides": '{"France": "weekly(sunday)"}',
+                    "mov-library_movies-template_collection_country_child_file_background_overrides": '{"France": "C:\\\\Posters\\\\france-bg.jpg"}',
+                    "mov-library_movies-template_collection_country_child_item_radarr_tag_overrides": '{"France": "country,france"}',
+                    "mov-library_movies-collection_continent": True,
+                    "mov-library_movies-template_collection_continent_child_url_poster_overrides": '{"Europe": "https://example.com/europe.jpg"}',
+                    "mov-library_movies-template_collection_continent_child_minimum_items_overrides": '{"Europe": "5"}',
+                    "mov-library_movies-template_collection_continent_child_item_radarr_tag_overrides": '{"Europe": ["continent", "europe"]}',
+                }
+            },
+            show_collections={
+                "shows": {
+                    "sho-library_shows-collection_country": True,
+                    "sho-library_shows-template_collection_country_child_sync_mode_overrides": '{"fr": "append"}',
+                    "sho-library_shows-template_collection_country_child_name_overrides": '{"fr": "French TV"}',
+                    "sho-library_shows-template_collection_country_child_item_sonarr_tag_overrides": '{"fr": "country,france"}',
+                    "sho-library_shows-collection_region": True,
+                    "sho-library_shows-template_collection_region_child_sync_mode_overrides": '{"Eastern Asia": "append"}',
+                    "sho-library_shows-template_collection_region_child_file_logo_overrides": '{"Eastern Asia": "C:\\\\Logos\\\\asia.png"}',
+                    "sho-library_shows-template_collection_region_child_item_sonarr_tag_overrides": '{"Eastern Asia": ["region", "asia"]}',
+                }
+            },
+        )
+
+    movie_entries = libraries_section["libraries"]["Movies"]["collection_files"]
+    show_entries = libraries_section["libraries"]["Shows"]["collection_files"]
+    movie_country = next(entry for entry in movie_entries if entry.get("default") == "country")
+    movie_continent = next(entry for entry in movie_entries if entry.get("default") == "continent")
+    show_country = next(entry for entry in show_entries if entry.get("default") == "country")
+    show_region = next(entry for entry in show_entries if entry.get("default") == "region")
+
+    assert movie_country["template_variables"]["trakt_list"] == ["https://trakt.tv/users/example/lists/france"]
+    assert movie_country["template_variables"]["name_France"] == "French Cinema"
+    assert movie_country["template_variables"]["schedule_France"] == "weekly(sunday)"
+    assert movie_country["template_variables"]["file_background_France"] == r"C:\Posters\france-bg.jpg"
+    assert movie_country["template_variables"]["item_radarr_tag_France"] == ["country", "france"]
+    assert movie_continent["template_variables"]["url_poster_Europe"] == "https://example.com/europe.jpg"
+    assert movie_continent["template_variables"]["minimum_items_Europe"] == 5
+    assert movie_continent["template_variables"]["item_radarr_tag_Europe"] == ["continent", "europe"]
+    assert show_country["template_variables"]["sync_mode_fr"] == "append"
+    assert show_country["template_variables"]["name_fr"] == "French TV"
+    assert show_country["template_variables"]["item_sonarr_tag_fr"] == ["country", "france"]
+    assert show_region["template_variables"]["sync_mode_Eastern Asia"] == "append"
+    assert show_region["template_variables"]["file_logo_Eastern Asia"] == r"C:\Logos\asia.png"
+    assert show_region["template_variables"]["item_sonarr_tag_Eastern Asia"] == ["region", "asia"]
+
+
+def test_build_libraries_section_expands_language_dynamic_child_override_maps(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            show_libraries={"sho-library_shows-library": "Shows"},
+            movie_collections={
+                "movies": {
+                    "mov-library_movies-collection_audio_language": True,
+                    "mov-library_movies-template_collection_audio_language_include": '["en", "fr"]',
+                    "mov-library_movies-template_collection_audio_language_child_use_overrides": '{"en": "false"}',
+                    "mov-library_movies-template_collection_audio_language_child_name_overrides": '{"en": "English Audio"}',
+                    "mov-library_movies-template_collection_audio_language_child_summary_overrides": '{"en": "Movies with English audio"}',
+                    "mov-library_movies-template_collection_audio_language_child_schedule_overrides": '{"fr": "weekly(sunday)"}',
+                    "mov-library_movies-template_collection_audio_language_child_sort_by_overrides": '{"fr": "title.asc"}',
+                    "mov-library_movies-template_collection_audio_language_child_limit_overrides": '{"fr": "25"}',
+                    "mov-library_movies-template_collection_audio_language_child_minimum_items_overrides": '{"fr": "3"}',
+                    "mov-library_movies-template_collection_audio_language_child_url_background_overrides": '{"en": "https://example.com/en-bg.jpg"}',
+                    "mov-library_movies-template_collection_audio_language_child_file_logo_overrides": '{"fr": "C:\\\\Logos\\\\fr-audio.png"}',
+                    "mov-library_movies-template_collection_audio_language_child_visible_home_overrides": '{"en": "true"}',
+                    "mov-library_movies-template_collection_audio_language_child_hub_priority_overrides": '{"fr": "4"}',
+                    "mov-library_movies-template_collection_audio_language_child_item_radarr_tag_overrides": '{"en": "audio,english"}',
+                }
+            },
+            show_collections={
+                "shows": {
+                    "sho-library_shows-collection_subtitle_language": True,
+                    "sho-library_shows-template_collection_subtitle_language_exclude": "ja",
+                    "sho-library_shows-template_collection_subtitle_language_child_name_overrides": '{"fr": "French Subtitles"}',
+                    "sho-library_shows-template_collection_subtitle_language_child_file_poster_overrides": '{"fr": "C:\\\\Posters\\\\fr-subtitles.jpg"}',
+                    "sho-library_shows-template_collection_subtitle_language_child_visible_library_overrides": '{"fr": "false"}',
+                    "sho-library_shows-template_collection_subtitle_language_child_item_sonarr_tag_overrides": '{"fr": ["subtitle", "french"]}',
+                }
+            },
+        )
+
+    movie_entries = libraries_section["libraries"]["Movies"]["collection_files"]
+    show_entries = libraries_section["libraries"]["Shows"]["collection_files"]
+    audio_language = next(entry for entry in movie_entries if entry.get("default") == "audio_language")
+    subtitle_language = next(entry for entry in show_entries if entry.get("default") == "subtitle_language")
+
+    assert audio_language["template_variables"]["include"] == ["en", "fr"]
+    assert audio_language["template_variables"]["use_en"] is False
+    assert audio_language["template_variables"]["name_en"] == "English Audio"
+    assert audio_language["template_variables"]["summary_en"] == "Movies with English audio"
+    assert audio_language["template_variables"]["schedule_fr"] == "weekly(sunday)"
+    assert audio_language["template_variables"]["sort_by_fr"] == "title.asc"
+    assert audio_language["template_variables"]["limit_fr"] == 25
+    assert audio_language["template_variables"]["minimum_items_fr"] == 3
+    assert audio_language["template_variables"]["url_background_en"] == "https://example.com/en-bg.jpg"
+    assert audio_language["template_variables"]["file_logo_fr"] == r"C:\Logos\fr-audio.png"
+    assert audio_language["template_variables"]["visible_home_en"] is True
+    assert audio_language["template_variables"]["hub_priority_fr"] == "4"
+    assert audio_language["template_variables"]["item_radarr_tag_en"] == ["audio", "english"]
+    assert subtitle_language["template_variables"]["exclude"] == ["ja"]
+    assert subtitle_language["template_variables"]["name_fr"] == "French Subtitles"
+    assert subtitle_language["template_variables"]["file_poster_fr"] == r"C:\Posters\fr-subtitles.jpg"
+    assert subtitle_language["template_variables"]["visible_library_fr"] is False
+    assert subtitle_language["template_variables"]["item_sonarr_tag_fr"] == ["subtitle", "french"]
+
+
+def test_build_libraries_section_expands_aspect_resolution_dynamic_child_override_maps(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            show_libraries={"sho-library_shows-library": "Shows"},
+            movie_collections={
+                "movies": {
+                    "mov-library_movies-collection_aspect": True,
+                    "mov-library_movies-template_collection_aspect_filter_term": "aspect",
+                    "mov-library_movies-template_collection_aspect_use_1.78": False,
+                    "mov-library_movies-template_collection_aspect_name_1.78": "Widescreen TV",
+                    "mov-library_movies-template_collection_aspect_child_schedule_overrides": '{"2.35": "weekly(sunday)"}',
+                    "mov-library_movies-template_collection_aspect_child_sync_mode_overrides": '{"2.35": "append"}',
+                    "mov-library_movies-template_collection_aspect_child_minimum_items_overrides": '{"1.33": "3"}',
+                    "mov-library_movies-template_collection_aspect_child_url_background_overrides": '{"1.78": "https://example.com/aspect-bg.jpg"}',
+                    "mov-library_movies-template_collection_aspect_child_item_radarr_tag_overrides": '{"1.78": "aspect,widescreen"}',
+                    "mov-library_movies-collection_resolution": True,
+                    "mov-library_movies-template_collection_resolution_include": '["4k", "1080"]',
+                    "mov-library_movies-template_collection_resolution_child_name_overrides": '{"4k": "Ultra HD"}',
+                    "mov-library_movies-template_collection_resolution_child_order_overrides": '{"4k": "01"}',
+                    "mov-library_movies-template_collection_resolution_child_schedule_overrides": '{"1080": "weekly(friday)"}',
+                    "mov-library_movies-template_collection_resolution_child_url_poster_overrides": '{"4k": "https://example.com/4k.jpg"}',
+                    "mov-library_movies-template_collection_resolution_child_item_radarr_tag_overrides": '{"4k": "resolution,4k"}',
+                }
+            },
+            show_collections={
+                "shows": {
+                    "sho-library_shows-collection_aspect": True,
+                    "sho-library_shows-template_collection_aspect_child_item_sonarr_tag_overrides": '{"2.35": ["aspect", "scope"]}',
+                    "sho-library_shows-collection_resolution": True,
+                    "sho-library_shows-template_collection_resolution_exclude": "480",
+                    "sho-library_shows-template_collection_resolution_child_file_square_art_overrides": '{"1080": "C:\\\\Square\\\\1080.png"}',
+                    "sho-library_shows-template_collection_resolution_child_item_sonarr_tag_overrides": '{"1080": ["resolution", "1080p"]}',
+                }
+            },
+        )
+
+    movie_entries = libraries_section["libraries"]["Movies"]["collection_files"]
+    show_entries = libraries_section["libraries"]["Shows"]["collection_files"]
+    movie_aspect = next(entry for entry in movie_entries if entry.get("default") == "aspect")
+    movie_resolution = next(entry for entry in movie_entries if entry.get("default") == "resolution")
+    show_aspect = next(entry for entry in show_entries if entry.get("default") == "aspect")
+    show_resolution = next(entry for entry in show_entries if entry.get("default") == "resolution")
+
+    assert movie_aspect["template_variables"]["filter_term"] == "aspect"
+    assert movie_aspect["template_variables"]["use_1.78"] is False
+    assert movie_aspect["template_variables"]["name_1.78"] == "Widescreen TV"
+    assert movie_aspect["template_variables"]["schedule_2.35"] == "weekly(sunday)"
+    assert movie_aspect["template_variables"]["sync_mode_2.35"] == "append"
+    assert movie_aspect["template_variables"]["minimum_items_1.33"] == 3
+    assert movie_aspect["template_variables"]["url_background_1.78"] == "https://example.com/aspect-bg.jpg"
+    assert movie_aspect["template_variables"]["item_radarr_tag_1.78"] == ["aspect", "widescreen"]
+    assert movie_resolution["template_variables"]["include"] == ["4k", "1080"]
+    assert movie_resolution["template_variables"]["name_4k"] == "Ultra HD"
+    assert movie_resolution["template_variables"]["order_4k"] == "01"
+    assert movie_resolution["template_variables"]["schedule_1080"] == "weekly(friday)"
+    assert movie_resolution["template_variables"]["url_poster_4k"] == "https://example.com/4k.jpg"
+    assert movie_resolution["template_variables"]["item_radarr_tag_4k"] == ["resolution", "4k"]
+    assert show_aspect["template_variables"]["item_sonarr_tag_2.35"] == ["aspect", "scope"]
+    assert show_resolution["template_variables"]["exclude"] == ["480"]
+    assert show_resolution["template_variables"]["file_square_art_1080"] == r"C:\Square\1080.png"
+    assert show_resolution["template_variables"]["item_sonarr_tag_1080"] == ["resolution", "1080p"]
 
 
 def test_build_libraries_section_emits_library_arr_overrides(app):
@@ -2456,15 +3320,9 @@ def test_build_libraries_section_emits_library_arr_overrides(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {"sho-library_shows-library": "Shows"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            show_libraries={"sho-library_shows-library": "Shows"},
+            movie_attributes={
                 "movies": {
                     "mov-library_movies-attribute_radarr_url": "http://radarr.local:7878",
                     "mov-library_movies-attribute_radarr_quality_profile": "HD-1080p",
@@ -2472,7 +3330,7 @@ def test_build_libraries_section_emits_library_arr_overrides(app):
                     "mov-library_movies-attribute_radarr_add_existing": "false",
                 }
             },
-            {
+            show_attributes={
                 "shows": {
                     "sho-library_shows-attribute_sonarr_url": "http://sonarr.local:8989",
                     "sho-library_shows-attribute_sonarr_language_profile": "English",
@@ -2480,12 +3338,6 @@ def test_build_libraries_section_emits_library_arr_overrides(app):
                     "sho-library_shows-attribute_sonarr_season_folder": "true",
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     movies = libraries_section["libraries"]["Movies"]["radarr"]
@@ -2635,6 +3487,47 @@ def test_collapse_collection_data_template_vars_handles_actor_style_data_blocks(
         "style": "signature",
         "data": {"depth": 1, "limit": 15},
     }
+
+
+def test_collection_section_blank_normalizes_to_none():
+    from modules import output
+
+    assert output._normalize_collection_template_var_value("collection_section", "") is None
+    assert output._normalize_collection_template_var_value("collection_section", None) is None
+
+
+def test_collection_template_variable_sibling_groups_emit_in_stable_sorted_order(app):
+    from modules.output_optimize import optimize_template_variables
+
+    config_data = {
+        "libraries": {
+            "Movies": {
+                "collection_files": [
+                    {
+                        "default": "seasonal",
+                        "template_variables": {
+                            "schedule_women": "daily",
+                            "schedule_black_history": "daily",
+                            "schedule_aapi": "daily",
+                            "schedule_valentine": "daily",
+                            "schedule_years": "daily",
+                        },
+                    }
+                ]
+            }
+        }
+    }
+
+    optimized = optimize_template_variables(config_data, {"Movies": "movie"})
+    template_variables = optimized["libraries"]["Movies"]["collection_files"][0]["template_variables"]
+
+    assert list(template_variables) == [
+        "schedule_aapi",
+        "schedule_black_history",
+        "schedule_valentine",
+        "schedule_women",
+        "schedule_years",
+    ]
 
 
 def test_collapse_collection_data_template_vars_removes_flat_data_keys_from_all_collection_entries():
@@ -3412,6 +4305,7 @@ def test_validate_plex_persists_telemetry_for_current_config(client, monkeypatch
 
     telemetry = {
         "server_name": "Test Plex",
+        "db_cache": "2048 MB",
         "maintenance_window": "02:00 – 05:00",
         "platform": "Windows",
     }
@@ -3428,8 +4322,40 @@ def test_validate_plex_persists_telemetry_for_current_config(client, monkeypatch
     assert resp.status_code == 200
     payload = resp.get_json()
     assert payload["validated"] is True
+    assert payload["db_cache"] == 2048
     assert payload["maintenance_window"] == "02:00 – 05:00"
     assert calls == {"save_settings": 1, "save_section": 1}
+
+
+def test_plex_page_normalizes_formatted_db_cache_on_load(client, isolated_config_dir):
+    from modules import database
+
+    config_name = "pytest_plex_formatted_db_cache"
+    with client.session_transaction() as sess:
+        sess["config_name"] = config_name
+
+    database.save_section_data(
+        name=config_name,
+        section="plex",
+        validated=True,
+        user_entered=True,
+        data={
+            "validated": True,
+            "plex": {
+                "url": "http://plex.local:32400",
+                "token": "token",
+                "db_cache": "2048 MB",
+                "timeout": 60,
+            },
+        },
+    )
+
+    resp = client.get("/step/010-plex")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    match = re.search(r'id="plex_db_cache"[^>]+value="([^"]*)"', html)
+    assert match is not None
+    assert match.group(1) == "2048"
 
 
 def test_validate_plex_fetches_sections_once(app, monkeypatch, qs_module):
@@ -3476,7 +4402,12 @@ def test_validate_plex_fetches_sections_once(app, monkeypatch, qs_module):
         def myPlexAccount(self):
             return FakeAccount()
 
-    monkeypatch.setattr(qs_module.validations, "PlexServer", FakePlex)
+    # PlexServer is imported into modules.validations_services (extracted from
+    # modules.validations in the Sprint 4 refactor).  Patch it there so the
+    # validate_plex_server function actually sees FakePlex.
+    from modules import validations_services
+
+    monkeypatch.setattr(validations_services, "PlexServer", FakePlex)
 
     with app.app_context():
         resp = qs_module.validations.validate_plex_server({"plex_url": "http://localhost:32400", "plex_token": "token"})
@@ -3753,6 +4684,47 @@ def test_import_config_preview_rejects_zip_with_unsupported_entries(client):
     assert payload["success"] is False
     assert "unsupported entries" in payload["message"].lower()
     assert "unexpected.exe" in payload["message"]
+
+
+def test_import_config_preview_accepts_windows_wrapped_bundle_directories(client):
+    import io
+    import zipfile
+    from pathlib import Path
+
+    bundle = io.BytesIO()
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("bullmoose20_prod9_config_bundle (test)/", b"")
+        archive.writestr("bullmoose20_prod9_config_bundle (test)/bullmoose20_prod9/", b"")
+        archive.writestr("bullmoose20_prod9_config_bundle (test)/bullmoose20_prod9/collection_files/", b"")
+        archive.writestr("bullmoose20_prod9_config_bundle (test)/bullmoose20_prod9/collection_files/mov-library_movies/", b"")
+        archive.writestr(
+            "bullmoose20_prod9_config_bundle (test)/bullmoose20_prod9/collection_files/mov-library_movies/config_collection_files_a8a07b81df/",
+            b"",
+        )
+        archive.writestr(
+            "bullmoose20_prod9_config_bundle (test)/bullmoose20_prod9/collection_files/mov-library_movies/config_collection_files_a8a07b81df/movies_refresh.yml",
+            "collections: {}\n",
+        )
+        archive.writestr("bullmoose20_prod9_config_bundle (test)/bullmoose20_prod9/fonts/", b"")
+        archive.writestr("bullmoose20_prod9_config_bundle (test)/bullmoose20_prod9/fonts/Poster.ttf", b"font")
+        archive.writestr("bullmoose20_prod9_config_bundle (test)/config.yml", "settings:\n  cache: true\n")
+        archive.writestr("bullmoose20_prod9_config_bundle (test)/README.txt", "Quickstart config bundle\n")
+    bundle.seek(0)
+
+    resp = client.post(
+        "/import-config/preview",
+        data={"config_name": "pytest_wrapped_bundle", "file": (bundle, "bundle.zip")},
+        content_type="multipart/form-data",
+    )
+
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    payload = resp.get_json()
+    assert payload["success"] is True
+
+    with client.session_transaction() as sess:
+        bundle_dir = Path(sess["import_preview_bundle_dir"])
+
+    assert (bundle_dir / "bullmoose20_prod9" / "collection_files" / "mov-library_movies" / "config_collection_files_a8a07b81df" / "movies_refresh.yml").exists()
 
 
 def test_import_config_preview_handles_yaml_date_scalars_in_cache(client):
@@ -4353,6 +5325,145 @@ def test_rename_config_moves_managed_library_file_directories(client, isolated_c
     assert old_name not in database.get_unique_config_names()
 
 
+def test_duplicate_config_copies_database_and_managed_artifacts(client, isolated_config_dir, app):
+    from modules import database
+    from pathlib import Path
+
+    source_name = "duplicate_source"
+    new_name = "duplicate_target"
+    kometa_path = Path(app.config["KOMETA_ROOT"]) / "config"
+    kometa_path.mkdir(parents=True, exist_ok=True)
+
+    (isolated_config_dir / f"{source_name}_config.yml").write_text(
+        f"libraries:\n  Movies:\n    collection_files:\n      - file: config/{source_name}/collection_files/mov-library_movies/movies.yml\n",
+        encoding="utf-8",
+    )
+    (kometa_path / f"{source_name}_config.yml").write_text(
+        f"metadata_path: config/{source_name}/metadata_files/mov-library_movies/movies.yml\n",
+        encoding="utf-8",
+    )
+    metadata_dir = isolated_config_dir / source_name / "metadata_files" / "mov-library_movies"
+    collection_dir = isolated_config_dir / source_name / "collection_files" / "mov-library_movies"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    collection_dir.mkdir(parents=True, exist_ok=True)
+    (metadata_dir / "movies.yml").write_text(
+        f"metadata:\n  Test:\n    file: config/{source_name}/metadata_files/mov-library_movies/movies.yml\n",
+        encoding="utf-8",
+    )
+    (collection_dir / "movies.yml").write_text("collections:\n  Test:\n    sort_title: Test\n", encoding="utf-8")
+
+    database.save_section_data(
+        name=source_name,
+        section="start",
+        validated=True,
+        user_entered=True,
+        data={"start": {"config_name": source_name}},
+    )
+    database.save_section_data(
+        name=source_name,
+        section="025-libraries",
+        validated=True,
+        user_entered=True,
+        data={
+            "libraries": {
+                "mov-library_movies": {
+                    "metadata_files": [f"config/{source_name}/metadata_files/mov-library_movies/movies.yml"],
+                    "collection_files": [f"config/{source_name}/collection_files/mov-library_movies/movies.yml"],
+                }
+            }
+        },
+    )
+    database.save_analytics_preferences(source_name, {"panels": {"summary": False}, "issues": {}})
+
+    with client.session_transaction() as sess:
+        sess["config_name"] = source_name
+
+    resp = client.post("/duplicate-config", json={"source_name": source_name, "new_name": new_name})
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["success"] is True
+    assert payload["source_name"] == source_name
+    assert payload["new_name"] == new_name
+
+    assert source_name in database.get_unique_config_names()
+    assert new_name in database.get_unique_config_names()
+
+    source_validated, _source_user_entered, source_data = database.retrieve_section_data(source_name, "025-libraries")
+    target_validated, target_user_entered, target_data = database.retrieve_section_data(new_name, "025-libraries")
+    assert source_validated is True
+    assert target_validated is True
+    assert target_user_entered is True
+    assert f"config/{source_name}/" in source_data["libraries"]["mov-library_movies"]["metadata_files"][0]
+    assert f"config/{new_name}/" in target_data["libraries"]["mov-library_movies"]["metadata_files"][0]
+    assert f"config/{new_name}/" in target_data["libraries"]["mov-library_movies"]["collection_files"][0]
+
+    _validated, _user_entered, start_data = database.retrieve_section_data(new_name, "start")
+    assert isinstance(start_data.get("start"), dict)
+
+    copied_metadata = isolated_config_dir / new_name / "metadata_files" / "mov-library_movies" / "movies.yml"
+    copied_collection = isolated_config_dir / new_name / "collection_files" / "mov-library_movies" / "movies.yml"
+    assert copied_metadata.exists()
+    assert copied_collection.exists()
+    assert f"config/{new_name}/metadata_files" in copied_metadata.read_text(encoding="utf-8")
+    assert f"config/{new_name}/collection_files" in (isolated_config_dir / f"{new_name}_config.yml").read_text(encoding="utf-8")
+    assert f"config/{new_name}/metadata_files" in (kometa_path / f"{new_name}_config.yml").read_text(encoding="utf-8")
+
+    with client.session_transaction() as sess:
+        assert sess["config_name"] == new_name
+
+
+def test_duplicate_config_rejects_existing_target(client, isolated_config_dir):
+    from modules import database
+
+    database.save_section_data(
+        name="duplicate_source",
+        section="start",
+        validated=True,
+        user_entered=True,
+        data={"start": {"config_name": "duplicate_source"}},
+    )
+    database.save_section_data(
+        name="duplicate_target",
+        section="start",
+        validated=True,
+        user_entered=True,
+        data={"start": {"config_name": "duplicate_target"}},
+    )
+
+    resp = client.post("/duplicate-config", json={"source_name": "duplicate_source", "new_name": "duplicate_target"})
+    assert resp.status_code == 400
+    payload = resp.get_json()
+    assert payload["success"] is False
+    assert "already exists" in payload["message"]
+
+
+def test_duplicate_config_form_post_redirects_and_activates_config(client, isolated_config_dir):
+    from modules import database
+
+    database.save_section_data(
+        name="duplicate_source",
+        section="start",
+        validated=True,
+        user_entered=True,
+        data={"start": {"config_name": "duplicate_source"}},
+    )
+
+    with client.session_transaction() as sess:
+        sess["config_name"] = "duplicate_source"
+
+    resp = client.post(
+        "/duplicate-config",
+        data={"source_name": "duplicate_source", "new_name": "duplicate_source_copy"},
+    )
+
+    assert resp.status_code == 303
+    assert resp.headers["Location"].endswith("/")
+    assert "duplicate_source_copy" in database.get_unique_config_names()
+
+    with client.session_transaction() as sess:
+        assert sess["config_name"] == "duplicate_source_copy"
+
+
 def test_prune_invalid_section_rows_removes_blank_config_entries(isolated_config_dir):
     import sqlite3
     from modules import database
@@ -4583,6 +5694,155 @@ def test_copy_library_settings_mirrors_metadata_files(client, isolated_config_di
     target_file = isolated_config_dir.parent / Path(target_entries[0]["location"])
     assert target_file.exists()
     assert target_file.read_text(encoding="utf-8") == managed_file.read_text(encoding="utf-8")
+
+
+def test_copy_library_settings_keeps_target_excluded_for_playlist_and_content_rating(client, isolated_config_dir, monkeypatch, app, library_routes_module):
+    from modules import database
+    from flask import session
+
+    config_name = "pytest_copy_playlist_content_rating"
+    database.save_section_data(
+        section="libraries",
+        validated=False,
+        user_entered=True,
+        name=config_name,
+        data={
+            "libraries": {
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-playlist": "true",
+                "mov-library_movies-collection_content_rating_us": True,
+                "mov-library_movies-template_collection_content_rating_us_limit": "40",
+                "mov-library_movies-movie-overlay_content_rating": "uk",
+                "mov-library_movies-movie-template_overlay_content_rating_uk[color]": "white",
+                "mov-library_target-library": "Other Movies",
+                "mov-library_target-collection_collectionless": True,
+                "libraries": "Movies,Other Movies",
+            },
+            "validated": False,
+        },
+    )
+    monkeypatch.setattr(
+        library_routes_module,
+        "_build_library_lists",
+        lambda: (
+            [
+                {"id": "mov-library_movies", "name": "Movies"},
+                {"id": "mov-library_target", "name": "Other Movies"},
+            ],
+            [],
+            {},
+        ),
+    )
+
+    with app.test_request_context("/copy_library_settings"):
+        session["config_name"] = config_name
+
+    with client.session_transaction() as sess:
+        sess["config_name"] = config_name
+
+    resp = client.post(
+        "/copy_library_settings",
+        json={
+            "source_library_id": "mov-library_movies",
+            "target_library_ids": ["mov-library_target"],
+            "source_payload": {
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-playlist": "true",
+                "mov-library_movies-collection_content_rating_us": True,
+                "mov-library_movies-template_collection_content_rating_us_limit": "40",
+                "mov-library_movies-movie-overlay_content_rating": "uk",
+                "mov-library_movies-movie-template_overlay_content_rating_uk[color]": "white",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["success"] is True
+
+    _validated, _user_entered, stored = database.retrieve_section_data(config_name, "libraries")
+    libraries = stored["libraries"]
+    assert libraries["mov-library_target-library"] == ""
+    assert libraries["mov-library_target-playlist"] is True
+    assert libraries["mov-library_target-collection_content_rating_us"] is True
+    assert libraries["mov-library_target-template_collection_content_rating_us_limit"] == 40
+    assert libraries["mov-library_target-movie-overlay_content_rating"] == "uk"
+    assert libraries["mov-library_target-movie-template_overlay_content_rating_uk[color]"] == "white"
+
+
+def test_copy_library_settings_preserves_unloaded_lazy_source_sections(client, isolated_config_dir, monkeypatch, app, library_routes_module):
+    from modules import database
+    from flask import session
+
+    config_name = "pytest_copy_lazy_source_sections"
+    database.save_section_data(
+        section="libraries",
+        validated=False,
+        user_entered=True,
+        name=config_name,
+        data={
+            "libraries": {
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-playlist": "true",
+                "mov-library_movies-attribute_language": "en",
+                "mov-library_movies-collection_award": True,
+                "mov-library_movies-template_collection_award_style": "signature",
+                "mov-library_movies-movie-overlay_resolution": "true",
+                "mov-library_movies-movie-template_overlay_resolution[horizontal_align]": "right",
+                "mov-library_target-library": "Other Movies",
+                "libraries": "Movies,Other Movies",
+            },
+            "validated": False,
+        },
+    )
+    monkeypatch.setattr(
+        library_routes_module,
+        "_build_library_lists",
+        lambda: (
+            [
+                {"id": "mov-library_movies", "name": "Movies"},
+                {"id": "mov-library_target", "name": "Other Movies"},
+            ],
+            [],
+            {},
+        ),
+    )
+
+    with app.test_request_context("/copy_library_settings"):
+        session["config_name"] = config_name
+
+    with client.session_transaction() as sess:
+        sess["config_name"] = config_name
+
+    resp = client.post(
+        "/copy_library_settings",
+        json={
+            "source_library_id": "mov-library_movies",
+            "target_library_ids": ["mov-library_target"],
+            "source_payload": {
+                "__loaded_sections": [],
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-playlist": "true",
+                "mov-library_movies-attribute_language": "fr",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["success"] is True
+
+    _validated, _user_entered, stored = database.retrieve_section_data(config_name, "libraries")
+    libraries = stored["libraries"]
+    assert libraries["mov-library_movies-attribute_language"] == "fr"
+    assert libraries["mov-library_movies-template_collection_award_style"] == "signature"
+    assert libraries["mov-library_movies-movie-template_overlay_resolution[horizontal_align]"] == "right"
+    assert libraries["mov-library_target-library"] == ""
+    assert libraries["mov-library_target-playlist"] is True
+    assert libraries["mov-library_target-attribute_language"] == "fr"
+    assert libraries["mov-library_target-collection_award"] is True
+    assert libraries["mov-library_target-template_collection_award_style"] == "signature"
+    assert libraries["mov-library_target-movie-overlay_resolution"] in {True, "true"}
+    assert libraries["mov-library_target-movie-template_overlay_resolution[horizontal_align]"] == "right"
 
 
 def test_sync_managed_library_artifacts_to_kometa_copies_and_prunes(isolated_config_dir, app):
@@ -4896,22 +6156,8 @@ def test_build_libraries_section_emits_schedule_overlays(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {"movies": {"mov-library_movies-top_level_schedule_overlays": "weekly(saturday)"}},
-            {},
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_top_level={"movies": {"mov-library_movies-top_level_schedule_overlays": "weekly(saturday)"}},
         )
 
     movies = libraries_section["libraries"]["Movies"]
@@ -4924,22 +6170,8 @@ def test_build_libraries_section_emits_auto_sort_hubs(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {"movies": {"mov-library_movies-top_level_auto_sort_hubs": "configured.desc"}},
-            {},
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_top_level={"movies": {"mov-library_movies-top_level_auto_sort_hubs": "configured.desc"}},
         )
 
     movies = libraries_section["libraries"]["Movies"]
@@ -4952,28 +6184,14 @@ def test_build_libraries_section_keeps_default_ratings_overlay_when_overlay_file
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_overlays={
                 "movies": {
                     "mov-library_movies-movie-overlay_ratings": True,
                     "mov-library_movies-movie-template_overlay_ratings[rating1]": "critic",
                     "mov-library_movies-movie-template_overlay_ratings[rating1_image]": "imdb",
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     overlay_entries = libraries_section["libraries"]["Movies"]["overlay_files"]
@@ -4988,28 +6206,14 @@ def test_build_libraries_section_emits_languages_overlay_language_list(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_overlays={
                 "movies": {
                     "mov-library_movies-movie-overlay_languages": True,
                     "mov-library_movies-movie-template_overlay_languages[languages]": ["en", "ja"],
                     "mov-library_movies-movie-template_overlay_languages[style]": "square",
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     overlay_entries = libraries_section["libraries"]["Movies"]["overlay_files"]
@@ -5025,28 +6229,14 @@ def test_build_libraries_section_emits_subtitle_languages_overlay_language_list(
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_overlays={
                 "movies": {
                     "mov-library_movies-movie-overlay_languages_subtitles": True,
                     "mov-library_movies-movie-template_overlay_languages_subtitles[languages]": ["en", "ja"],
                     "mov-library_movies-movie-template_overlay_languages_subtitles[style]": "square",
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     overlay_entries = libraries_section["libraries"]["Movies"]["overlay_files"]
@@ -5064,28 +6254,14 @@ def test_build_libraries_section_emits_languages_overlay_alignment_template_vari
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_overlays={
                 "movies": {
                     "mov-library_movies-movie-overlay_languages": True,
                     "mov-library_movies-movie-template_overlay_languages[flag_alignment]": "right",
                     "mov-library_movies-movie-template_overlay_languages[back_align]": "center",
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     overlay_entries = libraries_section["libraries"]["Movies"]["overlay_files"]
@@ -5101,28 +6277,14 @@ def test_build_libraries_section_emits_subtitle_languages_overlay_alignment_temp
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_overlays={
                 "movies": {
                     "mov-library_movies-movie-overlay_languages_subtitles": True,
                     "mov-library_movies-movie-template_overlay_languages_subtitles[flag_alignment]": "left",
                     "mov-library_movies-movie-template_overlay_languages_subtitles[back_align]": "right",
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     overlay_entries = libraries_section["libraries"]["Movies"]["overlay_files"]
@@ -5140,28 +6302,14 @@ def test_build_libraries_section_emits_streaming_overlay_region_originals_and_di
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_overlays={
                 "movies": {
                     "mov-library_movies-movie-overlay_streaming": True,
                     "mov-library_movies-movie-template_overlay_streaming[region]": "CA",
                     "mov-library_movies-movie-template_overlay_streaming[originals_only]": True,
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     overlay_entries = libraries_section["libraries"]["Movies"]["overlay_files"]
@@ -5176,28 +6324,14 @@ def test_build_libraries_section_emits_only_non_default_language_weight_override
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_overlays={
                 "movies": {
                     "mov-library_movies-movie-overlay_languages": True,
                     "mov-library_movies-movie-template_overlay_languages[weight_en]": "610",
                     "mov-library_movies-movie-template_overlay_languages[weight_ja]": "700",
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     overlay_entries = libraries_section["libraries"]["Movies"]["overlay_files"]
@@ -5278,19 +6412,8 @@ def test_build_libraries_section_includes_separator_placeholder_imdb_id(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_templates={
                 "movies": {
                     "mov-library_movies-template_variables[use_separator]": "gray",
                     "mov-library_movies-attribute_template_variables[placeholder_imdb_id]": "tt0108052",
@@ -5298,9 +6421,6 @@ def test_build_libraries_section_includes_separator_placeholder_imdb_id(app):
                     "mov-library_movies-template_variables[collection_mode]": "hide",
                 }
             },
-            {},
-            {},
-            {},
         )
 
     template_variables = libraries_section["libraries"]["Movies"]["template_variables"]
@@ -5315,28 +6435,14 @@ def test_build_libraries_section_includes_separator_placeholder_tmdb_movie(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_templates={
                 "movies": {
                     "mov-library_movies-template_variables[use_separator]": "gray",
                     "mov-library_movies-attribute_template_variables[placeholder_tmdb_movie]": "603",
                     "mov-library_movies-template_variables[language]": "en",
                 }
             },
-            {},
-            {},
-            {},
         )
 
     template_variables = libraries_section["libraries"]["Movies"]["template_variables"]
@@ -5350,28 +6456,14 @@ def test_build_libraries_section_includes_separator_placeholder_tvdb_show(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {},
-            {"sho-library_shows-library": "Shows"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {
+            show_libraries={"sho-library_shows-library": "Shows"},
+            show_templates={
                 "shows": {
                     "sho-library_shows-template_variables[use_separator]": "gray",
                     "sho-library_shows-attribute_template_variables[placeholder_tvdb_show]": "121361",
                     "sho-library_shows-template_variables[language]": "en",
                 }
             },
-            {},
-            {},
         )
 
     template_variables = libraries_section["libraries"]["Shows"]["template_variables"]
@@ -5419,27 +6511,13 @@ def test_build_libraries_section_omits_empty_collectionless_exclude_prefix(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_collections={
                 "movies": {
                     "mov-library_movies-collection_collectionless": True,
                     "mov-library_movies-template_collection_collectionless_exclude_prefix": "[]",
                 }
             },
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
         )
 
     collection_entries = libraries_section["libraries"]["Movies"]["collection_files"]
@@ -5454,27 +6532,34 @@ def test_build_libraries_section_emits_schedule(app):
 
     with app.app_context():
         libraries_section = output.build_libraries_section(
-            {"mov-library_movies-library": "Movies"},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {"movies": {"mov-library_movies-top_level_schedule": "weekly(saturday)"}},
-            {},
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_top_level={"movies": {"mov-library_movies-top_level_schedule": "weekly(saturday)"}},
         )
 
     movies = libraries_section["libraries"]["Movies"]
     assert movies["schedule"] == "weekly(saturday)"
     assert list(movies.keys())[:2] == ["schedule", "template_variables"]
+
+
+def test_build_libraries_section_omits_blank_top_level_schedules(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_top_level={
+                "movies": {
+                    "mov-library_movies-top_level_schedule": "",
+                    "mov-library_movies-top_level_schedule_overlays": "",
+                }
+            },
+            movie_templates={"movies": {"mov-library_movies-template_variables[use_separator]": "gray"}},
+        )
+
+    movies = libraries_section["libraries"]["Movies"]
+    assert "schedule" not in movies
+    assert "schedule_overlays" not in movies
+    assert movies["template_variables"]["sep_style"] == "gray"
 
 
 def test_save_kometa_install_mode_persists_existing_root(client, tmp_path):
@@ -5507,6 +6592,10 @@ def test_save_kometa_install_mode_persists_existing_root(client, tmp_path):
     assert user_entered is True
     assert stored["kometa"]["install_mode"] == "existing"
     assert stored["kometa"]["existing_root"] == str(existing_root)
+    assert stored["validation_status"] == "validated"
+    assert stored["validated"] is True
+    assert stored["validated_at"]
+    assert stored["validation_updated_at"] == stored["validated_at"]
 
 
 def test_validate_kometa_root_existing_mode_does_not_create_missing_root(client, tmp_path):
@@ -5521,11 +6610,78 @@ def test_validate_kometa_root_existing_mode_does_not_create_missing_root(client,
         },
     )
 
-    assert resp.status_code == 400
+    assert resp.status_code == 200
     payload = resp.get_json()
     assert payload["success"] is False
     assert "does not exist in this Quickstart environment" in payload["error"]
     assert not missing_root.exists()
+
+
+def test_validate_kometa_root_external_missing_generated_yaml_returns_json_error(client, tmp_path):
+    external_config = tmp_path / "kometa-config"
+    external_config.mkdir(parents=True, exist_ok=True)
+
+    resp = client.post(
+        "/validate-kometa-root",
+        json={
+            "config_name": "pytest_missing_generated_config",
+            "install_mode": "external",
+            "external_config_root": str(external_config),
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["success"] is False
+    assert payload["error"] == "Generated YAML not found."
+
+
+def test_validate_kometa_root_external_sync_exception_returns_json_error(client, tmp_path, monkeypatch):
+    from blueprints import kometa_updates
+
+    external_config = tmp_path / "kometa-config"
+    external_config.mkdir(parents=True, exist_ok=True)
+
+    def fail_sync(*args, **kwargs):
+        raise RuntimeError("sync failed")
+
+    monkeypatch.setattr(
+        kometa_updates.kometa_install,
+        "sync_generated_yaml_and_assets_to_kometa_config",
+        fail_sync,
+    )
+
+    resp = client.post(
+        "/validate-kometa-root",
+        json={
+            "config_name": "pytest_external_sync_failure",
+            "install_mode": "external",
+            "external_config_root": str(external_config),
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["success"] is False
+    assert payload["error"] == "Failed to sync generated config to the external Kometa config path."
+    assert any("sync failed" in line for line in payload["log"])
+
+
+def test_validate_kometa_root_target_resolution_exception_returns_json_error(client, monkeypatch):
+    from blueprints import kometa_updates
+
+    def fail_resolution(*args, **kwargs):
+        raise ValueError("bad target")
+
+    monkeypatch.setattr(kometa_updates.kometa_install, "resolve_kometa_request_target", fail_resolution)
+
+    resp = client.post("/validate-kometa-root", json={"config_name": "pytest_bad_kometa_target"})
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["success"] is False
+    assert payload["error"] == "Unable to validate Kometa path."
+    assert any("bad target" in line for line in payload["log"])
 
 
 def test_save_kometa_install_mode_rejects_non_kometa_folder(client, tmp_path):
@@ -5580,6 +6736,10 @@ def test_save_kometa_install_mode_persists_external_paths(client, tmp_path):
     assert stored["kometa"]["install_mode"] == "external"
     assert stored["kometa"]["external_config_root"] == str(external_config)
     assert stored["kometa"]["external_log_root"] == str(external_logs)
+    assert stored["validation_status"] == "validated"
+    assert stored["validated"] is True
+    assert stored["validated_at"]
+    assert stored["validation_updated_at"] == stored["validated_at"]
 
 
 def test_build_workspace_status_context_marks_start_error_for_missing_existing_kometa_root(app, tmp_path, qs_module):
@@ -5764,6 +6924,7 @@ def test_check_kometa_update_existing_mode_allows_status_check(client, tmp_path,
 
 
 def test_get_kometa_config_dir_prefers_persisted_external_selection(app, tmp_path):
+    from pathlib import Path
     from flask import session
     from modules import database, helpers
 
@@ -5787,13 +6948,14 @@ def test_get_kometa_config_dir_prefers_persisted_external_selection(app, tmp_pat
     )
 
     with app.test_request_context("/step/900-kometa"):
+        managed_root = (Path(helpers.CONFIG_DIR) / "kometa").resolve()
         app.config["KOMETA_INSTALL_MODE"] = "managed"
-        app.config["KOMETA_CONFIG_DIR"] = ""
-        app.config["KOMETA_LOG_DIR"] = ""
+        app.config["KOMETA_CONFIG_DIR"] = str(managed_root / "config")
+        app.config["KOMETA_LOG_DIR"] = str(managed_root / "config" / "logs")
         session["config_name"] = config_name
         session["kometa_install_mode"] = "managed"
-        session["kometa_config_dir"] = ""
-        session["kometa_log_dir"] = ""
+        session["kometa_config_dir"] = str(managed_root / "config")
+        session["kometa_log_dir"] = str(managed_root / "config" / "logs")
         assert helpers.get_kometa_config_dir() == external_config.resolve()
         assert helpers.get_kometa_log_dir() == external_logs.resolve()
 
@@ -5822,6 +6984,56 @@ def test_get_kometa_root_path_prefers_persisted_existing_selection(app, tmp_path
         session["config_name"] = config_name
         session["kometa_root"] = managed_default
         assert helpers.get_kometa_root_path() == existing_root.resolve()
+
+
+def test_get_kometa_install_mode_prefers_persisted_selection(app, tmp_path):
+    from flask import session
+    from modules import database, helpers
+
+    config_name = "pytest_persisted_existing_mode"
+    existing_root = tmp_path / "persisted-existing-mode"
+    existing_root.mkdir(parents=True, exist_ok=True)
+
+    database.save_section_data(
+        name=config_name,
+        section="kometa",
+        validated=False,
+        user_entered=True,
+        data={"kometa": {"install_mode": "existing", "existing_root": str(existing_root)}},
+    )
+
+    with app.test_request_context("/step/900-kometa"):
+        app.config["KOMETA_INSTALL_MODE"] = "managed"
+        session["config_name"] = config_name
+        session["kometa_install_mode"] = "managed"
+        assert helpers.get_kometa_install_mode() == "existing"
+
+
+def test_save_kometa_page_preserves_existing_install_selection(app, tmp_path):
+    from flask import session
+    from modules import database, persistence
+
+    config_name = "pytest_save_kometa_preserve_existing"
+    existing_root = tmp_path / "preserve-existing-kometa"
+    existing_root.mkdir(parents=True, exist_ok=True)
+
+    database.save_section_data(
+        name=config_name,
+        section="kometa",
+        validated=True,
+        user_entered=True,
+        data={"kometa": {"install_mode": "existing", "existing_root": str(existing_root)}},
+    )
+
+    with app.test_request_context("/step/900-kometa"):
+        session["config_name"] = config_name
+        persistence.save_settings("900-kometa", {"header_style": "single line"})
+
+    _validated, _user_entered, stored = database.retrieve_section_data(config_name, "kometa")
+    kometa = stored["kometa"]
+    assert kometa["install_mode"] == "existing"
+    assert kometa["existing_root"] == str(existing_root)
+    assert kometa["header_style"] == "single line"
 
 
 def test_normalize_config_name_for_storage_strips_yaml_filename_suffix():

@@ -369,6 +369,82 @@ def test_launch_imagemaid_command_aborts_when_runtime_env_reset_fails(tmp_path, 
     assert "could not reset ImageMaid env file before launch" in result
 
 
+def test_launch_kometa_command_sets_branch_name_from_local_branch_metadata(tmp_path, monkeypatch, qs_module):
+    is_win = qs_module.sys.platform.startswith("win")
+    kometa_root = tmp_path / "kometa"
+    venv_dir = kometa_root / "kometa-venv" / ("Scripts" if is_win else "bin")
+    venv_dir.mkdir(parents=True, exist_ok=True)
+    (kometa_root / "kometa.py").write_text("print('kometa')\n", encoding="utf-8")
+    (venv_dir / ("python.exe" if is_win else "python3")).write_text("", encoding="utf-8")
+    (kometa_root / ".kometa_branch").write_text("nightly", encoding="utf-8")
+    pid_file = tmp_path / "kometa.pid"
+    config_path = kometa_root / "config" / "config.yml"
+    popen_calls = {}
+
+    class FakeProc:
+        pid = 4321
+
+    def fake_popen(command_parts, cwd=None, stdout=None, stderr=None, start_new_session=None, env=None):
+        popen_calls["command_parts"] = command_parts
+        popen_calls["cwd"] = cwd
+        popen_calls["start_new_session"] = start_new_session
+        popen_calls["env"] = env
+        return FakeProc()
+
+    monkeypatch.setenv("BRANCH_NAME", "develop")
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_root_path", lambda: kometa_root)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_pid_file", lambda: str(pid_file))
+    monkeypatch.setattr(qs_module.helpers, "ts_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(qs_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setitem(qs_module._launch_kometa_command.__globals__, "extract_kometa_config_path", lambda *_args, **_kwargs: config_path)
+    monkeypatch.setitem(qs_module._launch_kometa_command.__globals__, "stamp_quickstart_config_marker", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(qs_module._launch_kometa_command.__globals__, "schedule_quickstart_run_marker", lambda *_args, **_kwargs: None)
+
+    ok, result = qs_module._launch_kometa_command("python kometa.py --collections-only", config_name="cfg")
+
+    assert ok is True
+    assert result == 4321
+    assert pid_file.read_text(encoding="utf-8") == "4321"
+    assert popen_calls["cwd"] == str(kometa_root)
+    assert popen_calls["start_new_session"] is True
+    assert popen_calls["env"]["BRANCH_NAME"] == "nightly"
+
+
+def test_launch_kometa_command_clears_inherited_branch_name_without_local_metadata(tmp_path, monkeypatch, qs_module):
+    is_win = qs_module.sys.platform.startswith("win")
+    kometa_root = tmp_path / "kometa"
+    venv_dir = kometa_root / "kometa-venv" / ("Scripts" if is_win else "bin")
+    venv_dir.mkdir(parents=True, exist_ok=True)
+    (kometa_root / "kometa.py").write_text("print('kometa')\n", encoding="utf-8")
+    (venv_dir / ("python.exe" if is_win else "python3")).write_text("", encoding="utf-8")
+    pid_file = tmp_path / "kometa.pid"
+    config_path = kometa_root / "config" / "config.yml"
+    popen_calls = {}
+
+    class FakeProc:
+        pid = 4321
+
+    def fake_popen(command_parts, cwd=None, stdout=None, stderr=None, start_new_session=None, env=None):
+        popen_calls["env"] = env
+        return FakeProc()
+
+    monkeypatch.setenv("BRANCH_NAME", "develop")
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_root_path", lambda: kometa_root)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_pid_file", lambda: str(pid_file))
+    monkeypatch.setattr(qs_module.helpers, "detect_git_branch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(qs_module.helpers, "ts_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(qs_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setitem(qs_module._launch_kometa_command.__globals__, "extract_kometa_config_path", lambda *_args, **_kwargs: config_path)
+    monkeypatch.setitem(qs_module._launch_kometa_command.__globals__, "stamp_quickstart_config_marker", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(qs_module._launch_kometa_command.__globals__, "schedule_quickstart_run_marker", lambda *_args, **_kwargs: None)
+
+    ok, result = qs_module._launch_kometa_command("python kometa.py --collections-only", config_name="cfg")
+
+    assert ok is True
+    assert result == 4321
+    assert "BRANCH_NAME" not in popen_calls["env"]
+
+
 def test_start_imagemaid_blocked_during_maintenance(client, tmp_path, monkeypatch, qs_module):
     imagemaid_root = tmp_path / "imagemaid"
     log_dir = imagemaid_root / "config" / "logs"
@@ -393,7 +469,7 @@ def test_start_imagemaid_blocked_during_maintenance(client, tmp_path, monkeypatc
     assert data["maintenance_window"] == "01:00-02:00"
     assert "Plex maintenance window" in data["error"]
 
-    content = (log_dir / "imagemaid.log").read_text(encoding="utf-8")
+    content = (log_dir / "imagemaid.quickstart-pending.log").read_text(encoding="utf-8")
     assert "[Quickstart] Maintenance marker: event=blocked_start" in content
     assert "config=" in content
     assert "tool=imagemaid" in content
@@ -731,7 +807,7 @@ def test_stop_kometa_writes_stop_marker(tmp_path, client, monkeypatch, qs_module
 
     resp = client.post("/stop-kometa")
     assert resp.status_code == 200
-    content = (log_dir / "meta.log").read_text(encoding="utf-8")
+    content = (log_dir / "meta.quickstart-pending.log").read_text(encoding="utf-8")
     assert "[Quickstart] Run event: event=stopped" in content
     assert "tool=kometa" in content
     assert "config=bullmoose20_prod9" in content
@@ -1151,8 +1227,9 @@ def test_tail_imagemaid_log_appends_maintenance_sidecar(client, isolated_config_
     assert data["success"] is True
     assert "runtime log line" in data["text"]
     assert "event=paused" in data["text"]
+    assert "# [Quickstart] Marker replay start" in data["text"]
     assert data["requested_lines"] == 50
-    assert data["total_lines"] == 2
+    assert data["total_lines"] >= 4
 
 
 def test_stop_imagemaid_writes_stop_marker(tmp_path, client, monkeypatch, qs_module):
@@ -1181,13 +1258,14 @@ def test_stop_imagemaid_writes_stop_marker(tmp_path, client, monkeypatch, qs_mod
 
     resp = client.post("/stop-imagemaid")
     assert resp.status_code == 200
-    content = log_path.read_text(encoding="utf-8")
+    pending_path = imagemaid_root / "config" / "logs" / "imagemaid.quickstart-pending.log"
+    content = pending_path.read_text(encoding="utf-8")
     assert "[Quickstart] Run event: event=stopped" in content
     assert "tool=imagemaid" in content
     assert "mode=restore" in content
 
 
-def test_write_quickstart_imagemaid_run_marker_writes_runtime_log(tmp_path, qs_module):
+def test_write_quickstart_imagemaid_run_marker_writes_pending_journal(tmp_path, qs_module):
     imagemaid_root = tmp_path / "imagemaid"
     log_path = imagemaid_root / "config" / "logs" / "imagemaid.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1198,7 +1276,8 @@ def test_write_quickstart_imagemaid_run_marker_writes_runtime_log(tmp_path, qs_m
     ok = qs_module._write_quickstart_imagemaid_run_marker(imagemaid_root, mode="restore", config_name="demo", log_path=log_path)
     assert ok is True
 
-    content = log_path.read_text(encoding="utf-8")
+    pending_path = imagemaid_root / "config" / "logs" / "imagemaid.quickstart-pending.log"
+    content = pending_path.read_text(encoding="utf-8")
     assert "[Quickstart] Run marker:" in content
     assert "config=demo" in content
     assert "tool=imagemaid" in content

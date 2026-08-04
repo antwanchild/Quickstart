@@ -25,9 +25,10 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css"
     integrity="sha384-XGjxtQfXaH2tnPFa9x+ruJTuLE3Aa6LhHSWRr1XeTyhezb4abCG4ccI5AkVDxqC+" crossorigin="anonymous">
 
-  <!-- Include jQuery -->
-  <script src="https://code.jquery.com/jquery-3.7.1.js" integrity="sha256-eKhayi8LEQwp4NKxN+CfCh+3qOVUtJn3QNZ0TciWLP4="
-    crossorigin="anonymous" defer></script>
+  <!-- jQuery removed 2026-07-07 as part of Roadmap Step 7 completion.
+       All static/local-js/* is now vanilla DOM. If you need to reintroduce
+       jQuery-shaped code, please: (1) don't; (2) if you must, load jQuery
+       as a devDependency in the specific page template, not globally. -->
 
   <!-- Include SortableJS -->
   <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"
@@ -70,10 +71,10 @@
     window.QS_TRAKT_REQUIREMENT_REASONS = {{ (trakt_requirement_reasons if trakt_requirement_reasons is defined else []) | tojson }};
     window.QS_MAL_REQUIREMENT_REASONS = {{ (mal_requirement_reasons if mal_requirement_reasons is defined else []) | tojson }};
   </script>
-  <script type="module" src="{{ url_for('static', filename='local-js/000-base.js') }}"></script>
-  <script type="module" src="{{ url_for('static', filename='local-js/pathValidation.js') }}"></script>
-  <script type="module" src="{{ url_for('static', filename='local-js/urlValidation.js') }}"></script>
-  <script type="module" src="{{ url_for('static', filename='local-js/templateStringList.js') }}"></script>
+  <script type="module" src="{{ asset_url('000-base') }}"></script>
+  <script type="module" src="{{ asset_url('pathValidation') }}"></script>
+  <script type="module" src="{{ asset_url('urlValidation') }}"></script>
+  <script type="module" src="{{ asset_url('templateStringList') }}"></script>
   <div class="header-container text-center">
     <img src="{{ url_for('static', filename='images/logo.webp') }}" alt="QUICKSTART" class="header-image" />
   </div>
@@ -138,14 +139,14 @@
   </div>
 
   <script type="module"
-    src="{{ url_for('static', filename='local-js/001-start.js') }}"></script>
+    src="{{ asset_url('001-start') }}"></script>
   {% if page_info['template_name'] != '001-start' %}
   {% if page_info.get('template_uses_module') %}
   <script type="module"
-    src="{{ url_for('static', filename='local-js/' + page_info['template_name'] + '.js') }}"></script>
+    src="{{ asset_url(page_info['template_name']) }}"></script>
   {% else %}
   <script type="text/javascript"
-    src="{{ url_for('static', filename='local-js/' + page_info['template_name'] + '.js') }}" defer></script>
+    src="{{ asset_url(page_info['template_name']) }}" defer></script>
   {% endif %}
   {% endif %}
 

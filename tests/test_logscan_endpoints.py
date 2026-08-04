@@ -110,6 +110,48 @@ def test_logscan_trends_reports_invalid_archived_log_candidates(client, isolated
     assert payload["ingest_health"]["invalid_archived_sample"] == [invalid_path.name]
 
 
+def test_logscan_trends_returns_lightweight_payload_while_reingest_runs(client, isolated_config_dir, monkeypatch, qs_module):
+    qs_module._reset_logscan_reingest_state()
+    qs_module.database.save_log_run(
+        {
+            "run_key": "run-existing",
+            "finished_at": "2026-04-23T10:00:00Z",
+            "config_name": "demo",
+            "created_at": "2026-04-23T10:00:00Z",
+        }
+    )
+    qs_module._update_logscan_reingest_state(
+        status="running",
+        job_id="job-running",
+        trigger="manual",
+        total=20,
+        scanned=7,
+        ingested=3,
+        current_file="meta-7.log.gz",
+    )
+    monkeypatch.setattr(qs_module, "_logscan_ingest_health", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("health scan should be skipped")))
+    monkeypatch.setattr(qs_module, "_build_logscan_resolution_context", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("resolution scan should be skipped")))
+    monkeypatch.setattr(qs_module, "_get_logscan_archive_storage_summary", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("archive storage should be skipped")))
+    acquired = qs_module.logscan_ingest_lock.acquire(blocking=False)
+    assert acquired is True
+    try:
+        resp = client.get("/logscan/trends")
+    finally:
+        qs_module.logscan_ingest_lock.release()
+        qs_module._reset_logscan_reingest_state()
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["reingest_running"] is True
+    assert payload["runs"] == []
+    assert payload["incomplete_runs"] == []
+    assert payload["total_runs"] == 1
+    assert payload["archive_storage"] is None
+    assert payload["ingest_health"]["source"] == "running"
+    assert payload["ingest_health"]["job_id"] == "job-running"
+    assert payload["ingest_health"]["scanned"] == 7
+
+
 def test_logscan_invalid_archived_log_delete_route_removes_only_invalid_archives(client, isolated_config_dir):
     archive_dir = isolated_config_dir / "cache" / "logscan" / "archive" / "imagemaid"
     archive_dir.mkdir(parents=True, exist_ok=True)
@@ -851,6 +893,23 @@ def test_normalize_logscan_archive_filenames_removes_archived_maintenance_sideca
     assert not sidecar_path.exists()
 
 
+def test_normalize_logscan_archive_filenames_removes_archived_pending_marker_artifact(isolated_config_dir, monkeypatch, qs_module):
+    archive_dir = isolated_config_dir / "cache" / "logscan" / "archive" / "kometa"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    pending_path = archive_dir / "meta.quickstart-pending.log"
+    pending_path.write_text("pending marker\n", encoding="utf-8")
+    cache = {"version": 1, "logs": {str(pending_path.resolve()): {"run_key": "run-pending", "run_complete": False}}}
+    saved = {}
+
+    monkeypatch.setattr(qs_module, "_load_logscan_ingest_cache", lambda: cache)
+    monkeypatch.setattr(qs_module, "_save_logscan_ingest_cache", lambda value: saved.setdefault("cache", value))
+
+    result = qs_module._normalize_logscan_archive_filenames()
+
+    assert result["renamed"] == 1
+    assert not pending_path.exists()
+
+
 def test_normalize_logscan_archive_filenames_collapses_repeated_kometa_archive_stem(isolated_config_dir, monkeypatch, qs_module):
     archive_dir = isolated_config_dir / "cache" / "logscan" / "archive" / "kometa"
     archive_dir.mkdir(parents=True, exist_ok=True)
@@ -1155,7 +1214,7 @@ def test_logscan_progress_includes_maintenance_sidecar_and_invalidates_cache(cli
     monkeypatch.setattr(qs_module.helpers, "is_kometa_running", lambda: True)
     monkeypatch.setattr(qs_module.persistence, "retrieve_settings", lambda *_args, **_kwargs: {"libraries": {}})
 
-    qs_module.LOGSCAN_PROGRESS_CACHE.update({"mtime": None, "size": None, "sidecar_mtime": None, "sidecar_size": None, "data": None})
+    qs_module.LOGSCAN_PROGRESS_CACHE.update({"mtime": None, "size": None, "aux_signature": None, "data": None})
 
     first = client.get("/logscan/progress")
     assert first.status_code == 200
@@ -1180,6 +1239,28 @@ def test_logscan_progress_includes_maintenance_sidecar_and_invalidates_cache(cli
     assert second_payload["maintenance_summary"]["had_pause"] is True
     assert second_payload["maintenance_summary"]["pause_count"] == 1
     assert second_payload["maintenance_summary"]["pause_seconds"] == 120
+
+
+def test_archive_log_file_refuses_live_meta_archive_when_pending_markers_cannot_flush(isolated_config_dir, monkeypatch, qs_module):
+    kometa_root = Path(qs_module.app.config["KOMETA_ROOT"])
+    log_dir = kometa_root / "config" / "logs"
+    archive_dir = isolated_config_dir / "cache" / "logscan" / "archive" / "kometa"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "meta.log"
+    log_path.write_text("live meta log\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        qs_module,
+        "_flush_quickstart_pending_markers",
+        lambda *_args, **_kwargs: {"flushed": False, "inserted": 0, "anchor": "running"},
+    )
+
+    archived = qs_module._archive_log_file(log_path, archive_dir, log_dir=log_dir, allow_live_meta=True)
+
+    assert archived is None
+    assert log_path.exists()
+    assert list(archive_dir.glob("*")) == []
 
 
 def test_logscan_reingest_ingests_day_runtime_log(client, isolated_config_dir, monkeypatch, qs_module):
@@ -1213,6 +1294,58 @@ def test_logscan_reingest_ingests_day_runtime_log(client, isolated_config_dir, m
     runs = qs_module.database.get_log_runs(limit=10)
     assert runs
     assert runs[0]["start_mode"] == "recovery"
+
+
+def test_logscan_reingest_flushes_ingest_cache_incrementally(isolated_config_dir, monkeypatch, qs_module):
+    class FakeAnalyzer:
+        _people_index = {}
+
+        def preload_people_index(self, *_args, **_kwargs):
+            return None
+
+        def analyze_content(self, _content, log_path=None, **_kwargs):
+            run_key = Path(log_path).stem
+            return {
+                "summary": {
+                    "run_key": run_key,
+                    "finished_at": f"2026-04-{run_key[-2:]}T10:00:00Z",
+                    "run_complete": True,
+                    "tool_name": "kometa",
+                    "created_at": f"2026-04-{run_key[-2:]}T10:00:00Z",
+                },
+                "recommendations": [],
+                "missing_people": [],
+            }
+
+        def collect_missing_people_lines(self, *_args, **_kwargs):
+            return []
+
+    log_dir = isolated_config_dir / "kometa" / "config" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_files = []
+    for idx in range(qs_module.LOGSCAN_INGEST_CACHE_FLUSH_INTERVAL + 1):
+        path = log_dir / f"meta-{idx:02d}.log"
+        path.write_text("finished run\n", encoding="utf-8")
+        log_files.append(path)
+
+    cache = {"version": 1, "logs": {}}
+    save_sizes = []
+    monkeypatch.setattr(qs_module.logscan, "LogscanAnalyzer", FakeAnalyzer)
+    monkeypatch.setattr(qs_module, "_get_logscan_log_files", lambda *_args, **_kwargs: log_files)
+    monkeypatch.setattr(qs_module, "_load_logscan_ingest_cache", lambda: cache)
+    monkeypatch.setattr(qs_module, "_clear_logscan_ingest_cache", lambda: None)
+    monkeypatch.setattr(qs_module, "_save_logscan_ingest_cache", lambda payload: save_sizes.append(len(payload.get("logs", {}))))
+    monkeypatch.setattr(qs_module, "_build_completed_log_progress_snapshot", lambda **_kwargs: {})
+    monkeypatch.setattr(qs_module, "_archive_log_file", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(qs_module.database, "clear_log_runs", lambda: True)
+    monkeypatch.setattr(qs_module.database, "save_log_run", lambda *_args, **_kwargs: True)
+
+    result = qs_module._perform_logscan_reingest(reset=True, update_state=False)
+
+    assert result["success"] is True
+    assert result["scanned"] == len(log_files)
+    assert save_sizes[0] == qs_module.LOGSCAN_INGEST_CACHE_FLUSH_INTERVAL
+    assert save_sizes[-1] == len(log_files)
 
 
 def test_logscan_reingest_archives_incomplete_rotated_live_log(client, isolated_config_dir, monkeypatch, qs_module):
@@ -2007,6 +2140,30 @@ def test_logscan_trends_returns_kometa_start_mode(client, isolated_config_dir, m
     assert payload["runs"]
     assert payload["runs"][0]["tool_name"] == "kometa"
     assert payload["runs"][0]["start_mode"] == "recovery"
+
+
+def test_logscan_trends_returns_quickstart_version_fields(client, isolated_config_dir, qs_module):
+    qs_module.database.save_log_run(
+        {
+            "run_key": "run-quickstart-version-1",
+            "tool_name": "kometa",
+            "finished_at": "2026-05-05T20:17:00Z",
+            "config_name": "demo",
+            "created_at": "2026-05-05T20:17:00Z",
+            "quickstart_run_marker": True,
+            "quickstart_version": "0.10.4-build302",
+            "quickstart_branch": "develop",
+            "kometa_version": "2.3.1",
+        }
+    )
+
+    resp = client.get("/logscan/trends")
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["runs"]
+    assert payload["runs"][0]["quickstart_run_marker"] is True
+    assert payload["runs"][0]["quickstart_version"] == "0.10.4-build302"
+    assert payload["runs"][0]["quickstart_branch"] == "develop"
 
 
 def test_logscan_startup_migration_defers_without_logs(isolated_config_dir, monkeypatch, qs_module):

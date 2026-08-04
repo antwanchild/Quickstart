@@ -54,6 +54,15 @@ def validate_apprise():
     return validations.validate_apprise_server(data)
 
 
+@bp.route("/validate_yamtrack", methods=["POST"])
+def validate_yamtrack():
+    data = request.get_json(silent=True) or {}
+    valid, message = url_validation.validate_url(data.get("yamtrack_url"), allow_local=True)
+    if not valid:
+        return jsonify({"valid": False, "error": f"Yamtrack URL: {message}"}), 400
+    return validations.validate_yamtrack_server(data)
+
+
 @bp.route("/validate_overlay_source_override", methods=["POST"])
 def validate_overlay_source_override():
     data = request.get_json(silent=True) or {}
@@ -103,7 +112,10 @@ def validate_plex():
     except Exception as e:
         helpers.ts_log(f"Failed to fetch Plex telemetry during validation: {e}", level="WARNING")
 
-    merged = {**plex_data, **telemetry}
+    # Keep validator fields authoritative for the Plex page contract. Telemetry
+    # uses display strings like "2048 MB", while the page's db_cache input needs
+    # the numeric value returned by validate_plex_server.
+    merged = {**telemetry, **plex_data}
     return jsonify(merged)
 
 

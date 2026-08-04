@@ -115,6 +115,12 @@ document.addEventListener('DOMContentLoaded', function () {
   const renameConfigNewName = document.getElementById('renameConfigNewName')
   const renameConfigError = document.getElementById('renameConfigError')
   const confirmRenameConfig = document.getElementById('confirmRenameConfig')
+  const duplicateConfigButton = document.getElementById('duplicateConfigButton')
+  const duplicateConfigModalEl = document.getElementById('duplicateConfigModal')
+  const duplicateConfigSource = document.getElementById('duplicateConfigSource')
+  const duplicateConfigNewName = document.getElementById('duplicateConfigNewName')
+  const duplicateConfigError = document.getElementById('duplicateConfigError')
+  const confirmDuplicateConfig = document.getElementById('confirmDuplicateConfig')
   const importConfigModalEl = document.getElementById('importConfigModal')
   const importConfigFile = document.getElementById('importConfigFile')
   const importConfigName = document.getElementById('importConfigName')
@@ -176,6 +182,7 @@ document.addEventListener('DOMContentLoaded', function () {
   let importReportFilter = 'all'
   let importNeedsPlexCredentials = false
   let importNeedsTmdbCredentials = false
+  let importConfirmInFlight = false
 
   if (importPlexTokenToggle && importPlexToken) {
     if (!importPlexToken.value.trim()) {
@@ -429,6 +436,7 @@ document.addEventListener('DOMContentLoaded', function () {
     resetConfigButton.disabled = isAddConfig
     if (deleteConfigButton) deleteConfigButton.disabled = isAddConfig
     if (renameConfigButton) renameConfigButton.disabled = isAddConfig
+    if (duplicateConfigButton) duplicateConfigButton.disabled = getAvailableConfigs().length === 0
 
     const box = document.getElementById('newConfigInput')
     if (box) box.classList.toggle('d-none', !(isAddConfig || onlyAddConfigAvailable))
@@ -973,17 +981,24 @@ document.addEventListener('DOMContentLoaded', function () {
       return
     }
     if (currentAction === 'reset') {
-      $.post('/clear_session', { name: selectedConfig }, function (response) {
-        if (response.status === 'success') {
-          showToast('success', response.message)
-          setTimeout(() => window.location.reload(), 4500)
-        } else {
-          showToast('error', response.message || 'An unexpected error occurred.')
-        }
-      }).fail(function (error) {
-        const errorMessage = error.responseJSON?.message || 'An unknown error occurred.'
-        showToast('error', errorMessage)
+      const body = new URLSearchParams({ name: selectedConfig })
+      fetch('/clear_session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body
       })
+        .then(response => response.json().then(data => ({ ok: response.ok, data })))
+        .then(({ ok, data }) => {
+          if (ok && data.status === 'success') {
+            showToast('success', data.message)
+            setTimeout(() => window.location.reload(), 4500)
+          } else {
+            showToast('error', data.message || 'An unexpected error occurred.')
+          }
+        })
+        .catch(() => {
+          showToast('error', 'An unknown error occurred.')
+        })
     } else if (currentAction === 'delete') {
       fetch(`/clear_data/${selectedConfig}`, { method: 'GET' })
         .then(response => {
@@ -1246,6 +1261,158 @@ document.addEventListener('DOMContentLoaded', function () {
     })
   }
 
+  function setDuplicateError (message) {
+    if (!duplicateConfigError) return
+    if (!message) {
+      duplicateConfigError.classList.add('d-none')
+      duplicateConfigError.textContent = ''
+      return
+    }
+    duplicateConfigError.classList.remove('d-none')
+    duplicateConfigError.textContent = message
+  }
+
+  function suggestDuplicateName (sourceName) {
+    const base = sanitizeConfigName(sourceName || 'config') || 'config'
+    let candidate = `${base}_copy`
+    let suffix = 2
+    while (isDuplicateName(candidate)) {
+      candidate = `${base}_copy_${suffix}`
+      suffix += 1
+    }
+    return candidate
+  }
+
+  function getCurrentDuplicateSourceName () {
+    const managedSelection = configSelector?.value && configSelector.value !== 'add_config'
+      ? configSelector.value
+      : ''
+    return managedSelection || activeConfigInput?.value || window.pageInfo?.config_name || ''
+  }
+
+  function prepareDuplicateConfigModal () {
+    const currentName = getCurrentDuplicateSourceName()
+    if (duplicateConfigSource && currentName) {
+      duplicateConfigSource.value = currentName
+    }
+    if (duplicateConfigNewName) {
+      duplicateConfigNewName.value = suggestDuplicateName(duplicateConfigSource?.value || currentName)
+      removeValidationMessages(duplicateConfigNewName)
+    }
+    setDuplicateError('')
+    updateDuplicateState()
+  }
+
+  function updateDuplicateState () {
+    if (!duplicateConfigSource || !duplicateConfigNewName || !confirmDuplicateConfig) return false
+    const sourceName = duplicateConfigSource.value || ''
+    const sanitized = sanitizeConfigName(duplicateConfigNewName.value)
+    duplicateConfigNewName.value = sanitized
+    removeValidationMessages(duplicateConfigNewName)
+    confirmDuplicateConfig.disabled = true
+    setDuplicateError('')
+
+    if (!sourceName) {
+      setDuplicateError('Select a source config.')
+      return false
+    }
+    if (!sanitized) return false
+    if (sanitized.toLowerCase() === sourceName.toLowerCase()) {
+      applyValidationStyles(duplicateConfigNewName, 'error', 'Name must be different.')
+      setDuplicateError('New name must be different.')
+      return false
+    }
+    if (isDuplicateName(sanitized)) {
+      applyValidationStyles(duplicateConfigNewName, 'error', 'Name already exists.')
+      setDuplicateError('Config name already exists.')
+      return false
+    }
+    applyValidationStyles(duplicateConfigNewName, 'success')
+    confirmDuplicateConfig.disabled = false
+    return true
+  }
+
+  if (duplicateConfigModalEl) {
+    duplicateConfigModalEl.addEventListener('show.bs.modal', () => {
+      prepareDuplicateConfigModal()
+    })
+    duplicateConfigModalEl.addEventListener('shown.bs.modal', () => {
+      updateDuplicateState()
+      duplicateConfigNewName?.focus()
+      duplicateConfigNewName?.select()
+    })
+  }
+
+  if (duplicateConfigButton) {
+    duplicateConfigButton.addEventListener('click', () => {
+      prepareDuplicateConfigModal()
+      window.setTimeout(updateDuplicateState, 0)
+    })
+  }
+
+  if (duplicateConfigSource) {
+    duplicateConfigSource.addEventListener('change', () => {
+      if (duplicateConfigNewName) {
+        duplicateConfigNewName.value = suggestDuplicateName(duplicateConfigSource.value)
+      }
+      updateDuplicateState()
+    })
+  }
+
+  if (duplicateConfigNewName) {
+    duplicateConfigNewName.addEventListener('input', updateDuplicateState)
+    duplicateConfigNewName.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return
+      event.preventDefault()
+      if (confirmDuplicateConfig && !confirmDuplicateConfig.disabled) {
+        confirmDuplicateConfig.click()
+      }
+    })
+  }
+
+  if (confirmDuplicateConfig) {
+    confirmDuplicateConfig.addEventListener('click', async (event) => {
+      event.preventDefault()
+      const sourceName = duplicateConfigSource?.value || ''
+      const newName = sanitizeConfigName(duplicateConfigNewName?.value || '')
+      if (!sourceName) {
+        setDuplicateError('Select a source config.')
+        return
+      }
+      if (!newName) {
+        setDuplicateError('Enter a new config name.')
+        return
+      }
+
+      const originalHtml = confirmDuplicateConfig.innerHTML
+      confirmDuplicateConfig.disabled = true
+      confirmDuplicateConfig.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Duplicating...'
+      try {
+        const res = await fetch('/duplicate-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source_name: sourceName, new_name: newName })
+        })
+        const data = await res.json()
+        if (!res.ok || !data.success) {
+          throw new Error(data.message || 'Duplicate failed.')
+        }
+        upsertConfigOption(data.new_name)
+        applyActiveConfigUi(data.new_name)
+        showToast('success', `Duplicated '${sourceName}' to '${data.new_name}'.`)
+        const modal = bootstrap.Modal.getInstance(duplicateConfigModalEl)
+        if (modal) modal.hide()
+        window.setTimeout(() => window.location.reload(), 900)
+      } catch (err) {
+        confirmDuplicateConfig.disabled = false
+        setDuplicateError(err.message || 'Duplicate failed.')
+      } finally {
+        confirmDuplicateConfig.innerHTML = originalHtml
+        updateDuplicateState()
+      }
+    })
+  }
+
   function setImportError (message) {
     if (!importConfigError) return
     if (!message) {
@@ -1356,6 +1523,7 @@ document.addEventListener('DOMContentLoaded', function () {
     gotify: 'Gotify',
     ntfy: 'ntfy',
     apprise: 'Apprise',
+    yamtrack: 'Yamtrack',
     github: 'GitHub',
     radarr: 'Radarr',
     sonarr: 'Sonarr',
@@ -1379,6 +1547,7 @@ document.addEventListener('DOMContentLoaded', function () {
     'gotify',
     'ntfy',
     'apprise',
+    'yamtrack',
     'webhooks',
     'anidb',
     'radarr',
@@ -1992,12 +2161,15 @@ document.addEventListener('DOMContentLoaded', function () {
     })
   }
 
-  if (confirmImportButton) {
+  if (confirmImportButton && confirmImportButton.dataset.importConfirmBound !== 'true') {
+    confirmImportButton.dataset.importConfirmBound = 'true'
     confirmImportButton.addEventListener('click', async () => {
+      if (importConfirmInFlight) return
       if (!importToken) {
         setImportError('Preview the import before confirming.')
         return
       }
+      importConfirmInFlight = true
       confirmImportButton.disabled = true
       confirmImportButton.textContent = 'Importing...'
 
@@ -2133,6 +2305,7 @@ document.addEventListener('DOMContentLoaded', function () {
           '080-gotify': 'Gotify',
           '085-ntfy': 'ntfy',
           '087-apprise': 'Apprise',
+          '088-yamtrack': 'Yamtrack',
           '090-webhooks': 'Webhooks',
           '100-anidb': 'AniDB',
           '110-radarr': 'Radarr',
@@ -2232,6 +2405,7 @@ document.addEventListener('DOMContentLoaded', function () {
           setImportError(message)
         }
       } finally {
+        importConfirmInFlight = false
         confirmImportButton.disabled = false
         confirmImportButton.textContent = 'Import'
       }

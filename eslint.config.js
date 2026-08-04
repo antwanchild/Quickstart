@@ -46,7 +46,11 @@ const browserGlobals = {
 // module, remove `jumpTo` from this list and add it to the
 // `no-restricted-syntax` ban below.
 const quickstartGlobals = {
-  $: 'readonly',
+  // NOTE: `$` was removed from this list on 2026-07-07 alongside the
+  // jQuery <script> removal from templates/000-base.html (Roadmap Step
+  // 7 completion). Re-adding it would silently allow jQuery calls to
+  // creep back in and either crash at runtime or force jQuery to be
+  // reintroduced. Don't.
   bootstrap: 'readonly',
   validateButton: 'readonly',
   showSpinner: 'readonly',
@@ -102,6 +106,7 @@ const moduleFiles = [
   'static/local-js/080-gotify.js',
   'static/local-js/085-ntfy.js',
   'static/local-js/087-apprise.js',
+  'static/local-js/088-yamtrack.js',
   'static/local-js/090-webhooks.js',
   'static/local-js/100-anidb.js',
   'static/local-js/110-radarr.js',
@@ -156,7 +161,6 @@ const retiredShimMessage = (name) =>
 module.exports = [
   {
     files: ['static/local-js/**/*.js'],
-    ignores: ['static/local-js/bootstrap.bundle.js'],
     languageOptions: {
       ecmaVersion: 'latest',
       sourceType: 'script',
@@ -179,6 +183,24 @@ module.exports = [
       'no-var': 'error',
       'prefer-const': 'error',
       eqeqeq: ['error', 'always', { null: 'ignore' }],
+      // Guard the app-config accessor boundary (#1334 Step 5). All
+      // app-level config reads/writes go through getAppConfig /
+      // setAppConfig in modules/appConfig.js so that the bootstrap
+      // mechanism (inline object today; fetched payload or reactive
+      // store tomorrow) can change in exactly one place. Direct
+      // window.QS_AppConfig member access re-couples call sites to the
+      // current mechanism. The accessor module itself is exempted in
+      // an override block below.
+      'no-restricted-properties': [
+        'error',
+        {
+          object: 'window',
+          property: 'QS_AppConfig',
+          message:
+            'Do not read window.QS_AppConfig directly. Import ' +
+            'getAppConfig/setAppConfig from modules/appConfig.js instead.'
+        }
+      ],
       // Regression guards for the inline-handler / shim cleanup sprint.
       'no-restricted-syntax': [
         'error',
@@ -203,6 +225,14 @@ module.exports = [
     files: moduleFiles,
     languageOptions: {
       sourceType: 'module'
+    }
+  },
+  {
+    // The accessor module is the one place allowed to touch
+    // window.QS_AppConfig -- it owns the namespace.
+    files: ['static/local-js/modules/appConfig.js'],
+    rules: {
+      'no-restricted-properties': 'off'
     }
   }
 ]

@@ -46,6 +46,7 @@ QS_SPECIAL_LIBRARY_TEMPLATE_KEYS = {
     "sep_style",
 }
 QS_SPECIAL_GLOBAL_SUPPORTED_KEYS = {
+    "collection_section",
     "minimum_items",
     "playlist_exclude_users",
     "playlist_sync_to_users",
@@ -56,6 +57,14 @@ QS_SPECIAL_PLAYLIST_SUPPORTED_KEYS = {
     "playlist_exclude_users",
     "playlist_sync_to_users",
     "sync_to_users",
+}
+LETTERBOXD_LEGACY_KEY_MAP = {
+    "use_top_250": "use_top_500",
+    "radarr_add_missing_top_250": "radarr_add_missing_top_500",
+    "visible_home_top_250": "visible_home_top_500",
+    "visible_library_top_250": "visible_library_top_500",
+    "visible_shared_top_250": "visible_shared_top_500",
+    "limit_top_250": "limit_top_500",
 }
 
 DEFAULT_EXCLUDED_DIR_NAMES = {
@@ -100,6 +109,7 @@ KOMETA_TOP_LEVEL_MARKERS = (
     "gotify",
     "ntfy",
     "apprise",
+    "yamtrack",
     "github",
     "radarr",
     "sonarr",
@@ -138,6 +148,8 @@ LIBRARY_OVERLAY_ONLY_KEYS = {
     "vertical_align",
     "horizontal_offset",
     "vertical_offset",
+    "horizontal_position",
+    "vertical_position",
     "back_width",
     "back_height",
     "back_padding",
@@ -146,7 +158,14 @@ LIBRARY_OVERLAY_ONLY_KEYS = {
     "back_align",
     "back_color",
     "back_line_color",
+    "builder_level",
+    "rating_alignment",
 }
+LIBRARY_OVERLAY_ONLY_PREFIXES = (
+    "rating1",
+    "rating2",
+    "rating3",
+)
 INTERNAL_OVERLAY_TEMPLATE_KEYS = {
     "final_horizontal_offset",
     "final_vertical_offset",
@@ -664,12 +683,20 @@ def build_qs_overlay_map(qs_overlays_path: Path, *, enrich_runtime_support: bool
 
 def overlay_key_supported_in_quickstart(alias: str | None, key: str, qs_overlays: dict[str, set[str]]) -> bool:
     alias_text = str(alias or "").strip().lower()
-    if key in qs_overlays.get(alias_text, set()):
+    alias_keys = qs_overlays.get(alias_text, set())
+    if key in alias_keys:
         return True
+
+    # Quickstart exposes ratings font sizing per slot rather than as the
+    # shared Kometa template variable, but users still get full control over
+    # the rendered ratings font sizes through those slot inputs.
+    if alias_text == "ratings" and key == "font_size":
+        if any(f"rating{idx}_font_size" in alias_keys for idx in ("1", "2", "3")):
+            return True
 
     source_override_prefixes = ("file", "url", "git", "repo")
     for prefix in source_override_prefixes:
-        if key.startswith(f"{prefix}_") and prefix in qs_overlays.get(alias_text, set()):
+        if key.startswith(f"{prefix}_") and prefix in alias_keys:
             return True
 
     # Quickstart models subtitle language flags as a dedicated overlay alias,
@@ -713,12 +740,32 @@ def build_qs_global_supported_keys(qs_attributes_path: Path) -> set[str]:
 def build_qs_playlist_supported_keys(qs_attributes_path: Path) -> set[str]:
     keys = set(QS_SPECIAL_PLAYLIST_SUPPORTED_KEYS)
     keys.update(build_qs_global_supported_keys(qs_attributes_path))
+    keys.update(str(key) for key in importer.PLAYLIST_SHARED_IMPORT_FIELDS.keys())
+    keys.update(str(key) for key in importer.PLAYLIST_KEYED_IMPORT_FIELDS.keys())
     return keys
 
 
-def build_schema_key_set(schema_path: Path) -> set[str]:
+def normalize_legacy_template_key(kind: str, alias: str | None, key: str) -> str:
+    if kind == "collection" and str(alias or "").strip().lower() == "letterboxd":
+        return LETTERBOXD_LEGACY_KEY_MAP.get(key, key)
+    return key
+
+
+def playlist_key_supported_in_quickstart(key: str, qs_playlist_keys: set[str]) -> bool:
+    if key in qs_playlist_keys:
+        return True
+
+    for prefix in importer.PLAYLIST_KEYED_IMPORT_FIELDS.keys():
+        if key.startswith(str(prefix)):
+            return True
+
+    return False
+
+
+def build_schema_key_index(schema_path: Path) -> tuple[set[str], list[re.Pattern[str]]]:
     data = load_json(schema_path)
     keys: set[str] = set()
+    patterns: list[re.Pattern[str]] = []
 
     def walk(node: Any) -> None:
         if isinstance(node, dict):
@@ -730,7 +777,10 @@ def build_schema_key_set(schema_path: Path) -> set[str]:
             pattern_properties = node.get("patternProperties")
             if isinstance(pattern_properties, dict):
                 for key, value in pattern_properties.items():
-                    keys.add(str(key))
+                    try:
+                        patterns.append(re.compile(str(key)))
+                    except re.error:
+                        pass
                     walk(value)
             for value in node.values():
                 walk(value)
@@ -739,7 +789,18 @@ def build_schema_key_set(schema_path: Path) -> set[str]:
                 walk(item)
 
     walk(data)
+    return keys, patterns
+
+
+def build_schema_key_set(schema_path: Path) -> set[str]:
+    keys, _patterns = build_schema_key_index(schema_path)
     return keys
+
+
+def schema_declares_key(key: str, schema_keys: set[str], schema_patterns: list[re.Pattern[str]]) -> bool:
+    if key in schema_keys:
+        return True
+    return any(pattern.fullmatch(key) for pattern in schema_patterns)
 
 
 def resolve_default_paths(alias: str, kind: str, kometa_defaults: Path) -> list[Path]:
@@ -2307,7 +2368,16 @@ def build_importer_summary(rows: list[dict[str, Any]]) -> dict[tuple[str, str | 
     return summary
 
 
+def is_library_overlay_only_key(key: str) -> bool:
+    if key in LIBRARY_OVERLAY_ONLY_KEYS:
+        return True
+    return any(key == prefix or key.startswith(f"{prefix}_") for prefix in LIBRARY_OVERLAY_ONLY_PREFIXES)
+
+
 QUICKSTART_RECOMMENDATION_EXCLUSIONS: dict[tuple[str, str], str] = {
+    ("collection", "in_the_last_released"): "basic_chart_search_window_not_user_facing_quickstart",
+    ("collection", "in_the_last_episodes"): "basic_chart_search_window_not_user_facing_quickstart",
+    ("overlay", "text"): "valid_but_not_recommended_for_quickstart",
     ("library", "metadata_path"): "legacy_library_path_key_not_recommended",
     ("library", "overlay_path"): "legacy_library_path_key_not_recommended",
     ("library", "reapply_overlays"): "valid_but_not_recommended_for_quickstart",
@@ -2326,12 +2396,17 @@ def get_quickstart_recommendation_exclusion(row: dict[str, Any]) -> str | None:
         return structural_reason
     kind = str(row.get("kind") or "")
     key = str(row.get("key") or "")
-    if kind == "library" and key in LIBRARY_OVERLAY_ONLY_KEYS:
+    if kind == "library" and is_library_overlay_only_key(key):
         return "overlay_rendering_key_misclassified_at_library_scope"
+    if kind == "overlay" and str(row.get("default") or "") == "languages" and key == "text":
+        return "valid_but_not_recommended_for_quickstart"
     return QUICKSTART_RECOMMENDATION_EXCLUSIONS.get((kind, key))
 
 
 MERGED_FIX_QUEUE_EXCLUSIONS: dict[tuple[str, str], str] = {
+    ("collection", "in_the_last_released"): "basic_chart_search_window_not_user_facing_quickstart",
+    ("collection", "in_the_last_episodes"): "basic_chart_search_window_not_user_facing_quickstart",
+    ("overlay", "text"): "valid_but_not_recommended_for_quickstart",
     ("library", "library_type"): "internal_importer_or_analyzer_metadata",
     ("library", "sort_by"): "library_template_variable_not_documented_for_quickstart",
     ("library", "exclude"): "library_template_variable_not_documented_for_quickstart",
@@ -2347,6 +2422,10 @@ def get_merged_fix_queue_exclusion(row: dict[str, Any]) -> str | None:
         return structural_reason
     kind = str(row.get("kind") or "")
     key = str(row.get("key") or "")
+    if kind == "library" and is_library_overlay_only_key(key):
+        return "overlay_rendering_key_misclassified_at_library_scope"
+    if kind == "overlay" and str(row.get("default") or "") == "languages" and key == "text":
+        return "valid_but_not_recommended_for_quickstart"
     return MERGED_FIX_QUEUE_EXCLUSIONS.get((kind, key))
 
 
@@ -3109,7 +3188,7 @@ def main() -> None:
         qs_library_keys = build_qs_library_template_keys(qs_attributes_path)
         qs_global_keys = build_qs_global_supported_keys(qs_attributes_path)
         qs_playlist_keys = build_qs_playlist_supported_keys(qs_attributes_path)
-        schema_keys = build_schema_key_set(kometa_schema_path)
+        schema_keys, schema_patterns = build_schema_key_index(kometa_schema_path)
         if progress_callback:
             print(
                 f"[progress][discovery] discovered {len(input_files)} YAML files across {len(inputs)} input root(s)",
@@ -3230,9 +3309,10 @@ def main() -> None:
         for idx, row in enumerate(uploaded[resumed_from_index:], start=resumed_from_index + 1):
             if verify_callback:
                 verify_callback("verifying findings", idx, len(uploaded))
-            key = row["key"]
             kind = row["kind"]
             alias = row["default"]
+            original_key = row["key"]
+            key = normalize_legacy_template_key(kind, alias, original_key)
             if kind == "collection":
                 supported = key in qs_collections.get(alias or "", set()) or key in qs_global_keys
                 quickstart_declared = supported
@@ -3244,7 +3324,7 @@ def main() -> None:
                 default_files = resolve_default_paths(alias or "", kind, kometa_defaults)
                 name_verified, matched_files = key_is_valid_for_default(key, default_files)
             elif kind == "playlist":
-                supported = key in qs_playlist_keys
+                supported = playlist_key_supported_in_quickstart(key, qs_playlist_keys)
                 quickstart_declared = supported
                 default_files = resolve_default_paths(alias or "", kind, kometa_defaults)
                 name_verified, matched_files = key_is_valid_for_default(key, default_files)
@@ -3255,7 +3335,7 @@ def main() -> None:
                 matched_files = []
 
             value_shape_verified, value_shape_rule = infer_value_shape(row["value"], key)
-            schema_declared = key in schema_keys
+            schema_declared = schema_declares_key(key, schema_keys, schema_patterns)
             validation_level = classify_validation_level(supported, schema_declared, name_verified)
             out = dict(row)
             out["supported_in_quickstart"] = supported
@@ -3268,6 +3348,9 @@ def main() -> None:
             out["value_shape_rule"] = value_shape_rule
             out["runtime_guaranteed"] = False
             out["valid_for_kometa"] = name_verified
+            if key != original_key:
+                out["legacy_key"] = original_key
+                out["key"] = key
             out["matched_default_files"] = [str(p.relative_to(kometa_defaults)) for p in matched_files]
             all_rows.append(out)
             verify_buffer.append(out)

@@ -1,4 +1,4 @@
-"""Config artifact management utilities extracted from _legacy.py."""
+"""Config artifact management utilities extracted from the original helpers.py monolith."""
 
 import datetime
 import re
@@ -6,7 +6,7 @@ import shutil
 
 from pathlib import Path
 
-from modules.helpers._legacy import CONFIG_DIR
+from modules.helpers._constants import CONFIG_DIR
 
 MANAGED_LIBRARY_FILE_DIRS = ("metadata_files", "collection_files", "overlay_files")
 MANAGED_OVERLAY_IMAGE_DIR = "overlay_images"
@@ -135,7 +135,7 @@ def sync_managed_library_artifacts_to_kometa(
     kometa_config_dir: str | Path | None = None,
 ) -> dict:
     from modules.helpers._file_utils import _directory_tree_signature
-    from modules.helpers._legacy import get_kometa_config_dir
+    from modules.helpers._kometa_paths import get_kometa_config_dir
     from modules.helpers._pid import handle_remove_readonly
 
     normalized = require_config_name_for_storage(config_name, context="Managed library artifact sync")
@@ -204,7 +204,7 @@ def delete_config_artifacts(
     kometa_root: str | Path | None = None,
     kometa_config_dir: str | Path | None = None,
 ) -> dict:
-    from modules.helpers._legacy import get_kometa_config_dir
+    from modules.helpers._kometa_paths import get_kometa_config_dir
 
     normalized = require_config_name_for_storage(config_name, context="Config artifact cleanup")
     if is_reserved_runtime_bundle_name(normalized):
@@ -301,7 +301,7 @@ def list_orphaned_config_artifacts(
     kometa_root: str | Path | None = None,
     kometa_config_dir: str | Path | None = None,
 ) -> dict:
-    from modules.helpers._legacy import get_kometa_config_dir
+    from modules.helpers._kometa_paths import get_kometa_config_dir
 
     config_dir = Path(CONFIG_DIR)
     archive_root = config_dir / "archives"

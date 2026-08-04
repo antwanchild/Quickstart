@@ -34,6 +34,7 @@ def _template_list():
         ("050-omdb.html", "OMDb"),
         ("060-mdblist.html", "MDBList"),
         ("087-apprise.html", "Apprise"),
+        ("088-yamtrack.html", "Yamtrack"),
         ("100-anidb.html", "AniDB"),
         ("110-radarr.html", "Radarr"),
         ("120-sonarr.html", "Sonarr"),
@@ -588,7 +589,7 @@ def test_workspace_app_readiness_imagemaid_missing_plex_points_to_plex(monkeypat
     assert payload["imagemaid"]["target_step"] == "010-plex"
 
 
-def test_workspace_app_readiness_kometa_freshness_keeps_app_available(monkeypatch, qs_module, workspace_status_module):
+def test_workspace_app_readiness_kometa_freshness_stays_ready(monkeypatch, qs_module, workspace_status_module):
     monkeypatch.setattr(qs_module.helpers, "get_menu_list", _template_list)
     monkeypatch.setattr(qs_module.database, "get_unique_config_names", lambda: ["cfg"])
     monkeypatch.setattr(workspace_status_module, "_build_workspace_status_context", lambda *_args, **_kwargs: {"readiness": {}})
@@ -610,9 +611,10 @@ def test_workspace_app_readiness_kometa_freshness_keeps_app_available(monkeypatc
 
     payload = qs_module._build_workspace_app_readiness("cfg")
 
-    assert payload["kometa"]["state"] == "review"
-    assert payload["kometa"]["summary"] == "Validation refresh recommended"
+    assert payload["kometa"]["state"] == "ready"
+    assert payload["kometa"]["summary"] == "Ready"
     assert payload["kometa"]["action_label"] == "Open Kometa"
+    assert payload["kometa"]["href"] == "/step/900-kometa"
 
 
 def test_workspace_status_context_aligns_app_steps_with_app_readiness(monkeypatch, qs_module, workspace_status_module):
@@ -882,6 +884,32 @@ def test_workspace_context_keeps_trakt_optional_without_dependency(monkeypatch, 
     assert ctx["trakt_requirement_reasons"] == []
 
 
+def test_trakt_optional_token_only_residue_stays_unknown(qs_module):
+    section_rows = {
+        "trakt": {
+            "validated": False,
+            "user_entered": True,
+            "data": {
+                "validation_status": "",
+                "validation_reason": "",
+                "trakt": {
+                    "authorization": {
+                        "access_token": "stale-access-token",
+                        "refresh_token": "stale-refresh-token",
+                    },
+                    "client_id": None,
+                    "client_secret": None,
+                    "pin": None,
+                    "force_refresh": False,
+                },
+            },
+        }
+    }
+
+    state = qs_module._derive_step_status("130-trakt", "optional", section_rows, config_exists=True)
+    assert state == "unknown"
+
+
 def test_optional_skipped_without_changes_stays_unknown(qs_module):
     section_rows = {
         "tautulli": {
@@ -989,6 +1017,31 @@ def test_mal_optional_without_credentials_ignores_stale_failed_marker(qs_module)
                 "mal": {
                     "cache_expiration": "60",
                     "authorization": {"access_token": ""},
+                },
+            },
+        }
+    }
+
+    state = qs_module._derive_step_status("140-mal", "optional", section_rows, config_exists=True)
+    assert state == "unknown"
+
+
+def test_mal_optional_token_only_residue_stays_unknown(qs_module):
+    section_rows = {
+        "mal": {
+            "validated": False,
+            "user_entered": True,
+            "data": {
+                "validation_status": "",
+                "validation_reason": "",
+                "mal": {
+                    "authorization": {
+                        "access_token": "stale-access-token",
+                        "refresh_token": "stale-refresh-token",
+                    },
+                    "client_id": None,
+                    "client_secret": None,
+                    "localhost_url": None,
                 },
             },
         }
@@ -1111,6 +1164,47 @@ def test_apprise_optional_without_location_stays_unknown(qs_module):
     }
 
     state = qs_module._derive_step_status("087-apprise", "optional", section_rows, config_exists=True)
+    assert state == "unknown"
+
+
+def test_yamtrack_optional_with_validated_credentials_is_ok(qs_module):
+    section_rows = {
+        "yamtrack": {
+            "validated": True,
+            "user_entered": True,
+            "data": {
+                "validation_status": "validated",
+                "yamtrack": {
+                    "url": "http://yamtrack.local:8000",
+                    "username": "kometa",
+                    "password": "secret",
+                },
+            },
+        }
+    }
+
+    state = qs_module._derive_step_status("088-yamtrack", "optional", section_rows, config_exists=True)
+    assert state == "ok"
+
+
+def test_yamtrack_optional_without_credentials_stays_unknown(qs_module):
+    section_rows = {
+        "yamtrack": {
+            "validated": False,
+            "user_entered": False,
+            "data": {
+                "validation_status": "skipped",
+                "validation_reason": "missing_credentials",
+                "yamtrack": {
+                    "url": "",
+                    "username": "",
+                    "password": "",
+                },
+            },
+        }
+    }
+
+    state = qs_module._derive_step_status("088-yamtrack", "optional", section_rows, config_exists=True)
     assert state == "unknown"
 
 
@@ -1596,3 +1690,49 @@ def test_libraries_mal_dependency_hint_endpoint_non_mal_source_returns_empty(cli
     assert payload["success"] is True
     assert payload["required"] is False
     assert payload["reasons"] == []
+
+
+def test_live_validation_rollup_skipped_optional_steps_do_not_warn():
+    from modules.workspace_rollups import _build_live_validation_rollup
+
+    template_keys = ["010-plex", "020-tmdb", "030-tautulli", "040-github"]
+    step_statuses = {
+        "010-plex": "ok",
+        "020-tmdb": "ok",
+        "030-tautulli": "warn",
+        "040-github": "warn",
+    }
+
+    rollup = _build_live_validation_rollup(step_statuses, template_keys)
+
+    assert rollup["counts"] == {"validated": 2, "failed": 0, "skipped": 2, "unknown": 0}
+    assert rollup["state"] == "ok"
+
+
+def test_live_validation_rollup_many_skipped_optional_steps_stays_green():
+    from modules.workspace_status_constants import QS_VALIDATION_STEP_KEYS
+    from modules.workspace_rollups import _build_live_validation_rollup
+
+    template_keys = sorted(QS_VALIDATION_STEP_KEYS)
+    validated_keys = {"010-plex", "020-tmdb", "025-libraries", "100-anidb", "150-settings"}
+    step_statuses = {key: ("ok" if key in validated_keys else "warn") for key in template_keys}
+
+    rollup = _build_live_validation_rollup(step_statuses, template_keys)
+
+    assert rollup["counts"] == {"validated": 5, "failed": 0, "skipped": 14, "unknown": 0}
+    assert rollup["state"] == "ok"
+
+
+def test_live_validation_rollup_skipped_only_steps_stay_neutral():
+    from modules.workspace_rollups import _build_live_validation_rollup
+
+    template_keys = ["030-tautulli", "040-github"]
+    step_statuses = {
+        "030-tautulli": "warn",
+        "040-github": "warn",
+    }
+
+    rollup = _build_live_validation_rollup(step_statuses, template_keys)
+
+    assert rollup["counts"] == {"validated": 0, "failed": 0, "skipped": 2, "unknown": 0}
+    assert rollup["state"] == "unknown"

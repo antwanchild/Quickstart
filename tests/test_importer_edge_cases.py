@@ -3,6 +3,65 @@ import json
 from modules import importer
 
 
+def test_load_yaml_config_resolves_merge_anchors():
+    parsed = importer.load_yaml_config("""
+radarr_defaults: &radarr_defaults
+  quality_profile: HD-1080p
+  root_folder_path: /movies
+
+libraries:
+  Movies:
+    radarr:
+      <<: *radarr_defaults
+      tag: kometa
+  4K Movies:
+    radarr:
+      <<: *radarr_defaults
+      quality_profile: 4K
+""")
+
+    assert parsed["libraries"]["Movies"]["radarr"] == {
+        "quality_profile": "HD-1080p",
+        "root_folder_path": "/movies",
+        "tag": "kometa",
+    }
+    assert parsed["libraries"]["4K Movies"]["radarr"] == {
+        "quality_profile": "4K",
+        "root_folder_path": "/movies",
+    }
+
+
+def test_load_yaml_config_dealiases_shared_anchor_objects():
+    parsed = importer.load_yaml_config("""
+common_tags: &common_tags
+  - kometa
+  - imported
+
+libraries:
+  Movies:
+    radarr:
+      tag: *common_tags
+  TV Shows:
+    sonarr:
+      tag: *common_tags
+""")
+
+    movie_tags = parsed["libraries"]["Movies"]["radarr"]["tag"]
+    show_tags = parsed["libraries"]["TV Shows"]["sonarr"]["tag"]
+
+    assert movie_tags == ["kometa", "imported"]
+    assert show_tags == ["kometa", "imported"]
+    assert movie_tags is not show_tags
+    movie_tags.append("movie-only")
+    assert show_tags == ["kometa", "imported"]
+
+
+def test_load_yaml_config_rejects_recursive_yaml_aliases():
+    parsed = importer.load_yaml_config("recursive: &recursive [*recursive]\n")
+
+    assert parsed == {}
+
+
 def test_prepare_import_payload_unknown_section():
     payload, report = importer.prepare_import_payload({"mystery": {"foo": "bar"}}, set(), set())
     assert payload == {}
@@ -36,6 +95,29 @@ def test_prepare_import_payload_maps_playlist_files_to_library_toggles():
     assert libraries["mov-library_movies-playlist"] == "true"
     assert "playlist_files" not in payload
     assert any("libraries.Movies.playlist_files" in line for line in report.lines)
+
+
+def test_prepare_import_payload_accepts_comma_separated_playlist_libraries():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {"Movies": {}, "TV Shows": {}},
+            "playlist_files": [
+                {
+                    "default": "playlist",
+                    "template_variables": {"libraries": "Movies, TV Shows"},
+                }
+            ],
+        },
+        {"Movies", "TV Shows"},
+        set(),
+    )
+
+    libraries = payload["libraries"]["libraries"]
+    assert libraries["mov-library_movies-library"] == "Movies"
+    assert libraries["mov-library_movies-playlist"] == "true"
+    assert libraries["mov-library_tvshows-library"] == "TV Shows"
+    assert libraries["mov-library_tvshows-playlist"] == "true"
+    assert any("playlist_files[0].template_variables.libraries" in line for line in report.lines)
 
 
 def test_prepare_import_payload_maps_playlist_template_variables_into_libraries_payload():
@@ -138,4 +220,72 @@ def test_prepare_import_payload_maps_apprise_config_to_location():
     payload, report = importer.prepare_import_payload({"apprise": {"config": "/config/apprise.yml"}}, set(), set())
 
     assert payload["apprise"]["apprise"]["location"] == "/config/apprise.yml"
+    assert any(line == "imported: apprise.config" for line in report.lines)
     assert report.counts["imported"] >= 1
+
+
+def test_annotate_yaml_marks_apprise_config_as_imported():
+    raw = "apprise:\n  config: /config/apprise.yml\n"
+    _, report = importer.prepare_import_payload({"apprise": {"config": "/config/apprise.yml"}}, set(), set())
+
+    annotated = importer.annotate_yaml_with_report(raw, report.lines)
+
+    assert "apprise:  # mapped" in annotated
+    assert "config: /config/apprise.yml  # mapped" in annotated
+    assert "No matching Quickstart mapping" not in annotated
+
+
+def test_prepare_import_payload_maps_yamtrack_credentials():
+    payload, report = importer.prepare_import_payload(
+        {
+            "yamtrack": {
+                "url": "http://yamtrack.local:8000",
+                "username": "kometa",
+                "password": "secret",
+            }
+        },
+        set(),
+        set(),
+    )
+
+    assert payload["yamtrack"]["yamtrack"] == {
+        "url": "http://yamtrack.local:8000",
+        "username": "kometa",
+        "password": "secret",
+    }
+    assert any("yamtrack.url" in line for line in report.lines)
+
+
+def test_coerce_import_bool_accepts_yaml_wide_truthy_and_falsy_values():
+    """Regression guard for the duplicate `_coerce_import_bool` bug.
+
+    Prior to develop #TBD, importer.py had TWO `_coerce_import_bool`
+    definitions.  Python's last-def-wins meant callers got the "wide"
+    version that accepts YAML-native `on`/`off` alongside the usual
+    `true`/`false`/`yes`/`no`/`1`/`0`.
+
+    The narrow (dead-code) def has been removed; this test locks
+    in the wide semantics so a future refactor can't silently
+    re-narrow the accepted set and break config imports that use
+    `field: on` / `field: off`.
+    """
+    assert importer._coerce_import_bool("true") is True
+    assert importer._coerce_import_bool("yes") is True
+    assert importer._coerce_import_bool("1") is True
+    assert importer._coerce_import_bool("on") is True
+    assert importer._coerce_import_bool("True") is True  # case-insensitive
+    assert importer._coerce_import_bool(" YES ") is True  # whitespace-tolerant
+
+    assert importer._coerce_import_bool("false") is False
+    assert importer._coerce_import_bool("no") is False
+    assert importer._coerce_import_bool("0") is False
+    assert importer._coerce_import_bool("off") is False
+    assert importer._coerce_import_bool("False") is False
+
+    assert importer._coerce_import_bool("maybe") is None
+    assert importer._coerce_import_bool("") is None
+    assert importer._coerce_import_bool(None) is None
+    assert importer._coerce_import_bool(42) is None
+
+    assert importer._coerce_import_bool(True) is True
+    assert importer._coerce_import_bool(False) is False

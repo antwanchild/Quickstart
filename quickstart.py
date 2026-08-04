@@ -1,3 +1,21 @@
+# ruff: noqa: E402
+#
+# We intentionally run enforce_preflight() before all other imports so
+# that broken Python builds (missing _sqlite3, _ssl, etc.) surface a
+# friendly error instead of a confusing stdlib traceback. That makes
+# this file's import-order-vs-code arrangement look like an E402 to
+# ruff for every subsequent import, so we suppress E402 file-wide.
+
+# Startup preflight: probe stdlib C-extensions (sqlite3, _ssl) BEFORE
+# any third-party import runs. Broken Python builds (usually pyenv/asdf
+# on hosts missing libsqlite3-dev / libssl-dev) would otherwise die
+# with a confusing traceback deep inside stdlib the moment `requests`
+# touches ssl or `modules.database` touches sqlite3. This surfaces a
+# friendly message instead. See modules/_preflight.py.
+from modules._preflight import enforce_preflight
+
+enforce_preflight()
+
 import argparse
 import gzip
 import inspect
@@ -181,6 +199,7 @@ from blueprints.imagemaid_updates import bp as imagemaid_updates_bp
 from blueprints.config_routes import bp as config_routes_bp
 from blueprints.download_routes import bp as download_routes_bp
 from blueprints.test_libraries_routes import bp as test_libraries_routes_bp
+from blueprints.external_yaml_routes import bp as external_yaml_routes_bp
 from blueprints import app_config_routes
 from blueprints.app_config_routes import bp as app_config_routes_bp
 from blueprints.library_routes import (
@@ -257,6 +276,8 @@ from modules.logscan_resume import (
 )
 from modules.logscan_imagemaid_analysis import (
     resolve_imagemaid_run_config_name as _resolve_imagemaid_run_config_name,
+)
+from modules.logscan_imagemaid_analyzer import (
     analyze_imagemaid_log_content as _analyze_imagemaid_log_content,
 )
 from modules.logscan_progress import (
@@ -265,6 +286,8 @@ from modules.logscan_progress import (
     get_progress_library_list as _get_progress_library_list,
     build_incomplete_progress_snapshot as _build_incomplete_progress_snapshot,  # noqa: F401 (used directly by tests as qs_module._build_incomplete_progress_snapshot)
     build_completed_log_progress_snapshot as _build_completed_log_progress_snapshot,
+)
+from modules.logscan_incomplete_resume import (
     analyze_incomplete_log_for_resume as _analyze_incomplete_log_for_resume,  # noqa: F401 (used directly by tests as qs_module._analyze_incomplete_log_for_resume)
     build_incomplete_run_from_cache_entry as _build_incomplete_run_from_cache_entry,  # noqa: F401 (used directly by tests as qs_module._build_incomplete_run_from_cache_entry)
     build_incomplete_resume_cache_fields as _build_incomplete_resume_cache_fields,
@@ -334,7 +357,11 @@ from modules.process_control import (
     maintenance_guard_loop as _maintenance_guard_loop,
     append_quickstart_meta_log_line as _append_quickstart_meta_log_line,  # noqa: F401 (used directly by tests as qs_module._append_quickstart_meta_log_line)
     get_kometa_maintenance_sidecar_path as _get_kometa_maintenance_sidecar_path,  # noqa: F401 (used directly by tests as qs_module._get_kometa_maintenance_sidecar_path)
+    get_kometa_pending_marker_path as _get_kometa_pending_marker_path,  # noqa: F401 (used directly by tests as qs_module._get_kometa_pending_marker_path)
+    get_imagemaid_pending_marker_path as _get_imagemaid_pending_marker_path,  # noqa: F401 (used directly by tests as qs_module._get_imagemaid_pending_marker_path)
     is_logscan_maintenance_sidecar as _is_logscan_maintenance_sidecar,
+    flush_quickstart_pending_markers as _flush_quickstart_pending_markers,  # noqa: F401 (used directly by tests as qs_module._flush_quickstart_pending_markers)
+    flush_imagemaid_pending_markers as _flush_imagemaid_pending_markers,  # noqa: F401 (used directly by tests as qs_module._flush_imagemaid_pending_markers)
     write_quickstart_maintenance_marker as _write_quickstart_maintenance_marker,  # noqa: F401 (used directly by tests as qs_module._write_quickstart_maintenance_marker)
     write_quickstart_imagemaid_run_marker as _write_quickstart_imagemaid_run_marker,  # noqa: F401 (load-bearing: tests + blueprints/imagemaid_routes.py access via qs_module)
     write_quickstart_stop_marker as _write_quickstart_stop_marker,
@@ -401,8 +428,9 @@ ACTIVE_WORK_POLICIES = {
     ],
 }
 LOG_STATS_CACHE = {"mtime": None, "size": None, "stats": None}
-LOGSCAN_ANALYSIS_CACHE = {"mtime": None, "size": None, "data": None}
-LOGSCAN_PROGRESS_CACHE = {"mtime": None, "size": None, "data": None}
+LOGSCAN_ANALYSIS_CACHE_VERSION = 3
+LOGSCAN_ANALYSIS_CACHE = {"mtime": None, "size": None, "version": LOGSCAN_ANALYSIS_CACHE_VERSION, "data": None}
+LOGSCAN_PROGRESS_CACHE = {"mtime": None, "size": None, "aux_signature": None, "data": None}
 
 VALIDATION_DOC_BASE = "/step/"
 VALIDATION_DOC_FALLBACK = "/step/900-kometa"
@@ -424,6 +452,7 @@ MODULE_PAGE_SCRIPTS = frozenset(
         "080-gotify",
         "085-ntfy",
         "087-apprise",
+        "088-yamtrack",
         "090-webhooks",
         "100-anidb",
         "110-radarr",
@@ -454,6 +483,7 @@ VALIDATION_DOCS = {
     "gotify": f"{VALIDATION_DOC_BASE}080-gotify",
     "ntfy": f"{VALIDATION_DOC_BASE}085-ntfy",
     "apprise": f"{VALIDATION_DOC_BASE}087-apprise",
+    "yamtrack": f"{VALIDATION_DOC_BASE}088-yamtrack",
     "mal": f"{VALIDATION_DOC_BASE}140-mal",
     "anidb": f"{VALIDATION_DOC_BASE}100-anidb",
     "webhooks": f"{VALIDATION_DOC_BASE}090-webhooks",
@@ -1043,6 +1073,41 @@ def _normalize_shared_playlist_file_entries_payload(libraries_data, config_name,
     return normalized, errors
 
 
+def _library_save_prefix_from_key(key):
+    prefix = _library_prefix_from_key(key)
+    if prefix:
+        return prefix
+    if not isinstance(key, str) or not key.startswith(("mov-library_", "sho-library_")):
+        return None
+    for suffix in ("-playlist", "-collection_files", "-metadata_files", "-overlay_files"):
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return None
+
+
+def _merge_libraries_payload_for_partial_step_save(incoming_libraries):
+    """Merge the submitted active library card into the full persisted map."""
+    incoming_libraries = incoming_libraries if isinstance(incoming_libraries, dict) else {}
+    settings = persistence.retrieve_settings("025-libraries")
+    existing_libraries = settings.get("libraries", {}) if isinstance(settings, dict) else {}
+    existing_libraries = existing_libraries if isinstance(existing_libraries, dict) else {}
+    merged_libraries = dict(existing_libraries)
+
+    for key, value in incoming_libraries.items():
+        prefix = _library_save_prefix_from_key(key)
+        if prefix and key in (f"{prefix}-library", f"{prefix}-playlist") and not _is_truthy_setting_value(value):
+            continue
+        merged_libraries[key] = value
+
+    for shared in ("mov-template_variables", "sho-template_variables"):
+        if shared in incoming_libraries:
+            merged_libraries[shared] = incoming_libraries[shared]
+        elif shared in existing_libraries and shared not in merged_libraries:
+            merged_libraries[shared] = existing_libraries[shared]
+
+    return merged_libraries
+
+
 DOTENV = os.path.relpath(os.path.join(helpers.CONFIG_DIR, ".env"))
 load_dotenv(DOTENV, override=True)
 
@@ -1058,6 +1123,15 @@ kometa_process = None
 
 app = Flask(__name__)
 
+# Register the Vite manifest lookup as a Jinja global so templates can
+# say ``{{ asset_url('000-base') }}`` instead of ``url_for('static',
+# filename='local-js/000-base.js')``. When ``static/dist/.vite/manifest.json``
+# exists (i.e. after ``npm run build``), asset_url() returns the hashed,
+# minified build output; otherwise it falls back to the raw source file
+# so ``python quickstart.py`` after a fresh clone still works.
+# Roadmap #1334 Step 4 activation. See modules/helpers/_vite_manifest.py.
+app.jinja_env.globals["asset_url"] = helpers.asset_url
+
 app.register_blueprint(validation_routes_bp)
 app.register_blueprint(asset_routes_bp)
 app.register_blueprint(kometa_updates_bp)
@@ -1065,6 +1139,7 @@ app.register_blueprint(imagemaid_updates_bp)
 app.register_blueprint(config_routes_bp)
 app.register_blueprint(download_routes_bp)
 app.register_blueprint(test_libraries_routes_bp)
+app.register_blueprint(external_yaml_routes_bp)
 app.register_blueprint(library_routes_bp)
 app.register_blueprint(import_config_routes_bp)
 app.register_blueprint(imagemaid_routes_bp)
@@ -1242,6 +1317,7 @@ logscan_reingest_state = {
     "status": "idle",
     "job_id": None,
 }
+LOGSCAN_INGEST_CACHE_FLUSH_INTERVAL = 10
 
 # Bump this integer when a release needs a one-time Analytics reset + log reingest
 # on startup. Quickstart persists the highest successful level to config/.env so
@@ -1935,6 +2011,7 @@ def step(name):
         if save_source_name == "libraries":
             clean_payload = persistence.clean_form_data(request.form)
             incoming_libraries = helpers.build_config_dict("libraries", clean_payload).get("libraries", {})
+            incoming_libraries = _merge_libraries_payload_for_partial_step_save(incoming_libraries)
             selected_library_ids = _selected_library_ids_from_libraries_data(incoming_libraries)
             validation_errors += _validate_library_collection_files(incoming_libraries, selected_library_ids)
             validation_errors += _validate_library_metadata_files(incoming_libraries, selected_library_ids)
@@ -2314,7 +2391,11 @@ def step(name):
 
     start_time = time.perf_counter()
 
-    needs_library_payload = name == "025-libraries"
+    # The Libraries page lazy-loads the actual library card via
+    # /library_fragment/<id>. Avoid loading the multi-MB collection/overlay
+    # payload during the initial picker-only render; the fragment route still
+    # loads the full payload when a card is requested.
+    needs_library_payload = False
     attribute_config = {}
     collection_config = []
     overlay_config = []
@@ -2372,6 +2453,7 @@ def step(name):
 
     if name == "900-kometa":
         validation_meta = []
+        validation_groups = []
         validation_bulk_rollup = None
         validation_bulk_rollup_at = None
         try:
@@ -2391,31 +2473,48 @@ def step(name):
         validation_rollup_state = "unknown"
         validation_rollup_at = None
         if final_gate.get("stage") != "todo":
-            for file, display_name in file_list:
-                template_key = file.rsplit(".", 1)[0]
+            template_display_names = {file.rsplit(".", 1)[0]: display_name for file, display_name in file_list}
+            validation_group_specs = [
+                ("setup", "Setup", workspace_status.get("required_keys", [])),
+                ("optional", "Optional Services", workspace_status.get("optional_keys", [])),
+                ("apps", "Apps", ["900-kometa", "915-imagemaid"]),
+                ("insights", "Insights", ["905-analytics"]),
+                ("other", "Other", ["910-sponsor"]),
+            ]
+            seen_validation_keys = set()
+
+            def build_validation_entry(template_key, group_key):
                 settings = persistence.retrieve_settings(template_key)
-                has_validation = template_key in QS_VALIDATION_STEP_KEYS
+                has_validation = template_key in QS_VALIDATION_STEP_KEYS or template_key == "001-start"
                 validation_status = None
                 validation_reason = None
                 validation_details = None
                 validation_updated_at = None
+                stored_validated = None
+                stored_validated_at = None
                 if has_validation:
-                    section_name = template_key.split("-", 1)[1]
+                    section_name = "kometa" if template_key == "001-start" else template_key.split("-", 1)[1]
                     stored_section = database.retrieve_section_data(config_name, section_name)
+                    if stored_section:
+                        stored_validated = stored_section[0]
                     stored_payload = stored_section[2] if stored_section else None
                     if isinstance(stored_payload, dict):
                         validation_status = stored_payload.get("validation_status")
                         validation_reason = stored_payload.get("validation_reason")
                         validation_details = stored_payload.get("validation_details")
                         validation_updated_at = stored_payload.get("validation_updated_at")
+                        stored_validated = stored_payload.get("validated", stored_validated)
+                        stored_validated_at = stored_payload.get("validated_at")
                 if not validation_status and has_validation:
-                    if helpers.booler(settings.get("validated", False)):
+                    if helpers.booler(stored_validated) or helpers.booler(settings.get("validated", False)):
                         validation_status = "validated"
-                    elif settings.get("validated_at"):
+                    elif stored_validated_at or settings.get("validated_at"):
                         validation_status = "failed"
                 if not validation_updated_at and has_validation:
-                    validation_updated_at = settings.get("validated_at")
+                    validation_updated_at = stored_validated_at or settings.get("validated_at")
 
+                validated = validation_status == "validated" or helpers.booler(stored_validated) or helpers.booler(settings.get("validated", False))
+                validated_at = validation_updated_at or stored_validated_at or settings.get("validated_at", "")
                 validation_result = ""
                 if validation_status:
                     label = validation_status.capitalize()
@@ -2433,18 +2532,39 @@ def step(name):
                     else:
                         validation_result = label
 
-                validation_meta.append(
-                    {
-                        "key": template_key,
-                        "label": display_name,
-                        "page": template_key,
-                        "has_validation": has_validation,
-                        "validated": helpers.booler(settings.get("validated", False)) if has_validation else None,
-                        "validated_at": settings.get("validated_at", "") if has_validation else "",
-                        "validation_updated_at": validation_updated_at if has_validation else "",
-                        "validation_result": validation_result,
-                    }
-                )
+                pill_state = "neutral"
+                if validated:
+                    pill_state = "validated"
+                elif validation_status == "failed":
+                    pill_state = "unvalidated"
+
+                return {
+                    "key": template_key,
+                    "label": template_display_names.get(template_key, template_key),
+                    "page": template_key,
+                    "group_key": group_key,
+                    "has_validation": has_validation,
+                    "validated": validated if has_validation else None,
+                    "validated_at": validated_at if has_validation else "",
+                    "validation_updated_at": validation_updated_at if has_validation else "",
+                    "validation_result": validation_result,
+                    "pill_state": pill_state,
+                }
+
+            for group_key, group_label, group_keys in validation_group_specs:
+                group_entries = []
+                for template_key in group_keys:
+                    if template_key in seen_validation_keys:
+                        continue
+                    has_validation = template_key in QS_VALIDATION_STEP_KEYS or template_key == "001-start"
+                    if not has_validation:
+                        continue
+                    entry = build_validation_entry(template_key, group_key)
+                    validation_meta.append(entry)
+                    group_entries.append(entry)
+                    seen_validation_keys.add(template_key)
+                if group_entries:
+                    validation_groups.append({"key": group_key, "label": group_label, "entries": group_entries})
             live_rollup = _build_live_validation_rollup(step_statuses, template_keys_for_rollup)
             validation_rollup = live_rollup.get("summary_text")
             validation_rollup_summary = live_rollup.get("counts", {})
@@ -2473,9 +2593,20 @@ def step(name):
             final_gate["config_valid"] = bool(validated)
             final_gate["stage"] = "kometa" if validated else "config"
         elif final_gate.get("stage") == "freshness":
-            validation_rollup_state = "warn"
+            try:
+                rollup_failed = int(validation_rollup_summary.get("failed") or 0)
+                rollup_validated = int(validation_rollup_summary.get("validated") or 0)
+            except (TypeError, ValueError):
+                rollup_failed = 0
+                rollup_validated = 0
+            if rollup_failed > 0:
+                validation_rollup_state = "error"
+            elif rollup_validated > 0:
+                validation_rollup_state = "ok"
+            else:
+                validation_rollup_state = "unknown"
             if not validation_bulk_rollup:
-                validation_bulk_rollup = f"Validation is stale. Bulk validation has not run in the last {QS_FINAL_VALIDATION_TTL_HOURS} hours."
+                validation_bulk_rollup = f"Validation is stale. Validate All has not completed in the last {QS_FINAL_VALIDATION_TTL_HOURS} hours."
         page_info["saved_filename"] = saved_filename
         page_info["yaml_valid"] = validated
         page_info["quickstart_root"] = helpers.get_app_root()
@@ -2530,6 +2661,7 @@ def step(name):
             overlay_fonts=overlay_fonts,
             service_validations=service_validations,
             validation_meta=validation_meta,
+            validation_groups=validation_groups,
             jump_to_validations=jump_to_validations,
             step_statuses=step_statuses,
             section_statuses=section_statuses,
@@ -2935,6 +3067,17 @@ def validate_all_services():
             ["apprise_location"],
         ),
         (
+            "088-yamtrack",
+            "yamtrack",
+            validations.validate_yamtrack_server,
+            lambda s: {
+                "yamtrack_url": s.get("yamtrack", {}).get("url"),
+                "yamtrack_username": s.get("yamtrack", {}).get("username"),
+                "yamtrack_password": s.get("yamtrack", {}).get("password"),
+            },
+            ["yamtrack_url", "yamtrack_username", "yamtrack_password"],
+        ),
+        (
             "110-radarr",
             "radarr",
             validations.validate_radarr_server,
@@ -3104,7 +3247,7 @@ def validate_all_services():
         details=kometa_details,
     )
 
-    # Bulk validation for libraries
+    # Validate All checks for libraries
     plex_settings = persistence.retrieve_settings("010-plex") or {}
     plex_is_valid = helpers.booler(plex_settings.get("validated", False)) if isinstance(plex_settings, dict) else False
     if not plex_is_valid:
@@ -3226,7 +3369,7 @@ def validate_all_services():
                 ),
             )
 
-    # Bulk validation for settings
+    # Validate All checks for settings
     settings_settings = persistence.retrieve_settings("150-settings") or {}
     settings_section = settings_settings.get("settings", {}) if isinstance(settings_settings, dict) else {}
     if not isinstance(settings_section, dict) or not settings_section:
@@ -3289,7 +3432,7 @@ def validate_all_services():
         else:
             update_section_validation("150-settings", "settings", True)
 
-    # Bulk validation for AniDB
+    # Validate All checks for AniDB
     anidb_settings = persistence.retrieve_settings("100-anidb") or {}
     anidb_data = anidb_settings.get("anidb", {}) if isinstance(anidb_settings, dict) else {}
     anidb_enabled = helpers.booler(anidb_data.get("enable")) if isinstance(anidb_data, dict) else False
@@ -3298,7 +3441,7 @@ def validate_all_services():
     else:
         skip_section_validation("100-anidb", "anidb", reason="disabled")
 
-    # Bulk validation for Webhooks
+    # Validate All checks for Webhooks
     webhooks_settings = persistence.retrieve_settings("090-webhooks") or {}
     webhooks_data = webhooks_settings.get("webhooks", {}) if isinstance(webhooks_settings, dict) else {}
     configured_webhooks = False
@@ -3313,7 +3456,7 @@ def validate_all_services():
     else:
         skip_section_validation("090-webhooks", "webhooks", reason="no_webhooks")
 
-    # Bulk validation for Trakt (token check if present)
+    # Validate All checks for Trakt (token check if present)
     trakt_settings = persistence.retrieve_settings("130-trakt") or {}
     trakt_data = trakt_settings.get("trakt", {}) if isinstance(trakt_settings, dict) else {}
     trakt_auth = trakt_data.get("authorization", {}) if isinstance(trakt_data, dict) else {}
@@ -3344,7 +3487,7 @@ def validate_all_services():
         except requests.exceptions.RequestException:
             update_section_validation("130-trakt", "trakt", False, reason="validation_error")
 
-    # Bulk validation for MAL (token check if present)
+    # Validate All checks for MAL (token check if present)
     mal_settings = persistence.retrieve_settings("140-mal") or {}
     mal_data = mal_settings.get("mal", {}) if isinstance(mal_settings, dict) else {}
     mal_auth = mal_data.get("authorization", {}) if isinstance(mal_data, dict) else {}
@@ -3421,7 +3564,7 @@ def validate_all_services():
     failed = summary.get("failed", 0)
     skipped = summary.get("skipped", 0)
     separator = "\u2022"
-    summary_text = f"Completed. Validated: {ok} {separator} Failed: {failed} {separator} Skipped: {skipped}."
+    summary_text = f"Validated: {ok} {separator} Failed: {failed} {separator} Skipped: {skipped}."
     summary_updated_at = utc_now_iso()
     summary_payload = {
         "summary_text": summary_text,
@@ -3949,7 +4092,7 @@ def logscan_analyze():
         return jsonify({"error": f"Failed to stat log: {str(e)}"}), 500
 
     cached = LOGSCAN_ANALYSIS_CACHE
-    if cached.get("mtime") == stats.st_mtime and cached.get("size") == stats.st_size:
+    if cached.get("version") == LOGSCAN_ANALYSIS_CACHE_VERSION and cached.get("mtime") == stats.st_mtime and cached.get("size") == stats.st_size:
         data = cached.get("data") or {}
         data["cached"] = True
         return jsonify(data)
@@ -4005,8 +4148,8 @@ def logscan_analyze():
             if _logscan_needs_reingest(cache_logs, log_path.parent):
                 _start_logscan_auto_reingest(log_path.parent)
 
-    LOGSCAN_ANALYSIS_CACHE.update({"mtime": stats.st_mtime, "size": stats.st_size, "data": result})
     result["cached"] = False
+    LOGSCAN_ANALYSIS_CACHE.update({"mtime": stats.st_mtime, "size": stats.st_size, "version": LOGSCAN_ANALYSIS_CACHE_VERSION, "data": dict(result)})
     return jsonify(result)
 
 
@@ -4015,6 +4158,7 @@ def logscan_progress():
     kometa_root = helpers.get_kometa_root_path()
     log_path = helpers.get_kometa_log_dir() / "meta.log"
     sidecar_path = _get_kometa_maintenance_sidecar_path(kometa_root)
+    pending_path = _get_kometa_pending_marker_path(kometa_root)
 
     if not log_path.exists():
         return jsonify({"error": f"Log file not found at: {log_path}"}), 404
@@ -4032,18 +4176,32 @@ def logscan_progress():
             except Exception:
                 max_lines = 4000
         force_full_read = max_lines is None
+        running = helpers.is_kometa_running()
+
+        if not running:
+            try:
+                _flush_quickstart_pending_markers(kometa_root, require_process_stopped=True)
+            except Exception:
+                pass
 
         log_stats = None
         try:
             log_stats = log_path.stat()
         except Exception:
             log_stats = None
-        sidecar_stats = None
-        try:
-            if sidecar_path.exists():
-                sidecar_stats = sidecar_path.stat()
-        except Exception:
-            sidecar_stats = None
+
+        def _build_aux_signature():
+            signature = []
+            for aux_path in (pending_path, sidecar_path):
+                try:
+                    if aux_path.exists() and aux_path.is_file():
+                        aux_stats = aux_path.stat()
+                        signature.append((aux_path.name.lower(), aux_stats.st_mtime, aux_stats.st_size))
+                except Exception:
+                    continue
+            return tuple(signature)
+
+        aux_signature = _build_aux_signature()
 
         cached = LOGSCAN_PROGRESS_CACHE
 
@@ -4052,11 +4210,7 @@ def logscan_progress():
                 return False
             if cached.get("mtime") != log_stats.st_mtime or cached.get("size") != log_stats.st_size:
                 return False
-            cached_sidecar_mtime = cached.get("sidecar_mtime")
-            cached_sidecar_size = cached.get("sidecar_size")
-            current_sidecar_mtime = sidecar_stats.st_mtime if sidecar_stats else None
-            current_sidecar_size = sidecar_stats.st_size if sidecar_stats else None
-            return cached_sidecar_mtime == current_sidecar_mtime and cached_sidecar_size == current_sidecar_size
+            return cached.get("aux_signature") == aux_signature
 
         def _read_progress_log_content():
             if force_full_read:
@@ -4065,10 +4219,14 @@ def logscan_progress():
                 lines = deque(handle, maxlen=max_lines)
             content = "".join(lines)
             try:
-                if sidecar_path.exists() and sidecar_path.is_file():
-                    sidecar_content = sidecar_path.read_text(encoding="utf-8", errors="replace").strip()
-                    if sidecar_content:
-                        content = f"{content.rstrip()}\n{sidecar_content}\n"
+                aux_content = []
+                for aux_path in (pending_path, sidecar_path):
+                    if aux_path.exists() and aux_path.is_file():
+                        text = aux_path.read_text(encoding="utf-8", errors="replace").strip()
+                        if text:
+                            aux_content.append(text)
+                if aux_content:
+                    content = f"{content.rstrip()}\n" + "\n".join(aux_content) + "\n"
             except Exception:
                 pass
             return content
@@ -4146,7 +4304,6 @@ def logscan_progress():
         started_at = ctx.get("started_at")
         config_path = ctx.get("config_path")
         run_mode = ctx.get("run_mode") or "all"
-        running = helpers.is_kometa_running()
         stopped_requested = bool(ctx.get("stop_requested_at"))
         cached_data = LOGSCAN_PROGRESS_CACHE.get("data")
         cache_matches_run = bool(cached_data and cached_data.get("run_started_at") == started_at)
@@ -4165,7 +4322,7 @@ def logscan_progress():
             return jsonify(data)
 
         if cached_data and cached_data.get("run_started_at") != started_at:
-            LOGSCAN_PROGRESS_CACHE.update({"mtime": None, "size": None, "sidecar_mtime": None, "sidecar_size": None, "data": None})
+            LOGSCAN_PROGRESS_CACHE.update({"mtime": None, "size": None, "aux_signature": None, "data": None})
         analyzer = logscan.LogscanAnalyzer()
         config_data = _load_progress_config(config_path)
         log_content = _read_progress_log_content()
@@ -4205,8 +4362,7 @@ def logscan_progress():
                 {
                     "mtime": log_stats.st_mtime,
                     "size": log_stats.st_size,
-                    "sidecar_mtime": sidecar_stats.st_mtime if sidecar_stats else None,
-                    "sidecar_size": sidecar_stats.st_size if sidecar_stats else None,
+                    "aux_signature": aux_signature,
                     "data": progress,
                 }
             )
@@ -4217,6 +4373,39 @@ def logscan_progress():
 
 @app.route("/logscan/trends", methods=["GET"])
 def logscan_trends():
+    snapshot = _logscan_reingest_snapshot()
+    if logscan_ingest_lock.locked() or snapshot.get("status") == "running":
+        total_runs = database.get_log_runs_count()
+        running_health = {
+            "source": "running",
+            "status": snapshot.get("status") or "running",
+            "job_id": snapshot.get("job_id"),
+            "trigger": snapshot.get("trigger"),
+            "migration_level": snapshot.get("migration_level"),
+            "total": snapshot.get("total", 0),
+            "scanned": snapshot.get("scanned", 0),
+            "ingested": snapshot.get("ingested", 0),
+            "duplicates": snapshot.get("duplicates", 0),
+            "skipped_incomplete": snapshot.get("skipped_incomplete", 0),
+            "skipped_invalid": snapshot.get("skipped_invalid", 0),
+            "errors": snapshot.get("errors", 0),
+            "current_file": snapshot.get("current_file"),
+            "needs_reingest": True,
+            "pending_active": True,
+        }
+        return jsonify(
+            {
+                "runs": [],
+                "incomplete_runs": [],
+                "total_runs": total_runs,
+                "total_incomplete_runs": 0,
+                "ingest_health": running_health,
+                "archive_storage": None,
+                "reingest_running": True,
+                "reingest": snapshot,
+            }
+        )
+
     try:
         _ingest_completed_live_logs("imagemaid")
         _archive_finished_live_meta_log_if_idle()
@@ -4231,20 +4420,73 @@ def logscan_trends():
         except Exception:
             limit = 50
         limit = max(1, min(limit, 500))
+    include_ingest_health = str(request.args.get("include_ingest_health", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    include_archive_storage = str(request.args.get("include_archive_storage", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    include_incomplete = str(request.args.get("include_incomplete", "1")).strip().lower() not in {"0", "false", "no", "off"}
     total_runs = database.get_log_runs_count()
-    ingest_health = _logscan_ingest_health()
     resolution_context = _build_logscan_resolution_context()
     runs = _annotate_logscan_runs(database.get_log_runs(limit=limit), context=resolution_context)
-    incomplete_runs = _annotate_logscan_runs(_get_logscan_incomplete_runs(limit=limit), context=resolution_context)
-    all_runs = database.get_log_runs(limit=None) if total_runs else []
+    incomplete_runs = []
+    all_incomplete_runs = []
+    if include_incomplete:
+        incomplete_runs = _annotate_logscan_runs(_get_logscan_incomplete_runs(limit=limit), context=resolution_context)
+        all_incomplete_runs = _get_logscan_incomplete_runs(limit=None)
+    payload = {
+        "runs": runs,
+        "incomplete_runs": incomplete_runs,
+        "total_runs": total_runs,
+        "total_incomplete_runs": len(all_incomplete_runs),
+        "ingest_health": _logscan_ingest_health() if include_ingest_health else None,
+        "archive_storage": None,
+        "reingest_running": False,
+    }
+    if include_archive_storage:
+        all_runs = database.get_log_runs(limit=None) if total_runs else []
+        payload["archive_storage"] = _get_logscan_archive_storage_summary(
+            all_runs=all_runs,
+            incomplete_runs=all_incomplete_runs,
+            context=resolution_context,
+        )
+    return jsonify(payload)
+
+
+@app.route("/logscan/trends/ingest-health", methods=["GET"])
+def logscan_trends_ingest_health():
+    snapshot = _logscan_reingest_snapshot()
+    if logscan_ingest_lock.locked() or snapshot.get("status") == "running":
+        return jsonify(
+            {
+                "source": "running",
+                "status": snapshot.get("status") or "running",
+                "job_id": snapshot.get("job_id"),
+                "trigger": snapshot.get("trigger"),
+                "migration_level": snapshot.get("migration_level"),
+                "total": snapshot.get("total", 0),
+                "scanned": snapshot.get("scanned", 0),
+                "ingested": snapshot.get("ingested", 0),
+                "duplicates": snapshot.get("duplicates", 0),
+                "skipped_incomplete": snapshot.get("skipped_incomplete", 0),
+                "skipped_invalid": snapshot.get("skipped_invalid", 0),
+                "errors": snapshot.get("errors", 0),
+                "current_file": snapshot.get("current_file"),
+                "needs_reingest": True,
+                "pending_active": True,
+            }
+        )
+    return jsonify(_logscan_ingest_health())
+
+
+@app.route("/logscan/trends/archive-storage", methods=["GET"])
+def logscan_trends_archive_storage():
+    snapshot = _logscan_reingest_snapshot()
+    if logscan_ingest_lock.locked() or snapshot.get("status") == "running":
+        return jsonify({"status": "running", "archive_storage": None, "reingest": snapshot}), 202
+    resolution_context = _build_logscan_resolution_context()
+    all_runs = database.get_log_runs(limit=None) if database.get_log_runs_count() else []
     all_incomplete_runs = _get_logscan_incomplete_runs(limit=None)
     return jsonify(
         {
-            "runs": runs,
-            "incomplete_runs": incomplete_runs,
-            "total_runs": total_runs,
-            "total_incomplete_runs": len(all_incomplete_runs),
-            "ingest_health": ingest_health,
+            "status": "idle",
             "archive_storage": _get_logscan_archive_storage_summary(
                 all_runs=all_runs,
                 incomplete_runs=all_incomplete_runs,
@@ -4252,6 +4494,26 @@ def logscan_trends():
             ),
         }
     )
+
+
+@app.route("/logscan/trends/incomplete-runs", methods=["GET"])
+def logscan_trends_incomplete_runs():
+    snapshot = _logscan_reingest_snapshot()
+    if logscan_ingest_lock.locked() or snapshot.get("status") == "running":
+        return jsonify({"status": "running", "incomplete_runs": [], "total_incomplete_runs": 0, "reingest": snapshot}), 202
+    raw_limit = str(request.args.get("limit", "50")).strip().lower()
+    if raw_limit == "all":
+        limit = None
+    else:
+        try:
+            limit = int(raw_limit)
+        except Exception:
+            limit = 50
+        limit = max(1, min(limit, 500))
+    resolution_context = _build_logscan_resolution_context()
+    runs = _annotate_logscan_runs(_get_logscan_incomplete_runs(limit=limit), context=resolution_context)
+    all_runs = _get_logscan_incomplete_runs(limit=None)
+    return jsonify({"status": "idle", "incomplete_runs": runs, "total_incomplete_runs": len(all_runs)})
 
 
 @app.route("/logscan/trends/recommendations", methods=["GET"])
@@ -4410,16 +4672,17 @@ def _normalize_logscan_archive_filenames(archive_dir=None):
     for current_archive_dir in archive_dirs:
         if not current_archive_dir.exists():
             continue
-        for sidecar_path in current_archive_dir.glob("*.quickstart-maintenance.log"):
-            try:
-                source_key = str(sidecar_path.resolve())
-                sidecar_path.unlink()
-                if source_key in cache_logs:
-                    cache_logs.pop(source_key, None)
-                    cache_dirty = True
-                renamed += 1
-            except Exception as exc:
-                errors.append(f"Failed to remove archived maintenance sidecar {sidecar_path}: {exc}")
+        for marker_glob in ("*.quickstart-maintenance.log", "*.quickstart-pending.log"):
+            for sidecar_path in current_archive_dir.glob(marker_glob):
+                try:
+                    source_key = str(sidecar_path.resolve())
+                    sidecar_path.unlink()
+                    if source_key in cache_logs:
+                        cache_logs.pop(source_key, None)
+                        cache_dirty = True
+                    renamed += 1
+                except Exception as exc:
+                    errors.append(f"Failed to remove archived Quickstart marker artifact {sidecar_path}: {exc}")
 
     for path in sorted(_iter_logscan_candidate_files(include_archive=True, include_compressed=True), key=lambda item: item.name.lower()):
         if _classify_logscan_file_location(path) != "archive":
@@ -4764,9 +5027,21 @@ def _archive_log_file(path, archive_dir, log_dir=None, allow_live_meta=False):
             return None
         if _is_logscan_maintenance_sidecar(path):
             return None
+        current_tool = _detect_logscan_tool_from_path(path)
         if path.name.lower() == "meta.log" and not allow_live_meta:
             return None
         if log_dir and path.resolve().parent != Path(log_dir).resolve():
+            return None
+        flush_result = None
+        if path.name.lower() == "meta.log":
+            flush_result = _flush_quickstart_pending_markers(path.parent.parent.parent, require_process_stopped=True)
+        elif current_tool == "imagemaid" and path.name.lower() == "imagemaid.log":
+            flush_result = _flush_imagemaid_pending_markers(path.parent.parent.parent, log_path=path, require_process_stopped=True)
+        if isinstance(flush_result, dict) and not flush_result.get("flushed"):
+            helpers.ts_log(
+                f"Skipping archive for {path.name} because pending Quickstart markers could not be flushed ({flush_result.get('anchor')}).",
+                level="WARNING",
+            )
             return None
         archive_dir = Path(archive_dir)
         archive_dir.mkdir(parents=True, exist_ok=True)
@@ -5031,6 +5306,15 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
         sample_incomplete = []
         sample_errors = []
 
+        def _flush_ingest_cache_progress(force=False):
+            nonlocal cache_dirty
+            if not cache_dirty:
+                return
+            if force:
+                ingest_cache["logs"] = cache_logs
+                _save_logscan_ingest_cache(ingest_cache)
+                cache_dirty = False
+
         for idx, path in enumerate(log_files, start=1):
             if update_state:
                 _update_logscan_reingest_state(current_file=path.name, scanned=max(0, idx - 1))
@@ -5221,6 +5505,8 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                     sample_incomplete=sample_incomplete,
                     sample_errors=sample_errors,
                 )
+            if idx % LOGSCAN_INGEST_CACHE_FLUSH_INTERVAL == 0:
+                _flush_ingest_cache_progress(force=True)
 
         cache_dir = _get_logscan_cache_dir()
         missing_people_log = cache_dir / "meta_people_missing.log"
@@ -5288,8 +5574,7 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                 current_file=None,
                 **result,
             )
-        if cache_dirty:
-            _save_logscan_ingest_cache(ingest_cache)
+        _flush_ingest_cache_progress(force=True)
         return result
     finally:
         logscan_ingest_lock.release()

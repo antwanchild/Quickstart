@@ -99,7 +99,7 @@
   {% elif final_gate.stage == 'freshness' %}
   <div class="fw-semibold mb-1">Validation is stale</div>
   <div>
-    Bulk validation is missing or older than {{ final_gate.validation_ttl_hours }} hours. Quickstart is running Validate All now and will refresh this page when it finishes.
+    Validate All is missing or older than {{ final_gate.validation_ttl_hours }} hours. Quickstart is running Validate All now and will refresh this page when it finishes.
     <span class="spinner-border spinner-border-sm ms-2" role="status" aria-hidden="true"></span>
   </div>
   {% elif final_gate.stage == 'config' %}
@@ -109,36 +109,41 @@
 </div>
 {% endif %}
 
-{% if validation_meta and (not final_gate or final_gate.stage != 'todo') %}
+{% if validation_groups and (not final_gate or final_gate.stage != 'todo') %}
 <div class="accordion mt-3 mb-3" id="validation-status-accordion">
   <div class="accordion-item">
     <h2 class="accordion-header" id="validation-status-heading">
       <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse"
         data-bs-target="#validation-status-collapse" aria-expanded="false" aria-controls="validation-status-collapse">
         Validation status
-        {% set rollup_validated = validation_rollup_summary.get('validated', 0) if validation_rollup_summary else 0 %}
-        {% set rollup_failed = validation_rollup_summary.get('failed', 0) if validation_rollup_summary else 0 %}
-        {% set rollup_skipped = validation_rollup_summary.get('skipped', 0) if validation_rollup_summary else 0 %}
-        {% set rollup_unknown = validation_rollup_summary.get('unknown', 0) if validation_rollup_summary else 0 %}
-        {% if validation_rollup_state == 'error' %}
-        {% set rollup_label = rollup_failed ~ ' failed' %}
+        {% set rollup_validated = (validation_rollup_summary.get('validated', 0) if validation_rollup_summary else 0)|int %}
+        {% set rollup_failed = (validation_rollup_summary.get('failed', 0) if validation_rollup_summary else 0)|int %}
+        {% set rollup_skipped = (validation_rollup_summary.get('skipped', 0) if validation_rollup_summary else 0)|int %}
+        {% set rollup_unknown = (validation_rollup_summary.get('unknown', 0) if validation_rollup_summary else 0)|int %}
+        {% if rollup_failed > 0 %}
+        {% set rollup_display_state = 'error' %}
+        {% elif rollup_validated > 0 %}
+        {% set rollup_display_state = 'ok' %}
         {% elif validation_rollup_state == 'warn' %}
-        {% set rollup_label = rollup_skipped ~ ' pending' %}
-        {% elif validation_rollup_state == 'ok' %}
+        {% set rollup_display_state = 'unknown' %}
+        {% else %}
+        {% set rollup_display_state = validation_rollup_state %}
+        {% endif %}
+        {% if rollup_display_state == 'error' %}
+        {% set rollup_label = rollup_failed ~ ' failed' %}
+        {% elif rollup_display_state == 'ok' %}
         {% set rollup_label = 'All good' %}
+        {% elif rollup_display_state == 'warn' %}
+        {% set rollup_label = 'Review needed' %}
         {% else %}
         {% set rollup_label = 'Not run' %}
         {% endif %}
-        <span id="validation-status-rollup-badge" class="badge ms-2 qs-validation-rollup-badge qs-validation-rollup-badge--{{ validation_rollup_state }}"
+        <span id="validation-status-rollup-badge" class="badge ms-2 qs-validation-rollup-badge qs-validation-rollup-badge--{{ rollup_display_state }}"
           data-qs-validation-rollup-badge
           data-validated="{{ rollup_validated }}"
           data-failed="{{ rollup_failed }}"
           data-skipped="{{ rollup_skipped }}">
           {{ rollup_label }}
-        </span>
-        <span class="small text-muted ms-2">
-          Last updated:
-          <span id="validation-status-last-run" data-validation-iso="{{ validation_rollup_at | default('', true) }}">Never</span>
         </span>
       </button>
     </h2>
@@ -150,75 +155,45 @@
             Status
             <span class="rating-mapping-option-via rating-mapping-option-via--header rating-mapping-option-via--neutral">Pill</span>
             shows the page name and is clickable; colors reflect validation status. Gray means not applicable.
-            <div class="mt-1 d-flex flex-wrap align-items-center gap-2">
-              Bulk legend:
-              <span class="rating-mapping-option-via rating-mapping-option-via--validated">Bulk</span>
-              <span class="rating-mapping-option-via rating-mapping-option-via--interactive">Interactive</span>
-              <span class="rating-mapping-option-via rating-mapping-option-via--neutral">N/A</span>
-            </div>
           </div>
           <button id="validate-all-services" type="button" class="btn btn-outline-info btn-sm" data-qs-validate-all>
-            <i class="bi bi-check2-circle me-1"></i> Validate Configured Services
+            <i class="bi bi-check2-circle me-1"></i> Validate All
             <span id="validate-all-spinner" class="spinner-border spinner-border-sm ms-1 d-none qs-validate-all-spinner" role="status" aria-hidden="true"></span>
           </button>
         </div>
-        <div class="small text-muted text-uppercase">Current validation summary</div>
-        <div id="validate-all-status" class="small text-muted">{{ validation_rollup if validation_rollup else 'Current status unavailable.' }}</div>
+        <div class="small text-muted text-uppercase">Validate All run summary</div>
+        {% set validate_all_summary = validation_bulk_rollup | replace('Completed. ', '') | replace('Completed ', '') if validation_bulk_rollup else '' %}
+        <div id="validate-all-status-bulk" class="small text-muted">{{ validate_all_summary if validate_all_summary else 'No Validate All run has completed yet.' }}</div>
         <div class="small text-muted mb-2">
-          Last updated:
-          <span id="validate-all-status-time" data-validation-iso="{{ validation_rollup_at | default('', true) }}">—</span>
-        </div>
-        <div class="small text-muted text-uppercase">Last bulk validation run</div>
-        <div id="validate-all-status-bulk" class="small text-muted">{{ validation_bulk_rollup if validation_bulk_rollup else 'No bulk validation run yet.' }}</div>
-        <div class="small text-muted mb-2">
-          Bulk updated:
+          Validate All completed:
           <span id="validate-all-status-bulk-time" data-validation-iso="{{ validation_bulk_rollup_at | default('', true) }}">—</span>
         </div>
-        {% set bulk_pages = ['010-plex','020-tmdb','025-libraries','030-tautulli','040-github','050-omdb','060-mdblist','070-notifiarr','080-gotify','085-ntfy','087-apprise','090-webhooks','100-anidb','110-radarr','120-sonarr','150-settings','130-trakt','140-mal'] %}
-        {% set interactive_pages = [] %}
-        {% set nonservice_pages = ['001-start','900-kometa','910-sponsor','905-analytics'] %}
         <div class="table-responsive" data-qs-sticky-first="true">
           <table class="table table-sm table-dark table-striped align-middle mb-0">
             <thead>
               <tr>
                 <th>Status</th>
-                <th>Bulk</th>
                 <th>Last validated</th>
                 <th>Time since</th>
                 <th>Validation Results</th>
               </tr>
             </thead>
             <tbody>
-              {% for entry in validation_meta %}
-              <tr data-validation-key="{{ entry.key }}">
+              {% for group in validation_groups %}
+              <tr class="qs-validation-group-row" data-validation-group-header="{{ group.key }}">
+                <th colspan="4">{{ group.label }}</th>
+              </tr>
+              {% for entry in group.entries %}
+              <tr data-validation-key="{{ entry.key }}" data-validation-group="{{ entry.group_key }}">
                 <td>
                   <div class="d-flex flex-column gap-1">
-                    {% if entry.has_validation %}
-                    <a class="rating-mapping-option-via rating-mapping-option-link validation-status-pill rating-mapping-option-via--{{ 'validated' if entry.validated else 'unvalidated' }}"
+                    <a class="rating-mapping-option-via rating-mapping-option-link validation-status-pill rating-mapping-option-via--{{ entry.pill_state }}"
                       href="javascript:void(0);" data-jumpto-page="{{ entry.page }}">
                       {{ entry.label }}
                     </a>
-                    {% else %}
-                    <a class="rating-mapping-option-via rating-mapping-option-link validation-status-pill rating-mapping-option-via--neutral"
-                      href="javascript:void(0);" data-jumpto-page="{{ entry.page }}">
-                      {{ entry.label }}
-                    </a>
-                    {% endif %}
                   </div>
                 </td>
                 <td>
-                  {% if entry.page in bulk_pages %}
-                  <span class="rating-mapping-option-via rating-mapping-option-via--validated">Bulk</span>
-                  {% elif entry.page in interactive_pages %}
-                  <span class="rating-mapping-option-via rating-mapping-option-via--interactive">Interactive</span>
-                  {% elif entry.page in nonservice_pages or not entry.has_validation %}
-                  <span class="rating-mapping-option-via rating-mapping-option-via--neutral">N/A</span>
-                  {% else %}
-                  <span class="rating-mapping-option-via rating-mapping-option-via--neutral">N/A</span>
-                  {% endif %}
-                </td>
-                <td>
-                  {% if entry.has_validation %}
                   <span class="validation-timestamp small text-muted"
                     data-validation-iso="{{ entry.validated_at | default('', true) }}">
                     {% if entry.validated_at %}
@@ -229,34 +204,24 @@
                     Never
                     {% endif %}
                   </span>
-                  {% else %}
-                  <span class="validation-timestamp small text-muted">N/A</span>
-                  {% endif %}
                 </td>
                 <td>
-                  {% if entry.has_validation %}
                   {% if entry.validated_at %}
                   <span class="validation-age small text-muted"
                     data-validation-iso-age="{{ entry.validated_at | default('', true) }}">—</span>
                   {% else %}
                   <span class="validation-age small text-muted">—</span>
                   {% endif %}
-                  {% else %}
-                  <span class="validation-age small text-muted">N/A</span>
-                  {% endif %}
                 </td>
                 <td>
-                  {% if entry.has_validation %}
                   {% if entry.validation_result %}
                   <span class="validation-result small text-muted">{{ entry.validation_result }}</span>
                   {% else %}
                   <span class="validation-result small text-muted">—</span>
                   {% endif %}
-                  {% else %}
-                  <span class="validation-result small text-muted">N/A</span>
-                  {% endif %}
                 </td>
               </tr>
+              {% endfor %}
               {% endfor %}
             </tbody>
           </table>
@@ -527,6 +492,18 @@
                 <span id="kometa-update-box-note">{{ 'Update this existing Kometa install manually outside Quickstart before running.' if page_info.kometa_install_mode == 'existing' else 'Click "Update Available" to apply it.' }}</span>
               </div>
 
+              <div id="kometa-update-progress" class="alert alert-secondary mt-2 mb-0 d-none" role="status" aria-live="polite">
+                <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-1">
+                  <div class="fw-semibold" id="kometa-update-progress-title">Kometa update progress</div>
+                  <span id="kometa-update-progress-percent" class="badge text-bg-secondary">0%</span>
+                </div>
+                <div id="kometa-update-progress-message" class="small text-muted mb-2">No Kometa update is running.</div>
+                <div class="progress" style="height: 10px;">
+                  <div id="kometa-update-progress-bar" class="progress-bar bg-secondary" role="progressbar"
+                    style="width: 0%;" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+                </div>
+              </div>
+
               <pre id="kometa-validation-log" class="form-control bg-dark text-light mt-3"
                 style="height: 300px; overflow-y: auto; overflow-x: auto; white-space: pre;"></pre>
             </div>
@@ -686,6 +663,79 @@
                 <label class="form-check-label" for="opt-{{ opt }}">--{{ opt }}</label>
               </div>
               {% endfor %}
+            </fieldset>
+          </div>
+        </div>
+      </div>
+
+      <!-- Validation Options -->
+      <div class="accordion-item">
+        <h2 class="accordion-header" id="heading-validationflags">
+          <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse"
+            data-bs-target="#collapse-validationflags" aria-expanded="false" aria-controls="collapse-validationflags">
+            Validation / Schema Checks
+            <span id="heading-validationflags-rollup-badge" class="badge ms-2 qs-validation-rollup-badge qs-validation-rollup-badge--unknown">
+              Default
+            </span>
+          </button>
+        </h2>
+        <div id="collapse-validationflags" class="accordion-collapse collapse" aria-labelledby="heading-validationflags"
+          data-bs-parent="#run-command-accordion">
+          <div class="accordion-body">
+            <div class="alert alert-secondary small mb-3">
+              Validation modes make Kometa validate and exit instead of running collections, overlays, operations, or schedules.
+              Normal run options are ignored while a validation mode is selected.
+            </div>
+            <fieldset>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="validate-mode" id="opt-validate-none" value="" checked>
+                <label class="form-check-label" for="opt-validate-none">Default</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="validate-mode" id="opt-validate" value="--validate">
+                <label class="form-check-label" for="opt-validate">--validate</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="validate-mode" id="opt-validate-file" value="--validate-file">
+                <label class="form-check-label" for="opt-validate-file">--validate-file</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="validate-mode" id="opt-validate-dir" value="--validate-dir">
+                <label class="form-check-label" for="opt-validate-dir">--validate-dir</label>
+              </div>
+
+              <div id="validate-config-options" class="mt-3">
+                <label class="form-label" for="opt-validate-level">--validate-level</label>
+                <select class="form-select" id="opt-validate-level">
+                  <option value="syntax">syntax</option>
+                  <option value="structure" selected>structure</option>
+                  <option value="full">full</option>
+                </select>
+                <div class="form-text">Controls how deep validation goes when validating the generated config. Default is <code>structure</code>.</div>
+
+                <div class="form-check mt-3">
+                  <input class="form-check-input" type="checkbox" id="opt-validate-schema" value="--validate-schema">
+                  <label class="form-check-label" for="opt-validate-schema">--validate-schema</label>
+                </div>
+              </div>
+
+              <div id="validate-file-options" class="mt-3 d-none">
+                <label class="form-label" for="opt-validate-file-val">YAML File Path</label>
+                <input type="text" class="form-control" id="opt-validate-file-val" placeholder="/path/to/collections.yml">
+                <div id="validate-file-error" class="text-danger small d-none mt-1"></div>
+              </div>
+
+              <div id="validate-dir-options" class="mt-3 d-none">
+                <label class="form-label" for="opt-validate-dir-val">YAML Directory Path</label>
+                <input type="text" class="form-control" id="opt-validate-dir-val" placeholder="/path/to/configs">
+                <div id="validate-dir-error" class="text-danger small d-none mt-1"></div>
+              </div>
+
+              <div id="validate-schema-path-options" class="mt-3 d-none">
+                <label class="form-label" for="opt-schema-path">--schema-path</label>
+                <input type="text" class="form-control" id="opt-schema-path" placeholder="/path/to/json-schema">
+                <div class="form-text">Optional path to the json-schema directory.</div>
+              </div>
             </fieldset>
           </div>
         </div>

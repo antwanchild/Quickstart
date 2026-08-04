@@ -1,3 +1,5 @@
+import json
+
 from modules import importer
 
 
@@ -46,6 +48,11 @@ def test_prepare_import_payload_accepts_chart_builder_size_template_variables():
                                 "list_size": 50,
                                 "list_days_popular": 7,
                                 "list_size_watched": 25,
+                                "image": "chart/color/plex",
+                                "url_logo_popular": "https://example.com/plex-popular.png",
+                                "sync_mode_watched": "append",
+                                "cache_builders_popular": 0,
+                                "collection_order_popular": "custom",
                             },
                         },
                         {
@@ -54,6 +61,13 @@ def test_prepare_import_payload_accepts_chart_builder_size_template_variables():
                                 "limit": 75,
                                 "limit_popular": 50,
                                 "limit_recommended": 30,
+                                "image": "chart/color/trakt",
+                                "url_logo_collected": "https://example.com/trakt-collected.png",
+                                "sync_mode_recommended": "append",
+                                "cache_builders_trending": 0,
+                                "collection_order_watched": "custom",
+                                "radarr_folder_collected": r"C:\Media\Movies",
+                                "sonarr_search_watched": "false",
                             },
                         },
                         {
@@ -62,13 +76,25 @@ def test_prepare_import_payload_accepts_chart_builder_size_template_variables():
                                 "limit": 60,
                                 "limit_airing": 20,
                                 "limit_trending": 40,
+                                "allowed_libraries": "show",
+                                "image": "chart/color/tmdb",
+                                "url_logo_airing": "https://example.com/tmdb-airing.png",
+                                "collection_order_air": "custom",
+                                "radarr_folder_top": r"C:\Media\Movies",
+                                "sonarr_search_air": "false",
                             },
                         },
                         {
                             "default": "simkl",
                             "template_variables": {
+                                "period": "week",
                                 "limit_trending_today": 15,
                                 "limit_dvd": 10,
+                                "image": "chart/color/simkl",
+                                "url_logo_trending_week": "https://example.com/simkl-week.png",
+                                "collection_order_dvd": "custom",
+                                "radarr_folder_dvd": r"C:\Media\Movies",
+                                "sonarr_search_trending_week": "false",
                             },
                         },
                         {
@@ -77,6 +103,13 @@ def test_prepare_import_payload_accepts_chart_builder_size_template_variables():
                                 "limit": 80,
                                 "limit_popular": 40,
                                 "limit_season": 25,
+                                "image": "chart/color/anilist",
+                                "url_logo_season": "https://example.com/anilist-season.png",
+                                "sync_mode_trending": "append",
+                                "cache_builders_season": 0,
+                                "collection_order_top": "custom",
+                                "radarr_folder_popular": r"C:\Media\Movies",
+                                "sonarr_search_season": "false",
                             },
                         },
                         {
@@ -85,6 +118,15 @@ def test_prepare_import_payload_accepts_chart_builder_size_template_variables():
                                 "limit": 90,
                                 "limit_favorited": 45,
                                 "limit_airing": 12,
+                                "starting_only": True,
+                                "starting_only_season": False,
+                                "image": "chart/color/mal",
+                                "url_logo_favorited": "https://example.com/mal-favorited.png",
+                                "sync_mode_season": "append",
+                                "cache_builders_airing": 0,
+                                "collection_order_top": "custom",
+                                "radarr_folder_favorited": r"C:\Media\Movies",
+                                "sonarr_search_season": "false",
                             },
                         },
                         {
@@ -93,6 +135,10 @@ def test_prepare_import_payload_accepts_chart_builder_size_template_variables():
                                 "limit": 20,
                                 "limit_released": 10,
                                 "limit_episodes": 5,
+                                "allowed_libraries": "show",
+                                "schedule": "weekly(sunday)",
+                                "url_logo_released": "https://example.com/released.png",
+                                "sort_by_episodes": "episode_air_date.asc",
                             },
                         },
                         {
@@ -102,12 +148,26 @@ def test_prepare_import_payload_accepts_chart_builder_size_template_variables():
                                 "limit_1001_movies": 80,
                                 "limit_top_500": 60,
                                 "limit_women_directors": 40,
+                                "allowed_libraries": "movie",
+                                "image": "chart/color/letterboxd",
+                                "url_logo_top_500": "https://example.com/letterboxd-top-500.png",
+                                "url_logo_cannes": "https://example.com/letterboxd-cannes.png",
+                                "sync_mode_oscars": "append",
+                                "cache_builders_black_directors": 0,
+                                "collection_order_cannes": "custom",
+                                "radarr_folder_women_directors": r"C:\Media\Movies",
+                                "sonarr_search_imdb_top_250": "false",
                             },
                         },
                         {
                             "default": "imdb",
                             "template_variables": {
                                 "limit": 250,
+                                "allowed_libraries": "movie",
+                                "url_logo_lowest": "https://example.com/lowest.png",
+                                "collection_order_top": "custom",
+                                "radarr_folder_top": r"C:\Media\Movies",
+                                "sonarr_search_popular": "false",
                             },
                         },
                         {
@@ -139,8 +199,15 @@ def test_prepare_import_payload_accepts_chart_builder_size_template_variables():
                         {
                             "default": "content_rating_us",
                             "template_variables": {
+                                "search_term": "content_rating",
+                                "image": "content_rating/us/<<key_name>>",
+                                "translation_key": "content_rating",
                                 "limit": 40,
                                 "limit_other": 5,
+                                "visible_home_PG-13": True,
+                                "hub_priority_PG-13": 1,
+                                "image_PG-13": "content_rating/us/PG-13-custom",
+                                "item_radarr_tag_R": ["rating", "r"],
                             },
                         },
                     ]
@@ -157,36 +224,101 @@ def test_prepare_import_payload_accepts_chart_builder_size_template_variables():
     assert libraries_payload["mov-library_movies-template_collection_tautulli_list_size"] == 50
     assert libraries_payload["mov-library_movies-template_collection_tautulli_list_days_popular"] == 7
     assert libraries_payload["mov-library_movies-template_collection_tautulli_list_size_watched"] == 25
+    assert libraries_payload["mov-library_movies-template_collection_tautulli_image"] == "chart/color/plex"
+    assert libraries_payload["mov-library_movies-template_collection_tautulli_url_logo_popular"] == "https://example.com/plex-popular.png"
+    assert libraries_payload["mov-library_movies-template_collection_tautulli_sync_mode_watched"] == "append"
+    assert libraries_payload["mov-library_movies-template_collection_tautulli_cache_builders_popular"] == 0
+    assert libraries_payload["mov-library_movies-template_collection_tautulli_collection_order_popular"] == "custom"
     assert libraries_payload["mov-library_movies-template_collection_trakt_limit"] == 75
     assert libraries_payload["mov-library_movies-template_collection_trakt_limit_popular"] == 50
     assert libraries_payload["mov-library_movies-template_collection_trakt_limit_recommended"] == 30
+    assert libraries_payload["mov-library_movies-template_collection_trakt_image"] == "chart/color/trakt"
+    assert libraries_payload["mov-library_movies-template_collection_trakt_url_logo_collected"] == "https://example.com/trakt-collected.png"
+    assert libraries_payload["mov-library_movies-template_collection_trakt_sync_mode_recommended"] == "append"
+    assert libraries_payload["mov-library_movies-template_collection_trakt_cache_builders_trending"] == 0
+    assert libraries_payload["mov-library_movies-template_collection_trakt_collection_order_watched"] == "custom"
+    assert libraries_payload["mov-library_movies-template_collection_trakt_radarr_folder_collected"] == r"C:\Media\Movies"
+    assert libraries_payload["mov-library_movies-template_collection_trakt_sonarr_search_watched"] == "false"
     assert libraries_payload["mov-library_movies-template_collection_tmdb_limit"] == 60
     assert libraries_payload["mov-library_movies-template_collection_tmdb_limit_airing"] == 20
     assert libraries_payload["mov-library_movies-template_collection_tmdb_limit_trending"] == 40
+    assert libraries_payload["mov-library_movies-template_collection_tmdb_allowed_libraries"] == "show"
+    assert libraries_payload["mov-library_movies-template_collection_tmdb_image"] == "chart/color/tmdb"
+    assert libraries_payload["mov-library_movies-template_collection_tmdb_url_logo_airing"] == "https://example.com/tmdb-airing.png"
+    assert libraries_payload["mov-library_movies-template_collection_tmdb_collection_order_air"] == "custom"
+    assert libraries_payload["mov-library_movies-template_collection_tmdb_radarr_folder_top"] == r"C:\Media\Movies"
+    assert libraries_payload["mov-library_movies-template_collection_tmdb_sonarr_search_air"] == "false"
+    assert libraries_payload["mov-library_movies-template_collection_simkl_period"] == "week"
     assert libraries_payload["mov-library_movies-template_collection_simkl_limit_trending_today"] == 15
     assert libraries_payload["mov-library_movies-template_collection_simkl_limit_dvd"] == 10
+    assert libraries_payload["mov-library_movies-template_collection_simkl_image"] == "chart/color/simkl"
+    assert libraries_payload["mov-library_movies-template_collection_simkl_url_logo_trending_week"] == "https://example.com/simkl-week.png"
+    assert libraries_payload["mov-library_movies-template_collection_simkl_collection_order_dvd"] == "custom"
+    assert libraries_payload["mov-library_movies-template_collection_simkl_radarr_folder_dvd"] == r"C:\Media\Movies"
+    assert libraries_payload["mov-library_movies-template_collection_simkl_sonarr_search_trending_week"] == "false"
     assert libraries_payload["mov-library_movies-template_collection_anilist_limit"] == 80
     assert libraries_payload["mov-library_movies-template_collection_anilist_limit_popular"] == 40
     assert libraries_payload["mov-library_movies-template_collection_anilist_limit_season"] == 25
+    assert libraries_payload["mov-library_movies-template_collection_anilist_image"] == "chart/color/anilist"
+    assert libraries_payload["mov-library_movies-template_collection_anilist_url_logo_season"] == "https://example.com/anilist-season.png"
+    assert libraries_payload["mov-library_movies-template_collection_anilist_sync_mode_trending"] == "append"
+    assert libraries_payload["mov-library_movies-template_collection_anilist_cache_builders_season"] == 0
+    assert libraries_payload["mov-library_movies-template_collection_anilist_collection_order_top"] == "custom"
+    assert libraries_payload["mov-library_movies-template_collection_anilist_radarr_folder_popular"] == r"C:\Media\Movies"
+    assert libraries_payload["mov-library_movies-template_collection_anilist_sonarr_search_season"] == "false"
     assert libraries_payload["mov-library_movies-template_collection_myanimelist_limit"] == 90
     assert libraries_payload["mov-library_movies-template_collection_myanimelist_limit_favorited"] == 45
     assert libraries_payload["mov-library_movies-template_collection_myanimelist_limit_airing"] == 12
+    assert libraries_payload["mov-library_movies-template_collection_myanimelist_starting_only"] is True
+    assert libraries_payload["mov-library_movies-template_collection_myanimelist_starting_only_season"] is False
+    assert libraries_payload["mov-library_movies-template_collection_myanimelist_image"] == "chart/color/mal"
+    assert libraries_payload["mov-library_movies-template_collection_myanimelist_url_logo_favorited"] == "https://example.com/mal-favorited.png"
+    assert libraries_payload["mov-library_movies-template_collection_myanimelist_sync_mode_season"] == "append"
+    assert libraries_payload["mov-library_movies-template_collection_myanimelist_cache_builders_airing"] == 0
+    assert libraries_payload["mov-library_movies-template_collection_myanimelist_collection_order_top"] == "custom"
+    assert libraries_payload["mov-library_movies-template_collection_myanimelist_radarr_folder_favorited"] == r"C:\Media\Movies"
+    assert libraries_payload["mov-library_movies-template_collection_myanimelist_sonarr_search_season"] == "false"
     assert libraries_payload["mov-library_movies-template_collection_basic_limit"] == 20
     assert libraries_payload["mov-library_movies-template_collection_basic_limit_released"] == 10
     assert libraries_payload["mov-library_movies-template_collection_basic_limit_episodes"] == 5
+    assert libraries_payload["mov-library_movies-template_collection_basic_allowed_libraries"] == "show"
+    assert libraries_payload["mov-library_movies-template_collection_basic_schedule"] == "weekly(sunday)"
+    assert libraries_payload["mov-library_movies-template_collection_basic_url_logo_released"] == "https://example.com/released.png"
+    assert libraries_payload["mov-library_movies-template_collection_basic_sort_by_episodes"] == "episode_air_date.asc"
     assert libraries_payload["mov-library_movies-template_collection_letterboxd_limit"] == 120
     assert libraries_payload["mov-library_movies-template_collection_letterboxd_limit_1001_movies"] == 80
     assert libraries_payload["mov-library_movies-template_collection_letterboxd_limit_top_500"] == 60
     assert libraries_payload["mov-library_movies-template_collection_letterboxd_limit_women_directors"] == 40
+    assert libraries_payload["mov-library_movies-template_collection_letterboxd_allowed_libraries"] == "movie"
+    assert libraries_payload["mov-library_movies-template_collection_letterboxd_image"] == "chart/color/letterboxd"
+    assert libraries_payload["mov-library_movies-template_collection_letterboxd_url_logo_top_500"] == "https://example.com/letterboxd-top-500.png"
+    assert libraries_payload["mov-library_movies-template_collection_letterboxd_url_logo_cannes"] == "https://example.com/letterboxd-cannes.png"
+    assert libraries_payload["mov-library_movies-template_collection_letterboxd_sync_mode_oscars"] == "append"
+    assert libraries_payload["mov-library_movies-template_collection_letterboxd_cache_builders_black_directors"] == 0
+    assert libraries_payload["mov-library_movies-template_collection_letterboxd_collection_order_cannes"] == "custom"
+    assert libraries_payload["mov-library_movies-template_collection_letterboxd_radarr_folder_women_directors"] == r"C:\Media\Movies"
+    assert libraries_payload["mov-library_movies-template_collection_letterboxd_sonarr_search_imdb_top_250"] == "false"
     assert libraries_payload["mov-library_movies-template_collection_imdb_limit"] == 250
+    assert libraries_payload["mov-library_movies-template_collection_imdb_allowed_libraries"] == "movie"
+    assert libraries_payload["mov-library_movies-template_collection_imdb_url_logo_lowest"] == "https://example.com/lowest.png"
+    assert libraries_payload["mov-library_movies-template_collection_imdb_collection_order_top"] == "custom"
+    assert libraries_payload["mov-library_movies-template_collection_imdb_radarr_folder_top"] == r"C:\Media\Movies"
+    assert libraries_payload["mov-library_movies-template_collection_imdb_sonarr_search_popular"] == "false"
     assert libraries_payload["mov-library_movies-template_collection_other_chart_limit"] == 125
     assert libraries_payload["mov-library_movies-template_collection_streaming_limit"] == 500
     assert libraries_payload["mov-library_movies-template_collection_streaming_discover_limit"] == 150
     assert libraries_payload["mov-library_movies-template_collection_seasonal_limit"] == 30
     assert libraries_payload["mov-library_movies-template_collection_seasonal_limit_halloween"] == 12
     assert libraries_payload["mov-library_movies-template_collection_year_limit"] == 8
+    assert libraries_payload["mov-library_movies-template_collection_content_rating_us_search_term"] == "content_rating"
+    assert libraries_payload["mov-library_movies-template_collection_content_rating_us_image"] == "content_rating/us/<<key_name>>"
+    assert libraries_payload["mov-library_movies-template_collection_content_rating_us_translation_key"] == "content_rating"
     assert libraries_payload["mov-library_movies-template_collection_content_rating_us_limit"] == 40
     assert libraries_payload["mov-library_movies-template_collection_content_rating_us_limit_other"] == 5
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_content_rating_us_child_visible_home_overrides"]) == {"PG-13": "true"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_content_rating_us_child_hub_priority_overrides"]) == {"PG-13": "1"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_content_rating_us_child_image_overrides"]) == {"PG-13": "content_rating/us/PG-13-custom"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_content_rating_us_child_item_radarr_tag_overrides"]) == {"R": "rating,r"}
     assert any("libraries.Movies.collection_files[0].template_variables.list_days" in line for line in report.lines)
     assert any("libraries.Movies.collection_files[1].template_variables.limit_popular" in line for line in report.lines)
     assert any("libraries.Movies.collection_files[2].template_variables.limit_airing" in line for line in report.lines)
@@ -201,6 +333,7 @@ def test_prepare_import_payload_accepts_chart_builder_size_template_variables():
     assert any("libraries.Movies.collection_files[11].template_variables.limit_halloween" in line for line in report.lines)
     assert any("libraries.Movies.collection_files[12].template_variables.limit" in line for line in report.lines)
     assert any("libraries.Movies.collection_files[13].template_variables.limit_other" in line for line in report.lines)
+    assert any("libraries.Movies.collection_files[13].template_variables.visible_home_PG-13" in line for line in report.lines)
 
 
 def test_prepare_import_payload_collapses_franchise_dynamic_child_template_variables():
@@ -214,9 +347,16 @@ def test_prepare_import_payload_collapses_franchise_dynamic_child_template_varia
                             "template_variables": {
                                 "build_collection": False,
                                 "name_10": "Skywalker Saga",
+                                "name_mapping_10": "Star Wars Skywalker Saga",
+                                "order_10": "01",
+                                "movie_10": [1891, 1892],
                                 "sync_mode_10": "append",
                                 "collection_order_10": "custom",
                                 "url_poster_10": "https://example.com/star-wars.jpg",
+                                "file_poster_10": r"C:\Posters\star-wars.jpg",
+                                "url_background_10": "https://example.com/star-wars-bg.jpg",
+                                "url_logo_10": "https://example.com/star-wars-logo.png",
+                                "url_square_art_10": "https://example.com/star-wars-square.png",
                                 "radarr_add_missing_10": True,
                                 "radarr_folder_10": r"C:\Media\Movies",
                                 "radarr_tag_10": ["4k", "franchise"],
@@ -234,7 +374,10 @@ def test_prepare_import_payload_collapses_franchise_dynamic_child_template_varia
                             "template_variables": {
                                 "build_collection": False,
                                 "summary_1399": "Dragons and dynasties",
+                                "name_mapping_1399": "Game of Thrones",
+                                "order_1399": "02",
                                 "sort_title_1399": "!350_Game of Thrones",
+                                "url_poster_1399": "https://example.com/got.jpg",
                                 "sonarr_add_missing_1399": True,
                                 "sonarr_folder_1399": r"C:\Media\Shows",
                                 "sonarr_tag_1399": ["tracked", "priority"],
@@ -256,16 +399,26 @@ def test_prepare_import_payload_collapses_franchise_dynamic_child_template_varia
     assert libraries_payload["mov-library_movies-template_collection_franchise_build_collection"] is False
     assert libraries_payload["mov-library_movies-template_collection_franchise_title_override"] == {"10": "Star Wars: Skywalker Saga"}
     assert libraries_payload["mov-library_movies-template_collection_franchise_child_name_overrides"] == '{"10": "Skywalker Saga"}'
+    assert libraries_payload["mov-library_movies-template_collection_franchise_child_name_mapping_overrides"] == '{"10": "Star Wars Skywalker Saga"}'
+    assert libraries_payload["mov-library_movies-template_collection_franchise_child_order_overrides"] == '{"10": "01"}'
+    assert libraries_payload["mov-library_movies-template_collection_franchise_child_movie_overrides"] == '{"10": "1891,1892"}'
     assert libraries_payload["mov-library_movies-template_collection_franchise_child_sync_mode_overrides"] == '{"10": "append"}'
     assert libraries_payload["mov-library_movies-template_collection_franchise_child_collection_order_overrides"] == '{"10": "custom"}'
     assert libraries_payload["mov-library_movies-template_collection_franchise_child_url_poster_overrides"] == '{"10": "https://example.com/star-wars.jpg"}'
+    assert libraries_payload["mov-library_movies-template_collection_franchise_child_file_poster_overrides"] == '{"10": "C:\\\\Posters\\\\star-wars.jpg"}'
+    assert libraries_payload["mov-library_movies-template_collection_franchise_child_url_background_overrides"] == '{"10": "https://example.com/star-wars-bg.jpg"}'
+    assert libraries_payload["mov-library_movies-template_collection_franchise_child_url_logo_overrides"] == '{"10": "https://example.com/star-wars-logo.png"}'
+    assert libraries_payload["mov-library_movies-template_collection_franchise_child_url_square_art_overrides"] == '{"10": "https://example.com/star-wars-square.png"}'
     assert libraries_payload["mov-library_movies-template_collection_franchise_child_radarr_add_missing_overrides"] == '{"10": "true"}'
     assert libraries_payload["mov-library_movies-template_collection_franchise_child_radarr_folder_overrides"] == '{"10": "C:\\\\Media\\\\Movies"}'
     assert libraries_payload["mov-library_movies-template_collection_franchise_child_radarr_tag_overrides"] == '{"10": "4k,franchise"}'
     assert libraries_payload["mov-library_movies-template_collection_franchise_child_item_radarr_tag_overrides"] == '{"10": "collection,tracked"}'
     assert libraries_payload["mov-library_movies-template_collection_franchise_child_radarr_monitor_overrides"] == '{"10": "false"}'
     assert libraries_payload["sho-library_shows-template_collection_franchise_child_summary_overrides"] == '{"1399": "Dragons and dynasties"}'
+    assert libraries_payload["sho-library_shows-template_collection_franchise_child_name_mapping_overrides"] == '{"1399": "Game of Thrones"}'
+    assert libraries_payload["sho-library_shows-template_collection_franchise_child_order_overrides"] == '{"1399": "02"}'
     assert libraries_payload["sho-library_shows-template_collection_franchise_child_sort_title_overrides"] == '{"1399": "!350_Game of Thrones"}'
+    assert libraries_payload["sho-library_shows-template_collection_franchise_child_url_poster_overrides"] == '{"1399": "https://example.com/got.jpg"}'
     assert libraries_payload["sho-library_shows-template_collection_franchise_child_sonarr_add_missing_overrides"] == '{"1399": "true"}'
     assert libraries_payload["sho-library_shows-template_collection_franchise_child_sonarr_folder_overrides"] == '{"1399": "C:\\\\Media\\\\Shows"}'
     assert libraries_payload["sho-library_shows-template_collection_franchise_child_sonarr_tag_overrides"] == '{"1399": "tracked,priority"}'
@@ -274,3 +427,981 @@ def test_prepare_import_payload_collapses_franchise_dynamic_child_template_varia
     assert libraries_payload["sho-library_shows-template_collection_franchise_build_collection"] is False
     assert any("libraries.Movies.collection_files[0].template_variables.name_10" in line for line in report.lines)
     assert any("libraries.Shows.collection_files[0].template_variables.sonarr_monitor_1399" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_universe_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "universe",
+                            "template_variables": {
+                                "url_poster_avp": "https://example.com/avp.jpg",
+                                "schedule_arrow": "weekly(sunday)",
+                                "trakt_list_trek": ["https://trakt.tv/users/example/lists/star-trek"],
+                                "delete_collections_named_mummy": ["The Mummy Universe"],
+                                "radarr_folder_avp": r"C:\Media\Movies",
+                                "radarr_search_avp": False,
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_universe"] is True
+    assert libraries_payload["mov-library_movies-template_collection_universe_child_url_poster_overrides"] == '{"avp": "https://example.com/avp.jpg"}'
+    assert libraries_payload["mov-library_movies-template_collection_universe_child_schedule_overrides"] == '{"arrow": "weekly(sunday)"}'
+    assert libraries_payload["mov-library_movies-template_collection_universe_child_trakt_list_overrides"] == '{"trek": "https://trakt.tv/users/example/lists/star-trek"}'
+    assert libraries_payload["mov-library_movies-template_collection_universe_child_delete_collections_named_overrides"] == '{"mummy": "The Mummy Universe"}'
+    assert libraries_payload["mov-library_movies-template_collection_universe_child_radarr_folder_overrides"] == '{"avp": "C:\\\\Media\\\\Movies"}'
+    assert libraries_payload["mov-library_movies-template_collection_universe_child_radarr_search_overrides"] == '{"avp": "false"}'
+    assert any("libraries.Movies.collection_files[0].template_variables.url_poster_avp" in line for line in report.lines)
+
+
+def test_prepare_import_payload_accepts_based_and_collectionless_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "based",
+                            "template_variables": {
+                                "translation_key": "based",
+                                "schedule": "weekly(sunday)",
+                                "delete_collections_named": ["Old Based"],
+                                "keywords_books": ["based on book", "based on novel"],
+                                "image_comics": "based/comics",
+                                "limit_true_story": 25,
+                                "sort_by_video_games": "release.desc",
+                                "url_poster_true_story": "https://example.com/true-story.jpg",
+                                "radarr_folder_books": r"C:\Media\Movies",
+                                "sonarr_search_video_games": False,
+                            },
+                        },
+                        {
+                            "default": "collectionless",
+                            "template_variables": {
+                                "collection_mode": "hide",
+                                "name_collectionless": "No Collections",
+                                "summary_collectionless": "Items not in collections",
+                                "url_poster": "https://example.com/collectionless.jpg",
+                                "tmdb_movie": [603],
+                                "tmdb_show": [1399],
+                                "imdb_id": ["tt0133093"],
+                                "imdb_list": ["ls123456789"],
+                                "plex_search": {"all": {"title": "Example"}},
+                                "mdblist_list": ["https://mdblist.com/lists/example/list"],
+                                "trakt_list": ["https://trakt.tv/users/example/lists/list"],
+                                "exclude": ["Marvel Cinematic Universe"],
+                                "exclude_prefix": ["!", "~"],
+                            },
+                        },
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_based"] is True
+    assert libraries_payload["mov-library_movies-template_collection_based_translation_key"] == "based"
+    assert libraries_payload["mov-library_movies-template_collection_based_schedule"] == "weekly(sunday)"
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_based_delete_collections_named"]) == ["Old Based"]
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_based_keywords_books"]) == ["based on book", "based on novel"]
+    assert libraries_payload["mov-library_movies-template_collection_based_image_comics"] == "based/comics"
+    assert libraries_payload["mov-library_movies-template_collection_based_limit_true_story"] == 25
+    assert libraries_payload["mov-library_movies-template_collection_based_sort_by_video_games"] == "release.desc"
+    assert libraries_payload["mov-library_movies-template_collection_based_url_poster_true_story"] == "https://example.com/true-story.jpg"
+    assert libraries_payload["mov-library_movies-template_collection_based_radarr_folder_books"] == r"C:\Media\Movies"
+    assert libraries_payload["mov-library_movies-template_collection_based_sonarr_search_video_games"] is False
+    assert libraries_payload["mov-library_movies-collection_collectionless"] is True
+    assert libraries_payload["mov-library_movies-template_collection_collectionless_collection_mode"] == "hide"
+    assert libraries_payload["mov-library_movies-template_collection_collectionless_name_collectionless"] == "No Collections"
+    assert libraries_payload["mov-library_movies-template_collection_collectionless_summary_collectionless"] == "Items not in collections"
+    assert libraries_payload["mov-library_movies-template_collection_collectionless_url_poster"] == "https://example.com/collectionless.jpg"
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_collectionless_tmdb_movie"]) == [603]
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_collectionless_tmdb_show"]) == [1399]
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_collectionless_imdb_id"]) == ["tt0133093"]
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_collectionless_imdb_list"]) == ["ls123456789"]
+    assert libraries_payload["mov-library_movies-template_collection_collectionless_plex_search"] == {"all": {"title": "Example"}}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_collectionless_mdblist_list"]) == ["https://mdblist.com/lists/example/list"]
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_collectionless_trakt_list"]) == ["https://trakt.tv/users/example/lists/list"]
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_collectionless_exclude"]) == ["Marvel Cinematic Universe"]
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_collectionless_exclude_prefix"]) == ["!", "~"]
+    assert any("libraries.Movies.collection_files[0].template_variables.keywords_books" in line for line in report.lines)
+    assert any("libraries.Movies.collection_files[1].template_variables.plex_search" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_streaming_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "streaming",
+                            "template_variables": {
+                                "use_amc": False,
+                                "use_movistar": False,
+                                "schedule_amc": "weekly(sunday)",
+                                "sort_by_filmin": "title.asc",
+                                "delete_collections_named_appletv": ["Apple TV+ Movies", "Apple TV+ Shows"],
+                                "discover_with_atresplayer": "62|2162",
+                                "url_logo_movistar": "https://example.com/movistar.png",
+                                "radarr_folder_amc": r"C:\Media\Movies\AMC",
+                                "radarr_tag_filmin": ["filmin", "euro"],
+                                "radarr_monitor_movistar": True,
+                                "sonarr_folder_amc": r"C:\Media\Shows\AMC",
+                                "sonarr_monitor_filmin": "future",
+                                "sonarr_search_atresplayer": False,
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_streaming"] is True
+    assert libraries_payload["mov-library_movies-template_collection_streaming_use_amc"] is False
+    assert libraries_payload["mov-library_movies-template_collection_streaming_use_movistar"] is False
+    assert libraries_payload["mov-library_movies-template_collection_streaming_child_schedule_overrides"] == '{"amc": "weekly(sunday)"}'
+    assert libraries_payload["mov-library_movies-template_collection_streaming_child_sort_by_overrides"] == '{"filmin": "title.asc"}'
+    assert libraries_payload["mov-library_movies-template_collection_streaming_child_delete_collections_named_overrides"] == '{"appletv": "Apple TV+ Movies,Apple TV+ Shows"}'
+    assert libraries_payload["mov-library_movies-template_collection_streaming_child_discover_with_overrides"] == '{"atresplayer": "62|2162"}'
+    assert libraries_payload["mov-library_movies-template_collection_streaming_child_url_logo_overrides"] == '{"movistar": "https://example.com/movistar.png"}'
+    assert libraries_payload["mov-library_movies-template_collection_streaming_child_radarr_folder_overrides"] == '{"amc": "C:\\\\Media\\\\Movies\\\\AMC"}'
+    assert libraries_payload["mov-library_movies-template_collection_streaming_child_radarr_tag_overrides"] == '{"filmin": "filmin,euro"}'
+    assert libraries_payload["mov-library_movies-template_collection_streaming_child_radarr_monitor_overrides"] == '{"movistar": "true"}'
+    assert libraries_payload["mov-library_movies-template_collection_streaming_child_sonarr_folder_overrides"] == '{"amc": "C:\\\\Media\\\\Shows\\\\AMC"}'
+    assert libraries_payload["mov-library_movies-template_collection_streaming_child_sonarr_monitor_overrides"] == '{"filmin": "future"}'
+    assert libraries_payload["mov-library_movies-template_collection_streaming_child_sonarr_search_overrides"] == '{"atresplayer": "false"}'
+    assert any("libraries.Movies.collection_files[0].template_variables.use_amc" in line for line in report.lines)
+    assert any("libraries.Movies.collection_files[0].template_variables.schedule_amc" in line for line in report.lines)
+    assert any("libraries.Movies.collection_files[0].template_variables.url_logo_movistar" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_seasonal_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "seasonal",
+                            "template_variables": {
+                                "name_mapping_halloween": "Spooky Season",
+                                "emoji_halloween": "🎃",
+                                "delete_collections_named_halloween": ["Old Halloween Movies"],
+                                "tmdb_collection_halloween": [185103, 11716],
+                                "tmdb_movie_halloween": [23437],
+                                "imdb_list_years": ["ls066838460"],
+                                "imdb_search_halloween": {"list.any": ["ls546214737"], "limit": 500},
+                                "trakt_list_halloween": ["https://trakt.tv/users/example/lists/halloween"],
+                                "mdblist_list_christmas": ["https://mdblist.com/lists/k0meta/christmas-extravaganza"],
+                                "letterboxd_list_black_history": ["https://letterboxd.com/mardarrius/list/black-is-beautiful/"],
+                                "url_logo_women": "https://example.com/women.png",
+                                "radarr_folder_halloween": r"C:\Media\Movies\Halloween",
+                                "radarr_tag_christmas": ["holiday", "christmas"],
+                                "item_radarr_tag_women": ["history"],
+                                "radarr_search_halloween": False,
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_seasonal"] is True
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_name_mapping_overrides"]) == {"halloween": "Spooky Season"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_emoji_overrides"]) == {"halloween": "🎃"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_delete_collections_named_overrides"]) == {"halloween": "Old Halloween Movies"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_tmdb_collection_overrides"]) == {"halloween": "185103,11716"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_tmdb_movie_overrides"]) == {"halloween": "23437"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_imdb_list_overrides"]) == {"years": "ls066838460"}
+    imdb_search_mapping = json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_imdb_search_overrides"])
+    assert json.loads(imdb_search_mapping["halloween"]) == {"list.any": ["ls546214737"], "limit": 500}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_trakt_list_overrides"]) == {
+        "halloween": "https://trakt.tv/users/example/lists/halloween"
+    }
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_mdblist_list_overrides"]) == {
+        "christmas": "https://mdblist.com/lists/k0meta/christmas-extravaganza"
+    }
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_letterboxd_list_overrides"]) == {
+        "black_history": "https://letterboxd.com/mardarrius/list/black-is-beautiful/"
+    }
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_url_logo_overrides"]) == {"women": "https://example.com/women.png"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_radarr_folder_overrides"]) == {"halloween": r"C:\Media\Movies\Halloween"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_radarr_tag_overrides"]) == {"christmas": "holiday,christmas"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_item_radarr_tag_overrides"]) == {"women": "history"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_seasonal_child_radarr_search_overrides"]) == {"halloween": "false"}
+    assert any("libraries.Movies.collection_files[0].template_variables.imdb_search_halloween" in line for line in report.lines)
+    assert any("libraries.Movies.collection_files[0].template_variables.letterboxd_list_black_history" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_region_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "region",
+                            "template_variables": {
+                                "use_North America": False,
+                                "name_North America": "North American Cinema",
+                                "summary_North America": "Movies from North America",
+                                "order_North America": "01",
+                                "schedule_Northern Africa": "weekly(sunday)",
+                                "sort_by_Western Europe": "title.asc",
+                                "limit_Central America": 12,
+                                "minimum_items_Central America": 3,
+                                "file_poster_North America": r"C:\Posters\north-america.jpg",
+                                "url_logo_Southern Europe": "https://example.com/europe.png",
+                                "visible_home_Caribbean": True,
+                                "visible_library_Caribbean": False,
+                                "visible_shared_Caribbean": True,
+                                "hub_priority_Australia and New Zealand": 7,
+                                "item_radarr_tag_North America": ["north", "america"],
+                            },
+                        }
+                    ]
+                },
+                "Shows": {
+                    "collection_files": [
+                        {
+                            "default": "region",
+                            "template_variables": {
+                                "sync_mode_Eastern Asia": "append",
+                                "item_sonarr_tag_Eastern Asia": ["anime"],
+                            },
+                        }
+                    ]
+                },
+            }
+        },
+        {"Movies"},
+        {"Shows"},
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_region"] is True
+    assert libraries_payload["sho-library_shows-collection_region"] is True
+    assert libraries_payload["mov-library_movies-template_collection_region_use_North America"] is False
+    assert libraries_payload["mov-library_movies-template_collection_region_name_North America"] == "North American Cinema"
+    assert libraries_payload["mov-library_movies-template_collection_region_summary_North America"] == "Movies from North America"
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_region_child_order_overrides"]) == {"North America": "01"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_region_child_schedule_overrides"]) == {"Northern Africa": "weekly(sunday)"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_region_child_sort_by_overrides"]) == {"Western Europe": "title.asc"}
+    assert libraries_payload["mov-library_movies-template_collection_region_limit_Central America"] == 12
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_region_child_minimum_items_overrides"]) == {"Central America": "3"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_region_child_file_poster_overrides"]) == {"North America": r"C:\Posters\north-america.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_region_child_url_logo_overrides"]) == {"Southern Europe": "https://example.com/europe.png"}
+    assert libraries_payload["mov-library_movies-template_collection_region_visible_home_Caribbean"] is True
+    assert libraries_payload["mov-library_movies-template_collection_region_visible_library_Caribbean"] is False
+    assert libraries_payload["mov-library_movies-template_collection_region_visible_shared_Caribbean"] is True
+    assert libraries_payload["mov-library_movies-template_collection_region_hub_priority_Australia and New Zealand"] == 7
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_region_child_item_radarr_tag_overrides"]) == {"North America": "north,america"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_region_child_sync_mode_overrides"]) == {"Eastern Asia": "append"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_region_child_item_sonarr_tag_overrides"]) == {"Eastern Asia": "anime"}
+    assert any("libraries.Movies.collection_files[0].template_variables.use_North America" in line for line in report.lines)
+    assert any("libraries.Movies.collection_files[0].template_variables.name_North America" in line for line in report.lines)
+    assert any("libraries.Shows.collection_files[0].template_variables.sync_mode_Eastern Asia" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_country_and_continent_geography_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "country",
+                            "template_variables": {
+                                "search_term": "country",
+                                "trakt_list": ["https://trakt.tv/users/example/lists/france"],
+                                "schedule_France": "weekly(sunday)",
+                                "name_France": "French Cinema",
+                                "file_background_France": r"C:\Posters\france-bg.jpg",
+                                "item_radarr_tag_France": ["country", "france"],
+                            },
+                        },
+                        {
+                            "default": "continent",
+                            "template_variables": {
+                                "search_term": "country",
+                                "url_poster_Europe": "https://example.com/europe.jpg",
+                                "minimum_items_Europe": 5,
+                                "item_radarr_tag_Europe": ["continent", "europe"],
+                            },
+                        },
+                    ]
+                },
+                "Shows": {
+                    "collection_files": [
+                        {
+                            "default": "country",
+                            "template_variables": {
+                                "filter_term": "origin_country",
+                                "sync_mode_fr": "append",
+                                "name_fr": "French TV",
+                                "item_sonarr_tag_fr": ["country", "france"],
+                            },
+                        },
+                        {
+                            "default": "continent",
+                            "template_variables": {
+                                "filter_term": "origin_country",
+                                "sync_mode_Europe": "append",
+                                "file_logo_Europe": r"C:\Logos\europe.png",
+                                "item_sonarr_tag_Europe": ["continent", "europe"],
+                            },
+                        },
+                    ]
+                },
+            }
+        },
+        {"Movies"},
+        {"Shows"},
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_country"] is True
+    assert libraries_payload["sho-library_shows-collection_country"] is True
+    assert libraries_payload["mov-library_movies-collection_continent"] is True
+    assert libraries_payload["sho-library_shows-collection_continent"] is True
+    assert libraries_payload["mov-library_movies-template_collection_country_search_term"] == "country"
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_country_trakt_list"]) == ["https://trakt.tv/users/example/lists/france"]
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_country_child_schedule_overrides"]) == {"France": "weekly(sunday)"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_country_child_name_overrides"]) == {"France": "French Cinema"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_country_child_file_background_overrides"]) == {"France": r"C:\Posters\france-bg.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_country_child_item_radarr_tag_overrides"]) == {"France": "country,france"}
+    assert libraries_payload["sho-library_shows-template_collection_country_filter_term"] == "origin_country"
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_country_child_sync_mode_overrides"]) == {"fr": "append"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_country_child_name_overrides"]) == {"fr": "French TV"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_country_child_item_sonarr_tag_overrides"]) == {"fr": "country,france"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_continent_child_url_poster_overrides"]) == {"Europe": "https://example.com/europe.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_continent_child_minimum_items_overrides"]) == {"Europe": "5"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_continent_child_item_radarr_tag_overrides"]) == {"Europe": "continent,europe"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_continent_child_sync_mode_overrides"]) == {"Europe": "append"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_continent_child_file_logo_overrides"]) == {"Europe": r"C:\Logos\europe.png"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_continent_child_item_sonarr_tag_overrides"]) == {"Europe": "continent,europe"}
+    assert any("libraries.Movies.collection_files[0].template_variables.trakt_list" in line for line in report.lines)
+    assert any("libraries.Shows.collection_files[0].template_variables.sync_mode_fr" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_language_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "audio_language",
+                            "template_variables": {
+                                "search_term": "audio_language",
+                                "include": ["en", "fr"],
+                                "use_en": False,
+                                "name_en": "English Audio",
+                                "summary_en": "Movies with English audio",
+                                "schedule_fr": "weekly(sunday)",
+                                "sort_by_fr": "title.asc",
+                                "limit_fr": 25,
+                                "minimum_items_fr": 3,
+                                "url_background_en": "https://example.com/en-bg.jpg",
+                                "file_logo_fr": r"C:\Logos\fr-audio.png",
+                                "visible_home_en": True,
+                                "hub_priority_fr": 4,
+                                "item_radarr_tag_en": ["audio", "english"],
+                            },
+                        }
+                    ]
+                },
+                "Shows": {
+                    "collection_files": [
+                        {
+                            "default": "subtitle_language",
+                            "template_variables": {
+                                "search_term": "subtitle_language",
+                                "exclude": ["ja"],
+                                "use_fr": False,
+                                "name_fr": "French Subtitles",
+                                "file_poster_fr": r"C:\Posters\fr-subtitles.jpg",
+                                "visible_library_fr": False,
+                                "item_sonarr_tag_fr": ["subtitle", "french"],
+                            },
+                        }
+                    ]
+                },
+            }
+        },
+        {"Movies"},
+        {"Shows"},
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_audio_language"] is True
+    assert libraries_payload["sho-library_shows-collection_subtitle_language"] is True
+    assert libraries_payload["mov-library_movies-template_collection_audio_language_search_term"] == "audio_language"
+    assert libraries_payload["mov-library_movies-template_collection_audio_language_include"] == '["en", "fr"]'
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_audio_language_child_use_overrides"]) == {"en": "false"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_audio_language_child_name_overrides"]) == {"en": "English Audio"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_audio_language_child_summary_overrides"]) == {"en": "Movies with English audio"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_audio_language_child_schedule_overrides"]) == {"fr": "weekly(sunday)"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_audio_language_child_sort_by_overrides"]) == {"fr": "title.asc"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_audio_language_child_limit_overrides"]) == {"fr": "25"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_audio_language_child_minimum_items_overrides"]) == {"fr": "3"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_audio_language_child_url_background_overrides"]) == {"en": "https://example.com/en-bg.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_audio_language_child_file_logo_overrides"]) == {"fr": r"C:\Logos\fr-audio.png"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_audio_language_child_visible_home_overrides"]) == {"en": "true"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_audio_language_child_hub_priority_overrides"]) == {"fr": "4"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_audio_language_child_item_radarr_tag_overrides"]) == {"en": "audio,english"}
+    assert libraries_payload["sho-library_shows-template_collection_subtitle_language_search_term"] == "subtitle_language"
+    assert libraries_payload["sho-library_shows-template_collection_subtitle_language_exclude"] == '["ja"]'
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_subtitle_language_child_use_overrides"]) == {"fr": "false"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_subtitle_language_child_name_overrides"]) == {"fr": "French Subtitles"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_subtitle_language_child_file_poster_overrides"]) == {"fr": r"C:\Posters\fr-subtitles.jpg"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_subtitle_language_child_visible_library_overrides"]) == {"fr": "false"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_subtitle_language_child_item_sonarr_tag_overrides"]) == {"fr": "subtitle,french"}
+    assert any("libraries.Movies.collection_files[0].template_variables.use_en" in line for line in report.lines)
+    assert any("libraries.Shows.collection_files[0].template_variables.item_sonarr_tag_fr" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_aspect_and_resolution_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "aspect",
+                            "template_variables": {
+                                "filter_term": "aspect",
+                                "use_1.78": False,
+                                "name_1.78": "Widescreen TV",
+                                "summary_2.35": "Cinemascope favorites",
+                                "schedule_2.35": "weekly(sunday)",
+                                "sync_mode_2.35": "append",
+                                "sort_by_1.85": "title.asc",
+                                "minimum_items_1.33": 3,
+                                "url_background_1.78": "https://example.com/aspect-bg.jpg",
+                                "item_radarr_tag_1.78": ["aspect", "widescreen"],
+                            },
+                        },
+                        {
+                            "default": "resolution",
+                            "template_variables": {
+                                "search_term": "resolution",
+                                "include": ["4k", "1080"],
+                                "name_4k": "Ultra HD",
+                                "summary_1080": "HD favorites",
+                                "order_4k": "01",
+                                "schedule_1080": "weekly(friday)",
+                                "url_poster_4k": "https://example.com/4k.jpg",
+                                "item_radarr_tag_4k": ["resolution", "4k"],
+                            },
+                        },
+                    ]
+                },
+                "Shows": {
+                    "collection_files": [
+                        {
+                            "default": "aspect",
+                            "template_variables": {
+                                "name_2.35": "Scope TV",
+                                "item_sonarr_tag_2.35": ["aspect", "scope"],
+                            },
+                        },
+                        {
+                            "default": "resolution",
+                            "template_variables": {
+                                "exclude": ["480"],
+                                "file_square_art_1080": r"C:\Square\1080.png",
+                                "item_sonarr_tag_1080": ["resolution", "1080p"],
+                            },
+                        },
+                    ]
+                },
+            }
+        },
+        {"Movies"},
+        {"Shows"},
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_aspect"] is True
+    assert libraries_payload["mov-library_movies-collection_resolution"] is True
+    assert libraries_payload["sho-library_shows-collection_aspect"] is True
+    assert libraries_payload["sho-library_shows-collection_resolution"] is True
+    assert libraries_payload["mov-library_movies-template_collection_aspect_filter_term"] == "aspect"
+    assert libraries_payload["mov-library_movies-template_collection_aspect_use_1.78"] is False
+    assert libraries_payload["mov-library_movies-template_collection_aspect_name_1.78"] == "Widescreen TV"
+    assert libraries_payload["mov-library_movies-template_collection_aspect_summary_2.35"] == "Cinemascope favorites"
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_aspect_child_schedule_overrides"]) == {"2.35": "weekly(sunday)"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_aspect_child_sync_mode_overrides"]) == {"2.35": "append"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_aspect_child_sort_by_overrides"]) == {"1.85": "title.asc"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_aspect_child_minimum_items_overrides"]) == {"1.33": "3"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_aspect_child_url_background_overrides"]) == {"1.78": "https://example.com/aspect-bg.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_aspect_child_item_radarr_tag_overrides"]) == {"1.78": "aspect,widescreen"}
+    assert libraries_payload["mov-library_movies-template_collection_resolution_search_term"] == "resolution"
+    assert libraries_payload["mov-library_movies-template_collection_resolution_include"] == '["4k", "1080"]'
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_resolution_child_name_overrides"]) == {"4k": "Ultra HD"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_resolution_child_summary_overrides"]) == {"1080": "HD favorites"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_resolution_child_order_overrides"]) == {"4k": "01"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_resolution_child_schedule_overrides"]) == {"1080": "weekly(friday)"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_resolution_child_url_poster_overrides"]) == {"4k": "https://example.com/4k.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_resolution_child_item_radarr_tag_overrides"]) == {"4k": "resolution,4k"}
+    assert libraries_payload["sho-library_shows-template_collection_aspect_name_2.35"] == "Scope TV"
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_aspect_child_item_sonarr_tag_overrides"]) == {"2.35": "aspect,scope"}
+    assert libraries_payload["sho-library_shows-template_collection_resolution_exclude"] == '["480"]'
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_resolution_child_file_square_art_overrides"]) == {"1080": r"C:\Square\1080.png"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_resolution_child_item_sonarr_tag_overrides"]) == {"1080": "resolution,1080p"}
+    assert any("libraries.Movies.collection_files[0].template_variables.sync_mode_2.35" in line for line in report.lines)
+    assert any("libraries.Shows.collection_files[1].template_variables.file_square_art_1080" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_studio_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "studio",
+                            "template_variables": {
+                                "use_A24": False,
+                                "name_Marvel Studios": "Marvel Films",
+                                "summary_Warner Bros. Pictures": "Warner favorites",
+                                "schedule_Studio Ghibli": "weekly(sunday)",
+                                "name_mapping_Lucasfilm Ltd": "lucasfilm",
+                                "sort_by_Marvel Studios": "title.asc",
+                                "limit_A24": 10,
+                                "url_poster_A24": "https://example.com/a24.jpg",
+                                "visible_home_Pixar": False,
+                                "visible_library_Pixar": True,
+                                "visible_shared_Pixar": False,
+                                "hub_priority_DreamWorks Studios": 3,
+                                "item_radarr_tag_Lucasfilm Ltd": ["space", "saga"],
+                                "item_sonarr_tag_Warner Bros. Pictures": ["prestige"],
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_studio"] is True
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_use_overrides"]) == {"A24": "false"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_name_overrides"]) == {"Marvel Studios": "Marvel Films"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_summary_overrides"]) == {"Warner Bros. Pictures": "Warner favorites"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_schedule_overrides"]) == {"Studio Ghibli": "weekly(sunday)"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_name_mapping_overrides"]) == {"Lucasfilm Ltd": "lucasfilm"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_sort_by_overrides"]) == {"Marvel Studios": "title.asc"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_limit_overrides"]) == {"A24": "10"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_url_poster_overrides"]) == {"A24": "https://example.com/a24.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_visible_home_overrides"]) == {"Pixar": "false"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_visible_library_overrides"]) == {"Pixar": "true"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_visible_shared_overrides"]) == {"Pixar": "false"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_hub_priority_overrides"]) == {"DreamWorks Studios": "3"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_item_radarr_tag_overrides"]) == {"Lucasfilm Ltd": "space,saga"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_studio_child_item_sonarr_tag_overrides"]) == {"Warner Bros. Pictures": "prestige"}
+    assert any("libraries.Movies.collection_files[0].template_variables.use_A24" in line for line in report.lines)
+    assert any("libraries.Movies.collection_files[0].template_variables.summary_Warner Bros. Pictures" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_network_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Shows": {
+                    "collection_files": [
+                        {
+                            "default": "network",
+                            "template_variables": {
+                                "use_Apple TV": False,
+                                "name_HBO Max": "Max Originals",
+                                "summary_Disney+": "Disney network picks",
+                                "schedule_Netflix": "weekly(friday)",
+                                "name_mapping_Apple TV": "apple_tv",
+                                "sort_by_Netflix": "release.desc",
+                                "limit_HBO": 15,
+                                "url_background_HBO": "https://example.com/hbo-bg.jpg",
+                                "visible_home_Showtime": True,
+                                "visible_library_Showtime": False,
+                                "visible_shared_Showtime": True,
+                                "hub_priority_Disney+": 5,
+                                "item_sonarr_tag_Apple TV": ["streaming", "tv"],
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        set(),
+        {"Shows"},
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["sho-library_shows-collection_network"] is True
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_use_overrides"]) == {"Apple TV": "false"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_name_overrides"]) == {"HBO Max": "Max Originals"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_summary_overrides"]) == {"Disney+": "Disney network picks"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_schedule_overrides"]) == {"Netflix": "weekly(friday)"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_name_mapping_overrides"]) == {"Apple TV": "apple_tv"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_sort_by_overrides"]) == {"Netflix": "release.desc"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_limit_overrides"]) == {"HBO": "15"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_url_background_overrides"]) == {"HBO": "https://example.com/hbo-bg.jpg"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_visible_home_overrides"]) == {"Showtime": "true"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_visible_library_overrides"]) == {"Showtime": "false"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_visible_shared_overrides"]) == {"Showtime": "true"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_hub_priority_overrides"]) == {"Disney+": "5"}
+    assert json.loads(libraries_payload["sho-library_shows-template_collection_network_child_item_sonarr_tag_overrides"]) == {"Apple TV": "streaming,tv"}
+    assert any("libraries.Shows.collection_files[0].template_variables.use_Apple TV" in line for line in report.lines)
+    assert any("libraries.Shows.collection_files[0].template_variables.summary_Disney+" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_genre_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "genre",
+                            "template_variables": {
+                                "use_Action": False,
+                                "schedule_Comedy": "weekly(sunday)",
+                                "sort_by_Drama": "title.asc",
+                                "limit_Horror": 25,
+                                "minimum_items_Sci-Fi": 3,
+                                "file_poster_Action": r"C:\Posters\action.jpg",
+                                "url_poster_Comedy": "https://example.com/comedy.jpg",
+                                "visible_home_Drama": True,
+                                "item_radarr_tag_Horror": ["genre", "horror"],
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_genre"] is True
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_genre_child_use_overrides"]) == {"Action": "false"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_genre_child_schedule_overrides"]) == {"Comedy": "weekly(sunday)"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_genre_child_sort_by_overrides"]) == {"Drama": "title.asc"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_genre_child_limit_overrides"]) == {"Horror": "25"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_genre_child_minimum_items_overrides"]) == {"Sci-Fi": "3"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_genre_child_file_poster_overrides"]) == {"Action": r"C:\Posters\action.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_genre_child_url_poster_overrides"]) == {"Comedy": "https://example.com/comedy.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_genre_child_visible_home_overrides"]) == {"Drama": "true"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_genre_child_item_radarr_tag_overrides"]) == {"Horror": "genre,horror"}
+    assert any("libraries.Movies.collection_files[0].template_variables.file_poster_Action" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_other_chart_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "other_chart",
+                            "template_variables": {
+                                "schedule_metacritic": "weekly(friday)",
+                                "sync_mode_commonsense": "append",
+                                "collection_order_pirated": "custom",
+                                "cache_builders_stevenlu": 2,
+                                "file_logo_commonsense": r"C:\Logos\css.png",
+                                "radarr_search_pirated": False,
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_other_chart"] is True
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_other_chart_child_schedule_overrides"]) == {"metacritic": "weekly(friday)"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_other_chart_child_sync_mode_overrides"]) == {"commonsense": "append"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_other_chart_child_collection_order_overrides"]) == {"pirated": "custom"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_other_chart_child_cache_builders_overrides"]) == {"stevenlu": "2"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_other_chart_child_file_logo_overrides"]) == {"commonsense": r"C:\Logos\css.png"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_other_chart_child_radarr_search_overrides"]) == {"pirated": "false"}
+    assert any("libraries.Movies.collection_files[0].template_variables.radarr_search_pirated" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_actor_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "actor",
+                            "template_variables": {
+                                "name_Tom Hanks": "Hanks Favorites",
+                                "tmdb_person_offset_Tom Hanks": 1,
+                                "limit_Tom Hanks": 50,
+                                "file_poster_Tom Hanks": r"C:\Posters\tom-hanks.jpg",
+                                "visible_library_Tom Hanks": False,
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_actor"] is True
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_actor_child_name_overrides"]) == {"Tom Hanks": "Hanks Favorites"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_actor_child_tmdb_person_offset_overrides"]) == {"Tom Hanks": "1"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_actor_child_limit_overrides"]) == {"Tom Hanks": "50"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_actor_child_file_poster_overrides"]) == {"Tom Hanks": r"C:\Posters\tom-hanks.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_actor_child_visible_library_overrides"]) == {"Tom Hanks": "false"}
+    assert any("libraries.Movies.collection_files[0].template_variables.tmdb_person_offset_Tom Hanks" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_movie_person_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "director",
+                            "template_variables": {
+                                "tmdb_person_offset_Christopher Nolan": 1,
+                                "name_Christopher Nolan": "Nolan Favorites",
+                                "limit_Christopher Nolan": 50,
+                                "file_poster_Christopher Nolan": r"C:\Posters\nolan.jpg",
+                                "visible_library_Christopher Nolan": False,
+                            },
+                        },
+                        {
+                            "default": "producer",
+                            "template_variables": {
+                                "tmdb_person_offset_Kathleen Kennedy": 2,
+                                "name_Kathleen Kennedy": "Kennedy Produced",
+                                "limit_Kathleen Kennedy": 40,
+                                "file_poster_Kathleen Kennedy": r"C:\Posters\kennedy.jpg",
+                                "visible_library_Kathleen Kennedy": True,
+                            },
+                        },
+                        {
+                            "default": "writer",
+                            "template_variables": {
+                                "tmdb_person_offset_Charlie Kaufman": 3,
+                                "name_Charlie Kaufman": "Kaufman Written",
+                                "limit_Charlie Kaufman": 30,
+                                "file_poster_Charlie Kaufman": r"C:\Posters\kaufman.jpg",
+                                "visible_library_Charlie Kaufman": False,
+                            },
+                        },
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_director"] is True
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_director_child_name_overrides"]) == {"Christopher Nolan": "Nolan Favorites"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_director_child_tmdb_person_offset_overrides"]) == {"Christopher Nolan": "1"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_director_child_limit_overrides"]) == {"Christopher Nolan": "50"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_director_child_file_poster_overrides"]) == {"Christopher Nolan": r"C:\Posters\nolan.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_director_child_visible_library_overrides"]) == {"Christopher Nolan": "false"}
+    assert libraries_payload["mov-library_movies-collection_producer"] is True
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_producer_child_name_overrides"]) == {"Kathleen Kennedy": "Kennedy Produced"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_producer_child_tmdb_person_offset_overrides"]) == {"Kathleen Kennedy": "2"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_producer_child_limit_overrides"]) == {"Kathleen Kennedy": "40"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_producer_child_file_poster_overrides"]) == {"Kathleen Kennedy": r"C:\Posters\kennedy.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_producer_child_visible_library_overrides"]) == {"Kathleen Kennedy": "true"}
+    assert libraries_payload["mov-library_movies-collection_writer"] is True
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_writer_child_name_overrides"]) == {"Charlie Kaufman": "Kaufman Written"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_writer_child_tmdb_person_offset_overrides"]) == {"Charlie Kaufman": "3"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_writer_child_limit_overrides"]) == {"Charlie Kaufman": "30"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_writer_child_file_poster_overrides"]) == {"Charlie Kaufman": r"C:\Posters\kaufman.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_writer_child_visible_library_overrides"]) == {"Charlie Kaufman": "false"}
+    assert any("libraries.Movies.collection_files[0].template_variables.tmdb_person_offset_Christopher Nolan" in line for line in report.lines)
+    assert any("libraries.Movies.collection_files[1].template_variables.tmdb_person_offset_Kathleen Kennedy" in line for line in report.lines)
+    assert any("libraries.Movies.collection_files[2].template_variables.tmdb_person_offset_Charlie Kaufman" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_year_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "year",
+                            "template_variables": {
+                                "search_term": "year",
+                                "image": "year/best/<<key>>",
+                                "translation_key": "year",
+                                "use_2024": False,
+                                "name_2024": "Best of This Year",
+                                "schedule_2023": "weekly(sunday)",
+                                "sort_by_2022": "title.asc",
+                                "limit_2021": 12,
+                                "minimum_items_2020": 3,
+                                "url_background_2019": "https://example.com/2019-bg.jpg",
+                                "file_logo_2018": r"C:\Logos\2018.png",
+                                "visible_home_2017": True,
+                                "item_radarr_tag_2016": ["year", "2016"],
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_year"] is True
+    assert libraries_payload["mov-library_movies-template_collection_year_search_term"] == "year"
+    assert libraries_payload["mov-library_movies-template_collection_year_image"] == "year/best/<<key>>"
+    assert libraries_payload["mov-library_movies-template_collection_year_translation_key"] == "year"
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_year_child_use_overrides"]) == {"2024": "false"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_year_child_name_overrides"]) == {"2024": "Best of This Year"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_year_child_schedule_overrides"]) == {"2023": "weekly(sunday)"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_year_child_sort_by_overrides"]) == {"2022": "title.asc"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_year_child_limit_overrides"]) == {"2021": "12"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_year_child_minimum_items_overrides"]) == {"2020": "3"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_year_child_url_background_overrides"]) == {"2019": "https://example.com/2019-bg.jpg"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_year_child_file_logo_overrides"]) == {"2018": r"C:\Logos\2018.png"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_year_child_visible_home_overrides"]) == {"2017": "true"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_year_child_item_radarr_tag_overrides"]) == {"2016": "year,2016"}
+    assert any("libraries.Movies.collection_files[0].template_variables.schedule_2023" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_decade_dynamic_child_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Shows": {
+                    "collection_files": [
+                        {
+                            "default": "decade",
+                            "template_variables": {
+                                "search_term": "year",
+                                "image": "decade/best/<<key>>",
+                                "translation_key": "decade",
+                                "use_2020": False,
+                                "summary_2010": "2010s favorites",
+                                "order_2000": "03",
+                                "schedule_1990": "weekly(friday)",
+                                "sort_by_1980": "critic_rating.desc",
+                                "limit_1970": 25,
+                                "url_square_art_1960": "https://example.com/1960-square.png",
+                                "file_background_1950": r"C:\Backgrounds\1950.jpg",
+                                "visible_library_1940": False,
+                                "item_sonarr_tag_1930": ["decade", "1930s"],
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Shows"},
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_shows-collection_decade"] is True
+    assert libraries_payload["mov-library_shows-template_collection_decade_search_term"] == "year"
+    assert libraries_payload["mov-library_shows-template_collection_decade_image"] == "decade/best/<<key>>"
+    assert libraries_payload["mov-library_shows-template_collection_decade_translation_key"] == "decade"
+    assert json.loads(libraries_payload["mov-library_shows-template_collection_decade_child_use_overrides"]) == {"2020": "false"}
+    assert json.loads(libraries_payload["mov-library_shows-template_collection_decade_child_summary_overrides"]) == {"2010": "2010s favorites"}
+    assert json.loads(libraries_payload["mov-library_shows-template_collection_decade_child_order_overrides"]) == {"2000": "03"}
+    assert json.loads(libraries_payload["mov-library_shows-template_collection_decade_child_schedule_overrides"]) == {"1990": "weekly(friday)"}
+    assert json.loads(libraries_payload["mov-library_shows-template_collection_decade_child_sort_by_overrides"]) == {"1980": "critic_rating.desc"}
+    assert json.loads(libraries_payload["mov-library_shows-template_collection_decade_child_limit_overrides"]) == {"1970": "25"}
+    assert json.loads(libraries_payload["mov-library_shows-template_collection_decade_child_url_square_art_overrides"]) == {"1960": "https://example.com/1960-square.png"}
+    assert json.loads(libraries_payload["mov-library_shows-template_collection_decade_child_file_background_overrides"]) == {"1950": r"C:\Backgrounds\1950.jpg"}
+    assert json.loads(libraries_payload["mov-library_shows-template_collection_decade_child_visible_library_overrides"]) == {"1940": "false"}
+    assert json.loads(libraries_payload["mov-library_shows-template_collection_decade_child_item_sonarr_tag_overrides"]) == {"1930": "decade,1930s"}
+    assert any("libraries.Shows.collection_files[0].template_variables.schedule_1990" in line for line in report.lines)
+
+
+def test_prepare_import_payload_collapses_award_year_template_variables():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {
+                "Movies": {
+                    "collection_files": [
+                        {
+                            "default": "oscars",
+                            "template_variables": {
+                                "allowed_libraries": "movie",
+                                "image": "award/oscars/winner/<<key>>",
+                                "translation_key": "oscars_year",
+                                "url_logo": "https://example.com/oscars.png",
+                                "collection_order_2024": "release",
+                                "image_2024": "award/oscars/winner/2024",
+                                "translation_key_2024": "oscars_year",
+                                "url_logo_2024": "https://example.com/oscars-2024.png",
+                                "radarr_folder_2024": r"C:\Media\Movies\Awards",
+                                "radarr_search_2024": False,
+                                "visible_home_2024": True,
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        {"Movies"},
+        set(),
+    )
+
+    libraries_payload = payload["libraries"]["libraries"]
+    assert libraries_payload["mov-library_movies-collection_oscars"] is True
+    assert libraries_payload["mov-library_movies-template_collection_oscars_allowed_libraries"] == "movie"
+    assert libraries_payload["mov-library_movies-template_collection_oscars_image"] == "award/oscars/winner/<<key>>"
+    assert libraries_payload["mov-library_movies-template_collection_oscars_translation_key"] == "oscars_year"
+    assert libraries_payload["mov-library_movies-template_collection_oscars_url_logo"] == "https://example.com/oscars.png"
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_oscars_child_collection_order_overrides"]) == {"2024": "release"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_oscars_child_image_overrides"]) == {"2024": "award/oscars/winner/2024"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_oscars_child_translation_key_overrides"]) == {"2024": "oscars_year"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_oscars_child_url_logo_overrides"]) == {"2024": "https://example.com/oscars-2024.png"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_oscars_child_radarr_folder_overrides"]) == {"2024": r"C:\Media\Movies\Awards"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_oscars_child_radarr_search_overrides"]) == {"2024": "false"}
+    assert json.loads(libraries_payload["mov-library_movies-template_collection_oscars_child_visible_home_overrides"]) == {"2024": "true"}
+    assert any("libraries.Movies.collection_files[0].template_variables.image_2024" in line for line in report.lines)

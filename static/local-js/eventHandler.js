@@ -1,3 +1,6 @@
+import { updateAccordionHighlights } from './modules/accordionHighlights.js'
+import { initializeOverlays, updateHiddenInputs } from './modules/separatorPreview.js'
+
 function callValidationHandler (methodName, ...args) {
   const handler = window.ValidationHandler
   if (!handler || typeof handler[methodName] !== 'function') {
@@ -6,9 +9,21 @@ function callValidationHandler (methodName, ...args) {
   return handler[methodName](...args)
 }
 
+function queryScopedElements (scope, selector) {
+  const root = scope && typeof scope.querySelectorAll === 'function' ? scope : document
+  const elements = []
+
+  if (root !== document && typeof root.matches === 'function' && root.matches(selector)) {
+    elements.push(root)
+  }
+
+  elements.push(...root.querySelectorAll(selector))
+  return elements
+}
+
 const EventHandler = {
-  attachLibraryListeners: function () {
-    document.querySelectorAll('.library-checkbox').forEach((checkbox) => {
+  attachLibraryListeners: function (scope = document) {
+    queryScopedElements(scope, '.library-checkbox').forEach((checkbox) => {
       const libraryId = checkbox.id.replace(/-(library|card-container)$/, '')
 
       if (checkbox.dataset.listenerAdded !== 'true') {
@@ -28,7 +43,7 @@ const EventHandler = {
       }
     })
 
-    document.querySelectorAll("[id$='-card-container']").forEach((library) => {
+    queryScopedElements(scope, "[id$='-card-container']").forEach((library) => {
       const libraryId = library.id.replace('-card-container', '')
       const isMovie = libraryId.startsWith('mov-library_')
 
@@ -94,29 +109,29 @@ const EventHandler = {
       })
 
       // Initialize overlays after image listeners
-      OverlayHandler.initializeOverlays(libraryId, isMovie)
+      initializeOverlays(libraryId, isMovie)
 
       // Attach overlay selection listeners (CHANGE events)
+      library.querySelectorAll('.accordion select').forEach(select => {
+        if (!select.dataset.listenerAdded) {
+          select.addEventListener('change', () => {
+            console.log(`[DEBUG] Dropdown changed: ${select.id} -> ${select.value}`)
+            updateAccordionHighlights()
+            callValidationHandler('updateValidationState')
+
+            // Trigger preview update if template variable
+            if (select.classList.contains('template-variable-select')) {
+              const nameParts = select.name.split('-')
+              const previewLibraryId = nameParts.slice(0, 2).join('-') // e.g., mov-library_movies
+              const type = nameParts[2] // e.g., movie
+              ImageHandler.generateSinglePreview(previewLibraryId, type)
+            }
+          })
+          select.dataset.listenerAdded = 'true'
+        }
+      })
+
       library.querySelectorAll('.accordion input').forEach((input) => {
-        library.querySelectorAll('.accordion select').forEach(select => {
-          if (!select.dataset.listenerAdded) {
-            select.addEventListener('change', () => {
-              console.log(`[DEBUG] Dropdown changed: ${select.id} -> ${select.value}`)
-              EventHandler.updateAccordionHighlights()
-              callValidationHandler('updateValidationState')
-
-              // Trigger preview update if template variable
-              if (select.classList.contains('template-variable-select')) {
-                const nameParts = select.name.split('-')
-                const previewLibraryId = nameParts.slice(0, 2).join('-') // e.g., mov-library_movies
-                const type = nameParts[2] // e.g., movie
-                ImageHandler.generateSinglePreview(previewLibraryId, type)
-              }
-            })
-            select.dataset.listenerAdded = 'true'
-          }
-        })
-
         if (input.id && !input.dataset.listenerAdded) {
           console.log(`[DEBUG] Attaching toggle listener for ${input.id}`)
           input.addEventListener('change', () => {
@@ -124,7 +139,7 @@ const EventHandler = {
 
             // Exclude preview overlay accordions from highlight updates
             if (!input.closest('.preview-accordion')) {
-              EventHandler.updateAccordionHighlights()
+              updateAccordionHighlights()
               callValidationHandler('updateValidationState')
             }
           })
@@ -133,7 +148,7 @@ const EventHandler = {
       })
 
       // Attach attribute_reset_overlays listeners
-      document.querySelectorAll("[id$='-attribute_reset_overlays']").forEach(dropdown => {
+      library.querySelectorAll("[id$='-attribute_reset_overlays']").forEach(dropdown => {
         if (!dropdown.dataset.listenerAdded) {
           console.log(`[DEBUG] Attaching change listener for Reset Overlays: ${dropdown.id}`)
 
@@ -141,7 +156,7 @@ const EventHandler = {
             console.log(`[DEBUG] Reset Overlays dropdown changed: ${this.id} -> ${this.value}`)
 
             // Ensure Highlights Update Properly
-            EventHandler.updateAccordionHighlights()
+            updateAccordionHighlights()
             callValidationHandler('updateValidationState')
           })
 
@@ -166,10 +181,10 @@ const EventHandler = {
       if (separatorDropdown && !separatorDropdown.dataset.listenerAdded) {
         console.log(`[DEBUG] Found separator dropdown: ${separatorDropdown.id}`)
         separatorDropdown.addEventListener('change', () => {
-          OverlayHandler.updateHiddenInputs(libraryId, isMovie)
+          updateHiddenInputs(libraryId, isMovie)
         })
         separatorDropdown.dataset.listenerAdded = true
-        OverlayHandler.updateHiddenInputs(libraryId, isMovie)
+        updateHiddenInputs(libraryId, isMovie)
       }
 
       // Attach listener for custom genre "Add" button
@@ -270,7 +285,8 @@ const EventHandler = {
           const isHidden = !input.offsetParent
           const min = parseFloat(input.dataset.minSaved || '0')
           const max = parseFloat(input.dataset.maxSaved || '10')
-          const val = parseFloat(input.value)
+          const rawValue = String(input.value || '').trim()
+          const val = parseFloat(rawValue)
           if (isHidden) {
             const feedback = input.parentElement?.querySelector('.invalid-feedback')
             input.setCustomValidity('')
@@ -279,7 +295,7 @@ const EventHandler = {
             return
           }
           const feedback = input.parentElement?.querySelector('.invalid-feedback')
-          const invalid = Number.isNaN(val) || val < min || val > max
+          const invalid = rawValue !== '' && (Number.isNaN(val) || val < min || val > max)
           if (invalid) {
             input.setCustomValidity(`Enter a value between ${min} and ${max}`)
             input.classList.add('is-invalid')
@@ -308,9 +324,7 @@ const EventHandler = {
         ) {
           return
         }
-        if (typeof EventHandler.updateAccordionHighlights === 'function') {
-          EventHandler.updateAccordionHighlights()
-        }
+        updateAccordionHighlights()
         callValidationHandler('updateValidationState')
       }
       library.querySelectorAll('input:not([type="hidden"]), select, textarea').forEach(el => {
@@ -344,239 +358,6 @@ const EventHandler = {
 
     libraryContainer.style.display = isVisible ? 'block' : 'none'
     console.log(`[DEBUG] Library ${libraryId} is now ${isVisible ? 'VISIBLE' : 'HIDDEN'}`)
-  },
-
-  /**
-   * Returns true if an accordion body has at least one enabled collection toggle selected.
-   * Returns false when collection toggles exist but none are selected.
-   * Returns null when no collection toggles are present.
-   */
-  hasCheckedTemplateGroupToggle: function (accordionBody) {
-    if (!accordionBody) return null
-    const toggles = Array.from(accordionBody.querySelectorAll("input[type='checkbox'][data-template-group]"))
-    if (!toggles.length) return null
-    return toggles.some(toggle => toggle.checked)
-  },
-
-  hasLibraryFileEntries: function (accordionBody) {
-    if (!accordionBody) return false
-    const hidden = accordionBody.querySelector(
-      'input[type="hidden"][name$="-metadata_files"], input[type="hidden"][name$="-collection_files"], input[type="hidden"][name$="-overlay_files"]'
-    )
-    if (!hidden) return false
-    const raw = String(hidden.value || '').trim()
-    return Boolean(raw && raw !== '[]')
-  },
-
-  /**
-   * Update accordion highlights when selections change
-   */
-  updateAccordionHighlights: function () {
-    console.log('🔍 [DEBUG] Updating accordion highlights...')
-
-    document.querySelectorAll('.accordion-item').forEach((accordion) => {
-      const accordionHeader = accordion.querySelector('.accordion-header')
-      if (!accordionHeader) return
-
-      const headerText = accordionHeader.textContent.trim()
-      const isPreviewOverlay = headerText.toLowerCase().includes('preview overlays')
-      const accordionBody = accordion.querySelector('.accordion-body')
-
-      // Skip preview overlays
-      if (isPreviewOverlay) {
-        accordionHeader.classList.remove('selected')
-        return
-      }
-
-      let isCheckedOrSelected = false
-      let hasValue = false
-
-      if (accordionBody) {
-        // 1. Check for directly selected inputs (checkboxes, radios, list selections)
-        isCheckedOrSelected = accordionBody.querySelector(
-          "input[type='checkbox']:checked:not(.readonly-toggle):not(.template-child-toggle):not([hidden]):not([type='hidden']), " +
-          "input[type='radio']:checked:not([hidden]):not([type='hidden']), " +
-          '.list-group li'
-        ) !== null
-
-        // 1b. Any non-empty inputs/selects also count as activity
-        // Suppress value-based highlighting for true Collection/Overlay sections,
-        // but allow it for "Delete Collections" (so its numeric field bubbles up).
-        const headerLower = headerText.toLowerCase()
-        const isLibraryFileSection = EventHandler.hasLibraryFileEntries(accordionBody)
-        const suppressValueCheck =
-          !isLibraryFileSection &&
-          (
-            headerLower.includes('overlay') ||
-            (headerLower.includes('collection') && !headerLower.includes('delete collections'))
-          )
-        if (isLibraryFileSection) {
-          hasValue = true
-        } else if (!suppressValueCheck) {
-          const textInputs = Array.from(
-            accordionBody.querySelectorAll("input[type='text'], input[type='number'], input[type='date']")
-          )
-          const selects = Array.from(accordionBody.querySelectorAll('select'))
-          hasValue = textInputs.some((input) => {
-            const v = (input.value || '').trim().toLowerCase()
-            return v && v !== 'none'
-          }) || selects.some((sel) => {
-            const v = (sel.value || '').trim().toLowerCase()
-            return v && v !== 'none'
-          })
-        }
-
-        // 2. Check for modified template selects, but only if toggle is still ON
-        if (!isCheckedOrSelected) {
-          isCheckedOrSelected = Array.from(
-            accordionBody.querySelectorAll('.template-variable-select[data-user-modified="true"]')
-          ).some((select) => {
-            const group = select.closest('.template-toggle-group')
-            const toggle = group?.querySelector('.overlay-toggle')
-            return toggle?.checked
-          })
-        }
-      }
-
-      // Collection accordions should not stay highlighted from child values/history
-      // when every parent collection toggle is off.
-      const anyTemplateGroupChecked = EventHandler.hasCheckedTemplateGroupToggle(accordionBody)
-      if (anyTemplateGroupChecked === false) {
-        isCheckedOrSelected = false
-        hasValue = false
-      }
-
-      if (isCheckedOrSelected || hasValue) {
-        accordionHeader.classList.add('selected')
-        if (accordion.dataset.qsMinimalYaml !== 'false') {
-          EventHandler.highlightParentAccordions(accordionHeader)
-        }
-      } else {
-        EventHandler.removeHighlightIfEmpty(accordionHeader)
-      }
-    })
-
-    // Special case: don't highlight parent "Overlays" if only preview overlays are selected
-    document.querySelectorAll('.accordion-item').forEach((accordion) => {
-      const accordionHeader = accordion.querySelector('.accordion-header')
-      const headerText = accordionHeader?.textContent.trim().toLowerCase()
-      if (headerText !== 'overlays') return
-
-      const childItems = accordion.querySelectorAll('.accordion-item')
-      const hasNonPreviewSelection = Array.from(childItems).some((child) => {
-        const childHeader = child.querySelector('.accordion-header')
-        const isPreview = childHeader?.textContent.trim().toLowerCase().includes('preview overlays')
-
-        if (isPreview) return false
-
-        // Only highlight if child toggle is on or has modified select tied to an enabled toggle
-        const hasActiveToggle = child.querySelector(
-          "input[type='checkbox']:checked:not(.readonly-toggle):not(.template-child-toggle):not([hidden]):not([type='hidden']), " +
-          "input[type='radio']:checked:not([hidden]):not([type='hidden']), " +
-          '.list-group li'
-        )
-        if (hasActiveToggle) return true
-
-        const hasModifiedSelectWithToggle = Array.from(
-          child.querySelectorAll('.template-variable-select[data-user-modified="true"]')
-        ).some((select) => {
-          const group = select.closest('.template-toggle-group')
-          const toggle = group?.querySelector('.overlay-toggle')
-          return toggle?.checked
-        })
-
-        return hasModifiedSelectWithToggle
-      })
-
-      if (hasNonPreviewSelection) {
-        accordionHeader.classList.add('selected')
-      } else {
-        accordionHeader.classList.remove('selected')
-      }
-    })
-  },
-
-  /**
-   * Highlight parent accordions when a child section is selected
-   */
-  highlightParentAccordions: function (element) {
-    while (element) {
-      const parentAccordion = element.closest('.accordion-item')
-      if (!parentAccordion) break
-      if (parentAccordion.dataset.qsMinimalYaml === 'false') {
-        parentAccordion.querySelector('.accordion-header')?.classList.add('selected')
-        return
-      }
-
-      const parentHeader = parentAccordion.querySelector('.accordion-header')
-      const parentText = parentHeader ? parentHeader.textContent.trim() : ''
-      const isPreviewOverlay = parentText.toLowerCase().includes('preview overlays')
-      const isOverlaysSection = parentText.toLowerCase().includes('overlays')
-
-      if (isPreviewOverlay) {
-        console.log(`🚫 [DEBUG] Skipping parent highlight for Preview Overlays: ${parentText}`)
-        return
-      }
-
-      if (isOverlaysSection) {
-        const hasValidChild = Array.from(parentAccordion.querySelectorAll('.accordion-item')).some(child => {
-          const childHeader = child.querySelector('.accordion-header')
-          const childText = childHeader ? childHeader.textContent.trim() : ''
-          const isPreviewChild = childText.toLowerCase().includes('preview overlays')
-
-          return !isPreviewChild && child.querySelector('input:checked:not(.template-child-toggle)')
-        })
-
-        if (!hasValidChild) {
-          console.log(`🚫 [DEBUG] Preventing Overlays from inheriting highlight due to only Preview Overlays: ${parentText}`)
-          return
-        }
-      }
-
-      console.log(`🎯 [DEBUG] Adding highlight to parent: ${parentText}`)
-      parentHeader.classList.add('selected')
-
-      element = parentAccordion.parentElement.closest('.accordion-item')?.querySelector('.accordion-header')
-    }
-  },
-
-  /**
-   * Remove highlight if an accordion has no selections
-   */
-  removeHighlightIfEmpty: function (element) {
-    if (!element) return
-    const accordionItem = element.closest('.accordion-item')
-    if (!accordionItem) return
-
-    const accordionId = accordionItem.id || ''
-    const isPreviewOverlay = accordionId.includes('-previewOverlays')
-
-    const accordionBody = accordionItem.querySelector('.accordion-body')
-
-    if (isPreviewOverlay) {
-      console.log(`🚫 [DEBUG] Preventing highlight removal check for Preview Overlays: ${accordionId}`)
-      return
-    }
-
-    const hasSelections = accordionBody?.querySelector(
-      "input[type='checkbox']:checked:not(.readonly-toggle):not(.template-child-toggle):not([hidden]):not([type='hidden']), " +
-      "input[type='radio']:checked:not([hidden]):not([type='hidden']), " +
-      "select[data-user-modified='true'] option:checked:not([value='']):not([value='none']), " +
-      '.list-group li'
-    ) !== null
-    const hasLibraryFileEntries = EventHandler.hasLibraryFileEntries(accordionBody)
-
-    // If this accordion has collection toggles and none are enabled, force no highlight.
-    const anyTemplateGroupChecked = EventHandler.hasCheckedTemplateGroupToggle(accordionBody)
-    const effectiveSelections = (anyTemplateGroupChecked === false) ? false : (hasSelections || hasLibraryFileEntries)
-
-    if (!effectiveSelections) {
-      element.classList.remove('selected')
-    }
-
-    // Recursively check parents
-    const parentAccordionHeader = accordionItem.parentElement.closest('.accordion-item')?.querySelector('.accordion-header')
-    EventHandler.removeHighlightIfEmpty(parentAccordionHeader)
   }
 }
 
@@ -598,22 +379,25 @@ const shouldReattachForNode = (node) => {
 }
 
 const observer = new MutationObserver((mutations) => {
-  let needsReattachment = false
+  const reattachmentScopes = new Set()
 
   mutations.forEach((mutation) => {
     if (mutation.addedNodes.length > 0) {
       mutation.addedNodes.forEach((node) => {
         if (shouldReattachForNode(node)) {
           console.log(`[DEBUG] New element detected: ${node.id || node.className}, triggering re-attachment.`)
-          needsReattachment = true
+          const cardScope = node.matches?.("[id$='-card-container']")
+            ? node
+            : node.closest?.("[id$='-card-container']")
+          reattachmentScopes.add(cardScope || node)
         }
       })
     }
   })
 
-  if (needsReattachment) {
+  if (reattachmentScopes.size > 0) {
     console.log('[DEBUG] Reattaching event listeners due to DOM mutation...')
-    EventHandler.attachLibraryListeners()
+    reattachmentScopes.forEach(scope => EventHandler.attachLibraryListeners(scope))
   }
 })
 
@@ -732,8 +516,9 @@ function installRatingSubmitGuard () {
       if (!input.offsetParent) return false
       const min = parseFloat(input.dataset.minSaved || input.getAttribute('min') || '0')
       const max = parseFloat(input.dataset.maxSaved || input.getAttribute('max') || '10')
-      const val = parseFloat(input.value)
-      return Number.isNaN(val) || val < min || val > max
+      const rawValue = String(input.value || '').trim()
+      const val = parseFloat(rawValue)
+      return rawValue !== '' && (Number.isNaN(val) || val < min || val > max)
     })
     if (invalid.length) {
       evt.preventDefault()

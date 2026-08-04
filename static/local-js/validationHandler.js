@@ -1,7 +1,50 @@
-const librariesValidatedAtInput = document.getElementById('libraries_validated_at')
+// ES module (#1346 Step 2 finish). Also publishes `window.ValidationHandler`
+// for the eventHandler/overlayHandler consumers that still read from window.
+// New JS consumers should prefer the named export.
+//
+// `export`ing the first `const` marker satisfies vite.detectModuleEntry's
+// "first non-comment token is import/export" rule; the real public API is
+// `ValidationHandler` further down.
+export const librariesValidatedAtInput = document.getElementById('libraries_validated_at')
 let librariesTouched = false
 
-const ValidationHandler = {
+function getConfiguredLibraryOptions (type) {
+  const picker = document.getElementById('libraryPicker')
+  if (!picker) return []
+  return Array.from(picker.querySelectorAll('option[value]')).filter(option => {
+    return option.value.startsWith(`${type}-library_`) && option.dataset.configured === 'true'
+  })
+}
+
+function optionLabel (option) {
+  return String(option.dataset.label || option.textContent || '')
+    .replace(/\s+\(configured\)$/, '')
+    .trim()
+}
+
+function hasLibraryConfigurationSignal (libraryContainer) {
+  if (!libraryContainer) return false
+  const card = libraryContainer.closest?.('.library-settings-card') || libraryContainer.querySelector?.('.library-settings-card') || libraryContainer
+  if (
+    window.QSLibraryValidation &&
+    typeof window.QSLibraryValidation.hasConfiguredSignal === 'function'
+  ) {
+    return window.QSLibraryValidation.hasConfiguredSignal(card)
+  }
+
+  if (libraryContainer.querySelector('.template-variable-section-has-overrides, .template-variable-field-has-override')) return true
+  if (Array.from(libraryContainer.querySelectorAll('.accordion-header.selected')).some(header => !header.closest('[data-qs-minimal-yaml="false"]'))) return true
+
+  const totalSummary = libraryContainer.querySelector('[data-library-total-summary]')
+  if (totalSummary && !totalSummary.classList.contains('d-none') && /\d/.test(totalSummary.textContent || '')) return true
+
+  return Array.from(libraryContainer.querySelectorAll('[data-lazy-override-count], [data-lazy-active]')).some(element => {
+    const count = Number(element.dataset.lazyOverrideCount || '0') || 0
+    return count > 0 || element.dataset.lazyActive === 'true'
+  })
+}
+
+export const ValidationHandler = {
   updateValidationState: function () {
     console.log('[DEBUG] Running validation state update.')
 
@@ -43,7 +86,7 @@ const ValidationHandler = {
     } else {
       console.log('[DEBUG] Validation Failed! Disabling navigation.')
       ValidationHandler.showValidationMessage(
-        'Please review your selections: ensure you have picked at least one library, selected an item inside each chosen library, and if using Separators, selected a valid <strong>Placeholder IMDb ID</strong>. Items needing attention are highlighted in red below.',
+        'Please review your selections: ensure you have picked at least one library, configured content inside each included library, and if using Separators, selected a valid <strong>Placeholder ID</strong>. Items needing attention are highlighted in red below.',
         'danger',
         { html: true }
       )
@@ -52,7 +95,8 @@ const ValidationHandler = {
   },
 
   validatePlexState: function () {
-    const plexValid = $('#plex_valid').data('plex-valid') === 'True'
+    const plexValidEl = document.getElementById('plex_valid')
+    const plexValid = plexValidEl && plexValidEl.dataset.plexValid === 'True'
     console.log('[DEBUG] Plex Valid:', plexValid)
 
     if (!plexValid) {
@@ -71,6 +115,24 @@ const ValidationHandler = {
 
   showAccordionForField: function (field) {
     if (!field) return
+    let detailSection = field.closest('[data-detail-section="true"]')
+    while (detailSection) {
+      const isHidden = detailSection.style.display === 'none' || detailSection.classList.contains('d-none') || detailSection.hidden
+      if (isHidden) {
+        const sectionId = detailSection.id
+        const toggle = sectionId
+          ? Array.from(document.querySelectorAll('[data-section-id]')).find(btn => btn.dataset.sectionId === sectionId)
+          : null
+        if (toggle && typeof toggle.click === 'function') {
+          toggle.click()
+        } else {
+          detailSection.style.display = 'block'
+          detailSection.hidden = false
+          detailSection.classList.remove('d-none')
+        }
+      }
+      detailSection = detailSection.parentElement?.closest('[data-detail-section="true"]')
+    }
     let collapse = field.closest('.accordion-collapse')
     while (collapse) {
       if (!collapse.classList.contains('show')) {
@@ -120,7 +182,7 @@ const ValidationHandler = {
       return false
     }
 
-    // Validate that all selected libraries have at least one highlight
+    // Validate that all selected libraries have configured content.
     const validateLibraries = () => {
       const selectedLibraries = [
         ...ValidationHandler.getSelectedLibraryIds('mov'),
@@ -144,18 +206,17 @@ const ValidationHandler = {
           return true
         }
 
-        const hasSelectedHeader = Array.from(libraryContainer.querySelectorAll('.accordion-header.selected'))
-          .some(header => !header.closest('[data-qs-minimal-yaml="false"]'))
-        console.log(`[DEBUG] Library "${libraryId}-container" has selected header highlight: ${hasSelectedHeader}`)
+        const hasConfiguredContent = hasLibraryConfigurationSignal(libraryContainer)
+        console.log(`[DEBUG] Library "${libraryId}-container" has configured content signal: ${hasConfiguredContent}`)
 
-        if (!hasSelectedHeader) {
+        if (!hasConfiguredContent) {
           invalidLibraries.push(libraryId)
         } else {
           // If the library is valid, remove red border
           libraryContainer.style.border = ''
         }
 
-        return hasSelectedHeader
+        return hasConfiguredContent
       })
 
       if (!isValid) {
@@ -230,11 +291,11 @@ const ValidationHandler = {
     }
 
     const allPlaceholdersValid = validatePlaceholderSelection()
-    const pathValid = (typeof PathValidation !== 'undefined' && PathValidation.validateAll)
-      ? PathValidation.validateAll()
+    const pathValid = (typeof window.PathValidation !== 'undefined' && window.PathValidation.validateAll)
+      ? window.PathValidation.validateAll()
       : true
-    const urlValid = (typeof URLValidation !== 'undefined' && URLValidation.validateAll)
-      ? URLValidation.validateAll()
+    const urlValid = (typeof window.URLValidation !== 'undefined' && window.URLValidation.validateAll)
+      ? window.URLValidation.validateAll()
       : true
 
     console.log(`[DEBUG] Libraries Valid: ${allLibrariesValid}`)
@@ -250,7 +311,7 @@ const ValidationHandler = {
     } else {
       console.log('[DEBUG] Some validations failed! Disabling navigation.')
       ValidationHandler.showValidationMessage(
-        'Each selected library must have at least one highlighted item, a valid separator placeholder must be selected if a separator is enabled, and any path or URL fields must be valid.',
+        'Each included library must have configured content, a valid separator placeholder must be selected if a separator is enabled, and any path or URL fields must be valid.',
         'danger'
       )
       ValidationHandler.disableNavigation(false)
@@ -259,21 +320,53 @@ const ValidationHandler = {
   },
 
   getSelectedLibraryIds: function (type) {
-    const selected = [...document.querySelectorAll(`input[id$='-library-value'][id^='${type}-library_']`)]
-      .filter(input => input.value && input.value.trim() !== '')
-      .map(input => input.id.replace('-library-value', ''))
+    const configuredOptions = getConfiguredLibraryOptions(type)
+    const selectedIds = new Set(configuredOptions.map(option => option.value))
+    const configuredOptionIds = new Set(configuredOptions.map(option => option.value))
+    const picker = document.getElementById('libraryPicker')
+    const pickerOptionIds = new Set(
+      Array.from(picker?.querySelectorAll(`option[value^='${type}-library_']`) || []).map(option => option.value)
+    )
 
+    document.querySelectorAll(`input[id$='-library-value'][id^='${type}-library_']`).forEach(input => {
+      if (!input.value || input.value.trim() === '') return
+      const id = input.id.replace('-library-value', '')
+      if (pickerOptionIds.has(id) && !configuredOptionIds.has(id)) return
+      selectedIds.add(id)
+    })
+
+    const selected = Array.from(selectedIds)
     console.log('[DEBUG] Selected', type, 'Library IDs:', selected)
     return selected
   },
 
   getSelectedLibraryNames: function (type) {
-    const names = [...document.querySelectorAll(`input[id$='-library-value'][id^='${type}-library_']`)]
-      .filter(input => input.value && input.value.trim() !== '')
-      .map(input => input.value.trim())
+    const configuredOptions = getConfiguredLibraryOptions(type)
+    const selectedNames = []
+    const selectedIds = new Set()
+    const picker = document.getElementById('libraryPicker')
+    const pickerOptionIds = new Set(
+      Array.from(picker?.querySelectorAll(`option[value^='${type}-library_']`) || []).map(option => option.value)
+    )
+    const configuredOptionIds = new Set(configuredOptions.map(option => option.value))
 
-    console.log('[DEBUG] Selected', type, 'Library Names:', names)
-    return names
+    configuredOptions.forEach(option => {
+      const label = optionLabel(option)
+      if (!label) return
+      selectedNames.push(label)
+      selectedIds.add(option.value)
+    })
+
+    document.querySelectorAll(`input[id$='-library-value'][id^='${type}-library_']`).forEach(input => {
+      if (!input.value || input.value.trim() === '') return
+      const id = input.id.replace('-library-value', '')
+      if (selectedIds.has(id)) return
+      if (pickerOptionIds.has(id) && !configuredOptionIds.has(id)) return
+      selectedNames.push(input.value.trim())
+    })
+
+    console.log('[DEBUG] Selected', type, 'Library Names:', selectedNames)
+    return selectedNames
   },
 
   // Backward compatibility alias
@@ -295,10 +388,10 @@ const ValidationHandler = {
     const selectedLibraries = libraryInput ? libraryInput.value.split(',').map(item => item.trim()) : []
     console.log('[DEBUG] Restoring Selected Libraries:', selectedLibraries)
 
-    $('.library-checkbox').each(function () {
-      if (selectedLibraries.includes($(this).val())) {
-        console.log(`[DEBUG] Restoring selection: ${$(this).val()}`)
-        $(this).prop('checked', true)
+    document.querySelectorAll('.library-checkbox').forEach(checkbox => {
+      if (selectedLibraries.includes(checkbox.value)) {
+        console.log(`[DEBUG] Restoring selection: ${checkbox.value}`)
+        checkbox.checked = true
       }
     })
   },
@@ -330,7 +423,8 @@ const ValidationHandler = {
     })
 
     // Keep the Previous button enabled
-    document.querySelector("#configForm button[data-nav-action='prev']").disabled = false
+    const prevBtn = document.querySelector("#configForm button[data-nav-action='prev']")
+    if (prevBtn) prevBtn.disabled = false
 
     // Handle accordions based on the lockAccordions flag
     if (!lockAccordions) {
@@ -350,6 +444,7 @@ const ValidationHandler = {
 }
 
 window.ValidationHandler = ValidationHandler
+export default ValidationHandler
 
 // Restore previously selected libraries
 ValidationHandler.restoreSelectedLibraries()

@@ -1,56 +1,30 @@
 import { createApiKeyValidator } from './modules/createApiKeyValidator.js'
-import { populateDropdown, setStatusMessageLines } from './modules/dropdownHelpers.js'
+import { populateArrDropdown, buildArrPreSubmit } from './modules/arrPageBase.js'
 
-// Per-wizard helpers: populate the three dropdowns from a validate response.
-// initialSonarrRootFolderPath/QualityProfile/LanguageProfile are window
-// globals injected by the rendered template (current selections from the
-// saved config), used to pre-select after dropdown population.
+// Sonarr wizard -- uses createApiKeyValidator for the credential flow,
+// arrPageBase helpers for the dropdown-populate and form-submit gate.
+//
+// skipWhenUnvalidated=true matches Radarr: an unvalidated user can
+// navigate away from the Sonarr page without a path check blocking
+// them. Previously Sonarr ran the path check unconditionally, which
+// stranded users with any invalid path field elsewhere on the page
+// (bug #1584 -- pre-existed the Step 6 factory migration by years).
+
 function populateSonarrDropdowns (data) {
-  populateDropdown(
-    'sonarr_root_folder_path', data.root_folders, 'path', 'path',
-    typeof initialSonarrRootFolderPath !== 'undefined' ? initialSonarrRootFolderPath : ''
-  )
-  populateDropdown(
-    'sonarr_quality_profile', data.quality_profiles, 'name', 'name',
-    typeof initialSonarrQualityProfile !== 'undefined' ? initialSonarrQualityProfile : ''
-  )
-  populateDropdown(
-    'sonarr_language_profile', data.language_profiles, 'name', 'name',
-    typeof initialSonarrLanguageProfile !== 'undefined' ? initialSonarrLanguageProfile : ''
-  )
+  populateArrDropdown('sonarr_root_folder_path', data.root_folders, 'path', 'path', 'initialSonarrRootFolderPath')
+  populateArrDropdown('sonarr_quality_profile', data.quality_profiles, 'name', 'name', 'initialSonarrQualityProfile')
+  populateArrDropdown('sonarr_language_profile', data.language_profiles, 'name', 'name', 'initialSonarrLanguageProfile')
 }
 
-// Pre-submit guard: navigation is allowed only if the user has either
-// (a) never validated Sonarr or (b) validated AND selected all three
-// dropdowns. Path validation from PathValidation (set up elsewhere)
-// also blocks if any path field is invalid.
-function validateSonarrPage () {
-  const validated = document.getElementById('sonarr_validated').value.toLowerCase() === 'true'
-  const rootFolderPath = document.getElementById('sonarr_root_folder_path').value
-  const qualityProfile = document.getElementById('sonarr_quality_profile').value
-  const languageProfile = document.getElementById('sonarr_language_profile').value
-  const pathsValid = (typeof PathValidation !== 'undefined' && PathValidation.validateAll)
-    ? PathValidation.validateAll()
-    : true
-
-  const errors = []
-  if (validated) {
-    if (!rootFolderPath) errors.push('Please select a valid Root Folder Path.')
-    if (!qualityProfile) errors.push('Please select a valid Quality Profile.')
-    if (!languageProfile) errors.push('Please select a valid Language Profile.')
-  }
-  if (!pathsValid) errors.push('Please fix invalid path fields before continuing.')
-
-  const statusMessage = document.getElementById('statusMessage')
-  if (errors.length) {
-    setStatusMessageLines(statusMessage, errors)
-    statusMessage.style.color = '#ea868f'
-    statusMessage.style.display = 'block'
-    return false
-  }
-  statusMessage.style.display = 'none'
-  return true
-}
+const validateSonarrPage = buildArrPreSubmit({
+  validatedFieldId: 'sonarr_validated',
+  dropdowns: [
+    { elementId: 'sonarr_root_folder_path', errorMessage: 'Please select a valid Root Folder Path.' },
+    { elementId: 'sonarr_quality_profile', errorMessage: 'Please select a valid Quality Profile.' },
+    { elementId: 'sonarr_language_profile', errorMessage: 'Please select a valid Language Profile.' }
+  ],
+  skipWhenUnvalidated: true  // Matches Radarr; fixes #1584.
+})
 
 createApiKeyValidator({
   fieldId: 'sonarr_token',

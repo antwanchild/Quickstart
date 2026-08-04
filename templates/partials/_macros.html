@@ -26,7 +26,8 @@ container_class="border rounded p-3 mb-2", number_input=None
             </button>
         </h2>
         <div id="{{ library.id }}-{{ prefix }}-body" class="accordion-collapse collapse"
-            aria-labelledby="{{ library.id }}-{{ prefix }}-header">
+            aria-labelledby="{{ library.id }}-{{ prefix }}-header"
+            data-library-override-scope="true" data-library-override-label="{{ title }}">
             <div class="accordion-body">
                 {% else %}
                 <div class="{{ container_class }}">
@@ -46,7 +47,8 @@ container_class="border rounded p-3 mb-2", number_input=None
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox"
                                     id="{{ library.id }}-attribute_{{ prefix }}_{{ source }}"
-                                    name="{{ library.id }}-attribute_{{ prefix }}_{{ source }}" value="true" {% if
+                                    name="{{ library.id }}-attribute_{{ prefix }}_{{ source }}" value="true"
+                                    data-default="false" {% if
                                     data['libraries'][library.id ~ '-attribute_' ~ prefix ~ '_' ~
                                     source]|string|lower=='true' %}checked{% endif %}>
                                 <input type="hidden" name="{{ library.id }}-attribute_{{ prefix }}_{{ source }}"
@@ -86,7 +88,7 @@ container_class="border rounded p-3 mb-2", number_input=None
                                     min="{{ number_input.min | default(1) }}" {% set
                                     raw_number=data.libraries[library.id ~ '-attribute_' ~ number_input.key] %} {% set
                                     safe_number='' if raw_number in [None, 'None' ] else raw_number %}
-                                    value="{{ safe_number }}">
+                                    value="{{ safe_number }}" data-default="">
                             </div>
                         </div>
                     </div>
@@ -116,7 +118,8 @@ container_class="border rounded p-3 mb-2", number_input=None
                             <ul class="list-group mb-2" id="{{ library.id }}-attribute_{{ prefix }}_custom_list"></ul>
                             <input type="hidden" name="{{ library.id }}-attribute_{{ prefix }}_custom"
                                 id="{{ library.id }}-attribute_{{ prefix }}_custom_hidden"
-                                value="{{ data['libraries'].get(library.id ~ '-attribute_' ~ prefix ~ '_custom', '[]') }}">
+                                value="{{ data['libraries'].get(library.id ~ '-attribute_' ~ prefix ~ '_custom', '[]') }}"
+                                data-default="[]">
                         </div>
                     </div>
                     {% else %}
@@ -140,12 +143,14 @@ container_class="border rounded p-3 mb-2", number_input=None
                             <input type="date" class="form-control"
                                 id="{{ library.id }}-attribute_{{ prefix }}_custom_input"
                                 name="{{ library.id }}-attribute_{{ prefix }}_custom_string" value="{{ safe_val }}"
+                                data-default=""
                                 placeholder="{{ custom_string_placeholder | default('YYYY-MM-DD') }}">
                             {% elif val_type == "rating" %}
                             <input type="number" class="form-control rating-range"
                                 data-validate="rating"
                                 id="{{ library.id }}-attribute_{{ prefix }}_custom_input"
                                 name="{{ library.id }}-attribute_{{ prefix }}_custom_string" min="0" max="10" step="0.1"
+                                data-default=""
                                 value="{{ safe_val }}"
                                 placeholder="{{ custom_string_placeholder | default('Enter rating between 0.0 and 10.0') }}">
                             <div class="invalid-feedback">
@@ -155,12 +160,14 @@ container_class="border rounded p-3 mb-2", number_input=None
                             <input type="number" class="form-control"
                                 id="{{ library.id }}-attribute_{{ prefix }}_custom_input"
                                 name="{{ library.id }}-attribute_{{ prefix }}_custom_string" min="1" step="1"
+                                data-default=""
                                 value="{{ safe_val }}"
                                 placeholder="{{ custom_string_placeholder | default('Enter number greater than 0') }}">
                             {% else %}
                             <input type="text" class="form-control"
                                 id="{{ library.id }}-attribute_{{ prefix }}_custom_input"
                                 name="{{ library.id }}-attribute_{{ prefix }}_custom_string" value="{{ safe_val }}"
+                                data-default=""
                                 placeholder="{{ custom_string_placeholder | default('Enter custom string') }}">
                             {% endif %}
                         </div>
@@ -178,7 +185,8 @@ container_class="border rounded p-3 mb-2", number_input=None
                             </ul>
                             <input type="hidden" name="{{ library.id }}-attribute_{{ prefix }}_order"
                                 id="{{ library.id }}-attribute_{{ prefix }}_order"
-                                value='{{ data["libraries"].get(library.id ~ "-attribute_" ~ prefix ~ "_order", "[]") }}'>
+                                value='{{ data["libraries"].get(library.id ~ "-attribute_" ~ prefix ~ "_order", "[]") }}'
+                                data-default="[]">
                         </div>
                     </div>
                     {% endif %}
@@ -210,7 +218,8 @@ prefix if yml_location == "top_level" else
 %}
 <div class="{{ container_class }}">
     <div class="form-check form-switch">
-        <input class="form-check-input" type="checkbox" id="{{ full_id }}" name="{{ full_name }}" value="true" {% if
+        <input class="form-check-input" type="checkbox" id="{{ full_id }}" name="{{ full_name }}" value="true"
+            data-default="false" {% if
             data.libraries[full_name]|string|lower=='true' %}checked{% endif %}>
         <input type="hidden" name="{{ full_name }}_hidden" value="false">
         <label class="form-check-label" for="{{ full_id }}">
@@ -237,7 +246,8 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
         </button>
     </h2>
     <div id="{{ library.id }}-{{ prefix }}-body" class="accordion-collapse collapse"
-        aria-labelledby="{{ library.id }}-{{ prefix }}-header">
+        aria-labelledby="{{ library.id }}-{{ prefix }}-header"
+        data-library-override-scope="true" data-library-override-label="{{ title }}">
         <div class="accordion-body">
             {% else %}
             <div class="{{ container_class }}">
@@ -257,7 +267,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                         <div class="form-check form-switch">
                             <input class="form-check-input" type="checkbox"
                                 id="{{ library.id }}-attribute_{{ toggle_id }}"
-                                name="{{ library.id }}-attribute_{{ toggle_id }}" value="true" {% if
+                                name="{{ library.id }}-attribute_{{ toggle_id }}" value="true" data-default="false" {% if
                                 data['libraries'][library.id ~ '-attribute_' ~ toggle_id]|string|lower=='true'
                                 %}checked{% endif %}>
                             <input type="hidden" name="{{ library.id }}-attribute_{{ toggle_id }}" value="false">
@@ -285,7 +295,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
 
 {% macro select_section(library, data, prefix, title, description, wiki, options,
 preview_image=False, tooltip_variant="info", container_class="border rounded p-3 mb-2",
-yml_location="attribute", telemetry=None, requires_plex_pass=False) %}
+yml_location="attribute", telemetry=None, requires_plex_pass=False, default_value=None) %}
 
 {# raw_prefix can contain brackets for name, but needs cleaning for id #}
 {% set raw_prefix =
@@ -297,48 +307,12 @@ prefix if yml_location == "top_level" else
 {% set field_id = (library.id ~ "-" ~ raw_prefix).replace("[", "_").replace("]", "") %}
 {% set field_name = library.id ~ "-" ~ raw_prefix %}
 {% set selected = data.libraries.get(field_name, '') %}
+{% set select_default = default_value if default_value is not none else (options[0][0] if options else '') %}
 {% set has_plex_pass = false %}
 {% if telemetry is mapping and telemetry.get("plex_pass") is sameas true %}
 {% set has_plex_pass = true %}
 {% endif %}
 {% set disable_for_plex_pass = requires_plex_pass and not has_plex_pass %}
-<div class="{{ container_class }}">
-    <div class="row">
-        <div class="col-md-6 mb-2">
-            <div class="input-group">
-                <span class="input-group-text" id="{{ field_id }}_text">
-                    <a href="{{ wiki }}" target="_blank" rel="noopener noreferrer">{{ title }}</a>
-                    <span class="text-{{ tooltip_variant }} ms-3" data-bs-toggle="tooltip" data-bs-html="true"
-                        title="{{ description }}">
-                        <i
-                            class="bi {% if tooltip_variant == 'danger' %}bi-exclamation-circle-fill{% else %}bi-info-circle-fill{% endif %}"></i>
-                    </span>
-                </span>
-                <select class="form-select" id="{{ field_id }}" {% if not disable_for_plex_pass %}name="{{ field_name }}"{% endif %}
-                    aria-describedby="{{ field_id }}_text" {% if preview_image %}data-preview="true" {% endif %}{% if disable_for_plex_pass %} disabled aria-disabled="true"{% endif %}>
-                    {% for value, label in options %}
-                    <option value="{{ value }}" {% if selected==value %}selected{% endif %}>{{ label }}</option>
-                    {% endfor %}
-                </select>
-            </div>
-            {% if disable_for_plex_pass %}
-            <input type="hidden" name="{{ field_name }}" value="{{ selected }}">
-            <div class="form-text text-warning">Requires Plex Pass. Validate Plex first if this should be available.</div>
-            {% endif %}
-        </div>
-
-        {% if preview_image and prefix != "placeholder_imdb_id" %}
-        <div class="col-md-6 d-flex align-items-center justify-content-center">
-            <div id="{{ field_id }}-separatorPreviewContainer">
-                <img id="{{ field_id }}-separatorPreviewImage" src="" alt="{{ field_id }} Separator Preview"
-                    class="img-fluid" style="max-width: 100%; height: auto; border: 1px solid #ccc;">
-            </div>
-        </div>
-        {% endif %}
-    </div>
-</div>
-
-{# Separator placeholder controls (conditionally shown with JS) #}
 {% if prefix == "use_separator" %}
 {% set library_media_type = 'movie' if library.id.startswith('mov-') else 'show' %}
 {% set source_select_id = library.id ~ "-attribute_template_variables_placeholder_source" %}
@@ -360,91 +334,148 @@ prefix if yml_location == "top_level" else
 {% else %}
 {% set active_source = 'imdb' %}
 {% endif %}
-<div class="row mt-2 separator-placeholder-wrapper visually-hidden"
-    data-separator-placeholder-wrapper="true"
-    data-library-id="{{ library.name }}"
-    data-library-prefix="{{ library.id }}"
-    data-library-type="{{ library_media_type }}">
-    <div class="col-12 col-xl-5">
-        <div class="input-group mb-2">
-            <span class="input-group-text" id="{{ source_select_id }}_text">
-                <a href="https://kometa.wiki/en/nightly/defaults/separators/#important-note" target="_blank"
-                    rel="noopener noreferrer">Placeholder Source</a>
-                <span class="text-{{ tooltip_variant }} ms-3" data-bs-toggle="tooltip" data-bs-html="true"
-                    title="Choose exactly one placeholder source for separators in this library.">
-                    <i
-                        class="bi {% if tooltip_variant == 'danger' %}bi-exclamation-circle-fill{% else %}bi-info-circle-fill{% endif %}"></i>
+{% endif %}
+<div class="{{ container_class }}">
+    <div class="row">
+        <div class="col-md-6 mb-2">
+            <div class="input-group">
+                <span class="input-group-text" id="{{ field_id }}_text">
+                    <a href="{{ wiki }}" target="_blank" rel="noopener noreferrer">{{ title }}</a>
+                    <span class="text-{{ tooltip_variant }} ms-3" data-bs-toggle="tooltip" data-bs-html="true"
+                        title="{{ description }}">
+                        <i
+                            class="bi {% if tooltip_variant == 'danger' %}bi-exclamation-circle-fill{% else %}bi-info-circle-fill{% endif %}"></i>
+                    </span>
                 </span>
-            </span>
-            <select class="form-select separator-placeholder-source" id="{{ source_select_id }}"
-                aria-describedby="{{ source_select_id }}_text"
-                data-default="imdb"
-                data-library-type="{{ library_media_type }}"
-                data-active-source="{{ active_source }}">
-                <option value="imdb" {% if active_source == 'imdb' %}selected{% endif %}>IMDb ID</option>
+                <select class="form-select" id="{{ field_id }}" {% if not disable_for_plex_pass %}name="{{ field_name }}"{% endif %}
+                    data-default="{{ select_default }}"
+                    aria-describedby="{{ field_id }}_text" {% if preview_image %}data-preview="true" {% endif %}{% if disable_for_plex_pass %} disabled aria-disabled="true"{% endif %}>
+                    {% for value, label in options %}
+                    <option value="{{ value }}" {% if selected==value %}selected{% endif %}>{{ label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            {% if disable_for_plex_pass %}
+            <input type="hidden" name="{{ field_name }}" value="{{ selected }}">
+            <div class="form-text text-warning">Requires Plex Pass. Validate Plex first if this should be available.</div>
+            {% endif %}
+            {% if prefix == "use_separator" %}
+            <div class="separator-placeholder-wrapper visually-hidden mt-2"
+                data-separator-placeholder-wrapper="true"
+                data-library-id="{{ library.name }}"
+                data-library-prefix="{{ library.id }}"
+                data-library-type="{{ library_media_type }}">
+                <div class="input-group mb-2">
+                    <span class="input-group-text" id="{{ source_select_id }}_text">
+                        <a href="https://kometa.wiki/en/nightly/defaults/separators/#important-note" target="_blank"
+                            rel="noopener noreferrer">Placeholder Source</a>
+                        <span class="text-{{ tooltip_variant }} ms-3" data-bs-toggle="tooltip" data-bs-html="true"
+                            title="Choose exactly one placeholder source for separators in this library.">
+                            <i
+                                class="bi {% if tooltip_variant == 'danger' %}bi-exclamation-circle-fill{% else %}bi-info-circle-fill{% endif %}"></i>
+                        </span>
+                    </span>
+                    <select class="form-select separator-placeholder-source" id="{{ source_select_id }}"
+                        aria-describedby="{{ source_select_id }}_text"
+                        data-default="imdb"
+                        data-library-type="{{ library_media_type }}"
+                        data-active-source="{{ active_source }}">
+                        <option value="imdb" {% if active_source == 'imdb' %}selected{% endif %}>IMDb ID</option>
+                        {% if library_media_type == 'movie' %}
+                        <option value="tmdb_movie" {% if active_source == 'tmdb_movie' %}selected{% endif %}>TMDb Movie ID</option>
+                        {% else %}
+                        <option value="tvdb_show" {% if active_source == 'tvdb_show' %}selected{% endif %}>TVDb Show ID</option>
+                        {% endif %}
+                    </select>
+                </div>
+                <div class="input-group mb-2 separator-placeholder-field" data-placeholder-source="imdb">
+                    <span class="input-group-text" id="{{ imdb_id }}_text">
+                        <a href="https://kometa.wiki/en/nightly/defaults/separators/#important-note" target="_blank"
+                            rel="noopener noreferrer">Placeholder IMDb ID</a>
+                    </span>
+                    <select class="form-select separator-placeholder-picklist" id="{{ imdb_id }}" name="{{ imdb_name }}"
+                        data-default=""
+                        data-separator-placeholder-input="imdb"
+                        data-separator-placeholder-value="{{ imdb_data | default('', true) }}"
+                        data-template-scalar-lookup="true"
+                        data-validation-preset="imdb_id_tmdb"
+                        data-library-name="{{ library.name }}"
+                        data-media-type="{{ library_media_type }}"
+                        aria-describedby="{{ imdb_id }}_text"
+                        title="Choose one of the top audience-rated Plex items with an IMDb ID.">
+                        <option value="">Loading top audience-rated items...</option>
+                        {% if imdb_data %}
+                        <option value="{{ imdb_data }}" selected>Saved IMDb ID: {{ imdb_data }}</option>
+                        {% endif %}
+                    </select>
+                </div>
+                <input type="hidden" id="{{ imdb_id }}__lookup_labels" name="{{ imdb_name }}__lookup_labels"
+                    value="{{ data['libraries'].get(imdb_name ~ '__lookup_labels', '{}') | default('{}', true) }}"
+                    data-template-metadata="lookup-labels" data-skip-override-count="true">
                 {% if library_media_type == 'movie' %}
-                <option value="tmdb_movie" {% if active_source == 'tmdb_movie' %}selected{% endif %}>TMDb Movie ID</option>
+                <div class="input-group mb-2 separator-placeholder-field d-none" data-placeholder-source="tmdb_movie">
+                    <span class="input-group-text" id="{{ tmdb_id }}_text">
+                        <a href="https://kometa.wiki/en/nightly/defaults/separators/#important-note" target="_blank"
+                            rel="noopener noreferrer">Placeholder TMDb Movie ID</a>
+                    </span>
+                    <select class="form-select separator-placeholder-picklist" id="{{ tmdb_id }}" name="{{ tmdb_name }}"
+                        data-default=""
+                        data-separator-placeholder-input="tmdb_movie"
+                        data-separator-placeholder-value="{{ tmdb_data | default('', true) }}"
+                        data-template-scalar-lookup="true"
+                        data-validation-preset="numeric_id"
+                        data-library-name="{{ library.name }}"
+                        data-media-type="{{ library_media_type }}"
+                        aria-describedby="{{ tmdb_id }}_text"
+                        title="Choose one of the top audience-rated Plex movies with a TMDb ID.">
+                        <option value="">Loading top audience-rated items...</option>
+                        {% if tmdb_data %}
+                        <option value="{{ tmdb_data }}" selected>Saved TMDb Movie ID: {{ tmdb_data }}</option>
+                        {% endif %}
+                    </select>
+                </div>
+                <input type="hidden" id="{{ tmdb_id }}__lookup_labels" name="{{ tmdb_name }}__lookup_labels"
+                    value="{{ data['libraries'].get(tmdb_name ~ '__lookup_labels', '{}') | default('{}', true) }}"
+                    data-template-metadata="lookup-labels" data-skip-override-count="true">
                 {% else %}
-                <option value="tvdb_show" {% if active_source == 'tvdb_show' %}selected{% endif %}>TVDb Show ID</option>
+                <div class="input-group mb-2 separator-placeholder-field d-none" data-placeholder-source="tvdb_show">
+                    <span class="input-group-text" id="{{ tvdb_id }}_text">
+                        <a href="https://kometa.wiki/en/nightly/defaults/separators/#important-note" target="_blank"
+                            rel="noopener noreferrer">Placeholder TVDb Show ID</a>
+                    </span>
+                    <select class="form-select separator-placeholder-picklist" id="{{ tvdb_id }}" name="{{ tvdb_name }}"
+                        data-default=""
+                        data-separator-placeholder-input="tvdb_show"
+                        data-separator-placeholder-value="{{ tvdb_data | default('', true) }}"
+                        aria-describedby="{{ tvdb_id }}_text"
+                        title="Choose one of the top audience-rated Plex shows with a TVDb ID.">
+                        <option value="">Loading top audience-rated items...</option>
+                        {% if tvdb_data %}
+                        <option value="{{ tvdb_data }}" selected>Saved TVDb Show ID: {{ tvdb_data }}</option>
+                        {% endif %}
+                    </select>
+                </div>
                 {% endif %}
-            </select>
+            </div>
+            {% endif %}
+            {% if preview_image and prefix == "use_separator" %}
+            <div id="{{ field_id }}-separatorPreviewContainer" class="mt-3 justify-content-start" style="display: none;">
+                <img id="{{ field_id }}-separatorPreviewImage" alt="{{ field_id }} Separator Preview"
+                    class="img-fluid" style="max-width: 320px; width: 100%; height: auto; border: 1px solid #ccc;">
+            </div>
+            {% endif %}
         </div>
-    </div>
-    <div class="col-12 col-xl-7">
-        <div class="input-group mb-2 separator-placeholder-field" data-placeholder-source="imdb">
-            <span class="input-group-text" id="{{ imdb_id }}_text">
-                <a href="https://kometa.wiki/en/nightly/defaults/separators/#important-note" target="_blank"
-                    rel="noopener noreferrer">Placeholder IMDb ID</a>
-            </span>
-            <input type="text" class="form-control" id="{{ imdb_id }}" name="{{ imdb_name }}"
-                value="{{ imdb_data | default('', true) }}"
-                data-default=""
-                data-separator-placeholder-input="imdb"
-                aria-describedby="{{ imdb_id }}_text"
-                placeholder="tt1234567"
-                pattern="tt\d{7,8}"
-                title="IMDb IDs must look like tt1234567"
-                inputmode="text"
-                autocapitalize="off">
-        </div>
-        {% if library_media_type == 'movie' %}
-        <div class="input-group mb-2 separator-placeholder-field d-none" data-placeholder-source="tmdb_movie">
-            <span class="input-group-text" id="{{ tmdb_id }}_text">
-                <a href="https://kometa.wiki/en/nightly/defaults/separators/#important-note" target="_blank"
-                    rel="noopener noreferrer">Placeholder TMDb Movie ID</a>
-            </span>
-            <input type="text" class="form-control" id="{{ tmdb_id }}" name="{{ tmdb_name }}"
-                value="{{ tmdb_data | default('', true) }}"
-                data-default=""
-                data-separator-placeholder-input="tmdb_movie"
-                aria-describedby="{{ tmdb_id }}_text"
-                placeholder="603"
-                pattern="\d+"
-                title="TMDb movie IDs must be numeric"
-                inputmode="numeric"
-                data-numeric-only="true">
-        </div>
-        {% else %}
-        <div class="input-group mb-2 separator-placeholder-field d-none" data-placeholder-source="tvdb_show">
-            <span class="input-group-text" id="{{ tvdb_id }}_text">
-                <a href="https://kometa.wiki/en/nightly/defaults/separators/#important-note" target="_blank"
-                    rel="noopener noreferrer">Placeholder TVDb Show ID</a>
-            </span>
-            <input type="text" class="form-control" id="{{ tvdb_id }}" name="{{ tvdb_name }}"
-                value="{{ tvdb_data | default('', true) }}"
-                data-default=""
-                data-separator-placeholder-input="tvdb_show"
-                aria-describedby="{{ tvdb_id }}_text"
-                placeholder="121361"
-                pattern="\d+"
-                title="TVDb show IDs must be numeric"
-                inputmode="numeric"
-                data-numeric-only="true">
+
+        {% if preview_image and prefix not in ["placeholder_imdb_id", "use_separator"] %}
+        <div class="col-md-6 d-flex align-items-center justify-content-center">
+            <div id="{{ field_id }}-separatorPreviewContainer">
+                <img id="{{ field_id }}-separatorPreviewImage" src="" alt="{{ field_id }} Separator Preview"
+                    class="img-fluid" style="max-width: 100%; height: auto; border: 1px solid #ccc;">
+            </div>
         </div>
         {% endif %}
     </div>
 </div>
-{% endif %}
 {% endmacro %}
 
 
@@ -466,7 +497,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
         <div class="col-md-6 mb-2">
             <div class="form-check form-switch">
                 <input class="form-check-input" type="checkbox" id="{{ library.id }}-attribute_{{ toggle.key }}"
-                    name="{{ library.id }}-attribute_{{ toggle.key }}" value="true" {% if data.libraries[library.id
+                    name="{{ library.id }}-attribute_{{ toggle.key }}" value="true" data-default="false" {% if data.libraries[library.id
                     ~ '-attribute_' ~ toggle.key]|string|lower=='true' %}checked{% endif %}>
                 <input type="hidden" name="{{ library.id }}-attribute_{{ toggle.key }}" value="false">
                 <label class="form-check-label" for="{{ library.id }}-attribute_{{ toggle.key }}">
@@ -498,7 +529,8 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                 <input type="number" class="form-control" id="{{ library.id }}-attribute_{{ number_input.key }}"
                     name="{{ library.id }}-attribute_{{ number_input.key }}" min="{{ number_input.min | default(1) }}"
                     {% set raw_number=data.libraries[library.id ~ '-attribute_' ~ number_input.key] %} {% set
-                    safe_number='' if raw_number in [None, 'None' ] else raw_number %} value="{{ safe_number }}">
+                    safe_number='' if raw_number in [None, 'None' ] else raw_number %} value="{{ safe_number }}"
+                    data-default="">
             </div>
         </div>
     </div>
@@ -530,7 +562,8 @@ tooltip_variant='info', container_class='border rounded p-3 mb-2') %}
             </button>
         </h2>
         <div id="{{ library.id }}-{{ prefix }}-body" class="accordion-collapse collapse"
-            aria-labelledby="{{ library.id }}-{{ prefix }}-header">
+            aria-labelledby="{{ library.id }}-{{ prefix }}-header"
+            data-library-override-scope="true" data-library-override-label="{{ title }}">
             <div class="accordion-body">
                 {% else %}
                 <div class="{{ container_class }}">
@@ -550,7 +583,8 @@ tooltip_variant='info', container_class='border rounded p-3 mb-2') %}
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox"
                                     id="{{ library.id }}-attribute_{{ toggle.key }}"
-                                    name="{{ library.id }}-attribute_{{ toggle.key }}" value="true" {% if
+                                    name="{{ library.id }}-attribute_{{ toggle.key }}" value="true"
+                                    data-default="false" {% if
                                     data.libraries[library.id ~ '-attribute_' ~ toggle.key]|string|lower=='true'
                                     %}checked{% endif %}>
                                 <input type="hidden" name="{{ library.id }}-attribute_{{ toggle.key }}" value="false">
@@ -585,7 +619,7 @@ tooltip_variant='info', container_class='border rounded p-3 mb-2') %}
                                     min="{{ number_input.min | default(1) }}" {% set
                                     raw_number=data.libraries[library.id ~ '-attribute_' ~ number_input.key] %} {% set
                                     safe_number='' if raw_number in [None, 'None' ] else raw_number %}
-                                    value="{{ safe_number }}"
+                                    value="{{ safe_number }}" data-default=""
                                     aria-describedby="{{ library.id }}-attribute_{{ number_input.key }}_text">
                             </div>
                         </div>
@@ -596,7 +630,8 @@ tooltip_variant='info', container_class='border rounded p-3 mb-2') %}
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox"
                                     id="{{ library.id }}-attribute_{{ toggle.key }}"
-                                    name="{{ library.id }}-attribute_{{ toggle.key }}" value="true" {% if
+                                    name="{{ library.id }}-attribute_{{ toggle.key }}" value="true"
+                                    data-default="false" {% if
                                     data.libraries[library.id ~ '-attribute_' ~ toggle.key]|string|lower=='true'
                                     %}checked{% endif %}>
                                 <input type="hidden" name="{{ library.id }}-attribute_{{ toggle.key }}" value="false">
@@ -660,7 +695,8 @@ select_input.key if yml_location == "top_level" else
             </button>
         </h2>
         <div id="{{ library.id }}-{{ prefix }}-body" class="accordion-collapse collapse"
-            aria-labelledby="{{ library.id }}-{{ prefix }}-header">
+            aria-labelledby="{{ library.id }}-{{ prefix }}-header"
+            data-library-override-scope="true" data-library-override-label="{{ title }}">
             <div class="accordion-body">
                 {% else %}
                 <div class="{{ container_class }}">
@@ -688,7 +724,7 @@ select_input.key if yml_location == "top_level" else
                         <div class="col-md-6 mb-2">
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox" id="{{ toggle_id }}"
-                                    name="{{ toggle_name }}" value="true" {% if
+                                    name="{{ toggle_name }}" value="true" data-default="false" {% if
                                     data.libraries[toggle_name]|string|lower=='true' %}checked{% endif %}>
                                 <input type="hidden" name="{{ toggle_name }}" value="false">
                                 <label class="form-check-label" for="{{ toggle_id }}">
@@ -717,6 +753,7 @@ select_input.key if yml_location == "top_level" else
                                     </span>
                                 </span>
                                 <select class="form-select" id="{{ select_id }}" name="{{ select_name }}"
+                                    data-default=""
                                     aria-describedby="{{ select_id }}_label">
                                     {% set selected = data.libraries.get(select_name, '') %}
                                     {% for value, label in select_input.options %}
@@ -763,7 +800,8 @@ select_input.key if yml_location == "top_level" else
             </button>
         </h2>
         <div id="{{ library.id }}-{{ section.prefix }}-body" class="accordion-collapse collapse"
-            aria-labelledby="{{ library.id }}-{{ section.prefix }}-header">
+            aria-labelledby="{{ library.id }}-{{ section.prefix }}-header"
+            data-library-override-scope="true" data-library-override-label="{{ section.title }}">
             <div class="accordion-body">
                 {% else %}
                 <div class="{{ section.container_class }}">
@@ -784,6 +822,7 @@ select_input.key if yml_location == "top_level" else
                                 id="{{ library.id }}-attribute_{{ section.prefix }}_path"
                                 name="{{ library.id }}-attribute_{{ section.prefix }}_path"
                                 value="{{ data.libraries[library.id ~ '-attribute_' ~ section.prefix ~ '_path'] | default('') }}"
+                                data-default=""
                                 placeholder="{{ section.text_input.placeholder }}">
                         </div>
                     </div>
@@ -809,7 +848,8 @@ select_input.key if yml_location == "top_level" else
                             <ul class="list-group mb-2" id="{{ library.id }}-{{ section.prefix }}_custom_list"></ul>
                             <input type="hidden" name="{{ library.id }}-attribute_{{ section.prefix }}_exclude"
                                 id="{{ library.id }}-{{ section.prefix }}_custom_hidden"
-                                value="{{ data.libraries[library.id ~ '-attribute_' ~ section.prefix ~ '_exclude'] | default('[]') }}">
+                                value="{{ data.libraries[library.id ~ '-attribute_' ~ section.prefix ~ '_exclude'] | default('[]') }}"
+                                data-default="[]">
                         </div>
                     </div>
 
@@ -820,7 +860,8 @@ select_input.key if yml_location == "top_level" else
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox"
                                     id="{{ library.id }}-attribute_{{ toggle.key }}"
-                                    name="{{ library.id }}-attribute_{{ toggle.key }}" value="true" {% if
+                                    name="{{ library.id }}-attribute_{{ toggle.key }}" value="true"
+                                    data-default="false" {% if
                                     data.libraries[library.id ~ '-attribute_' ~ toggle.key]|string|lower=='true'
                                     %}checked{% endif %}>
                                 <input type="hidden" name="{{ library.id }}-attribute_{{ toggle.key }}" value="false">
@@ -872,7 +913,8 @@ select_input.key if yml_location == "top_level" else
             </button>
         </h2>
         <div id="{{ library.id }}-{{ section.prefix }}-body" class="accordion-collapse collapse"
-            aria-labelledby="{{ library.id }}-{{ section.prefix }}-header">
+            aria-labelledby="{{ library.id }}-{{ section.prefix }}-header"
+            data-library-override-scope="true" data-library-override-label="{{ section.title }}">
             <div class="accordion-body">
                 {% else %}
                 <div class="{{ section.container_class }}">
@@ -898,7 +940,8 @@ select_input.key if yml_location == "top_level" else
                     <ul class="list-group mb-2" id="{{ library.id }}-attribute_{{ section.prefix }}_list"></ul>
                     <input type="hidden" name="{{ library.id }}-attribute_{{ section.prefix }}"
                         id="{{ library.id }}-attribute_{{ section.prefix }}_hidden"
-                        value="{{ data.libraries[library.id ~ '-attribute_' ~ section.prefix] | default('{}') }}">
+                        value="{{ data.libraries[library.id ~ '-attribute_' ~ section.prefix] | default('{}') }}"
+                        data-default="{}">
 
                     {% if "accordion" in section.container_class %}
                 </div> {# .accordion-body #}
@@ -1011,7 +1054,7 @@ field_prefix ~ "_" ~ prefix if field_prefix else prefix) %}
             <input type="text" class="form-control" id="{{ full_id }}_schedule_raw" data-schedule-raw
                 placeholder="{{ placeholder }}" value="{{ field_value }}">
         </details>
-        <input type="hidden" id="{{ full_id }}" name="{{ full_name }}" value="{{ field_value }}">
+        <input type="hidden" id="{{ full_id }}" name="{{ full_name }}" value="{{ field_value }}" data-default="">
     </div>
 </div>
 {% else %}
@@ -1026,10 +1069,10 @@ field_prefix ~ "_" ~ prefix if field_prefix else prefix) %}
             </span>
         </span>
         {% if multiline %}
-        <textarea class="form-control" id="{{ full_id }}" name="{{ full_name }}"
+        <textarea class="form-control" id="{{ full_id }}" name="{{ full_name }}" data-default=""
             placeholder="{{ placeholder }}" rows="{{ rows }}">{{ field_value }}</textarea>
         {% else %}
-        <input type="text" class="form-control" id="{{ full_id }}" name="{{ full_name }}"
+        <input type="text" class="form-control" id="{{ full_id }}" name="{{ full_name }}" data-default=""
             placeholder="{{ placeholder }}" value="{{ field_value }}">
         {% endif %}
     </div>
@@ -1083,7 +1126,8 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
 {% set accordion_safe = group.accordion | replace(' ', '') %}
 <!-- Plex Pass: {{ telemetry.plex_pass }} -->
 <!-- {{ group.accordion }} Collection Accordion -->
-<div class="accordion mt-3" id="{{ library.id }}-{{ accordion_safe }}Accordion">
+<div class="accordion mt-3" id="{{ library.id }}-{{ accordion_safe }}Accordion"
+    data-collection-group-shell="true" data-library-id="{{ library.id }}">
     <div class="accordion-item">
         <h2 class="accordion-header overlay-accordion-header d-flex align-items-center">
             <button class="accordion-button collapsed flex-grow-1" type="button" data-bs-toggle="collapse"
@@ -1095,6 +1139,13 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
         <div id="{{ library.id }}-{{ accordion_safe }}" class="accordion-collapse collapse"
             data-bs-parent="#{{ library.id }}-{{ accordion_safe }}Accordion">
             <div class="accordion-body">
+                <div class="d-flex justify-content-end mb-3 collection-parent-reset-actions">
+                    <button type="button"
+                        class="btn btn-sm btn-outline-secondary btn-overlay reset-offset-btn"
+                        data-collection-parent-reset="true">
+                        Reset {{ group.accordion }}
+                    </button>
+                </div>
 
                 {% set lib_meta = telemetry.libraries[library.name] if telemetry.libraries and library.name in
                 telemetry.libraries else {} %}
@@ -1220,19 +1271,119 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                     {% endfor %}
                     {% set ordered_collection_items = prioritized_collection_items.priority + prioritized_collection_items.remaining %}
                     {% endif %}
-                    {% set season = namespace(open=false) %}
+                    {% set clean_id = collection.id.replace('collection_', '') %}
+                    {% set collection_details_id = library.id ~ '-template_collection_' ~ clean_id ~ '-details' %}
                     {% set has_plex_pass = telemetry is mapping and telemetry.get("plex_pass") is sameas true %}
+                    {% set visible_collection_items = [] %}
+                    {% for item in ordered_collection_items
+                        if (not item.media_types or library.type in item.media_types)
+                        and (not item.key.startswith('visible_') or telemetry.plex_pass) %}
+                    {% set _ = visible_collection_items.append(item) %}
+                    {% endfor %}
+                    {% set section_defs = collection.template_variable_sections if collection.template_variable_sections is defined else [] %}
+                    {% set render_groups = namespace(items=[]) %}
+                    {% if section_defs %}
+                    {% set known_section_ids = [] %}
+                    {% for section_def in section_defs if section_def.id is defined %}
+                    {% set _ = known_section_ids.append(section_def.id) %}
+                    {% set section_items = [] %}
+                    {% for item in visible_collection_items if item.section is defined and item.section == section_def.id %}
+                    {% set _ = section_items.append(item) %}
+                    {% endfor %}
+                    {% if section_items %}
+                    {% set _ = render_groups.items.append({
+                        'id': section_def.id,
+                        'label': section_def.label | default(section_def.id | replace('_', ' ') | title),
+                        'summary': section_def.summary | default(''),
+                        'default_open': section_def.default_open is sameas true,
+                        'fields': section_items,
+                        'flat': false
+                    }) %}
+                    {% endif %}
+                    {% endfor %}
+                    {% set unsectioned_items = [] %}
+                    {% for item in visible_collection_items %}
+                    {% if item.section is not defined or item.section not in known_section_ids %}
+                    {% set _ = unsectioned_items.append(item) %}
+                    {% endif %}
+                    {% endfor %}
+                    {% if unsectioned_items %}
+                    {% set _ = render_groups.items.append({
+                        'id': 'other',
+                        'label': 'Other',
+                        'summary': '',
+                        'default_open': false,
+                        'fields': unsectioned_items,
+                        'flat': false
+                    }) %}
+                    {% endif %}
+                    {% endif %}
+                    {% if not render_groups.items %}
+                    {% set _ = render_groups.items.append({
+                        'id': 'all',
+                        'label': 'Details',
+                        'summary': '',
+                        'default_open': true,
+                        'fields': visible_collection_items,
+                        'flat': true
+                    }) %}
+                    {% endif %}
                     <div class="child-toggle-wrapper ms-4 mt-2"
                         data-toggle-parent="{{ library.id }}-{{ collection.id }}" style="display: none;">
-                        <div class="d-flex align-items-center gap-2 flex-wrap mb-2">
+                        <div class="d-flex align-items-center gap-2 flex-wrap mb-2 collection-detail-actions">
+                            <button type="button"
+                                class="btn btn-sm btn-outline-secondary btn-overlay collection-details-toggle"
+                                data-section-id="{{ collection_details_id }}"
+                                data-show-label="Show Details"
+                                data-hide-label="Hide Details"
+                                aria-expanded="false">
+                                Show Details
+                            </button>
                             <button type="button" class="btn btn-sm btn-outline-secondary btn-overlay reset-offset-btn">
                                 Reset to Defaults
                             </button>
                         </div>
-                        {% for item in ordered_collection_items
-                        if (not item.media_types or library.type in item.media_types)
-                        and (not item.key.startswith('visible_') or telemetry.plex_pass) %}
-                        {% set clean_id = collection.id.replace('collection_', '') %}
+                        <div class="collection-template-section mt-2"
+                            id="{{ collection_details_id }}"
+                            data-detail-section="true"
+                            style="display: none;">
+                        {% for render_group in render_groups.items %}
+                        {% if not render_group.flat %}
+                        {% set section_body_id = collection_details_id ~ '-section-' ~ render_group.id %}
+                        <div class="border rounded p-2 mb-3 collection-variable-section" data-collection-variable-section="true"
+                            data-section-id="{{ render_group.id }}">
+                            <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mb-2">
+                                <div class="fw-semibold">{{ render_group.label }}</div>
+                                <div class="d-flex align-items-center gap-2">
+                                    <span class="small text-muted" data-collection-section-summary>Defaults</span>
+                                    <button type="button"
+                                        class="btn btn-sm btn-outline-secondary btn-overlay collection-variable-section-toggle"
+                                        data-section-id="{{ section_body_id }}"
+                                        data-show-label="Show"
+                                        data-hide-label="Hide"
+                                        aria-expanded="{{ 'true' if render_group.default_open else 'false' }}">
+                                        {{ 'Hide' if render_group.default_open else 'Show' }}
+                                    </button>
+                                </div>
+                            </div>
+                            {% if render_group.summary %}
+                            <div class="form-text mb-2">{{ render_group.summary }}</div>
+                            {% endif %}
+                            <div class="collection-variable-section-body"
+                                id="{{ section_body_id }}"
+                                data-detail-section="true"
+                                data-default-open="{{ 'true' if render_group.default_open else 'false' }}"
+                                style="display: {{ 'block' if render_group.default_open else 'none' }};">
+                                <div class="d-flex justify-content-end mb-2">
+                                    <button type="button"
+                                        class="btn btn-sm btn-outline-secondary btn-overlay reset-offset-btn"
+                                        data-collection-variable-section-reset="true">
+                                        Reset {{ render_group.label }}
+                                    </button>
+                                </div>
+                        {% endif %}
+                        {% set season = namespace(open=false) %}
+                        {% for item in render_group.fields %}
                         {% set input_name = (library.id ~ '-template_collection_' ~ clean_id ~ '_' ~ item.key) if item.key is defined else '' %}
                         {% set field_requires_plex_pass = item.requires_plex_pass is defined and item.requires_plex_pass %}
                         {% set field_disabled = disable_toggle or (field_requires_plex_pass and not has_plex_pass) %}
@@ -1368,6 +1519,12 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                         {% else %}
                         {% set list_default_json = '[]' %}
                         {% endif %}
+                        {% set string_input_mode = item.input_mode | default('text') %}
+                        {% if item.options is defined %}
+                        {% set string_options_json = item.options | tojson %}
+                        {% else %}
+                        {% set string_options_json = '' %}
+                        {% endif %}
                         <div class="mb-2" data-template-string-list data-hidden-input="{{ input_name }}"
                             data-library-name="{{ library.name }}"
                             data-media-type="{{ library.type }}"
@@ -1375,7 +1532,9 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                             {% if item.mutually_exclusive_with %}data-mutually-exclusive-with="{{ item.mutually_exclusive_with }}"{% endif %}
                             {% if item.validation_preset %}data-validation-preset="{{ item.validation_preset }}"{% endif %}
                             {% if item.validation_mode %}data-validation-mode="{{ item.validation_mode }}"{% endif %}
-                            {% if item.validation_normalize %}data-validation-normalize="{{ item.validation_normalize }}"{% endif %}>
+                            {% if item.validation_normalize %}data-validation-normalize="{{ item.validation_normalize }}"{% endif %}
+                            data-input-mode="{{ string_input_mode }}"
+                            data-select-options='{{ string_options_json }}'>
                             <div class="input-group">
                                 <span class="input-group-text" id="{{ input_name }}_text" style="width: 170px;">
                                     {{ item.label }}
@@ -1387,11 +1546,20 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                     </span>
                                     {% endif %}
                                 </span>
+                                {% if string_input_mode == 'select' %}
+                                <select class="form-select" id="{{ input_name }}_input" data-template-string-input
+                                    aria-describedby="{{ input_name }}_text"
+                                    {% if disable_toggle %}disabled{% endif %}>
+                                    <option value="">{{ item.placeholder | default('Select a value') }}</option>
+                                </select>
+                                {% else %}
                                 <input type="text" class="form-control" id="{{ input_name }}_input"
+                                    data-template-string-input
                                     aria-describedby="{{ input_name }}_text"
                                     placeholder="{{ item.placeholder | default('Add value') }}"
                                     {% if item.validation_preset %}data-validation-preset="{{ item.validation_preset }}"{% endif %}
                                     {% if disable_toggle %}disabled{% endif %}>
+                                {% endif %}
                                 <button class="btn nav-button" type="button" data-template-string-add
                                     {% if disable_toggle %}disabled{% endif %}>Add</button>
                             </div>
@@ -1399,6 +1567,9 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                         <ul class="list-group mt-2" data-template-string-items></ul>
                         <input type="hidden" id="{{ input_name }}" name="{{ input_name }}" value="{{ list_json }}"
                             data-default='{{ list_default_json }}'>
+                        <input type="hidden" id="{{ input_name }}__lookup_labels" name="{{ input_name }}__lookup_labels"
+                            value="{{ data['libraries'].get(input_name ~ '__lookup_labels', '{}') | default('{}', true) }}"
+                            data-template-metadata="lookup-labels" data-skip-override-count="true">
                         </div>
                         {% elif item.type == 'mapping_list' %}
                         {% set stored_map = data['libraries'].get(input_name) %}
@@ -1417,11 +1588,19 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                         {% set map_default_json = '{}' %}
                         {% endif %}
                         {% set label_width = item.label_width if item.label_width is defined else (320 if item.label|length > 24 else 170) %}
+                        {% set key_input_mode = item.key_input_mode | default('text') %}
+                        {% if item.key_options is defined %}
+                        {% set key_options_json = item.key_options | tojson %}
+                        {% else %}
+                        {% set key_options_json = '' %}
+                        {% endif %}
                         <div class="mb-2" data-template-mapping-list data-hidden-input="{{ input_name }}"
                             data-library-name="{{ library.name }}"
                             data-media-type="{{ library.type }}"
                             data-validation-preset="{{ item.validation_preset | default('') }}"
                             data-key-validation-preset="{{ item.key_validation_preset | default('') }}"
+                            data-key-input-mode="{{ key_input_mode }}"
+                            data-key-options='{{ key_options_json }}'
                             data-lookup-display-mode="{{ item.lookup_display_mode | default('stacked') }}"
                             data-value-display-label="{{ item.value_display_label | default('') }}"
                             data-mapping-value-kind="{{ item.dynamic_child_value_kind | default('string_list') }}">
@@ -1437,10 +1616,18 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                     </span>
                                     {% endif %}
                                 </span>
+                                {% if key_input_mode == 'select' %}
+                                <select class="form-select" data-template-mapping-key
+                                    aria-describedby="{{ input_name }}_text"
+                                    {% if disable_toggle %}disabled{% endif %}>
+                                    <option value="">{{ item.key_placeholder | default('Select a key') }}</option>
+                                </select>
+                                {% else %}
                                 <input type="text" class="form-control" data-template-mapping-key
                                     aria-describedby="{{ input_name }}_text"
                                     placeholder="{{ item.key_placeholder | default('Add key') }}"
                                     {% if disable_toggle %}disabled{% endif %}>
+                                {% endif %}
                                 <input type="text" class="form-control" data-template-mapping-value
                                     aria-describedby="{{ input_name }}_text"
                                     placeholder="{{ item.value_placeholder | default('Add comma-separated values') }}"
@@ -1503,7 +1690,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                             <input type="hidden" id="{{ input_name }}" name="{{ input_name }}" value="{{ stored_val }}"
                                 data-default="{{ item.default | default('', true) }}">
                         </div>
-                        {% elif item.key is defined and item.key.startswith('schedule_') %}
+                        {% elif item.type == 'schedule' or (item.key is defined and item.key.startswith('schedule_')) %}
                         {% set schedule_label = 'Schedule' %}
                         {% set schedule_tooltip = "Configure when this collection updates." %}
                         {% set label_width = 140 %}
@@ -1645,6 +1832,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                 value="{{ data['libraries'].get(input_name, item.default) | default('', true) }}"
                                 data-default="{{ item.default | default('', true) }}"
                                 {% if item.key is defined %}data-template-variable-key="{{ item.key }}"{% endif %}
+                                {% if item.validation_preset %}data-template-scalar-lookup="true" data-library-name="{{ library.name }}" data-media-type="{{ library.type }}"{% endif %}
                                 {% if field_requires_plex_pass %}data-requires-plex-pass="true" data-plex-pass-available="{{ 'true' if has_plex_pass else 'false' }}"{% endif %}
                                 {% if item.requires_any_of_template_keys is defined and item.requires_any_of_template_keys %}data-requires-any-of-template-keys="{{ item.requires_any_of_template_keys | join(',') }}" data-requirement-hint="{{ item.requirement_hint | default('', true) }}"{% endif %}
                                 {% if item.mutually_exclusive_with %}data-mutually-exclusive-with="{{ item.mutually_exclusive_with }}"{% endif %}
@@ -1663,6 +1851,11 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                 {% endif %}
                                 {% if field_disabled %}disabled{% endif %}>
                         </div>
+                        {% if item.validation_preset %}
+                        <input type="hidden" id="{{ input_name }}__lookup_labels" name="{{ input_name }}__lookup_labels"
+                            value="{{ data['libraries'].get(input_name ~ '__lookup_labels', '{}') | default('{}', true) }}"
+                            data-template-metadata="lookup-labels" data-skip-override-count="true">
+                        {% endif %}
                         {% if field_requires_plex_pass and not has_plex_pass %}
                         <input type="hidden" name="{{ input_name }}" value="{{ data['libraries'].get(input_name, item.default) | default('', true) }}">
                         <div class="form-text text-warning mb-2">Requires Plex Pass. Validate Plex first if this should be available.</div>
@@ -1677,6 +1870,12 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                         {% if is_seasonal and season.open %}
                     </div>
                         {% endif %}
+                        {% if not render_group.flat %}
+                            </div>
+                        </div>
+                        {% endif %}
+                        {% endfor %}
+                        </div>
                     </div>
                     {% endif %}
                 </div>
@@ -1920,6 +2119,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                     {% endif %}
                                                 </div>
                                                 <div class="overlay-template-section mt-2" id="{{ details_id }}"
+                                                    data-detail-section="true"
                                                     style="display: none;">
                                                 {% set is_mapping = overlay.template_variables is mapping %}
                                                 {% set raw_tv_items = overlay.template_variables.items() if is_mapping else overlay.template_variables %}
@@ -1938,8 +2138,130 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                 {% else %}
                                                 {% set tv_items = raw_tv_items %}
                                                 {% endif %}
+                                                {% set overlay_sections = overlay.template_variable_sections if overlay.template_variable_sections is defined else [] %}
+                                                {% if overlay.id == 'overlay_ratings' and not overlay_sections %}
+                                                {% set overlay_sections = [
+                                                    {'id': 'basics', 'label': 'Basics', 'summary': 'Core ratings overlay behavior.', 'default_open': false},
+                                                    {'id': 'rating_slots', 'label': 'Rating Slots', 'summary': 'Choose rating sources and icon images for each slot.', 'default_open': false},
+                                                    {'id': 'font', 'label': 'Font', 'summary': 'Per-slot font, color, and stroke settings.', 'default_open': false},
+                                                    {'id': 'background', 'label': 'Background', 'summary': 'Background fill, outline, dimensions, and padding.', 'default_open': false},
+                                                    {'id': 'placement', 'label': 'Placement', 'summary': 'Overlay alignment, slot offsets, and position controls.', 'default_open': false}
+                                                ] %}
+                                                {% endif %}
+                                                {% set overlay_render_groups = [] %}
+                                                {% if overlay_sections %}
+                                                {% set grouped_vars = [] %}
+                                                {% for section_def in overlay_sections %}
+                                                    {% set section_items = [] %}
+                                                    {% for tv_item in tv_items %}
+                                                        {% if is_mapping %}
+                                                            {% set tv_var_name = tv_item[0] %}
+                                                            {% set tv_var_details = tv_item[1] %}
+                                                        {% else %}
+                                                            {% set tv_var_details = tv_item %}
+                                                            {% set tv_var_name = tv_var_details.key or ('var' ~ loop.index0) %}
+                                                        {% endif %}
+                                                        {% set tv_section = namespace(value=(tv_var_details.section if tv_var_details.section is defined else 'basics')) %}
+                                                        {% if overlay.id == 'overlay_ratings' %}
+                                                            {% if tv_var_name in ['rating1', 'rating1_image', 'rating2', 'rating2_image', 'rating3', 'rating3_image'] %}
+                                                                {% set tv_section.value = 'rating_slots' %}
+                                                            {% elif tv_var_name.endswith('_font') or tv_var_name.endswith('_font_size') or tv_var_name.endswith('_font_color') or tv_var_name.endswith('_stroke_width') or tv_var_name.endswith('_stroke_color') %}
+                                                                {% set tv_section.value = 'font' %}
+                                                            {% elif tv_var_name.startswith('back_') or tv_var_name.startswith('addon_') %}
+                                                                {% set tv_section.value = 'background' %}
+                                                            {% elif tv_var_name in ['horizontal_position', 'vertical_position', 'rating_alignment', 'horizontal_offset', 'vertical_offset'] or tv_var_name.endswith('_horizontal_offset') or tv_var_name.endswith('_vertical_offset') %}
+                                                                {% set tv_section.value = 'placement' %}
+                                                            {% else %}
+                                                                {% set tv_section.value = 'basics' %}
+                                                            {% endif %}
+                                                        {% endif %}
+                                                        {% if tv_section.value == section_def.id %}
+                                                            {% set _ = section_items.append(tv_item) %}
+                                                            {% set _ = grouped_vars.append(tv_var_name) %}
+                                                        {% endif %}
+                                                    {% endfor %}
+                                                    {% if section_items %}
+                                                        {% set _ = overlay_render_groups.append({
+                                                            'id': section_def.id,
+                                                            'label': section_def.label,
+                                                            'summary': section_def.summary if section_def.summary is defined else '',
+                                                            'default_open': section_def.default_open if section_def.default_open is defined else false,
+                                                            'fields': section_items,
+                                                            'flat': false
+                                                        }) %}
+                                                    {% endif %}
+                                                {% endfor %}
+                                                {% set ungrouped_items = [] %}
+                                                {% for tv_item in tv_items %}
+                                                    {% if is_mapping %}
+                                                        {% set tv_var_name = tv_item[0] %}
+                                                    {% else %}
+                                                        {% set tv_var_details = tv_item %}
+                                                        {% set tv_var_name = tv_var_details.key or ('var' ~ loop.index0) %}
+                                                    {% endif %}
+                                                    {% if tv_var_name not in grouped_vars %}
+                                                        {% set _ = ungrouped_items.append(tv_item) %}
+                                                    {% endif %}
+                                                {% endfor %}
+                                                {% if ungrouped_items %}
+                                                    {% set _ = overlay_render_groups.append({
+                                                        'id': 'other',
+                                                        'label': 'Other',
+                                                        'summary': 'Additional overlay settings.',
+                                                        'default_open': false,
+                                                        'fields': ungrouped_items,
+                                                        'flat': false
+                                                    }) %}
+                                                {% endif %}
+                                                {% endif %}
+                                                {% if not overlay_render_groups %}
+                                                    {% set _ = overlay_render_groups.append({
+                                                        'id': 'all',
+                                                        'label': 'Details',
+                                                        'summary': '',
+                                                        'default_open': true,
+                                                        'fields': tv_items,
+                                                        'flat': true
+                                                    }) %}
+                                                {% endif %}
                                                 {% set seen_vars = [] %}
-                                                {% for item in tv_items %}
+                                                {% for render_group in overlay_render_groups %}
+                                                {% if not render_group.flat %}
+                                                {% set render_group_body_id = template_name ~ '-' ~ render_group.id ~ '-section-body' %}
+                                                <div class="border rounded p-2 mb-3 collection-variable-section overlay-variable-section"
+                                                    data-overlay-variable-section="true"
+                                                    data-overlay-variable-section-id="{{ render_group.id }}">
+                                                    <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mb-2">
+                                                        <div class="fw-semibold">{{ render_group.label }}</div>
+                                                        <div class="d-flex align-items-center gap-2">
+                                                            <span class="small text-muted" data-overlay-section-summary>Defaults</span>
+                                                            <button type="button"
+                                                                class="btn btn-sm btn-outline-secondary btn-overlay overlay-variable-section-toggle"
+                                                                data-section-id="{{ render_group_body_id }}"
+                                                                data-show-label="Show"
+                                                                data-hide-label="Hide"
+                                                                aria-expanded="{{ 'true' if render_group.default_open else 'false' }}">
+                                                                {{ 'Hide' if render_group.default_open else 'Show' }}
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                    {% if render_group.summary %}
+                                                    <div class="form-text mb-2">{{ render_group.summary }}</div>
+                                                    {% endif %}
+                                                    <div class="overlay-variable-section-body"
+                                                        id="{{ render_group_body_id }}"
+                                                        data-detail-section="true"
+                                                        data-default-open="{{ 'true' if render_group.default_open else 'false' }}"
+                                                        style="display: {{ 'block' if render_group.default_open else 'none' }};">
+                                                        <div class="d-flex justify-content-end mb-2">
+                                                            <button type="button"
+                                                                class="btn btn-sm btn-outline-secondary btn-overlay reset-offset-btn"
+                                                                data-overlay-variable-section-reset="true">
+                                                                Reset {{ render_group.label }}
+                                                            </button>
+                                                        </div>
+                                                {% endif %}
+                                                {% for item in render_group.fields %}
                                                 {% if is_mapping %}
                                                 {% set var_name = item[0] %}
                                                 {% set var_details = item[1] %}
@@ -2037,7 +2359,8 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                     <input type="hidden"
                                                         id="{{ template_name }}-{{ var_name }}"
                                                         name="{{ template_name }}[{{ var_name }}]"
-                                                        value="{{ hidden_value if hidden_value != '' else var_details.default }}">
+                                                        value="{{ hidden_value if hidden_value != '' else var_details.default }}"
+                                                        data-default="{{ var_details.default }}">
                                                     {% elif var_details.input_type == "number" %}
                                                     {% if var_name in ['horizontal_offset', 'initial_horizontal_offset'] %}{% set ns.has_offsets = true %}{% set ns.h_id = template_name ~ '-' ~ var_name %}{% endif %}
                                                     {% if var_name in ['vertical_offset', 'initial_vertical_offset'] %}{% set ns.has_offsets = true %}{% set ns.v_id = template_name ~ '-' ~ var_name %}{% endif %}
@@ -2180,7 +2503,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                             aria-describedby="{{ input_id }}_text"
                                                             value="{{ safe_text_value }}"
                                                             data-default="{{ var_details.default }}"
-                                                            {% if var_name == 'text' and overlay.id in ['overlay_aspect', 'overlay_video_format'] %}data-skip-yaml="true"{% endif %}>
+                                                            {% if var_name == 'text' and overlay.id in ['overlay_aspect', 'overlay_video_format'] %}data-skip-yaml="true" data-skip-override-count="true"{% endif %}>
                                                     </div>
                                                         {% endif %}
                                                     {% elif var_details.input_type == "multiselect" %}
@@ -2286,6 +2609,11 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                     {% endif %}
                                                     {% endif %}
                                                     {% endfor %}
+                                                {% if not render_group.flat %}
+                                                    </div>
+                                                </div>
+                                                {% endif %}
+                                                {% endfor %}
 
                                                 {% if not ns.has_offsets and effective_offsets is mapping %}
                                                 {% set h_default = effective_offsets.get('horizontal', 0) %}

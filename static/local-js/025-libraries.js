@@ -1,3 +1,11 @@
+// Static ES-module imports (hoisted). Migrated from window.EventHandler
+// in #1346 step 2f -- direct-consumer form of the accordion-highlight
+// surface. Both this file and the dynamically-imported modules below
+// share the same module instance (ES modules are singletons keyed by
+// URL), so importing here is the same object EventHandler.updateAccordionHighlights
+// delegates to.
+import { updateAccordionHighlights } from '/static/local-js/modules/accordionHighlights.js'
+
 // Load all helper modules in parallel. These publish their symbols
 // via window.* shims (same pattern as pathValidation.js).
 await Promise.all([
@@ -28,6 +36,67 @@ const copyModal = copyModalEl ? new bootstrap.Modal(copyModalEl) : null
 let activeLibraryId = null
 let loadRequestId = 0
 let allowNextStepNavigation = false
+let lookupLabelAutosaveTimer = null
+let libraryCardInitializing = 0
+
+function setLibrariesButtonBusy (button, busy, label = 'Working...') {
+  if (!button) return
+  if (!button.dataset.librariesBusyOriginalHtml) {
+    button.dataset.librariesBusyOriginalHtml = button.innerHTML
+  }
+  if (!button.dataset.librariesBusyOriginalWidth) {
+    const width = button.getBoundingClientRect ? button.getBoundingClientRect().width : 0
+    if (width > 0) {
+      button.dataset.librariesBusyOriginalWidth = `${Math.ceil(width)}px`
+      button.style.minWidth = button.dataset.librariesBusyOriginalWidth
+    }
+  }
+  button.disabled = !!busy
+  button.setAttribute('aria-busy', busy ? 'true' : 'false')
+  if (busy) {
+    button.innerHTML = `<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>${label}`
+  } else {
+    button.innerHTML = button.dataset.librariesBusyOriginalHtml || button.innerHTML
+    button.removeAttribute('aria-busy')
+  }
+}
+
+function shouldShowLibrariesButtonSpinner (button) {
+  if (!button || button.disabled || button.getAttribute('aria-busy') === 'true') return false
+  if (!button.classList.contains('btn')) return false
+  if (button.classList.contains('accordion-button') || button.classList.contains('btn-close')) return false
+  if (button.matches('[data-bs-dismiss], [data-bs-toggle="collapse"], [data-bs-toggle="dropdown"], [data-bs-toggle="modal"]')) return false
+  if (button.matches('[data-toggle-secret-visibility], [data-collection-section-move], [data-section-id]')) return false
+  if (button.matches('[data-external-yaml-undo], [data-external-yaml-redo], [data-external-yaml-select-all], [data-external-yaml-search-prev], [data-external-yaml-search-next]')) return false
+  if (button.matches('.style-preview-card, .font-picker-card, .overlay-details-toggle')) return false
+  if (button.closest('.btn-group') && button.querySelector('.bi-chevron-up, .bi-chevron-down')) return false
+  return true
+}
+
+function showLibrariesButtonClickSpinner (button, label = 'Working...') {
+  if (!shouldShowLibrariesButtonSpinner(button)) return
+  const token = String(Date.now())
+  button.dataset.librariesClickBusyToken = token
+  setLibrariesButtonBusy(button, true, label)
+  window.setTimeout(() => {
+    if (button.dataset.librariesClickBusyToken !== token) return
+    delete button.dataset.librariesClickBusyToken
+    setLibrariesButtonBusy(button, false)
+  }, 450)
+}
+
+function setLibrariesButtonPersistentBusy (button, busy, label = 'Working...') {
+  if (busy && button?.dataset?.librariesClickBusyToken) {
+    delete button.dataset.librariesClickBusyToken
+  }
+  setLibrariesButtonBusy(button, busy, label)
+}
+
+document.addEventListener('click', event => {
+  const button = event.target.closest('button')
+  if (!button || !document.body.contains(button)) return
+  showLibrariesButtonClickSpinner(button)
+}, true)
 const dependencyHintConfigs = {
   tautulli: {
     stepKey: '030-tautulli',
@@ -350,6 +419,970 @@ function getActiveConfigName () {
   return String(document.querySelector('[name="newConfigName"]')?.value || '').trim()
 }
 
+const externalYamlEditorKinds = {
+  metadata_files: {
+    label: 'Metadata file',
+    defaultFilename: 'metadata.yml',
+    typeSelector: '[data-metadata-file-type]',
+    locationSelector: '[data-metadata-file-location]',
+    rowSelector: '[data-metadata-file-row]',
+    editorSelector: '[data-metadata-files-editor]',
+    setStatus: setMetadataFileStatus,
+    sync: syncMetadataFilesEditor
+  },
+  collection_files: {
+    label: 'Collection file',
+    defaultFilename: 'collections.yml',
+    typeSelector: '[data-collection-file-type]',
+    locationSelector: '[data-collection-file-location]',
+    rowSelector: '[data-collection-file-row]',
+    editorSelector: '[data-collection-files-editor]',
+    setStatus: setCollectionFileStatus,
+    sync: syncCollectionFilesEditor
+  },
+  overlay_files: {
+    label: 'Overlay file',
+    defaultFilename: 'overlays.yml',
+    typeSelector: '[data-overlay-file-type]',
+    locationSelector: '[data-overlay-file-location]',
+    rowSelector: '[data-overlay-file-row]',
+    editorSelector: '[data-overlay-files-editor]',
+    setStatus: setOverlayFileStatus,
+    sync: syncOverlayFilesEditor
+  },
+  playlist_files: {
+    label: 'Playlist file',
+    defaultFilename: 'playlists.yml',
+    typeSelector: '[data-playlist-file-type]',
+    locationSelector: '[data-playlist-file-location]',
+    rowSelector: '[data-playlist-file-row]',
+    editorSelector: '[data-playlist-files-editor]',
+    setStatus: setPlaylistFileStatus,
+    sync: syncPlaylistFilesEditor
+  }
+}
+
+let externalYamlModalState = null
+
+function getExternalYamlEditorConfig (kind) {
+  return externalYamlEditorKinds[String(kind || '').trim()] || null
+}
+
+function updateExternalYamlEditButton (row, kind) {
+  const config = getExternalYamlEditorConfig(kind)
+  if (!row || !config) return
+  const button = row.querySelector(`[data-external-yaml-edit][data-external-yaml-kind="${kind}"]`)
+  if (!button) return
+  const type = String(row.querySelector(config.typeSelector)?.value || '').trim().toLowerCase()
+  const location = String(row.querySelector(config.locationSelector)?.value || '').trim()
+  button.disabled = false
+  if (type === 'folder') {
+    button.textContent = 'Choose File'
+    button.disabled = !location
+    button.title = location ? 'Choose a local YAML file inside this folder to edit.' : 'Enter a folder path first.'
+  } else if (['url', 'git', 'repo'].includes(type)) {
+    button.textContent = 'Copy Local'
+    button.disabled = !location
+    button.title = location ? 'Copy this remote YAML source to a local editable file.' : 'Enter a remote YAML source first.'
+  } else if (type === 'file' || !type) {
+    button.textContent = location ? 'Edit' : 'Create'
+    button.title = ''
+  } else {
+    button.disabled = true
+    button.textContent = 'Edit'
+    button.title = 'This source type is not editable in Quickstart.'
+  }
+}
+
+function getExternalYamlModal () {
+  let modalEl = document.getElementById('externalYamlEditorModal')
+  if (modalEl) return prepareLibrariesModal(modalEl)
+  modalEl = document.createElement('div')
+  modalEl.className = 'modal fade'
+  modalEl.id = 'externalYamlEditorModal'
+  modalEl.tabIndex = -1
+  modalEl.setAttribute('aria-hidden', 'true')
+  modalEl.innerHTML = `
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+      <div class="modal-content bg-dark text-light">
+        <div class="modal-header">
+          <h5 class="modal-title" data-external-yaml-title>Edit YAML file</h5>
+          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <div class="alert alert-info small">
+            YAML syntax errors block saving. Schema warnings are reported but do not block saving.
+          </div>
+          <div class="alert alert-warning small d-none" data-external-yaml-copy-warning>
+            This remote source will be saved as a local Quickstart-managed file. After saving, the row will use the local copy and will not track upstream remote changes.
+          </div>
+          <div class="border rounded p-3 mb-3 d-none" data-external-yaml-folder-panel>
+            <label class="form-label small text-muted" for="externalYamlEditorFolderFile">Folder YAML file</label>
+            <select class="form-select mb-2" id="externalYamlEditorFolderFile" data-external-yaml-folder-file></select>
+            <div class="input-group input-group-sm">
+              <span class="input-group-text">New file</span>
+              <input type="text" class="form-control" placeholder="custom.yml" data-external-yaml-folder-new>
+              <button type="button" class="btn btn-outline-primary" data-external-yaml-folder-create>Use New File</button>
+            </div>
+            <div class="form-text">Only top-level .yml and .yaml files in this folder are listed.</div>
+          </div>
+          <label class="form-label small text-muted" for="externalYamlEditorLocation">Location</label>
+          <input type="text" class="form-control mb-3" id="externalYamlEditorLocation" data-external-yaml-location>
+          <div class="external-yaml-editor-toolbar">
+            <label class="form-label small text-muted mb-0" for="externalYamlEditorContent">YAML</label>
+            <div class="external-yaml-editor-actions">
+              <div class="external-yaml-search" data-external-yaml-search>
+                <input type="search" class="form-control form-control-sm" placeholder="Search YAML" aria-label="Search YAML" data-external-yaml-search-input>
+                <button type="button" class="btn btn-outline-secondary btn-sm" data-external-yaml-search-prev title="Previous match" disabled>
+                  <i class="bi bi-chevron-up"></i>
+                </button>
+                <button type="button" class="btn btn-outline-secondary btn-sm" data-external-yaml-search-next title="Next match" disabled>
+                  <i class="bi bi-chevron-down"></i>
+                </button>
+                <span class="external-yaml-search-count" data-external-yaml-search-count></span>
+              </div>
+              <button type="button" class="btn btn-outline-secondary btn-sm" data-external-yaml-select-all>
+                Select All
+              </button>
+              <button type="button" class="btn btn-outline-secondary btn-sm" data-external-yaml-undo disabled>
+                <i class="bi bi-arrow-counterclockwise"></i> Undo
+              </button>
+              <button type="button" class="btn btn-outline-secondary btn-sm" data-external-yaml-redo disabled>
+                <i class="bi bi-arrow-clockwise"></i> Redo
+              </button>
+            </div>
+          </div>
+          <div class="external-yaml-status-banner d-none" data-external-yaml-status></div>
+          <div class="external-yaml-editor-shell">
+            <div class="external-yaml-editor-lines" aria-hidden="true" data-external-yaml-lines></div>
+            <textarea class="form-control font-monospace external-yaml-editor-content" id="externalYamlEditorContent" data-external-yaml-content rows="22" spellcheck="false" wrap="off"></textarea>
+          </div>
+          <div class="external-yaml-editor-help small text-muted mt-2">
+            Line numbers are clickable from validation results. Pressing Tab inserts two spaces.
+          </div>
+          <div class="external-yaml-status-details mt-3 small d-none" data-external-yaml-status></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-info" data-external-yaml-validate>Validate YAML</button>
+          <button type="button" class="btn btn-success" data-external-yaml-save>Save</button>
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+        </div>
+      </div>
+    </div>
+  `
+  document.body.appendChild(modalEl)
+  initExternalYamlEditor(modalEl)
+  modalEl.addEventListener('hide.bs.modal', event => {
+    if (externalYamlModalState?.allowCloseOnce) {
+      externalYamlModalState.allowCloseOnce = false
+      return
+    }
+    if (!isExternalYamlEditorDirty(modalEl)) return
+    const discard = window.confirm('Discard unsaved YAML changes?')
+    if (!discard) {
+      event.preventDefault()
+    }
+  })
+  return prepareLibrariesModal(modalEl)
+}
+
+function getExternalYamlContentInput (modalEl) {
+  return modalEl?.querySelector('[data-external-yaml-content]') || null
+}
+
+function getExternalYamlContent (modalEl) {
+  return getExternalYamlContentInput(modalEl)?.value || ''
+}
+
+function getExternalYamlLocation (modalEl) {
+  return modalEl?.querySelector('[data-external-yaml-location]')?.value || ''
+}
+
+function externalYamlValidationSummary (validation, prefix = 'Validation complete.', savedLocation = '') {
+  const issues = Array.isArray(validation?.issues) ? validation.issues : []
+  const warnings = Array.isArray(validation?.warnings) ? validation.warnings : []
+  const errorCount = issues.filter(issue => issue?.severity === 'error').length
+  const warningCount = warnings.length || issues.filter(issue => issue?.severity !== 'error').length
+  const locationSuffix = savedLocation ? ` Saved to ${savedLocation}.` : ''
+  if (!validation?.can_save) {
+    const location = issues.find(issue => issue?.line)?.line
+    const lineSuffix = location ? ` Check line ${location}.` : ''
+    return `${validation?.error || 'YAML syntax validation failed.'}${lineSuffix}`
+  }
+  if (warningCount) {
+    return `${prefix} YAML is valid with ${warningCount} schema warning${warningCount === 1 ? '' : 's'}.${locationSuffix}`
+  }
+  if (errorCount) {
+    return `${prefix} YAML has ${errorCount} error${errorCount === 1 ? '' : 's'}.${locationSuffix}`
+  }
+  return `${prefix} YAML and schema validation passed.${locationSuffix}`
+}
+
+function setExternalYamlDirtyState (modalEl, dirty) {
+  if (!externalYamlModalState) return
+  externalYamlModalState.dirty = Boolean(dirty)
+  const title = modalEl?.querySelector('[data-external-yaml-title]')
+  if (title) {
+    const baseTitle = externalYamlModalState.baseTitle || title.textContent.replace(/\s+\*$/, '')
+    externalYamlModalState.baseTitle = baseTitle
+    title.textContent = `${baseTitle}${externalYamlModalState.dirty ? ' *' : ''}`
+  }
+}
+
+function isExternalYamlEditorDirty (modalEl) {
+  if (!externalYamlModalState) return false
+  const savedContent = externalYamlModalState.savedContent ?? ''
+  const savedLocation = externalYamlModalState.savedLocation ?? ''
+  return getExternalYamlContent(modalEl) !== savedContent || getExternalYamlLocation(modalEl) !== savedLocation
+}
+
+function syncExternalYamlDirtyState (modalEl) {
+  setExternalYamlDirtyState(modalEl, isExternalYamlEditorDirty(modalEl))
+}
+
+function markExternalYamlEditorClean (modalEl, location = null) {
+  if (!externalYamlModalState) return
+  if (location !== null) {
+    const locationInput = modalEl?.querySelector('[data-external-yaml-location]')
+    if (locationInput) locationInput.value = location || ''
+  }
+  externalYamlModalState.savedContent = getExternalYamlContent(modalEl)
+  externalYamlModalState.savedLocation = getExternalYamlLocation(modalEl)
+  setExternalYamlDirtyState(modalEl, false)
+}
+
+function issueLineSet (issues) {
+  const lines = new Set()
+  if (!Array.isArray(issues)) return lines
+  issues.forEach(issue => {
+    const line = Number(issue?.line)
+    if (Number.isInteger(line) && line > 0) lines.add(line)
+  })
+  return lines
+}
+
+function syncExternalYamlEditorLineNumbers (modalEl) {
+  const contentInput = getExternalYamlContentInput(modalEl)
+  const gutter = modalEl?.querySelector('[data-external-yaml-lines]')
+  if (!contentInput || !gutter) return
+  const lineCount = Math.max(1, contentInput.value.split(/\r\n|\r|\n/).length)
+  const markedLines = issueLineSet(externalYamlModalState?.issues)
+  gutter.replaceChildren()
+  for (let line = 1; line <= lineCount; line += 1) {
+    const lineEl = document.createElement('button')
+    lineEl.type = 'button'
+    lineEl.className = 'external-yaml-editor-line'
+    lineEl.textContent = String(line)
+    lineEl.dataset.externalYamlLine = String(line)
+    if (markedLines.has(line)) lineEl.classList.add('external-yaml-editor-line--issue')
+    gutter.appendChild(lineEl)
+  }
+  gutter.scrollTop = contentInput.scrollTop
+}
+
+function setExternalYamlEditorContent (modalEl, content) {
+  const contentInput = getExternalYamlContentInput(modalEl)
+  if (!contentInput) return
+  contentInput.value = String(content || '')
+  syncExternalYamlEditorLineNumbers(modalEl)
+  resetExternalYamlUndoHistory(modalEl)
+  resetExternalYamlSearch(modalEl)
+}
+
+function externalYamlHistoryState () {
+  if (!externalYamlModalState) return null
+  if (!externalYamlModalState.history) {
+    externalYamlModalState.history = { stack: [], index: -1, applying: false, timer: null }
+  }
+  return externalYamlModalState.history
+}
+
+function updateExternalYamlUndoRedoButtons (modalEl) {
+  const history = externalYamlHistoryState()
+  const undoButton = modalEl?.querySelector('[data-external-yaml-undo]')
+  const redoButton = modalEl?.querySelector('[data-external-yaml-redo]')
+  const canUndo = Boolean(history && history.index > 0)
+  const canRedo = Boolean(history && history.index >= 0 && history.index < history.stack.length - 1)
+  if (undoButton) undoButton.disabled = !canUndo
+  if (redoButton) redoButton.disabled = !canRedo
+}
+
+function resetExternalYamlUndoHistory (modalEl) {
+  const history = externalYamlHistoryState()
+  if (!history) return
+  if (history.timer) {
+    window.clearTimeout(history.timer)
+    history.timer = null
+  }
+  history.stack = [getExternalYamlContent(modalEl)]
+  history.index = 0
+  history.applying = false
+  updateExternalYamlUndoRedoButtons(modalEl)
+}
+
+function captureExternalYamlUndoHistory (modalEl) {
+  const history = externalYamlHistoryState()
+  if (!history || history.applying) return
+  const content = getExternalYamlContent(modalEl)
+  if (history.index >= 0 && history.stack[history.index] === content) {
+    updateExternalYamlUndoRedoButtons(modalEl)
+    return
+  }
+  if (history.index < history.stack.length - 1) {
+    history.stack = history.stack.slice(0, history.index + 1)
+  }
+  history.stack.push(content)
+  if (history.stack.length > 100) {
+    history.stack.shift()
+  }
+  history.index = history.stack.length - 1
+  updateExternalYamlUndoRedoButtons(modalEl)
+}
+
+function scheduleExternalYamlUndoHistoryCapture (modalEl) {
+  const history = externalYamlHistoryState()
+  if (!history || history.applying) return
+  if (history.timer) window.clearTimeout(history.timer)
+  history.timer = window.setTimeout(() => {
+    history.timer = null
+    captureExternalYamlUndoHistory(modalEl)
+  }, 250)
+}
+
+function applyExternalYamlUndoHistory (modalEl, direction) {
+  const history = externalYamlHistoryState()
+  const contentInput = getExternalYamlContentInput(modalEl)
+  if (!history || !contentInput) return
+  const nextIndex = history.index + direction
+  if (nextIndex < 0 || nextIndex >= history.stack.length) return
+  if (history.timer) {
+    window.clearTimeout(history.timer)
+    history.timer = null
+    captureExternalYamlUndoHistory(modalEl)
+  }
+  history.applying = true
+  history.index = nextIndex
+  contentInput.value = history.stack[history.index]
+  const cursor = contentInput.value.length
+  contentInput.setSelectionRange(cursor, cursor)
+  syncExternalYamlEditorLineNumbers(modalEl)
+  history.applying = false
+  updateExternalYamlUndoRedoButtons(modalEl)
+  syncExternalYamlDirtyState(modalEl)
+  updateExternalYamlSearch(modalEl)
+}
+
+function externalYamlSearchState () {
+  if (!externalYamlModalState) return null
+  if (!externalYamlModalState.search) {
+    externalYamlModalState.search = { query: '', matches: [], index: -1 }
+  }
+  return externalYamlModalState.search
+}
+
+function updateExternalYamlSearchControls (modalEl) {
+  const state = externalYamlSearchState()
+  const prevButton = modalEl?.querySelector('[data-external-yaml-search-prev]')
+  const nextButton = modalEl?.querySelector('[data-external-yaml-search-next]')
+  const count = modalEl?.querySelector('[data-external-yaml-search-count]')
+  const hasMatches = Boolean(state && state.matches.length)
+  if (prevButton) prevButton.disabled = !hasMatches
+  if (nextButton) nextButton.disabled = !hasMatches
+  if (count) {
+    count.textContent = !state?.query ? '' : (hasMatches ? `${state.index + 1}/${state.matches.length}` : '0 matches')
+  }
+}
+
+function resetExternalYamlSearch (modalEl) {
+  const state = externalYamlSearchState()
+  if (!state) return
+  state.query = ''
+  state.matches = []
+  state.index = -1
+  const input = modalEl?.querySelector('[data-external-yaml-search-input]')
+  if (input) input.value = ''
+  updateExternalYamlSearchControls(modalEl)
+}
+
+function updateExternalYamlSearch (modalEl, preserveIndex = true) {
+  const state = externalYamlSearchState()
+  const input = modalEl?.querySelector('[data-external-yaml-search-input]')
+  if (!state || !input) return
+  const query = String(input.value || '')
+  const content = getExternalYamlContent(modalEl)
+  const previousIndex = preserveIndex ? state.index : -1
+  state.query = query
+  state.matches = []
+  state.index = -1
+  if (query) {
+    const lowerContent = content.toLowerCase()
+    const lowerQuery = query.toLowerCase()
+    let offset = lowerContent.indexOf(lowerQuery)
+    while (offset !== -1) {
+      state.matches.push(offset)
+      offset = lowerContent.indexOf(lowerQuery, offset + Math.max(1, lowerQuery.length))
+    }
+    if (state.matches.length) {
+      state.index = Math.min(Math.max(0, previousIndex), state.matches.length - 1)
+    }
+  }
+  updateExternalYamlSearchControls(modalEl)
+}
+
+function jumpExternalYamlSearch (modalEl, direction) {
+  const state = externalYamlSearchState()
+  const contentInput = getExternalYamlContentInput(modalEl)
+  if (!state || !contentInput) return
+  updateExternalYamlSearch(modalEl)
+  if (!state.matches.length) return
+  state.index = (state.index + direction + state.matches.length) % state.matches.length
+  const offset = state.matches[state.index]
+  const queryLength = String(state.query || '').length
+  contentInput.focus()
+  contentInput.setSelectionRange(offset, offset + queryLength)
+  updateExternalYamlSearchControls(modalEl)
+}
+
+function externalYamlOffsetForLineColumn (content, line, column) {
+  const lines = String(content || '').split(/\r\n|\r|\n/)
+  const targetLine = Math.max(1, Number(line) || 1)
+  const targetColumn = Math.max(1, Number(column) || 1)
+  let offset = 0
+  for (let index = 0; index < Math.min(targetLine - 1, lines.length); index += 1) {
+    offset += lines[index].length + 1
+  }
+  return Math.min(String(content || '').length, offset + targetColumn - 1)
+}
+
+function jumpExternalYamlEditorToIssue (modalEl, issue) {
+  const contentInput = getExternalYamlContentInput(modalEl)
+  if (!contentInput || !issue?.line) return
+  const offset = externalYamlOffsetForLineColumn(contentInput.value, issue.line, issue.column || 1)
+  contentInput.focus()
+  contentInput.setSelectionRange(offset, offset)
+  const lineHeight = Number.parseFloat(window.getComputedStyle(contentInput).lineHeight) || 20
+  contentInput.scrollTop = Math.max(0, (Number(issue.line) - 4) * lineHeight)
+  syncExternalYamlEditorLineNumbers(modalEl)
+}
+
+function initExternalYamlEditor (modalEl) {
+  const contentInput = getExternalYamlContentInput(modalEl)
+  if (!contentInput || contentInput.dataset.externalYamlEditorReady === 'true') return
+  contentInput.dataset.externalYamlEditorReady = 'true'
+  contentInput.addEventListener('input', () => {
+    const history = externalYamlHistoryState()
+    if (externalYamlModalState) {
+      externalYamlModalState.issues = []
+    }
+    syncExternalYamlEditorLineNumbers(modalEl)
+    if (!history?.applying) {
+      syncExternalYamlDirtyState(modalEl)
+      updateExternalYamlSearch(modalEl)
+      renderExternalYamlStatus(
+        modalEl.querySelector('[data-external-yaml-status]'),
+        'warning',
+        'Edited since last validation. Validate YAML or Save to check this file.'
+      )
+      scheduleExternalYamlUndoHistoryCapture(modalEl)
+    }
+  })
+  contentInput.addEventListener('scroll', () => {
+    const gutter = modalEl.querySelector('[data-external-yaml-lines]')
+    if (gutter) gutter.scrollTop = contentInput.scrollTop
+  })
+  contentInput.addEventListener('keydown', event => {
+    if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'z') {
+      event.preventDefault()
+      applyExternalYamlUndoHistory(modalEl, -1)
+      return
+    }
+    if ((event.ctrlKey || event.metaKey) && (event.key.toLowerCase() === 'y' || (event.shiftKey && event.key.toLowerCase() === 'z'))) {
+      event.preventDefault()
+      applyExternalYamlUndoHistory(modalEl, 1)
+      return
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
+      event.preventDefault()
+      modalEl.querySelector('[data-external-yaml-search-input]')?.focus()
+      return
+    }
+    if (event.key !== 'Tab') return
+    event.preventDefault()
+    const start = contentInput.selectionStart
+    const end = contentInput.selectionEnd
+    const indent = '  '
+    contentInput.value = `${contentInput.value.slice(0, start)}${indent}${contentInput.value.slice(end)}`
+    const cursor = start + indent.length
+    contentInput.setSelectionRange(cursor, cursor)
+    contentInput.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  const searchInput = modalEl.querySelector('[data-external-yaml-search-input]')
+  if (searchInput && searchInput.dataset.externalYamlSearchReady !== 'true') {
+    searchInput.dataset.externalYamlSearchReady = 'true'
+    searchInput.addEventListener('input', () => updateExternalYamlSearch(modalEl, false))
+    searchInput.addEventListener('keydown', event => {
+      if (event.key !== 'Enter') return
+      event.preventDefault()
+      jumpExternalYamlSearch(modalEl, event.shiftKey ? -1 : 1)
+    })
+  }
+  const locationInput = modalEl.querySelector('[data-external-yaml-location]')
+  if (locationInput && locationInput.dataset.externalYamlLocationReady !== 'true') {
+    locationInput.dataset.externalYamlLocationReady = 'true'
+    locationInput.addEventListener('input', () => {
+      syncExternalYamlDirtyState(modalEl)
+      renderExternalYamlStatus(
+        modalEl.querySelector('[data-external-yaml-status]'),
+        'warning',
+        'Location edited. Save to write this YAML file to the new target.'
+      )
+    })
+  }
+}
+
+function renderExternalYamlStatus (target, type, message, warnings = []) {
+  if (!target) return
+  const modalEl = target.closest('.modal') || document
+  const targets = Array.from(modalEl.querySelectorAll('[data-external-yaml-status]'))
+  const renderTargets = targets.length ? targets : [target]
+  renderTargets.forEach(statusTarget => {
+    const isBanner = statusTarget.classList.contains('external-yaml-status-banner')
+    statusTarget.replaceChildren()
+    statusTarget.className = isBanner ? 'external-yaml-status-banner' : 'external-yaml-status-details mt-3 small'
+    statusTarget.classList.remove('d-none')
+    statusTarget.classList.add(`external-yaml-status--${type === 'error' ? 'error' : (type === 'success' ? 'success' : 'warning')}`)
+    const summary = document.createElement('div')
+    summary.textContent = message || ''
+    statusTarget.appendChild(summary)
+    if (!isBanner && warnings.length) {
+      const list = document.createElement('ul')
+      list.className = 'mb-0 mt-2 ps-3'
+      warnings.forEach(warning => {
+        const item = document.createElement('li')
+        item.textContent = String(warning || '')
+        list.appendChild(item)
+      })
+      statusTarget.appendChild(list)
+    }
+  })
+}
+
+function renderExternalYamlIssueList (target, issues) {
+  if (!target || !Array.isArray(issues) || !issues.length) return
+  const list = document.createElement('div')
+  list.className = 'external-yaml-issue-list mt-2'
+  issues.forEach(issue => {
+    const item = document.createElement('button')
+    item.type = 'button'
+    item.className = `external-yaml-issue external-yaml-issue--${issue.severity === 'error' ? 'error' : 'warning'}`
+    const location = issue.line ? `Line ${issue.line}${issue.column ? `:${issue.column}` : ''}` : (issue.path ? issue.path : issue.source || 'YAML')
+    item.textContent = `${location} - ${issue.message || 'Validation issue'}`
+    item.addEventListener('click', () => jumpExternalYamlEditorToIssue(getExternalYamlModal(), issue))
+    list.appendChild(item)
+  })
+  target.appendChild(list)
+}
+
+function renderExternalYamlValidationStatus (validation, prefix = 'Validation complete.') {
+  const modalEl = getExternalYamlModal()
+  const status = modalEl.querySelector('[data-external-yaml-status]')
+  const issues = Array.isArray(validation?.issues) ? validation.issues : []
+  if (externalYamlModalState) {
+    externalYamlModalState.issues = issues
+  }
+  syncExternalYamlEditorLineNumbers(modalEl)
+  if (!validation?.can_save) {
+    renderExternalYamlStatus(status, 'error', externalYamlValidationSummary(validation, prefix))
+    renderExternalYamlIssueList(modalEl.querySelector('.external-yaml-status-details'), issues)
+    return
+  }
+  const warnings = Array.isArray(validation.warnings) ? validation.warnings : []
+  if (warnings.length) {
+    renderExternalYamlStatus(status, 'warning', externalYamlValidationSummary(validation, prefix), warnings)
+    renderExternalYamlIssueList(modalEl.querySelector('.external-yaml-status-details'), issues)
+  } else {
+    renderExternalYamlStatus(status, 'success', externalYamlValidationSummary(validation, prefix))
+  }
+}
+
+function renderExternalYamlSaveStatus (validation, location, prefix = 'Saved.') {
+  const modalEl = getExternalYamlModal()
+  const status = modalEl.querySelector('[data-external-yaml-status]')
+  const issues = Array.isArray(validation?.issues) ? validation.issues : []
+  if (externalYamlModalState) {
+    externalYamlModalState.issues = issues
+  }
+  syncExternalYamlEditorLineNumbers(modalEl)
+  const warnings = Array.isArray(validation?.warnings) ? validation.warnings : []
+  const message = externalYamlValidationSummary(validation, prefix, location)
+  if (!validation?.can_save) {
+    renderExternalYamlStatus(status, 'error', message)
+    renderExternalYamlIssueList(modalEl.querySelector('.external-yaml-status-details'), issues)
+  } else if (warnings.length) {
+    renderExternalYamlStatus(status, 'warning', message, warnings)
+    renderExternalYamlIssueList(modalEl.querySelector('.external-yaml-status-details'), issues)
+  } else {
+    renderExternalYamlStatus(status, 'success', message)
+  }
+}
+
+function setExternalYamlModalMode (modalEl, mode) {
+  const folderPanel = modalEl.querySelector('[data-external-yaml-folder-panel]')
+  const remoteCopyWarning = modalEl.querySelector('[data-external-yaml-copy-warning]')
+  folderPanel?.classList.toggle('d-none', mode !== 'folder')
+  remoteCopyWarning?.classList.toggle('d-none', mode !== 'remote')
+}
+
+function loadExternalYamlEditorPayload (modalEl, payload, prefix) {
+  const locationInput = modalEl.querySelector('[data-external-yaml-location]')
+  if (locationInput) locationInput.value = payload.location || ''
+  setExternalYamlEditorContent(modalEl, payload.content || '')
+  markExternalYamlEditorClean(modalEl)
+  renderExternalYamlValidationStatus(payload.validation, prefix)
+}
+
+function confirmExternalYamlDiscardIfDirty (modalEl) {
+  if (!isExternalYamlEditorDirty(modalEl)) return true
+  return window.confirm('Discard unsaved YAML changes and load a different file?')
+}
+
+function externalYamlFolderNewFileLocation (folderLocation, filename) {
+  const folder = String(folderLocation || '').trim().replace(/\\/g, '/').replace(/\/+$/, '')
+  const file = String(filename || '').trim().replace(/\\/g, '/').split('/').filter(Boolean).pop() || ''
+  if (!folder || !file) return ''
+  return `${folder}/${file}`
+}
+
+async function loadExternalYamlFileIntoModal (modalEl, kind, location, libraryId, prefix) {
+  const response = await fetch('/external_yaml_file/read', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      kind,
+      location,
+      config_name: getActiveConfigName(),
+      library_id: libraryId
+    })
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok || !payload.success) {
+    renderExternalYamlStatus(modalEl.querySelector('[data-external-yaml-status]'), 'error', payload.error || 'YAML file could not be opened.')
+    return null
+  }
+  loadExternalYamlEditorPayload(modalEl, payload, prefix || (payload.created ? 'Create template loaded.' : 'File loaded.'))
+  return payload
+}
+
+async function validateExternalYamlModalContent () {
+  if (!externalYamlModalState) return null
+  const modalEl = getExternalYamlModal()
+  const response = await fetch('/external_yaml_file/validate', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      kind: externalYamlModalState.kind,
+      content: getExternalYamlContent(modalEl)
+    })
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok || !payload.success) {
+    renderExternalYamlStatus(modalEl.querySelector('[data-external-yaml-status]'), 'error', payload.error || 'YAML validation failed.')
+    return null
+  }
+  renderExternalYamlValidationStatus(payload.validation)
+  return payload.validation
+}
+
+async function saveExternalYamlModalContent () {
+  if (!externalYamlModalState) return
+  const modalEl = getExternalYamlModal()
+  const saveButton = modalEl.querySelector('[data-external-yaml-save]')
+  const locationInput = modalEl.querySelector('[data-external-yaml-location]')
+  setLibrariesButtonPersistentBusy(saveButton, true, 'Saving...')
+  try {
+    const response = await fetch('/external_yaml_file/save', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: externalYamlModalState.kind,
+        location: locationInput?.value || '',
+        content: getExternalYamlContent(modalEl),
+        config_name: getActiveConfigName(),
+        library_id: externalYamlModalState.libraryId
+      })
+    })
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok || !payload.success) {
+      renderExternalYamlStatus(
+        modalEl.querySelector('[data-external-yaml-status]'),
+        'error',
+        payload.validation?.error || payload.error || 'YAML could not be saved.'
+      )
+      return
+    }
+
+    const config = getExternalYamlEditorConfig(externalYamlModalState.kind)
+    const row = externalYamlModalState.row
+    const editor = externalYamlModalState.editor
+    const rowType = row?.querySelector(config.typeSelector)
+    const rowLocation = row?.querySelector(config.locationSelector)
+    if (externalYamlModalState.mode === 'remote' && rowType) {
+      rowType.value = 'file'
+    }
+    if (externalYamlModalState.mode !== 'folder' && rowLocation && payload.location) {
+      rowLocation.value = payload.location
+    }
+    const warnings = Array.isArray(payload.validation?.warnings) ? payload.validation.warnings : []
+    const savedLocation = String(payload.location || locationInput?.value || '').trim()
+    config.setStatus(row, 'success', {
+      text: savedLocation ? `Saved ${savedLocation}.` : (payload.message || 'Saved.'),
+      files: warnings
+    })
+    config.sync(editor)
+    updateExternalYamlEditButton(row, externalYamlModalState.kind)
+    markExternalYamlEditorClean(modalEl, savedLocation)
+    renderExternalYamlSaveStatus(payload.validation, savedLocation, payload.message || 'Saved.')
+  } catch {
+    renderExternalYamlStatus(modalEl.querySelector('[data-external-yaml-status]'), 'error', 'YAML save request failed.')
+  } finally {
+    setLibrariesButtonPersistentBusy(saveButton, false)
+  }
+}
+
+async function openExternalYamlEditor (row, kind) {
+  const config = getExternalYamlEditorConfig(kind)
+  if (!row || !config) return
+  const type = String(row.querySelector(config.typeSelector)?.value || '').trim().toLowerCase()
+  const location = String(row.querySelector(config.locationSelector)?.value || '').trim()
+  const editor = row.closest(config.editorSelector)
+  const libraryId = String(editor?.dataset.libraryId || '').trim()
+  if (!['file', 'folder', 'url', 'git', 'repo'].includes(type || 'file')) {
+    config.setStatus(row, '', 'This source type cannot be edited in Quickstart.')
+    return
+  }
+  if (type !== 'file' && !location) {
+    config.setStatus(row, '', 'Enter a source location first.')
+    return
+  }
+
+  const modalEl = getExternalYamlModal()
+  const modal = bootstrap.Modal.getOrCreateInstance(modalEl)
+  const mode = type === 'folder' ? 'folder' : (['url', 'git', 'repo'].includes(type) ? 'remote' : 'file')
+  const titlePrefix = mode === 'folder' ? 'Choose' : (mode === 'remote' ? 'Copy Local' : (location ? 'Edit' : 'Create'))
+  const title = `${titlePrefix} ${config.label}`
+  modalEl.querySelector('[data-external-yaml-title]').textContent = title
+  modalEl.querySelectorAll('[data-external-yaml-status]').forEach(status => status.classList.add('d-none'))
+  const locationInput = modalEl.querySelector('[data-external-yaml-location]')
+  locationInput.value = location
+  locationInput.disabled = mode === 'folder' || (mode === 'file' && Boolean(location))
+  setExternalYamlModalMode(modalEl, mode)
+  externalYamlModalState = {
+    row,
+    editor,
+    kind,
+    libraryId,
+    mode,
+    sourceType: type,
+    folderLocation: mode === 'folder' ? location : '',
+    issues: [],
+    savedContent: '',
+    savedLocation: location,
+    dirty: false,
+    baseTitle: title
+  }
+  setExternalYamlEditorContent(modalEl, '')
+  syncExternalYamlEditorLineNumbers(modalEl)
+  modal.show()
+
+  try {
+    if (mode === 'remote') {
+      renderExternalYamlStatus(modalEl.querySelector('[data-external-yaml-status]'), 'warning', 'Fetching remote YAML source...')
+      const response = await fetch('/external_yaml_file/remote_read', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          kind,
+          source_type: type,
+          location,
+          config_name: getActiveConfigName(),
+          library_id: libraryId
+        })
+      })
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok || !payload.success) {
+        renderExternalYamlStatus(modalEl.querySelector('[data-external-yaml-status]'), 'error', payload.error || 'Remote YAML source could not be copied.')
+        return
+      }
+      loadExternalYamlEditorPayload(modalEl, payload, 'Remote source loaded.')
+      return
+    }
+
+    if (mode === 'folder') {
+      renderExternalYamlStatus(modalEl.querySelector('[data-external-yaml-status]'), 'warning', 'Loading folder YAML files...')
+      const response = await fetch('/external_yaml_file/folder_files', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          kind,
+          location,
+          config_name: getActiveConfigName(),
+          library_id: libraryId
+        })
+      })
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok || !payload.success) {
+        renderExternalYamlStatus(modalEl.querySelector('[data-external-yaml-status]'), 'error', payload.error || 'Folder YAML files could not be listed.')
+        return
+      }
+      const select = modalEl.querySelector('[data-external-yaml-folder-file]')
+      const newInput = modalEl.querySelector('[data-external-yaml-folder-new]')
+      select.replaceChildren()
+      const files = Array.isArray(payload.files) ? payload.files : []
+      files.forEach(file => {
+        const option = document.createElement('option')
+        option.value = file.location || ''
+        option.textContent = file.name || file.location || ''
+        select.appendChild(option)
+      })
+      select.disabled = !files.length
+      newInput.value = config.defaultFilename || 'custom.yml'
+      externalYamlModalState.folderLocation = payload.folder || location
+      if (files.length) {
+        await loadExternalYamlFileIntoModal(modalEl, kind, files[0].location, libraryId, 'Folder file loaded.')
+      } else {
+        const newLocation = externalYamlFolderNewFileLocation(externalYamlModalState.folderLocation, newInput.value)
+        await loadExternalYamlFileIntoModal(modalEl, kind, newLocation, libraryId, 'Create template loaded. No YAML files were found in this folder.')
+      }
+      return
+    }
+
+    await loadExternalYamlFileIntoModal(modalEl, kind, location, libraryId)
+  } catch {
+    renderExternalYamlStatus(modalEl.querySelector('[data-external-yaml-status]'), 'error', 'YAML file could not be opened.')
+  }
+}
+
+document.addEventListener('click', async function (event) {
+  const editButton = event.target.closest('[data-external-yaml-edit]')
+  if (editButton) {
+    const kind = String(editButton.dataset.externalYamlKind || '').trim()
+    const config = getExternalYamlEditorConfig(kind)
+    const row = config ? editButton.closest(config.rowSelector) : null
+    await openExternalYamlEditor(row, kind)
+    return
+  }
+
+  const validateButton = event.target.closest('[data-external-yaml-validate]')
+  if (validateButton) {
+    setLibrariesButtonPersistentBusy(validateButton, true, 'Validating...')
+    try {
+      await validateExternalYamlModalContent()
+    } finally {
+      setLibrariesButtonPersistentBusy(validateButton, false)
+    }
+    return
+  }
+
+  const saveButton = event.target.closest('[data-external-yaml-save]')
+  if (saveButton) {
+    await saveExternalYamlModalContent()
+    return
+  }
+
+  const undoButton = event.target.closest('[data-external-yaml-undo]')
+  if (undoButton) {
+    applyExternalYamlUndoHistory(getExternalYamlModal(), -1)
+    return
+  }
+
+  const redoButton = event.target.closest('[data-external-yaml-redo]')
+  if (redoButton) {
+    applyExternalYamlUndoHistory(getExternalYamlModal(), 1)
+    return
+  }
+
+  const selectAllButton = event.target.closest('[data-external-yaml-select-all]')
+  if (selectAllButton) {
+    const contentInput = getExternalYamlContentInput(getExternalYamlModal())
+    if (contentInput) {
+      contentInput.focus()
+      contentInput.select()
+    }
+    return
+  }
+
+  const searchPrevButton = event.target.closest('[data-external-yaml-search-prev]')
+  if (searchPrevButton) {
+    jumpExternalYamlSearch(getExternalYamlModal(), -1)
+    return
+  }
+
+  const searchNextButton = event.target.closest('[data-external-yaml-search-next]')
+  if (searchNextButton) {
+    jumpExternalYamlSearch(getExternalYamlModal(), 1)
+    return
+  }
+
+  const folderCreateButton = event.target.closest('[data-external-yaml-folder-create]')
+  if (folderCreateButton) {
+    const modalEl = getExternalYamlModal()
+    const newInput = modalEl.querySelector('[data-external-yaml-folder-new]')
+    const filename = String(newInput?.value || '').trim()
+    if (!externalYamlModalState || externalYamlModalState.mode !== 'folder') return
+    if (!filename.toLowerCase().endsWith('.yml') && !filename.toLowerCase().endsWith('.yaml')) {
+      renderExternalYamlStatus(modalEl.querySelector('[data-external-yaml-status]'), 'error', 'New YAML file name must end with .yml or .yaml.')
+      return
+    }
+    if (!confirmExternalYamlDiscardIfDirty(modalEl)) return
+    const newLocation = externalYamlFolderNewFileLocation(externalYamlModalState.folderLocation, filename)
+    await loadExternalYamlFileIntoModal(modalEl, externalYamlModalState.kind, newLocation, externalYamlModalState.libraryId, 'Create template loaded.')
+  }
+})
+
+document.addEventListener('input', function (event) {
+  const target = event.target
+  if (!target) return
+  Object.entries(externalYamlEditorKinds).forEach(([kind, config]) => {
+    if (!target.matches(`${config.typeSelector}, ${config.locationSelector}`)) return
+    const row = target.closest(config.rowSelector)
+    updateExternalYamlEditButton(row, kind)
+  })
+
+})
+
+window.addEventListener('beforeunload', event => {
+  const modalEl = document.getElementById('externalYamlEditorModal')
+  if (!modalEl || !isExternalYamlEditorDirty(modalEl)) return
+  event.preventDefault()
+  event.returnValue = ''
+})
+
+document.addEventListener('change', function (event) {
+  const target = event.target
+  if (!target) return
+  Object.entries(externalYamlEditorKinds).forEach(([kind, config]) => {
+    if (!target.matches(`${config.typeSelector}, ${config.locationSelector}`)) return
+    const row = target.closest(config.rowSelector)
+    updateExternalYamlEditButton(row, kind)
+  })
+
+  if (target.matches('[data-external-yaml-folder-file]')) {
+    const location = String(target.value || '').trim()
+    if (!externalYamlModalState || externalYamlModalState.mode !== 'folder' || !location) return
+    const modalEl = getExternalYamlModal()
+    if (!confirmExternalYamlDiscardIfDirty(modalEl)) {
+      target.value = externalYamlModalState.savedLocation || ''
+      return
+    }
+    loadExternalYamlFileIntoModal(modalEl, externalYamlModalState.kind, location, externalYamlModalState.libraryId, 'Folder file loaded.')
+  }
+})
+
 function applyNormalizedLibraryFileLocation (row, selector, payload, editor, syncFn) {
   const normalizedLocation = String(payload?.normalized_location || '').trim()
   if (!row || !normalizedLocation) return
@@ -382,8 +1415,9 @@ function buildMetadataFileRow (entry = {}) {
           <label class="form-label small text-muted">Location</label>
           <input type="text" class="form-control form-control-sm" data-metadata-file-location placeholder="config/metadata.yml, config/metadata/, user/file.yml, or https://example.com/metadata.yml">
         </div>
-        <div class="col-md-3 d-flex gap-2 justify-content-md-end">
+        <div class="col-md-3 d-flex gap-2 flex-wrap justify-content-md-end">
           <button type="button" class="btn btn-success btn-sm" data-validate-metadata-file>Validate</button>
+          <button type="button" class="btn btn-outline-primary btn-sm" data-external-yaml-edit data-external-yaml-kind="metadata_files">Edit</button>
           <button type="button" class="btn btn-danger btn-sm" data-remove-metadata-file>Remove</button>
         </div>
       </div>
@@ -403,6 +1437,7 @@ function buildMetadataFileRow (entry = {}) {
     wrapper.dataset.metadataFileButtonState = 'success'
   }
   updateMetadataFileValidateButton(wrapper, Boolean(entry.validated))
+  updateExternalYamlEditButton(wrapper, 'metadata_files')
   return wrapper
 }
 
@@ -729,8 +1764,9 @@ function buildCollectionFileRow (entry = {}) {
           <label class="form-label small text-muted">Location</label>
           <input type="text" class="form-control form-control-sm" data-collection-file-location placeholder="config/collections.yml, config/collections/, user/file.yml, or https://example.com/collections.yml">
         </div>
-        <div class="col-md-3 d-flex gap-2 justify-content-md-end">
+        <div class="col-md-3 d-flex gap-2 flex-wrap justify-content-md-end">
           <button type="button" class="btn btn-success btn-sm" data-validate-collection-file>Validate</button>
+          <button type="button" class="btn btn-outline-primary btn-sm" data-external-yaml-edit data-external-yaml-kind="collection_files">Edit</button>
           <button type="button" class="btn btn-danger btn-sm" data-remove-collection-file>Remove</button>
         </div>
       </div>
@@ -750,6 +1786,7 @@ function buildCollectionFileRow (entry = {}) {
     wrapper.dataset.collectionFileButtonState = 'success'
   }
   updateCollectionFileValidateButton(wrapper, Boolean(entry.validated))
+  updateExternalYamlEditButton(wrapper, 'collection_files')
   return wrapper
 }
 
@@ -978,8 +2015,8 @@ function updateCollectionFilesAccordionState (editor) {
     accordionHeader.classList.add('selected')
   } else {
     accordionHeader.classList.remove('selected')
-    if (!hasEntries && !hasInvalid && typeof EventHandler !== 'undefined' && typeof EventHandler.updateAccordionHighlights === 'function') {
-      EventHandler.updateAccordionHighlights()
+    if (!hasEntries && !hasInvalid) {
+      updateAccordionHighlights()
     }
   }
 }
@@ -1267,8 +2304,9 @@ function buildOverlayFileRow (entry = {}) {
           <label class="form-label small text-muted">Location</label>
           <input type="text" class="form-control form-control-sm" data-overlay-file-location placeholder="config/overlays.yml, config/overlays/, user/file.yml, or https://example.com/overlays.yml">
         </div>
-        <div class="col-md-3 d-flex gap-2 justify-content-md-end">
+        <div class="col-md-3 d-flex gap-2 flex-wrap justify-content-md-end">
           <button type="button" class="btn btn-success btn-sm" data-validate-overlay-file>Validate</button>
+          <button type="button" class="btn btn-outline-primary btn-sm" data-external-yaml-edit data-external-yaml-kind="overlay_files">Edit</button>
           <button type="button" class="btn btn-danger btn-sm" data-remove-overlay-file>Remove</button>
         </div>
       </div>
@@ -1288,6 +2326,7 @@ function buildOverlayFileRow (entry = {}) {
     wrapper.dataset.overlayFileButtonState = 'success'
   }
   updateOverlayFileValidateButton(wrapper, Boolean(entry.validated))
+  updateExternalYamlEditButton(wrapper, 'overlay_files')
   return wrapper
 }
 
@@ -1516,8 +2555,8 @@ function updateOverlayFilesAccordionState (editor) {
     accordionHeader.classList.add('selected')
   } else {
     accordionHeader.classList.remove('selected')
-    if (!hasEntries && !hasInvalid && typeof EventHandler !== 'undefined' && typeof EventHandler.updateAccordionHighlights === 'function') {
-      EventHandler.updateAccordionHighlights()
+    if (!hasEntries && !hasInvalid) {
+      updateAccordionHighlights()
     }
   }
 }
@@ -1731,7 +2770,8 @@ function buildPlaylistFileRow (entry = {}) {
           <label class="form-label small text-muted">Location</label>
           <input type="text" class="form-control form-control-sm" data-playlist-file-location placeholder="config/playlists.yml, user/playlists.yml, or https://example.com/playlists.yml">
         </div>
-        <div class="col-md-3 d-flex gap-2 justify-content-md-end">
+        <div class="col-md-3 d-flex gap-2 flex-wrap justify-content-md-end">
+          <button type="button" class="btn btn-outline-primary btn-sm" data-external-yaml-edit data-external-yaml-kind="playlist_files">Edit</button>
           <button type="button" class="btn btn-success btn-sm" data-validate-playlist-file>Validate</button>
           <button type="button" class="btn btn-danger btn-sm" data-remove-playlist-file>Remove</button>
         </div>
@@ -1752,6 +2792,7 @@ function buildPlaylistFileRow (entry = {}) {
     wrapper.dataset.playlistFileButtonState = 'success'
   }
   updatePlaylistFileValidateButton(wrapper, Boolean(entry.validated))
+  updateExternalYamlEditButton(wrapper, 'playlist_files')
   return wrapper
 }
 
@@ -1956,6 +2997,11 @@ function syncPlaylistFilesEditor (editor, emitEvents = true) {
   if (!editor) return []
   const hidden = editor.querySelector('input[type="hidden"][name="playlist_files_entries"]')
   if (!hidden) return []
+  const alreadySyncing = editor.dataset.playlistFilesSyncing === 'true'
+  if (emitEvents && alreadySyncing) {
+    emitEvents = false
+  }
+  editor.dataset.playlistFilesSyncing = 'true'
   const rows = Array.from(editor.querySelectorAll('[data-playlist-file-row]'))
   const entries = rows.map(row => {
     const type = row.querySelector('[data-playlist-file-type]')?.value
@@ -1968,6 +3014,7 @@ function syncPlaylistFilesEditor (editor, emitEvents = true) {
     hidden.dispatchEvent(new Event('input', { bubbles: true }))
     hidden.dispatchEvent(new Event('change', { bubbles: true }))
   }
+  delete editor.dataset.playlistFilesSyncing
   updatePlaylistFilesAccordionState(editor)
   return entries
 }
@@ -2000,6 +3047,26 @@ function initPlaylistFilesEditors (scope) {
     renderPlaylistFilesEditor(editor)
     editor.dataset.playlistFilesReady = 'true'
   })
+}
+
+function renderLibraryFileEditorForHiddenInput (input) {
+  if (!input || input.type !== 'hidden') return false
+
+  const editorConfigs = [
+    { selector: '[data-metadata-files-editor]', render: renderMetadataFilesEditor },
+    { selector: '[data-collection-files-editor]', render: renderCollectionFilesEditor },
+    { selector: '[data-overlay-files-editor]', render: renderOverlayFilesEditor },
+    { selector: '[data-playlist-files-editor]', render: renderPlaylistFilesEditor }
+  ]
+
+  for (const config of editorConfigs) {
+    const editor = input.closest(config.selector)
+    if (!editor) continue
+    config.render(editor)
+    return true
+  }
+
+  return false
 }
 
 document.addEventListener('click', async event => {
@@ -2062,6 +3129,7 @@ document.addEventListener('click', async event => {
 document.addEventListener('input', event => {
   const target = event.target
   if (!target || !target.closest('[data-playlist-files-editor]')) return
+  if (target.matches('input[type="hidden"][name="playlist_files_entries"]')) return
   const row = target.closest('[data-playlist-file-row]')
   const editor = target.closest('[data-playlist-files-editor]')
   if (row) {
@@ -2074,6 +3142,7 @@ document.addEventListener('input', event => {
 document.addEventListener('change', event => {
   const target = event.target
   if (!target || !target.closest('[data-playlist-files-editor]')) return
+  if (target.matches('input[type="hidden"][name="playlist_files_entries"]')) return
   const row = target.closest('[data-playlist-file-row]')
   const editor = target.closest('[data-playlist-files-editor]')
   if (row) {
@@ -3259,7 +4328,7 @@ function initScheduleBuilders (scope) {
       if (mode === 'custom') {
         nextValue = String(rawInput?.value || '').trim()
       } else {
-        nextValue = buildValueFromInputs(mode) || defaultValue || ''
+        nextValue = buildValueFromInputs(mode) || ''
       }
       hidden.value = nextValue
       updatePreview(nextValue)
@@ -3325,7 +4394,7 @@ function initScheduleBuilders (scope) {
     }
 
     hidden.addEventListener('change', () => {
-      const nextRaw = String(hidden.value || defaultValue || '').trim()
+      const nextRaw = String(hidden.value || '').trim()
       const nextParsed = parseSchedule(nextRaw)
       applyParsed(nextParsed)
       updateFromBuilder()
@@ -3335,6 +4404,13 @@ function initScheduleBuilders (scope) {
   })
 }
 
+const languageCollectionKeys = JSON.parse(`["ab", "aa", "af", "ak", "sq", "am", "ar", "an", "hy", "as", "av", "ae", "ay", "az", "bm", "ba", "eu", "be", "bn", "bi", "bs", "br", "bg", "my", "ca", "km", "ch", "ce", "ny", "zh", "cu", "cv", "kw", "co", "cr", "hr", "cs", "da", "dv", "nl", "dz", "en", "eo", "et", "ee", "fo", "fj", "fil", "fi", "fr", "ff", "gd", "gl", "lg", "ka", "de", "el", "gn", "gu", "ht", "ha", "he", "hz", "hi", "ho", "hu", "is", "io", "ig", "id", "ia", "ie", "iu", "ik", "ga", "it", "ja", "jv", "kl", "kn", "kr", "ks", "kk", "ki", "rw", "ky", "kv", "kg", "ko", "kj", "ku", "lo", "la", "lv", "li", "ln", "lt", "lu", "lb", "mk", "mg", "ms", "ml", "mt", "gv", "mi", "mr", "mh", "myn", "mn", "na", "nv", "ng", "ne", "nd", "se", "no", "nb", "nn", "oc", "oj", "or", "om", "os", "pi", "ps", "fa", "pl", "pt", "pa", "qu", "ro", "rm", "rom", "rn", "ru", "sm", "sg", "sa", "sc", "sr", "sn", "ii", "sd", "si", "sk", "sl", "so", "nr", "st", "es", "su", "sw", "ss", "sv", "tl", "ty", "tai", "tg", "ta", "tt", "te", "th", "bo", "ti", "to", "ts", "tn", "tr", "tk", "tw", "ug", "uk", "ur", "uz", "ve", "vi", "vo", "wa", "cy", "fy", "wo", "xh", "yi", "yo", "za", "zu", "other"]`).map(value => String(value))
+const countryNameCollectionKeys = JSON.parse(`["Algeria", "Egypt", "Libya", "Morocco", "Sudan", "Tunisia", "Western Sahara", "British Indian Ocean Territory", "Burundi", "Comoros", "Djibouti", "Eritrea", "Ethiopia", "French Southern Territories", "Kenya", "Madagascar", "Malawi", "Mauritius", "Mayotte", "Mozambique", "R\u00e9union", "Rwanda", "Seychelles", "Somalia", "South Sudan", "Uganda", "Tanzania", "Zambia", "Zimbabwe", "Angola", "Cameroon", "Central African Republic", "Chad", "Republic of the Congo", "Democratic Republic of the Congo", "Equatorial Guinea", "Gabon", "S\u00e3o Tom\u00e9 and Pr\u00edncipe", "Botswana", "Eswatini", "Lesotho", "Namibia", "South Africa", "Benin", "Burkina Faso", "Cape Verde", "C\u00f4te d'Ivoire", "Gambia", "Ghana", "Guinea", "Guinea-Bissau", "Liberia", "Mali", "Mauritania", "Niger", "Nigeria", "Saint Helena, Ascension and Tristan da Cunha", "Senegal", "Sierra Leone", "Togo", "Anguilla", "Antigua and Barbuda", "Aruba", "Bahamas", "Barbados", "Bonaire, Sint Eustatius and Saba", "Netherlands Antilles", "British Virgin Islands", "Cayman Islands", "Cuba", "Cura\u00e7ao", "Dominica", "Dominican Republic", "Grenada", "Guadeloupe", "Haiti", "Jamaica", "Martinique", "Montserrat", "Puerto Rico", "Saint Barth\u00e9lemy", "Saint Kitts and Nevis", "Saint Lucia", "Saint Martin", "Saint Vincent and the Grenadines", "Sint Maarten", "Trinidad and Tobago", "Turks and Caicos Islands", "US Virgin Islands", "Belize", "Costa Rica", "El Salvador", "Guatemala", "Honduras", "Mexico", "Nicaragua", "Panama", "Argentina", "Bolivia", "Bouvet Island", "Brazil", "Chile", "Colombia", "Ecuador", "Falkland Islands", "French Guiana", "Guyana", "Paraguay", "Peru", "South Georgia and the South Sandwich Islands", "Suriname", "Uruguay", "Venezuela", "Bermuda", "Canada", "Greenland", "Saint Pierre and Miquelon", "United States", "Antarctica", "Kazakhstan", "Kyrgyzstan", "Tajikistan", "Turkmenistan", "Uzbekistan", "China", "Hong Kong", "Macao", "North Korea", "Japan", "Mongolia", "South Korea", "Taiwan", "Brunei", "Cambodia", "Indonesia", "Laos", "Malaysia", "Myanmar", "Philippines", "Singapore", "Thailand", "East Timor", "Vietnam", "Afghanistan", "Bangladesh", "Bhutan", "India", "Iran", "Maldives", "Nepal", "Pakistan", "Sri Lanka", "Armenia", "Azerbaijan", "Bahrain", "Cyprus", "Georgia", "Iraq", "Israel", "Jordan", "Kuwait", "Lebanon", "Oman", "Qatar", "Saudi Arabia", "Palestine", "Syria", "Turkey", "United Arab Emirates", "Yemen", "Belarus", "Bulgaria", "Czech Republic", "Hungary", "Poland", "Moldova", "Romania", "Russia", "Slovakia", "Ukraine", "\u00c5land Islands", "Guernsey", "Jersey", "Sark", "Denmark", "Estonia", "Faroe Islands", "Finland", "Iceland", "Ireland", "Northern Ireland", "Isle of Man", "Latvia", "Lithuania", "Norway", "Svalbard and Jan Mayen Islands", "Sweden", "United Kingdom", "Albania", "Andorra", "Bosnia and Herzegovina", "Croatia", "Gibraltar", "Greece", "Kosovo", "Vatican City", "Italy", "Malta", "Montenegro", "North Macedonia", "Portugal", "San Marino", "Serbia", "Serbia and Montenegro", "Slovenia", "Spain", "Yugoslavia", "Austria", "Belgium", "France", "Germany", "Liechtenstein", "Luxembourg", "Monaco", "Netherlands", "Switzerland", "Australia", "Christmas Island", "Cocos (Keeling) Islands", "Heard Island and McDonald Islands", "New Zealand", "Norfolk Island", "Fiji", "New Caledonia", "Papua New Guinea", "Solomon Islands", "Vanuatu", "Guam", "Kiribati", "Marshall Islands", "Micronesia", "Nauru", "Northern Mariana Islands", "Palau", "US Minor Outlying Islands", "American Samoa", "Cook Islands", "French Polynesia", "Niue", "Pitcairn Islands", "Samoa", "Tokelau", "Tonga", "Tuvalu", "Wallis and Futuna Islands", "other"]`).map(value => String(value))
+const countryCodeCollectionKeys = JSON.parse(`["dz", "eg", "ly", "ma", "sd", "tn", "eh", "io", "bi", "km", "dj", "er", "et", "tf", "ke", "mg", "mw", "mu", "yt", "mz", "re", "rw", "sc", "so", "ss", "ug", "tz", "zm", "zw", "ao", "cm", "cf", "td", "cg", "cd", "gq", "ga", "st", "bw", "sz", "ls", "na", "za", "bj", "bf", "cv", "ci", "gm", "gh", "gn", "gw", "lr", "ml", "mr", "ne", "ng", "sh", "sn", "sl", "tg", "ai", "ag", "aw", "bs", "bb", "bq", "an", "vg", "ky", "cu", "cw", "dm", "do", "gd", "gp", "ht", "jm", "mq", "ms", "pr", "bl", "kn", "lc", "mf", "vc", "sx", "tt", "tc", "vi", "bz", "cr", "sv", "gt", "hn", "mx", "ni", "pa", "ar", "bo", "bv", "br", "cl", "co", "ec", "fk", "gf", "gy", "py", "pe", "gs", "sr", "uy", "ve", "bm", "ca", "gl", "pm", "us", "aq", "kz", "kg", "tj", "tm", "uz", "cn", "hk", "mo", "kp", "jp", "mn", "kr", "tw", "bn", "kh", "id", "la", "my", "mm", "ph", "sg", "th", "tp", "vn", "af", "bd", "bt", "in", "ir", "mv", "np", "pk", "lk", "am", "az", "bh", "cy", "ge", "iq", "il", "jo", "kw", "lb", "om", "qa", "sa", "ps", "sy", "tr", "ae", "ye", "by", "bg", "cz", "hu", "pl", "md", "ro", "ru", "sk", "ua", "ax", "gg", "je", "cq", "dk", "ee", "fo", "fi", "is", "ie", "im", "lv", "lt", "no", "sj", "se", "gb", "al", "ad", "ba", "hr", "gi", "gr", "xk", "va", "it", "mt", "me", "mk", "pt", "sm", "rs", "si", "es", "yu", "at", "be", "fr", "de", "li", "lu", "mc", "nl", "ch", "au", "cx", "cc", "hm", "nz", "nf", "fj", "nc", "pg", "sb", "vu", "gu", "ki", "mh", "fm", "nr", "mp", "pw", "um", "as", "ck", "pf", "nu", "pn", "ws", "tk", "to", "tv", "wf", "other"]`).map(value => String(value))
+const continentCollectionKeys = JSON.parse(`["Africa", "Americas", "Antarctica", "Asia", "Europe", "Oceania", "other"]`).map(value => String(value))
+const regionCollectionKeys = JSON.parse(`["Northern Africa", "Eastern Africa", "Central Africa", "Southern Africa", "Western Africa", "Caribbean", "Central America", "South America", "North America", "Antarctica", "Central Asia", "Eastern Asia", "South-Eastern Asia", "Southern Asia", "Western Asia", "Eastern Europe", "Northern Europe", "Southern Europe", "Western Europe", "Australia and New Zealand", "Melanesia", "Micronesia", "Polynesia", "other"]`).map(value => String(value))
+const studioCollectionKeys = JSON.parse(`["8bit", "A-1 Pictures", "A.C.G.T.", "Acca effe", "Actas", "AIC", "Ajia-Do", "Akatsuki", "Animation Do", "Ankama", "APPP", "Arms", "Artland", "Artmic", "Arvo Animation", "Asahi Production", "Ashi Productions", "asread.", "AtelierPontdarc", "B.CMAY PICTURES", "Bandai Namco Pictures", "Bee Train", "Berlanti Productions", "Bibury Animation Studios", "bilibili", "Bones", "Brain's Base", "Bridge", "BUG FILMS", "C-Station", "C2C", "Children's Playground Entertainment", "Cloud Hearts", "CloverWorks", "Colored Pencil Animation", "CoMix Wave Films", "Connect", "Craftar Studios", "Creators in Pack", "CygamesPictures", "David Production", "Diomed\\u00e9a", "DLE", "Doga Kobo", "domerica", "Drive", "EMT Squared", "Encourage Films", "ENGI", "feel.", "Felix Film", "Fenz", "GAINAX", "Gallop", "Geek Toys", "Gekkou", "Gemba", "GENCO", "Geno Studio", "GoHands", "Gonzo", "Graphinica", "Group Tac", "Hal Film Maker", "Haoliners Animation League", "Hoods Entertainment", "Hotline", "J.C.Staff", "Jumondou", "Kadokawa", "Khara", "Kinema Citrus", "Kyoto Animation", "Lan Studio", "LandQ Studio", "Lay-duce", "Lerche", "LIDENFILMS", "M.S.C", "Madhouse", "Magic Bus", "Maho Film", "Manglobe", "MAPPA", "Millepensee", "Namu Animation", "NAZ", "Nexus", "Nippon Animation", "Nomad", "Nut", "Okuruto Noboru", "OLM", "Orange", "Ordet", "OZ", "P.A. Works", "P.I.C.S.", "Passione", "Pb Animation Co. Ltd", "Pierrot", "Pine Jam", "Platinum Vision", "Polygon Pictures", "Pony Canyon", "Production +h.", "Production I.G", "Production IMS", "Production Reed", "Project No.9", "Quad", "Radix", "Revoroot", "Saetta", "SANZIGEN", "Satelight", "Science SARU", "Sentai Filmworks", "Seven Arcs", "Shaft", "Shin-Ei Animation", "Shogakukan", "Shuka", "Signal.MD", "Silver", "SILVER LINK.", "Square Enix", "Staple Entertainment", "Studio 3Hz", "Studio A-CAT", "Studio Bind", "Studio Blanc.", "Studio Chizu", "Studio Comet", "Studio Deen", "Studio Elle", "Studio Ghibli", "Studio Flad", "Studio Gokumi", "Studio Guts", "Studio Hibari", "Studio Kafka", "Studio Kai", "Studio Mir", "studio MOTHER", "Studio Palette", "Studio Rikka", "Studio Signpost", "Studio VOLN", "STUDIO4\\u00b0C", "Sunrise Beyond", "Sunrise", "SynergySP", "Tatsunoko Production", "Telecom Animation Film", "Tezuka Productions", "TMS Entertainment", "TNK", "Toei Animation", "Topcraft", "Triangle Staff", "Trigger", "TROYCA", "TYO Animations", "Typhoon Graphics", "ufotable", "V1 Studio", "W-Toon Studio", "Wawayu Animation", "White Fox", "Wit Studio", "Wolfsbane", "Xebec", "Yokohama Animation Lab", "Yostar Pictures", "Yumeta Company", "Zero-G", "Zexcs", "3 Arts Entertainment", "6th & Idaho", "20th Century Animation", "20th Century Studios", "20th Century Fox Television", "21 Laps Entertainment", "87Eleven", "87North Productions", "101 Studios", "1492 Pictures", "A Bigger Boat", "A+E Studios", "A24", "Aardman", "Aamir Khan Productions", "ABC Signature", "ABC Studios", "Ace Entertainment", "AGBO", "Amazon Studios", "Amblin Entertainment", "AMC Studios", "Anima Sola Productions", "Annapurna Pictures", "Ardustry Entertainment", "Artisan Entertainment", "Artists First", "Atlas Entertainment", "Atresmedia", "Bad Hat Harry Productions", "Bad Robot", "Bad Wolf", "Barunson E&A", "Bakken Record", "Bardel Entertainment", "BBC Studios", "Bill Melendez Productions", "Blade", "Bleecker Street", "Blown Deadline Productions", "Blue Ice Pictures", "Blue Sky Studios", "Bluegrass Films", "Blueprint Pictures", "Blumhouse Productions", "Blur Studio", "Bold Films", "Bona Film Group", "Bonanza Productions", "Boo Pictures", "Bosque Ranch Productions", "Box to Box Films", "Brandywine Productions", "Broken Lizard Industries", "Broken Road Productions", "Calt Production", "Canal+", "Carnival Films", "Carolco", "Cartoon Saloon", "Carsey-Werner Company", "Castle Rock Entertainment", "CBS Productions", "CBS Studios", "CBS Television Studios", "Centropolis Entertainment", "Chernin Entertainment", "Chimp Television", "Chris Morgan Productions", "Cinergi Pictures Entertainment", "Codeblack Entertainment", "Columbia Pictures", "Constantin Film", "Cowboy Films", "Cross Creek Pictures", "Dark Horse Entertainment", "Davis Entertainment", "DC Comics", "Dimension Films", "Dino De Laurentiis Company", "Disney Television Animation", "DisneyToon Studios", "Don Simpson Jerry Bruckheimer Films", "Doozer", "Dreams Salon Entertainment Culture", "DreamWorks Studios", "DreamWorks Pictures", "Dropout", "Dynamic Planning", "Eleventh Hour Films", "EMJAG Productions", "Endeavor Content", "Entertainment 360", "Entertainment One", "Eon Productions", "Everest Entertainment", "Expectation Entertainment", "Exposure Labs", "Fandango", "Fields Entertainment", "Film4 Productions", "FilmDistrict", "FilmNation Entertainment", "Flynn Picture Company", "Focus Features", "Food Network", "Fortiche Production", "Fox Television Studios", "Freckle Films", "Frederator Studios", "FremantleMedia", "Fuqua Films", "Gallagher Films Ltd", "Gary Sanchez Productions", "Gaumont", "Generator Entertainment", "Golden Harvest", "Gracie Films", "Green Hat Films", "Grindstone Entertainment Group", "Hallmark", "HandMade Films", "Happy Madison Productions", "HartBeat Productions", "Hartswood Films", "Hasbro", "HBO", "Heyday Films", "Hughes Entertainment", "Hungry Man", "Hurwitz & Schlossberg Productions", "Hyperobject Industries", "Icon Entertainment International", "IFC Films", "Illumination Entertainment", "Imagin", "Imperative Entertainment", "Impossible Factual", "Ingenious Media", "Irwin Entertainment", "Jerry Bruckheimer Films", "Jessie Films", "Jinks-Cohen Company", "Kazak Productions", "Kennedy Miller Productions", "Kilter Films", "Kjam Media", "Kudos", "Kurtzman Orci", "Laika Entertainment", "Landscape Entertainment", "Laura Ziskin Productions", "Leftfield Pictures", "Legendary Pictures", "Let's Not Turn This Into a Whole Big Production", "Lifetime", "Levity Entertainment Group", "Lightstorm Entertainment", "Likely Story", "Lionsgate", "Live Entertainment", "Lord Miller Productions", "Lucasfilm Ltd", "Magic Light Pictures", "Magnolia Pictures", "Malevolent Films", "Mandalay Entertainment", "Mandarin", "Mandarin Motion Pictures Limited", "Marv Films", "Marvel Animation", "Marvel Studios", "Matt Tolmach Productions", "Maximum Effort", "Media Res", "Metro-Goldwyn-Mayer", "Michael Patrick King Productions", "Millennium Films", "Miramax", "NEON", "Netflix", "New Line Cinema", "Nickelodeon Animation Studio", "NorthSouth Productions", "Nu Boyana Film Studios", "O2 Filmes", "Open Road Films", "Original Film", "Orion Pictures", "Palomar", "Paramount Animation", "Paramount Pictures", "Paramount Television Studios", "Participant", "Phoenix Pictures", "Piki Films", "Pixar", "Plan B Entertainment", "PlayStation Productions", "Playtone", "Plum Pictures", "Powerhouse Animation Studios", "PRA", "Prescience", "Prospect Park", "Pulse Films", "Radar Pictures", "RadicalMedia", "Railsplitter Pictures", "Rankin Bass Productions", "RatPac Entertainment", "Red Dog Culture House", "Regency Pictures", "Reveille Productions", "Rip Cord Productions", "RocketScience", "Savoy Pictures", "Scenic Labs", "Scion Films", "Scott Free Productions", "Sculptor Media", "Screen Gems", "Sean Daniel Company", "Searchlight Pictures", "Secret Hideout", "See-Saw Films", "Serendipity Pictures", "Shaw Brothers", "Show East", "Showtime Networks", "Sil-Metropole Organisation", "Silverback Films", "Siren Pictures", "SISTER", "Sixteen String Jack Productions", "SKA Films", "Sky studios", "Skydance", "Sony Pictures Animation", "Sony Pictures", "Sph\\u00e8re M\\u00e9dia Plus", "Spyglass Entertainment", "St\\u00f6\\u00f0 2", "Star Thrower Entertainment", "Stark Raving Black Productions", "StudioCanal", "Studio 8", "Studio Babelsberg", "Studio Dragon", "Studio Live", "STX Entertainment", "Summit Entertainment", "Syfy", "Syncopy", "T-Street Productions", "Tall Ship Productions", "Team Downey", "Temple Street Productions", "The Cat in the Hat Productions", "The Donners' Company", "The Jim Henson Company", "The Kennedy-Marshall Company", "The Linson Company", "The Littlefield Company", "The Mark Gordon Company", "The Sea Change Project", "The Stone Quarry", "The Weinstein Company", "Tim Burton Productions", "TOHO", "Thunder Road", "Titmouse", "Tomorrow Studios", "Touchstone Pictures", "Touchstone Television", "Trademark Films", "Triage Entertainment", "Tribeca Productions", "TriStar Pictures", "TSG Entertainment", "Twisted Pictures", "UCP", "United Artists", "Universal Animation Studios", "Universal Pictures", "Universal Television", "Vancouver Media", "Vertigo Entertainment", "Village Roadshow Pictures", "W. Chump and Sons", "Walden Media", "Walt Disney Animation Studios", "Walt Disney Pictures", "Walt Disney Productions", "Warner Animation Group", "Warner Bros. Pictures", "Warner Bros. Television", "Warner Premiere", "warparty", "Waverly Films", "Wayfare Entertainment", "Williams Street", "Whitaker Entertainment", "Wiedemann & Berg Television", "Winkler Films", "Wolf Entertainment", "Working Title Films"]`).map(value => String(value))
+const networkCollectionKeys = JSON.parse(`["#0", 5, "7mate", "ABC", "ABC Family", "ABC Kids", "ABC TV", "ABS-CBN", "Acorn TV", "Adult Swim", "AHC", "ALTBalaji", "Amazon Kids+", "AMC", "AMC+", "Animal Planet", "ANIMAX", "Angel Studios", "Antena 3", "Apple TV", "ARD", "Arte", "Atresplayer Premium", "Atres Player", "AT-X", "Audience", "AXN", "Azteca Uno", "A&E", "BBC America", "BBC Four", "BBC iPlayer", "BBC One", "BBC Scotland", "BBC Three", "BBC Two", "BET", "BET+", "bilibili", "Binge", "BluTV", "Boomerang", "Bravo", "BritBox", "C More", "Canale 5", "Canal+", "Cartoon Network", "Cartoonito", "CBC", "CBC Television", "Cbeebies", "CBS", "Channel 3", "Channel 4", "CHCH-DT", "Cinemax", "Citytv", "CNN", "Comedy Central", "Cooking Channel", "Crackle", "Crave", "Criterion Channel", "Crunchyroll", "CTV", "Cuatro", "Curiosity Stream", "DC Universe", "Discovery", "Discovery Kids", "discovery+", "Disney Channel", "Disney Junior", "Disney XD", "Disney+", "DR1", "Dropout", "Elisa Viihde", "Elisa Viihde Viaplay", "ENA", "Epix", "ESPN", "EXXEN", "E!", "E4", "Facebook Watch", "Family Channel", "Ficci\\u00f3n Producciones", "Flooxer", "Food Network", "FOX", "Fox Kids", "France 2", "Freeform", "Freevee", "Fuji TV", "funnyordie.com", "FX", "FXX", "GA\\u0130N", "Game Show Network", "Global TV", "Globoplay", "GMA Network", "Hallmark", "HBO", "HBO Max", "HGTV", "History", "HOT3", "Hulu", "ICTV", "IFC", "IMDb TV", "Investigation Discovery", "ION Television", "iQiyi", "ITV", "ITV Encore", "ITV1", "ITV2", "ITV3", "ITV4", "ITVBe", "ITVX", "JioCinema", "joyn", "JTBC", "Kan 11", "Kanal 5", "KBS2", "Kids WB", "La 1", "La Une", "Las Estrellas", "Lifetime", "Lionsgate+", "Logo", "Magnolia Network", "MasterClass", "MBC", "MBN", "MGM+", "mitele", "Movistar Plus+", "MTV", "M-Net", "National Geographic", "NBC", "Netflix", "Network 10", "NFL Network", "NHK", "Nick", "Nick Jr", "Nickelodeon", "Nicktoons", "Nine Network", "Nippon TV", "NRK1", "OCS City", "OCS Max", "ORF", "Oxygen", "Pantaya", "Paramount Network", "Paramount+", "PBS", "PBS Kids", "Peacock", "Plan\\u00e8te+ A&E", "Prime Video", "Quibi", "Rai 1", "Reelz", "RT\\u00c9 One", "RTL", "RTL T\\u00e9l\\u00e9", "RTP1", "R\\u00daV", "S4C", "SAT.1", "SBS", "Science", "Seeso", "Seven Network", "Shahid", "Showcase", "Showmax", "Showtime", "Shudder", "Sky", "Smithsonian", "Space", "Spectrum", "Spike", "St\\u00f6\\u00f0 2", "Stan", "Starz", "STAR+", "Sundance TV", "SVT", "SVT Play", "SVT1", "Syfy", "Syndication", "TBS", "Telecinco", "Telefe", "Telemundo", "Televisi\\u00f3n de Galicia", "Televisi\\u00f3n P\\u00fablica Argentina", "Tencent Video", "TF1", "The CW", "The Daily Wire", "The Roku Channel", "The WB", "TLC", "TNT", "Tokyo MX", "Travel Channel", "truTV", "tubi", "Turner Classic Movies", "TV 2", "tv asahi", "TV Globo", "TV Land", "TV Tokyo", "TV3", "TV4", "TV4 Play", "TVB Jade", "tving", "tvN", "TVNZ 1", "TVNZ 2", "TVP1", "U", "U&Alibi", "U&Dave", "U&Drama", "U&Eden", "U&Gold", "U&W", "U&Yesterday", "UniM\\u00e1s", "Universal Kids", "Universal TV", "Univision", "UPN", "USA Network", "U+ Mobile TV", "VH1", "Viaplay", "Vice", "Virgin Media One", "ViuTV", "ViX+", "VRT 1", "VRT Max", "VTM", "W", "WE tv", "Xbox Live", "YLE", "Youku", "YouTube", "ZDF", "ZEE5"]`).map(value => String(value))
 const templateStringListPresetConfigs = {
   generic_text: {
     duplicateInsensitive: false,
@@ -3383,6 +4459,14 @@ const templateStringListPresetConfigs = {
     validate: value => /^\d+$/.test(value)
       ? { valid: true }
       : { valid: false, message: 'Enter a numeric ID like 603 or 1399.' }
+  },
+  imdb_id_tmdb: {
+    duplicateInsensitive: true,
+    normalize: value => value.toLowerCase(),
+    lookupService: 'tmdb',
+    validate: value => /^tt\d{7,8}$/i.test(value)
+      ? { valid: true }
+      : { valid: false, message: 'Enter an IMDb ID like tt1234567 or tt12345678.' }
   },
   imdb_id_plex: {
     duplicateInsensitive: true,
@@ -3444,6 +4528,15 @@ const templateStringListPresetConfigs = {
       ? { valid: true }
       : { valid: false, message: 'Enter a supported streaming service key like netflix, disney, or amazon.' }
   },
+  other_chart_key: {
+    duplicateInsensitive: true,
+    normalize: value => value.toLowerCase(),
+    suggestions: ['commonsense', 'metacritic', 'stevenlu', 'pirated'],
+    allowedValues: new Set(['commonsense', 'metacritic', 'stevenlu', 'pirated']),
+    validate: value => templateStringListPresetConfigs.other_chart_key.allowedValues.has(value)
+      ? { valid: true }
+      : { valid: false, message: 'Select a supported Other Charts key like commonsense, metacritic, stevenlu, or pirated.' }
+  },
   universe_key: {
     duplicateInsensitive: true,
     normalize: value => value.toLowerCase(),
@@ -3470,6 +4563,69 @@ const templateStringListPresetConfigs = {
     validate: value => templateStringListPresetConfigs.seasonal_key.allowedValues.has(value)
       ? { valid: true }
       : { valid: false, message: 'Enter a supported seasonal key like halloween, christmas, or women.' }
+  },
+  language_key: {
+    duplicateInsensitive: true,
+    normalize: value => value.replace(/\s+/g, ' ').trim().toLowerCase(),
+    suggestions: ['en', 'fr', 'ja', 'ko', 'es', 'other'],
+    allowedValues: new Set(languageCollectionKeys),
+    validate: value => templateStringListPresetConfigs.language_key.allowedValues.has(value)
+      ? { valid: true }
+      : { valid: false, message: 'Select a supported language code like en, fr, ja, or other.' }
+  },
+  country_name_key: {
+    duplicateInsensitive: true,
+    normalize: value => value.replace(/\s+/g, ' ').trim(),
+    suggestions: ['France', 'Japan', 'United States of America', 'India', 'other'],
+    allowedValues: new Set(countryNameCollectionKeys),
+    validate: value => templateStringListPresetConfigs.country_name_key.allowedValues.has(value)
+      ? { valid: true }
+      : { valid: false, message: 'Select a supported country key like France, Japan, or other.' }
+  },
+  country_code_key: {
+    duplicateInsensitive: true,
+    normalize: value => value.replace(/\s+/g, ' ').trim(),
+    suggestions: ['fr', 'jp', 'us', 'in', 'other'],
+    allowedValues: new Set(countryCodeCollectionKeys),
+    validate: value => templateStringListPresetConfigs.country_code_key.allowedValues.has(value)
+      ? { valid: true }
+      : { valid: false, message: 'Select a supported country code key like fr, jp, us, or other.' }
+  },
+  continent_key: {
+    duplicateInsensitive: true,
+    normalize: value => value.replace(/\s+/g, ' ').trim(),
+    suggestions: ['Africa', 'Americas', 'Asia', 'Europe', 'Oceania', 'other'],
+    allowedValues: new Set(continentCollectionKeys),
+    validate: value => templateStringListPresetConfigs.continent_key.allowedValues.has(value)
+      ? { valid: true }
+      : { valid: false, message: 'Select a supported continent key like Africa, Europe, or other.' }
+  },
+  region_key: {
+    duplicateInsensitive: true,
+    normalize: value => value.replace(/\s+/g, ' ').trim(),
+    suggestions: ['North America', 'Western Europe', 'Eastern Asia', 'Caribbean', 'other'],
+    allowedValues: new Set(regionCollectionKeys),
+    validate: value => templateStringListPresetConfigs.region_key.allowedValues.has(value)
+      ? { valid: true }
+      : { valid: false, message: 'Select a supported region key like North America, Eastern Asia, or other.' }
+  },
+  studio_key: {
+    duplicateInsensitive: true,
+    normalize: value => value.replace(/\s+/g, ' ').trim(),
+    suggestions: ['A24', 'Marvel Studios', 'Pixar', 'Studio Ghibli', 'Warner Bros. Pictures'],
+    allowedValues: new Set(studioCollectionKeys),
+    validate: value => templateStringListPresetConfigs.studio_key.allowedValues.has(value)
+      ? { valid: true }
+      : { valid: false, message: 'Select a supported studio key like A24, Pixar, or Warner Bros. Pictures.' }
+  },
+  network_key: {
+    duplicateInsensitive: true,
+    normalize: value => value.replace(/\s+/g, ' ').trim(),
+    suggestions: ['Apple TV', 'Disney+', 'HBO Max', 'Netflix', 'Showtime'],
+    allowedValues: new Set(networkCollectionKeys),
+    validate: value => templateStringListPresetConfigs.network_key.allowedValues.has(value)
+      ? { valid: true }
+      : { valid: false, message: 'Select a supported network key like Netflix, HBO Max, or Apple TV.' }
   },
   content_rating: {
     duplicateInsensitive: true,
@@ -3510,8 +4666,9 @@ function inferTemplateStringListPreset (wrapper, input) {
   return 'generic_text'
 }
 
-function ensureTemplateStringListDatalist (wrapper, input, presetConfig, presetName) {
+function ensureTemplatePresetDatalist (wrapper, input, presetConfig, presetName) {
   if (!wrapper || !input || !presetConfig || !Array.isArray(presetConfig.suggestions) || !presetConfig.suggestions.length) return
+  if (String(input.tagName || '').toUpperCase() === 'SELECT') return
   if (presetConfig.suggestions.length > 50) return
   const existingListId = input.getAttribute('list')
   if (existingListId && document.getElementById(existingListId)) return
@@ -3529,6 +4686,69 @@ function ensureTemplateStringListDatalist (wrapper, input, presetConfig, presetN
     wrapper.appendChild(datalist)
   }
   input.setAttribute('list', datalistId)
+}
+
+function getTemplatePresetSelectableOptions (presetConfig) {
+  if (!presetConfig) return []
+  if (Array.isArray(presetConfig.selectOptions) && presetConfig.selectOptions.length) {
+    return presetConfig.selectOptions
+  }
+  if (presetConfig.allowedValues instanceof Set && presetConfig.allowedValues.size) {
+    return Array.from(presetConfig.allowedValues)
+  }
+  if (Array.isArray(presetConfig.allowedValues) && presetConfig.allowedValues.length) {
+    return presetConfig.allowedValues
+  }
+  if (Array.isArray(presetConfig.suggestions) && presetConfig.suggestions.length) {
+    return presetConfig.suggestions
+  }
+  return []
+}
+
+function parseTemplateSelectableOptions (wrapper, presetConfig, datasetKey = 'keyOptions') {
+  const raw = String(wrapper?.dataset?.[datasetKey] || '').trim()
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map(option => {
+            if (option && typeof option === 'object') {
+              const value = String(option.value || '').trim()
+              const label = String(option.label || value).trim()
+              return value ? { value, label } : null
+            }
+            const value = String(option || '').trim()
+            return value ? { value, label: value } : null
+          })
+          .filter(Boolean)
+      }
+    } catch {}
+  }
+
+  return getTemplatePresetSelectableOptions(presetConfig)
+    .map(option => {
+      const value = String(option || '').trim()
+      return value ? { value, label: value } : null
+    })
+    .filter(Boolean)
+}
+
+function ensureTemplateSelectOptions (wrapper, selectInput, presetConfig, datasetKey = 'keyOptions') {
+  if (!wrapper || !selectInput || String(selectInput.tagName || '').toUpperCase() !== 'SELECT') return
+  const options = parseTemplateSelectableOptions(wrapper, presetConfig, datasetKey)
+  if (!options.length) return
+
+  const currentValue = String(selectInput.value || '').trim()
+  selectInput.querySelectorAll('option[data-template-generated-option="true"]').forEach(option => option.remove())
+  options.forEach(({ value, label }) => {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    option.dataset.templateGeneratedOption = 'true'
+    selectInput.appendChild(option)
+  })
+  selectInput.value = currentValue
 }
 
 function setupTemplateStringListHandlers (scope) {
@@ -3561,7 +4781,7 @@ function setupTemplateStringListHandlers (scope) {
     }
   }
 
-  function applyLookupState (target, presetConfig, presetName, value, context = {}) {
+function applyLookupState (target, presetConfig, presetName, value, context = {}, onResolvedLabel = null) {
     if (!target || !presetConfig?.lookupService || !value) return
 
     if (presetConfig.lookupService === 'tmdb') {
@@ -3581,8 +4801,11 @@ function setupTemplateStringListHandlers (scope) {
       })
       lookupTemplateStringValue(presetName, value, context).then(result => {
         if (!target.isConnected) return
-        if (result.valid && result.verified && result.label) {
-          const successMessage = result.message || `TMDb: ${result.label}`
+      if (result.valid && result.verified && result.label) {
+        if (typeof onResolvedLabel === 'function') {
+          onResolvedLabel(value, result.label)
+        }
+        const successMessage = result.message || `TMDb: ${result.label}`
           setLookupState(target, {
             valid: true,
             verified: true,
@@ -3625,8 +4848,11 @@ function setupTemplateStringListHandlers (scope) {
       })
       lookupTemplateStringValue(presetName, value, context).then(result => {
         if (!target.isConnected) return
-        if (result.valid && result.verified && result.label) {
-          const successMessage = result.message || `Plex: ${result.label}`
+      if (result.valid && result.verified && result.label) {
+        if (typeof onResolvedLabel === 'function') {
+          onResolvedLabel(value, result.label)
+        }
+        const successMessage = result.message || `Plex: ${result.label}`
           setLookupState(target, {
             valid: true,
             verified: true,
@@ -3683,16 +4909,97 @@ function setupTemplateStringListHandlers (scope) {
   }
 
   const root = scope || document
+  root.querySelectorAll('[data-template-scalar-lookup="true"]').forEach(input => {
+    if (input.dataset.templateScalarLookupBound === 'true') return
+
+    const presetName = String(input.dataset.validationPreset || '').trim()
+    const presetConfig = templateStringListPresetConfigs[presetName]
+    if (!presetConfig?.lookupService) return
+
+    const lookupLabelsHidden = input.id ? document.getElementById(`${input.id}__lookup_labels`) : null
+    const libraryName = String(input.dataset.libraryName || '').trim()
+    const mediaType = String(input.dataset.mediaType || '').trim()
+    const lookupMeta = document.createElement('div')
+    lookupMeta.className = 'small mt-1 d-none'
+
+    const wrapper = input.closest('[data-collection-field-wrapper="true"], .input-group') || input
+    wrapper.insertAdjacentElement('afterend', lookupMeta)
+
+    function writeLookupLabels (labels) {
+      if (!lookupLabelsHidden) return
+      const cleanLabels = Object.fromEntries(
+        Object.entries(labels || {})
+          .map(([key, value]) => [String(key || '').trim(), String(value || '').trim()])
+          .filter(([key, value]) => key && value)
+      )
+      lookupLabelsHidden.value = JSON.stringify(cleanLabels)
+      lookupLabelsHidden.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+
+    function validateScalarValue () {
+      const rawValue = String(input.value || '').trim()
+      const normalized = presetConfig.normalize ? presetConfig.normalize(rawValue) : rawValue
+      const result = presetConfig.validate ? presetConfig.validate(normalized) : { valid: Boolean(normalized) }
+      return {
+        value: normalized,
+        valid: Boolean(result.valid),
+        message: result.message || 'Enter a valid value.'
+      }
+    }
+
+    function storeLookupLabel (value, label) {
+      if (!lookupLabelsHidden || !value || !label) return
+      const key = String(value).trim()
+      const normalizedLabel = String(label).trim()
+      if (!key || !normalizedLabel) return
+      writeLookupLabels({ [key]: normalizedLabel })
+      scheduleLookupLabelAutosave()
+    }
+
+    function runLookup () {
+      const checked = validateScalarValue()
+      if (!checked.value) {
+        setLookupState(lookupMeta, { message: '' })
+        writeLookupLabels({})
+        return
+      }
+      if (!checked.valid) {
+        setLookupState(lookupMeta, {
+          valid: false,
+          verified: true,
+          message: checked.message
+        })
+        writeLookupLabels({})
+        return
+      }
+      if (input.value !== checked.value) {
+        input.value = checked.value
+      }
+      applyLookupState(lookupMeta, presetConfig, presetName, checked.value, { libraryName, mediaType }, storeLookupLabel)
+    }
+
+    input.addEventListener('input', () => {
+      writeLookupLabels({})
+      setLookupState(lookupMeta, { message: '' })
+    })
+    input.addEventListener('change', runLookup)
+    input.addEventListener('blur', runLookup)
+    runLookup()
+    input.dataset.templateScalarLookupBound = 'true'
+  })
+
   root.querySelectorAll('[data-template-string-list]').forEach(wrapper => {
     if (wrapper.dataset.listenerAdded) return
     const hiddenId = wrapper.dataset.hiddenInput
     const hidden = hiddenId ? document.getElementById(hiddenId) : wrapper.querySelector('input[type="hidden"]')
-    const input = wrapper.querySelector('input[type="text"]')
+    const lookupLabelsHidden = hiddenId ? document.getElementById(`${hiddenId}__lookup_labels`) : null
+    const input = wrapper.querySelector('[data-template-string-input]')
     const addBtn = wrapper.querySelector('[data-template-string-add]')
     const list = wrapper.querySelector('[data-template-string-items]')
     const feedback = wrapper.querySelector('[data-template-string-feedback]')
     const templateVariableKey = String(wrapper.dataset.templateVariableKey || '').trim()
     const mutuallyExclusiveWith = String(wrapper.dataset.mutuallyExclusiveWith || '').trim()
+    const inputMode = String(wrapper.dataset.inputMode || 'text').trim().toLowerCase()
 
     if (!hidden || !input || !addBtn || !list) return
 
@@ -3700,7 +5007,10 @@ function setupTemplateStringListHandlers (scope) {
     const presetConfig = templateStringListPresetConfigs[presetName] || templateStringListPresetConfigs.generic_text
     const libraryName = String(wrapper.dataset.libraryName || '').trim()
     const mediaType = String(wrapper.dataset.mediaType || '').trim()
-    ensureTemplateStringListDatalist(wrapper, input, presetConfig, presetName)
+    ensureTemplatePresetDatalist(wrapper, input, presetConfig, presetName)
+    if (inputMode === 'select') {
+      ensureTemplateSelectOptions(wrapper, input, presetConfig, 'selectOptions')
+    }
 
     function parseStoredStringList (rawValue) {
       const raw = String(rawValue || '').trim()
@@ -3714,6 +5024,61 @@ function setupTemplateStringListHandlers (scope) {
         // fall through to treat as single value
       }
       return [raw]
+    }
+
+    function parseLookupLabels () {
+      if (!lookupLabelsHidden) return {}
+      const raw = String(lookupLabelsHidden.value || '').trim()
+      if (!raw) return {}
+      try {
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return Object.fromEntries(
+            Object.entries(parsed)
+              .map(([key, value]) => [String(key || '').trim(), String(value || '').trim()])
+              .filter(([key, value]) => key && value)
+          )
+        }
+      } catch {
+        return {}
+      }
+      return {}
+    }
+
+    function writeLookupLabels (labels) {
+      if (!lookupLabelsHidden) return
+      const cleanLabels = Object.fromEntries(
+        Object.entries(labels || {})
+          .map(([key, value]) => [String(key || '').trim(), String(value || '').trim()])
+          .filter(([key, value]) => key && value)
+      )
+      lookupLabelsHidden.value = JSON.stringify(cleanLabels)
+      lookupLabelsHidden.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+
+    function pruneLookupLabels (values) {
+      if (!lookupLabelsHidden) return
+      const allowed = new Set((values || []).map(value => String(value || '').trim()).filter(Boolean))
+      const labels = parseLookupLabels()
+      let changed = false
+      Object.keys(labels).forEach(key => {
+        if (!allowed.has(key)) {
+          delete labels[key]
+          changed = true
+        }
+      })
+      if (changed) writeLookupLabels(labels)
+    }
+
+    function storeLookupLabel (value, label) {
+      if (!lookupLabelsHidden || !value || !label) return
+      const labels = parseLookupLabels()
+      const key = String(value).trim()
+      const normalizedLabel = String(label).trim()
+      if (!key || !normalizedLabel || labels[key] === normalizedLabel) return
+      labels[key] = normalizedLabel
+      writeLookupLabels(labels)
+      scheduleLookupLabelAutosave()
     }
 
     function getCounterpartHiddenId () {
@@ -3845,7 +5210,7 @@ function setupTemplateStringListHandlers (scope) {
         })
 
         if (item.valid && presetConfig.lookupService) {
-          applyLookupState(lookupMeta, presetConfig, presetName, item.value, { libraryName, mediaType })
+          applyLookupState(lookupMeta, presetConfig, presetName, item.value, { libraryName, mediaType }, storeLookupLabel)
         }
       })
     }
@@ -3867,6 +5232,7 @@ function setupTemplateStringListHandlers (scope) {
       }
 
       hidden.value = JSON.stringify(normalizedValues)
+      pruneLookupLabels(normalizedValues)
       renderList(analyzed)
 
       const invalidItems = analyzed.filter(item => !item.valid)
@@ -3912,12 +5278,15 @@ function setupTemplateStringListHandlers (scope) {
       syncState(parseValues())
     })
     input.addEventListener('input', clearTransientFeedback)
-    input.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') {
-        event.preventDefault()
-        addValue()
-      }
-    })
+    input.addEventListener('change', clearTransientFeedback)
+    if (String(input.tagName || '').toUpperCase() !== 'SELECT') {
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault()
+          addValue()
+        }
+      })
+    }
 
     wrapper.dataset.listenerAdded = 'true'
   })
@@ -3939,6 +5308,7 @@ function setupTemplateMappingListHandlers (scope) {
     const feedback = wrapper.querySelector('[data-template-mapping-feedback]')
     const validationPreset = String(wrapper.dataset.validationPreset || '').trim().toLowerCase()
     const keyValidationPreset = String(wrapper.dataset.keyValidationPreset || '').trim().toLowerCase()
+    const keyInputMode = String(wrapper.dataset.keyInputMode || 'text').trim().toLowerCase()
     const lookupDisplayMode = String(wrapper.dataset.lookupDisplayMode || 'stacked').trim().toLowerCase()
     const valueDisplayLabel = String(wrapper.dataset.valueDisplayLabel || '').trim()
     const valueKind = String(wrapper.dataset.mappingValueKind || 'string_list').trim().toLowerCase()
@@ -3949,6 +5319,10 @@ function setupTemplateMappingListHandlers (scope) {
       : null
 
     if (!hidden || !keyInput || !valueInput || !addBtn || !list) return
+    ensureTemplatePresetDatalist(wrapper, keyInput, keyPresetConfig, keyValidationPreset || 'mapping-key')
+    if (keyInputMode === 'select') {
+      ensureTemplateSelectOptions(wrapper, keyInput, keyPresetConfig, 'keyOptions')
+    }
 
     function getServiceValidationState (serviceName) {
       const el = document.getElementById(`qs-validate-${serviceName}`)
@@ -4318,20 +5692,24 @@ function setupTemplateMappingListHandlers (scope) {
     hidden.addEventListener('change', () => {
       syncState(parseStoredMapping(hidden.value))
     })
-    keyInput.addEventListener('input', () => {
+    const clearKeyFeedback = () => {
       setFeedback('')
       setKeyInputValidity({ valid: true })
-    })
+    }
+    keyInput.addEventListener('input', clearKeyFeedback)
+    keyInput.addEventListener('change', clearKeyFeedback)
     valueInput.addEventListener('input', () => {
       setFeedback('')
       setValueInputValidity({ valid: true })
     })
-    keyInput.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') {
-        event.preventDefault()
-        addEntry()
-      }
-    })
+    if (String(keyInput.tagName || '').toUpperCase() !== 'SELECT') {
+      keyInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault()
+          addEntry()
+        }
+      })
+    }
     valueInput.addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
         event.preventDefault()
@@ -4643,6 +6021,60 @@ function refreshPickerLabels () {
   updateConfiguredCounts()
 }
 
+function isLibraryCardInitializing (card) {
+  return libraryCardInitializing > 0 || card?.dataset?.libraryInitializing === 'true'
+}
+
+function setLibraryIncludedFromUserEdit (card, libraryId) {
+  if (!libraryPicker || !card || !libraryId) return
+  const toggle = card.querySelector('.include-library-toggle')
+  if (!toggle || toggle.checked || toggle.disabled) return
+  const targetInputId = toggle.dataset.targetInput
+  const targetInput = targetInputId ? document.getElementById(targetInputId) : null
+  const option = libraryPicker.querySelector(`option[value="${libraryId}"]`)
+  toggle.checked = true
+  if (targetInput) targetInput.value = toggle.value
+  if (option) option.dataset.configured = 'true'
+  toggle.dispatchEvent(new Event('change', { bubbles: true }))
+}
+
+function shouldAutoIncludeLibraryEditTarget (target) {
+  if (!target || !target.closest) return false
+  if (target.closest('[data-resetting="true"]')) return false
+  if (target.closest('.external-yaml-editor-modal')) return false
+  if (target.matches('.include-library-toggle, .library-advanced-toggle, .accordion-button')) return false
+  if (target.matches('[data-bs-toggle="collapse"], [data-bs-toggle="modal"], [data-bs-dismiss]')) return false
+  if (target.matches('[data-toggle-secret-visibility], [data-collection-details-toggle], [data-overlay-details-toggle]')) return false
+  if (target.matches('[data-external-yaml-edit], [data-external-yaml-create], [data-external-yaml-choose]')) return false
+
+  if (target.matches('[data-playlist-key-toggle]')) return true
+  if (target.matches('[data-template-string-add], [data-template-mapping-add], [data-add-asset-directory]')) return true
+  if (target.matches('[data-add-collection-file], [data-add-metadata-file], [data-add-overlay-file], [data-add-playlist-file]')) return true
+  if (target.matches('[data-remove-collection-file], [data-remove-metadata-file], [data-remove-overlay-file], [data-remove-playlist-file]')) return true
+  if (target.matches('.library-remove-asset-directory')) return true
+
+  const field = target.matches('input, select, textarea') ? target : target.closest('input, select, textarea')
+  if (!field || field.disabled || !field.name) return false
+  if (field.type === 'file') return false
+  if (field.type === 'hidden' && isInternalTemplateMetadataField(field)) return false
+  if (field.dataset?.skipYaml === 'true' || field.dataset?.skipOverrideCount === 'true') return false
+  if (field.classList.contains('include-library-toggle')) return false
+  return true
+}
+
+function wireAutoIncludeOnLibraryEdits (card, libraryId) {
+  if (!card || card.dataset.autoIncludeOnEditBound === 'true') return
+  const maybeInclude = event => {
+    if (!event.isTrusted || isLibraryCardInitializing(card)) return
+    if (!shouldAutoIncludeLibraryEditTarget(event.target)) return
+    setLibraryIncludedFromUserEdit(card, libraryId)
+  }
+  card.addEventListener('input', maybeInclude)
+  card.addEventListener('change', maybeInclude)
+  card.addEventListener('click', maybeInclude)
+  card.dataset.autoIncludeOnEditBound = 'true'
+}
+
 function wireIncludeToggle (card, libraryId) {
   if (!libraryPicker || !card) return
   const toggle = card.querySelector('.include-library-toggle')
@@ -4656,13 +6088,10 @@ function wireIncludeToggle (card, libraryId) {
   function syncStatus () {
     if (!status) return
     const included = toggle.checked
-    status.textContent = included ? 'Included in YAML' : 'Excluded from YAML'
+    status.textContent = included ? 'Included in config' : 'Excluded from config'
     status.classList.toggle('bg-success', included)
     status.classList.toggle('bg-secondary', !included)
     if (playlistToggle) {
-      if (!included) {
-        playlistToggle.checked = false
-      }
       playlistToggle.disabled = !included
       playlistToggle.closest('.form-check')?.classList.toggle('opacity-50', !included)
     }
@@ -4944,103 +6373,394 @@ function wireLibraryServiceValidationButtons (card) {
   card.dataset.libraryServiceValidationBound = 'true'
 }
 
+function setCachedCardFormSubmission (card, cached) {
+  if (!card) return
+  card.querySelectorAll('input, select, textarea').forEach(el => {
+    if (cached) {
+      el.dataset.qsCachedDisabled = el.disabled ? 'true' : 'false'
+      el.disabled = true
+    } else if (el.dataset.qsCachedDisabled !== undefined) {
+      el.disabled = el.dataset.qsCachedDisabled === 'true'
+      delete el.dataset.qsCachedDisabled
+    }
+  })
+}
+
 function moveCurrentToCache () {
   const current = libraryContainer.firstElementChild
   if (current) {
+    setCachedCardFormSubmission(current, true)
     current.style.display = 'none'
     libraryCache.appendChild(current)
   }
 }
 
+function initializeLibraryCardControls (card, libraryId) {
+  libraryCardInitializing += 1
+  if (card) card.dataset.libraryInitializing = 'true'
+  try {
+    initPlaylistKeyToggleGroups(card)
+    initPlaylistUserPickers(card)
+    initPlaylistFilesEditors(card)
+    initSecretVisibilityToggles(card)
+    syncHiddenCheckboxPairs(card)
+    wireIncludeToggle(card, libraryId)
+    wireAutoIncludeOnLibraryEdits(card, libraryId)
+    wireAdvancedToggle(card)
+    wireLibraryServiceValidationButtons(card)
+    refreshPickerLabels()
+    initTooltips(card)
+    sortLanguageSelects(card)
+    setupOverlayLanguageWeightBuilders(card)
+    initNumericOnlyInputs(card)
+    setupCollectionTemplateFieldRules(card)
+    initStylePreviewGrids(card)
+    initRelativeYearInputs(card)
+    initScheduleBuilders(card)
+    initLibraryAssetDirectoryInputs(card)
+    wireOffsetReset(card)
+    wireRatingsOffsetSync(card)
+    initSortablesInScope(card)
+    setupCustomStringListHandlers('mass_genre_update', card)
+    setupCustomStringListHandlers('radarr_remove_by_tag', card)
+    setupCustomStringListHandlers('sonarr_remove_by_tag', card)
+    setupCustomStringListHandlers('metadata_backup', card)
+    setupCustomStringListHandlers('mass_content_rating_update', card)
+    setupCustomStringListHandlers('mass_genre_mapper', card)
+    setupTemplateStringListHandlers(card)
+    setupTemplateMappingListHandlers(card)
+    setupMappingListHandlers('genre_mapper', card)
+    setupMappingListHandlers('content_rating_mapper', card)
+    wireOverlayDetailToggles(card)
+    wireOverlayVariableSectionToggles(card)
+    wireCollectionDetailToggles(card)
+    wireCollectionVariableSectionToggles(card)
+    setupParentChildToggleVisibility(card)
+    if (typeof setupParentChildToggleSync === 'function') {
+      setupParentChildToggleSync()
+    }
+    setupAddMissingDependencies(card)
+    wireOverlayTemplateSections(card)
+    wireCollectionTemplateSections(card)
+    wireOverlayVariableSections(card)
+    wireCollectionVariableSections(card)
+    wireLibraryOverrideScopes(card)
+    wireLazyCollectionGroups(card)
+    updateLazySectionOverrideSummaries(card)
+    refreshTemplateOverrideState(card)
+    wireOffsetReset(card)
+    if (typeof OverlayHandler !== 'undefined' && OverlayHandler.initializeOverlayBoards) {
+      OverlayHandler.initializeOverlayBoards(card)
+    }
+    if (typeof OverlayHandler !== 'undefined' && OverlayHandler.initializeOverlayPositioners) {
+      OverlayHandler.initializeOverlayPositioners(card)
+    }
+    if (typeof OverlayHandler !== 'undefined' && OverlayHandler.initializeJumpButtons) {
+      OverlayHandler.initializeJumpButtons(card)
+    }
+    if (typeof EventHandler !== 'undefined') {
+      EventHandler.attachLibraryListeners(card)
+    }
+    if (typeof PathValidation !== 'undefined' && PathValidation.attach) {
+      PathValidation.attach(card)
+    }
+    if (typeof URLValidation !== 'undefined' && URLValidation.attach) {
+      URLValidation.attach(card)
+    }
+    if (typeof ValidationHandler !== 'undefined' && ValidationHandler.updateValidationState) {
+      ValidationHandler.updateValidationState()
+    }
+    wireFontUploads(card)
+    wireFontPreviews(card)
+    wireFontPickerButtons(card)
+    bindDependencyRequirementHintLiveRefresh(card)
+    scheduleDependencyRequirementHintRefresh(0)
+  } finally {
+    libraryCardInitializing = Math.max(0, libraryCardInitializing - 1)
+    if (card) delete card.dataset.libraryInitializing
+  }
+}
+
+function wireLazyLibrarySections (card) {
+  if (!card || card.dataset.lazyLibrarySectionsBound === 'true') return
+
+  card.addEventListener('shown.bs.collapse', event => {
+    const collapse = event.target
+    if (!collapse || !collapse.querySelector) return
+    const placeholder = collapse.querySelector('[data-library-lazy-section][data-library-id]')
+    if (!placeholder || placeholder.dataset.lazyState === 'loaded' || placeholder.dataset.lazyState === 'loading') return
+
+    const sectionName = placeholder.dataset.libraryLazySection
+    const libraryId = placeholder.dataset.libraryId
+    if (!sectionName || !libraryId) return
+
+    const spinner = placeholder.querySelector('.spinner-border')
+    const status = placeholder.querySelector('span')
+    placeholder.dataset.lazyState = 'loading'
+    spinner?.classList.remove('d-none')
+    if (status) status.textContent = `Loading ${sectionName} settings...`
+
+    fetch(`/library_fragment/${encodeURIComponent(libraryId)}/section/${encodeURIComponent(sectionName)}`, {
+      credentials: 'same-origin'
+    })
+      .then(res => {
+        if (!res.ok) throw new Error(`Failed to load ${sectionName} (${res.status})`)
+        return res.text()
+      })
+      .then(html => {
+        const body = placeholder.closest('.accordion-body')
+        if (!body) return
+        body.innerHTML = html
+        placeholder.dataset.lazyState = 'loaded'
+        initializeLibraryCardControls(card, libraryId)
+      })
+      .catch(err => {
+        console.error('[Libraries] Failed to load lazy library section', err)
+        placeholder.dataset.lazyState = 'error'
+        spinner?.classList.add('d-none')
+        if (status) status.textContent = `Unable to load ${sectionName} settings. Close and reopen this section to retry.`
+        if (typeof showToast === 'function') {
+          showToast('error', `Unable to load ${sectionName} settings. Try again.`)
+        }
+      })
+  })
+
+  card.dataset.lazyLibrarySectionsBound = 'true'
+}
+
+function loadedCollectionGroupMarker (card) {
+  if (!card) return null
+  let marker = card.querySelector('input[type="hidden"][name="__loaded_collection_groups"]')
+  if (marker) return marker
+
+  marker = document.createElement('input')
+  marker.type = 'hidden'
+  marker.name = '__loaded_collection_groups'
+  marker.value = ''
+  card.appendChild(marker)
+  return marker
+}
+
+function resetCollectionDefaultsMarker (card) {
+  if (!card) return null
+  let marker = card.querySelector('input[type="hidden"][name="__reset_collection_defaults"]')
+  if (marker) return marker
+
+  marker = document.createElement('input')
+  marker.type = 'hidden'
+  marker.name = '__reset_collection_defaults'
+  marker.value = 'false'
+  card.appendChild(marker)
+  return marker
+}
+
+function markCollectionDefaultsReset (card) {
+  const marker = resetCollectionDefaultsMarker(card)
+  if (marker) marker.value = 'true'
+}
+
+function markLazyCollectionGroupLoaded (card, groupIndex) {
+  const marker = loadedCollectionGroupMarker(card)
+  if (!marker) return
+  const values = new Set(String(marker.value || '').split(',').map(value => value.trim()).filter(Boolean))
+  values.add(String(groupIndex))
+  marker.value = Array.from(values).sort((a, b) => Number(a) - Number(b)).join(',')
+}
+
+function loadLazyCollectionGroup (collapse, card) {
+  if (!collapse || collapse.dataset?.collectionGroupLazyCollapse !== 'true') {
+    return Promise.resolve(collapse?.closest('[data-collection-group-shell="true"]') || null)
+  }
+  if (collapse.dataset.lazyState === 'loading') {
+    return Promise.reject(new Error('Collection group is already loading.'))
+  }
+
+  const libraryId = collapse.dataset.libraryId || card?.dataset?.libraryId || activeLibraryId
+  const groupIndex = collapse.dataset.collectionGroupIndex
+  if (!libraryId || groupIndex === undefined) {
+    return Promise.reject(new Error('Missing collection group identifiers.'))
+  }
+
+  const shell = collapse.closest('[data-collection-group-shell="true"]')
+  const placeholder = collapse.querySelector('[data-collection-group-lazy-placeholder]')
+  const spinner = placeholder?.querySelector('.spinner-border')
+  const status = placeholder?.querySelector('span')
+  collapse.dataset.lazyState = 'loading'
+  spinner?.classList.remove('d-none')
+  if (status) status.textContent = 'Loading collection group settings...'
+
+  return fetch(`/library_fragment/${encodeURIComponent(libraryId)}/section/collections/group/${encodeURIComponent(groupIndex)}`, {
+    credentials: 'same-origin'
+  })
+    .then(res => {
+      if (!res.ok) throw new Error(`Failed to load collection group (${res.status})`)
+      return res.text()
+    })
+    .then(html => {
+      if (!shell) return null
+      const template = document.createElement('template')
+      template.innerHTML = String(html || '').trim()
+      const replacement = template.content.firstElementChild
+      if (!replacement) throw new Error('Empty collection group fragment')
+      shell.replaceWith(replacement)
+      replacement.dataset.collectionGroupLoaded = 'true'
+      replacement.dataset.collectionGroupIndex = String(groupIndex)
+      const replacementCollapse = replacement.querySelector('.accordion-collapse')
+      const replacementButton = replacement.querySelector('.accordion-button')
+      if (replacementCollapse) {
+        replacementCollapse.classList.add('show')
+        replacementCollapse.dataset.collectionGroupLoaded = 'true'
+        replacementCollapse.dataset.collectionGroupIndex = String(groupIndex)
+      }
+      if (replacementButton) {
+        replacementButton.classList.remove('collapsed')
+        replacementButton.setAttribute('aria-expanded', 'true')
+      }
+      markLazyCollectionGroupLoaded(card, groupIndex)
+      initializeLibraryCardControls(card, libraryId)
+      refreshTemplateOverrideState(card)
+      return replacement
+    })
+}
+
+function wireLazyCollectionGroups (card) {
+  if (!card || card.dataset.lazyCollectionGroupsBound === 'true') return
+
+  card.addEventListener('shown.bs.collapse', event => {
+    const collapse = event.target
+    if (!collapse || collapse.dataset?.collectionGroupLazyCollapse !== 'true') return
+    if (collapse.dataset.lazyState === 'loaded' || collapse.dataset.lazyState === 'loading') return
+    const placeholder = collapse.querySelector('[data-collection-group-lazy-placeholder]')
+    const spinner = placeholder?.querySelector('.spinner-border')
+    const status = placeholder?.querySelector('span')
+
+    loadLazyCollectionGroup(collapse, card)
+      .catch(err => {
+        console.error('[Libraries] Failed to load lazy collection group', err)
+        collapse.dataset.lazyState = 'error'
+        spinner?.classList.add('d-none')
+        if (status) status.textContent = 'Unable to load this collection group. Close and reopen it to retry.'
+        if (typeof showToast === 'function') {
+          showToast('error', 'Unable to load collection group settings. Try again.')
+        }
+      })
+  })
+
+  card.dataset.lazyCollectionGroupsBound = 'true'
+}
+
 function mountCard (card, libraryId) {
   libraryContainer.replaceChildren()
+  setCachedCardFormSubmission(card, false)
   card.style.display = ''
   libraryContainer.appendChild(card)
   activeLibraryId = libraryId
-  initPlaylistKeyToggleGroups(card)
-  initPlaylistUserPickers(card)
-  initPlaylistFilesEditors(card)
-  initSecretVisibilityToggles(card)
-  syncHiddenCheckboxPairs(card)
-  wireIncludeToggle(card, libraryId)
-  wireAdvancedToggle(card)
-  wireLibraryServiceValidationButtons(card)
-  refreshPickerLabels()
-  initTooltips(card)
-  sortLanguageSelects(card)
-  setupOverlayLanguageWeightBuilders(card)
-  initNumericOnlyInputs(card)
-  setupCollectionTemplateFieldRules(card)
-  initStylePreviewGrids(card)
-  initRelativeYearInputs(card)
-  initScheduleBuilders(card)
-  initLibraryAssetDirectoryInputs(card)
-  wireOffsetReset(card)
-  wireRatingsOffsetSync(card)
-  initSortablesInScope(card)
-  setupCustomStringListHandlers('mass_genre_update', card)
-  setupCustomStringListHandlers('radarr_remove_by_tag', card)
-  setupCustomStringListHandlers('sonarr_remove_by_tag', card)
-  setupCustomStringListHandlers('metadata_backup', card)
-  setupCustomStringListHandlers('mass_content_rating_update', card)
-  setupCustomStringListHandlers('mass_genre_mapper', card)
-  setupTemplateStringListHandlers(card)
-  setupTemplateMappingListHandlers(card)
-  setupMappingListHandlers('genre_mapper', card)
-  setupMappingListHandlers('content_rating_mapper', card)
-  wireOverlayDetailToggles(card)
-  setupParentChildToggleVisibility(card)
-  if (typeof setupParentChildToggleSync === 'function') {
-    setupParentChildToggleSync()
+  wireLazyLibrarySections(card)
+  initializeLibraryCardControls(card, libraryId)
+}
+
+function fetchLibraryFragment (libraryId, attempt = 0) {
+  return fetch(`/library_fragment/${encodeURIComponent(libraryId)}`, {
+    credentials: 'same-origin'
+  })
+    .then(res => {
+      if (!res.ok) {
+        throw new Error(`Failed to load library ${libraryId} (${res.status})`)
+      }
+      return res.text()
+    })
+    .catch(err => {
+      if (attempt < 1) {
+        return new Promise(resolve => window.setTimeout(resolve, 250))
+          .then(() => fetchLibraryFragment(libraryId, attempt + 1))
+      }
+      throw err
+    })
+}
+
+function restorePreviousLibrarySelection (previousLibraryId) {
+  if (libraryPicker && previousLibraryId) {
+    libraryPicker.value = previousLibraryId
   }
-  setupAddMissingDependencies(card)
-  wireOverlayTemplateSections(card)
-  if (typeof OverlayHandler !== 'undefined' && OverlayHandler.initializeOverlayBoards) {
-    OverlayHandler.initializeOverlayBoards(card)
+  if (!libraryContainer.firstElementChild && previousLibraryId) {
+    const previousCard = libraryCache.querySelector(`[data-library-id="${previousLibraryId}"]`)
+    if (previousCard) {
+      mountCard(previousCard, previousLibraryId)
+    }
   }
-  if (typeof OverlayHandler !== 'undefined' && OverlayHandler.initializeOverlayPositioners) {
-    OverlayHandler.initializeOverlayPositioners(card)
-  }
-  if (typeof OverlayHandler !== 'undefined' && OverlayHandler.initializeJumpButtons) {
-    OverlayHandler.initializeJumpButtons(card)
-  }
-  if (typeof EventHandler !== 'undefined') {
-    EventHandler.attachLibraryListeners()
-  }
-  if (typeof PathValidation !== 'undefined' && PathValidation.attach) {
-    PathValidation.attach(card)
-  }
-  if (typeof URLValidation !== 'undefined' && URLValidation.attach) {
-    URLValidation.attach(card)
-  }
-  if (typeof ValidationHandler !== 'undefined' && ValidationHandler.updateValidationState) {
-    ValidationHandler.updateValidationState()
-  }
-  wireFontUploads(card)
-  wireFontPreviews(card)
-  wireFontPickerButtons(card)
-  bindDependencyRequirementHintLiveRefresh(card)
-  scheduleDependencyRequirementHintRefresh(0)
 }
 
 wireFontPickerModal()
 
+function isUncheckedTemplateParentToggle (field) {
+  if (!field || field.type !== 'checkbox' || field.dataset?.radioGroup === 'true') return false
+  if (field.dataset?.default !== undefined) return false
+  return !field.checked && Boolean(field.matches('[data-template-group], .overlay-toggle'))
+}
+
+function shouldOmitDefaultFieldFromLibraryPayload (field) {
+  if (!field || !field.dataset || field.dataset.default === undefined) return false
+  if (field.classList?.contains('include-library-toggle') || field.classList?.contains('playlist-library-toggle')) return false
+  if (String(field.name || '').endsWith('-library') || String(field.name || '').endsWith('-playlist')) return false
+  if (isInternalTemplateMetadataField(field)) return false
+  return !isCollectionSectionFieldConfigured([field])
+}
+
 function buildPayloadFromCard (card) {
   const payload = {}
   const libraryId = activeLibraryId || String(card?.querySelector('[name]')?.name || '').split('-')[0]
+  const loadedLazySections = []
+  ;['collections', 'overlays'].forEach(sectionName => {
+    const section = document.getElementById(`${libraryId}-${sectionName}`)
+    const placeholder = card.querySelector(`[data-library-lazy-section="${sectionName}"][data-library-id="${libraryId}"]`)
+    if (section && !placeholder) {
+      loadedLazySections.push(sectionName)
+    }
+  })
+  payload.__loaded_sections = loadedLazySections
+  const loadedCollectionGroups = new Set()
+  const collectionGroupMarker = card.querySelector('input[type="hidden"][name="__loaded_collection_groups"]')
+  String(collectionGroupMarker?.value || '').split(',').forEach(value => {
+    const trimmed = value.trim()
+    if (trimmed) loadedCollectionGroups.add(trimmed)
+  })
+  card.querySelectorAll('[data-collection-group-loaded="true"][data-collection-group-index]').forEach(group => {
+    loadedCollectionGroups.add(String(group.dataset.collectionGroupIndex || '').trim())
+  })
+  payload.__loaded_collection_groups = Array.from(loadedCollectionGroups)
+    .filter(Boolean)
+    .sort((a, b) => Number(a) - Number(b))
+  const resetCollectionDefaults = card.querySelector('input[type="hidden"][name="__reset_collection_defaults"]')
+  if (resetCollectionDefaults && resetCollectionDefaults.value === 'true') {
+    payload.__reset_collection_defaults = 'true'
+  }
   const checkboxNames = new Set(
     Array.from(card.querySelectorAll('input[type="checkbox"][name]'))
       .map(el => String(el.name || '').trim())
       .filter(Boolean)
   )
+  const radioCheckboxValues = new Map()
+  card.querySelectorAll('input[type="checkbox"][name][data-radio-group="true"]').forEach(el => {
+    const name = String(el.name || '').trim()
+    if (!name || el.disabled) return
+    if (!radioCheckboxValues.has(name)) {
+      radioCheckboxValues.set(name, '')
+    }
+    if (el.checked) {
+      radioCheckboxValues.set(name, el.value || 'true')
+    }
+  })
   card.querySelectorAll('input, select, textarea').forEach(el => {
     if (!el.name || el.disabled) return
+    if (el.name === '__loaded_collection_groups' || el.name === '__reset_collection_defaults') return
     if (el.dataset && el.dataset.skipYaml === 'true') return
     if (el.type === 'file') return
 
     if (el.type === 'hidden' && checkboxNames.has(String(el.name || '').trim())) {
       return
     }
+    if (isUncheckedTemplateParentToggle(el)) return
+    if (shouldOmitDefaultFieldFromLibraryPayload(el)) return
 
     if (el.tagName === 'SELECT' && el.multiple) {
       payload[el.name] = Array.from(el.selectedOptions).map(opt => opt.value)
@@ -5048,6 +6768,15 @@ function buildPayloadFromCard (card) {
     }
 
     if (el.type === 'checkbox') {
+      if (el.dataset && el.dataset.radioGroup === 'true') {
+        if (!Object.prototype.hasOwnProperty.call(payload, el.name)) {
+          const selectedValue = radioCheckboxValues.get(el.name) || ''
+          if (selectedValue) {
+            payload[el.name] = selectedValue
+          }
+        }
+        return
+      }
       payload[el.name] = el.checked ? (el.value || 'true') : 'false'
       return
     }
@@ -5072,11 +6801,12 @@ function buildPayloadFromCard (card) {
       if (!el.name || el.disabled) return
       if (card.contains(el)) return
       if (checkboxNames.has(String(el.name || '').trim())) return
+      if (shouldOmitDefaultFieldFromLibraryPayload(el)) return
       payload[el.name] = el.value ?? ''
     })
   }
   card.querySelectorAll('input.playlist-library-toggle[type="checkbox"][name]:disabled').forEach(el => {
-    payload[el.name] = 'false'
+    payload[el.name] = el.checked ? (el.value || 'true') : 'false'
   })
   return payload
 }
@@ -5089,34 +6819,11 @@ function initLibraryAssetDirectoryInputs (card) {
     const inputName = container.dataset.inputName
     const addBtnSelector = `[data-add-asset-directory="${container.id}"]`
     const addBtn = card.querySelector(addBtnSelector)
-    let counter = container.querySelectorAll(`input[name="${inputName}"]`).length
-
-    const buildRow = (value = '') => {
-      counter += 1
-      const row = document.createElement('div')
-      row.className = 'input-group mb-2'
-
-      const input = document.createElement('input')
-      input.type = 'text'
-      input.className = 'form-control'
-      input.name = inputName
-      input.id = `${container.id}_${counter}`
-      input.placeholder = 'Add Asset Directory'
-      input.dataset.pathRule = 'asset_directory'
-      input.value = value
-
-      const removeBtn = document.createElement('button')
-      removeBtn.className = 'btn btn-danger library-remove-asset-directory'
-      removeBtn.type = 'button'
-      removeBtn.textContent = 'Remove'
-
-      row.append(input, removeBtn)
-      return row
-    }
+    container.dataset.assetDirectoryCounter = String(container.querySelectorAll(`input[name="${inputName}"]`).length)
 
     if (addBtn) {
       addBtn.addEventListener('click', () => {
-        const row = buildRow('')
+        const row = buildLibraryAssetDirectoryRow(container, inputName, '')
         container.appendChild(row)
         if (typeof PathValidation !== 'undefined' && PathValidation.attach) {
           PathValidation.attach(row)
@@ -5139,38 +6846,134 @@ function initLibraryAssetDirectoryInputs (card) {
   })
 }
 
-function autosaveActiveLibrary () {
+function buildLibraryAssetDirectoryRow (container, inputName, value = '') {
+  const current = Number(container?.dataset?.assetDirectoryCounter || '0') || 0
+  const next = current + 1
+  if (container) {
+    container.dataset.assetDirectoryCounter = String(next)
+  }
+
+  const row = document.createElement('div')
+  row.className = 'input-group mb-2'
+
+  const input = document.createElement('input')
+  input.type = 'text'
+  input.className = 'form-control'
+  input.name = inputName
+  input.id = `${container?.id || 'asset_directory'}_${next}`
+  input.placeholder = 'Add Asset Directory'
+  input.dataset.pathRule = 'asset_directory'
+  input.value = value
+
+  const removeBtn = document.createElement('button')
+  removeBtn.className = 'btn btn-danger library-remove-asset-directory'
+  removeBtn.type = 'button'
+  removeBtn.textContent = 'Remove'
+
+  row.append(input, removeBtn)
+  return row
+}
+
+function resetLibraryAssetDirectoryContainers (scope, changes) {
+  if (!scope) return []
+  const changedInputs = []
+
+  scope.querySelectorAll('[data-library-asset-directory-container]').forEach(container => {
+    const inputName = container.dataset.inputName
+    if (!inputName) return
+
+    const rows = Array.from(container.querySelectorAll('.input-group'))
+    const values = Array.from(container.querySelectorAll(`input[name="${inputName}"]`))
+      .map(input => String(input.value || '').trim())
+    const populated = values.filter(Boolean)
+    const needsReset = populated.length > 0 || rows.length !== 1
+    if (!needsReset) return
+
+    if (Array.isArray(changes)) {
+      changes.push({
+        label: 'Asset Directory',
+        from: populated.length ? populated.join(', ') : `${rows.length} blank rows`,
+        to: 'Default'
+      })
+    }
+
+    container.replaceChildren()
+    container.dataset.assetDirectoryCounter = '0'
+    const row = buildLibraryAssetDirectoryRow(container, inputName, '')
+    container.appendChild(row)
+    if (typeof PathValidation !== 'undefined' && PathValidation.attach) {
+      PathValidation.attach(row)
+    }
+    const input = row.querySelector(`input[name="${inputName}"]`)
+    if (input) {
+      changedInputs.push(input)
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+  })
+
+  return changedInputs
+}
+
+function scheduleLookupLabelAutosave (delayMs = 900) {
+  if (lookupLabelAutosaveTimer) {
+    clearTimeout(lookupLabelAutosaveTimer)
+    lookupLabelAutosaveTimer = null
+  }
+  lookupLabelAutosaveTimer = setTimeout(() => {
+    lookupLabelAutosaveTimer = null
+    if (!activeLibraryId || window.QS_SWITCHING_CONFIG) return
+    autosaveActiveLibrary({ quiet: true, lookupLabelsOnly: true })
+      .catch(err => {
+        console.warn('[Autosave] Failed to persist lookup labels', err)
+      })
+  }, Math.max(0, Number(delayMs) || 0))
+}
+
+function buildLookupLabelPayloadFromCard (card) {
+  const payload = { __lookup_labels_only: true }
+  if (!card) return payload
+  card.querySelectorAll('input[type="hidden"][name$="__lookup_labels"]').forEach(el => {
+    if (!el.name || el.disabled) return
+    payload[el.name] = el.value ?? '{}'
+  })
+  return payload
+}
+
+function autosaveActiveLibrary (options = {}) {
   const card = libraryContainer.firstElementChild
   if (!activeLibraryId || !card) return Promise.resolve()
   if (window.QS_SWITCHING_CONFIG) return Promise.resolve()
+  const quiet = Boolean(options && options.quiet)
+  const lookupLabelsOnly = Boolean(options && options.lookupLabelsOnly)
 
-  if (typeof PathValidation !== 'undefined' && PathValidation.validateAll) {
+  if (!lookupLabelsOnly && typeof PathValidation !== 'undefined' && PathValidation.validateAll) {
     const pathValid = PathValidation.validateAll(card)
     if (!pathValid) {
       if (typeof ValidationHandler !== 'undefined' && typeof ValidationHandler.focusFirstInvalidField === 'function') {
         ValidationHandler.focusFirstInvalidField(card)
       }
-      if (typeof showToast === 'function') {
+      if (!quiet && typeof showToast === 'function') {
         showToast('error', 'Please fix invalid path fields before saving.')
       }
       return Promise.reject(new Error('Invalid path fields'))
     }
   }
 
-  if (typeof URLValidation !== 'undefined' && URLValidation.validateAll) {
+  if (!lookupLabelsOnly && typeof URLValidation !== 'undefined' && URLValidation.validateAll) {
     const urlValid = URLValidation.validateAll(card)
     if (!urlValid) {
       if (typeof ValidationHandler !== 'undefined' && typeof ValidationHandler.focusFirstInvalidField === 'function') {
         ValidationHandler.focusFirstInvalidField(card)
       }
-      if (typeof showToast === 'function') {
+      if (!quiet && typeof showToast === 'function') {
         showToast('error', 'Please fix invalid URL fields before saving.')
       }
       return Promise.reject(new Error('Invalid URL fields'))
     }
   }
 
-  const payload = buildPayloadFromCard(card)
+  const payload = lookupLabelsOnly ? buildLookupLabelPayloadFromCard(card) : buildPayloadFromCard(card)
   const collectionEditor = card.querySelector('[data-collection-files-editor]')
   const metadataEditor = card.querySelector('[data-metadata-files-editor]')
   const overlayEditor = card.querySelector('[data-overlay-files-editor]')
@@ -5202,7 +7005,7 @@ function autosaveActiveLibrary () {
       return res.json().catch(() => ({}))
     })
     .then(data => {
-      if (data && data.success && typeof showToast === 'function') {
+      if (data && data.success && !quiet && typeof showToast === 'function') {
         showToast('success', `Autosaved ${friendlyName}.`)
       }
       if (data && data.success) {
@@ -5213,7 +7016,7 @@ function autosaveActiveLibrary () {
     })
     .catch(err => {
       console.error('[Autosave] Failed to save library', activeLibraryId, err)
-      if (typeof showToast === 'function') {
+      if (!quiet && typeof showToast === 'function') {
         showToast('error', err.message || `Autosave failed for ${friendlyName}.`)
       }
       throw err
@@ -5335,6 +7138,7 @@ function openCopyModal (sourceId, sourceName, sourceType) {
         if (libraryPicker && libraryPicker.value) {
           loadLibrary(libraryPicker.value)
         }
+        refreshTemplateOverrideState(libraryContainer?.firstElementChild || document)
         if (typeof showToast === 'function') {
           const label = filtered.length === 1 ? 'library' : 'libraries'
           showToast('success', `Mirrored settings to ${filtered.length} ${label}.`)
@@ -5356,9 +7160,8 @@ function openCopyModal (sourceId, sourceName, sourceType) {
       })
   }
 
-  // Ensure we don't accumulate handlers across openings
-  copyConfirmBtn.onclick = null
-  copyConfirmBtn.addEventListener('click', onConfirm)
+  // Replace the previous modal source/target closure each time this opens.
+  copyConfirmBtn.onclick = onConfirm
 }
 
 function loadLibrary (libraryId, context = 'switch') {
@@ -5387,28 +7190,23 @@ function loadLibrary (libraryId, context = 'switch') {
       if (requestId !== loadRequestId) return
 
       if (!libraryId) {
+        moveCurrentToCache()
         libraryContainer.replaceChildren()
         activeLibraryId = null
         setLoading(false)
         return
       }
 
-      // Move currently active card to cache (to preserve state/inputs)
-      moveCurrentToCache()
-
       const cached = libraryCache.querySelector(`[data-library-id="${libraryId}"]`)
       if (cached) {
         if (requestId !== loadRequestId) return
+        moveCurrentToCache()
         mountCard(cached, libraryId)
         setLoading(false)
         return
       }
 
-      fetch(`/library_fragment/${encodeURIComponent(libraryId)}`)
-        .then(res => {
-          if (!res.ok) throw new Error(`Failed to load library ${libraryId}`)
-          return res.text()
-        })
+      fetchLibraryFragment(libraryId)
         .then(html => {
           if (requestId !== loadRequestId) return
           const parser = new DOMParser()
@@ -5416,19 +7214,23 @@ function loadLibrary (libraryId, context = 'switch') {
           const parsedCard = doc.body.firstElementChild
           const card = parsedCard ? document.importNode(parsedCard, true) : null
           if (!card) throw new Error('Empty fragment response')
+          moveCurrentToCache()
           mountCard(card, libraryId)
           setLoading(false)
         })
         .catch(err => {
-          console.error(err)
+          if (requestId !== loadRequestId) return
+          console.error('[Libraries] Failed to load library fragment', err)
+          restorePreviousLibrarySelection(previousLibraryId)
+          if (typeof showToast === 'function') {
+            showToast('error', 'Unable to load that library. Your current library stayed open; try again.')
+          }
           setLoading(false)
         })
     })
     .catch(() => {
       if (requestId !== loadRequestId) return
-      if (libraryPicker && previousLibraryId) {
-        libraryPicker.value = previousLibraryId
-      }
+      restorePreviousLibrarySelection(previousLibraryId)
       setLoading(false)
     })
 }
@@ -5439,18 +7241,7 @@ if (libraryPicker) {
   })
 
   refreshPickerLabels()
-  const configuredFirst = libraryPicker.querySelector('option[data-configured="true"]')
-  const firstLibrary = libraryPicker.value ||
-    configuredFirst?.value ||
-    libraryPicker.querySelector('option[value]:not([value=""])')?.value
-  if (configuredFirst) {
-    libraryPicker.value = configuredFirst.value
-    loadLibrary(configuredFirst.value, 'initial')
-  } else if (firstLibrary) {
-    loadLibrary(firstLibrary, 'initial')
-  } else {
-    libraryPicker.value = ''
-  }
+  libraryPicker.value = ''
 }
 
 document.addEventListener('qs:before-step-navigation', (event) => {
@@ -5504,7 +7295,13 @@ document.querySelectorAll('.overlay-template-section').forEach((el) => {
 })
 
 wireOverlayDetailToggles()
+wireOverlayVariableSectionToggles()
+wireCollectionDetailToggles()
+wireCollectionVariableSectionToggles()
 wireOverlayTemplateSections()
+wireCollectionTemplateSections()
+wireOverlayVariableSections()
+wireCollectionVariableSections()
 wireRatingsOffsetSync()
 
 document.addEventListener('click', (e) => {
@@ -5546,12 +7343,14 @@ function getCollectionSectionEntries (libraryId) {
       collectionId,
       label,
       inputId: input.id,
+      defaultValue: String(input.dataset.default || '').trim(),
       currentValue: String(input.value || '').trim(),
+      effectiveValue: String(input.value || input.dataset.default || '').trim(),
       domIndex: index
     })
   })
   entries.sort((left, right) => {
-    const byValue = compareCollectionSectionValues(left.currentValue, right.currentValue)
+    const byValue = compareCollectionSectionValues(left.effectiveValue, right.effectiveValue)
     if (byValue !== 0) return byValue
     return left.domIndex - right.domIndex
   })
@@ -5582,8 +7381,8 @@ function buildCollectionSectionListItem (entry, position) {
       </div>
     </div>
     <div class="text-end">
-      <div class="small text-muted">Current</div>
-      <span class="badge bg-secondary" data-collection-section-current>${entry.currentValue || 'blank'}</span>
+      <div class="small text-muted">${entry.currentValue ? 'Current' : 'Default'}</div>
+      <span class="badge bg-secondary" data-collection-section-current>${entry.currentValue || entry.defaultValue || 'blank'}</span>
       <div class="small text-muted mt-1">New: <span data-collection-section-next>${String(position * 10).padStart(3, '0')}</span></div>
     </div>
   `
@@ -5596,6 +7395,17 @@ function refreshCollectionSectionPreviewNumbers (list) {
     const next = item.querySelector('[data-collection-section-next]')
     if (next) next.textContent = String((index + 1) * 10).padStart(3, '0')
   })
+}
+
+function setCollectionSectionActionBusy (button, busy) {
+  setLibrariesButtonPersistentBusy(button, busy)
+}
+
+function markCollectionSectionModalCustomOrder (modalEl) {
+  if (!modalEl) return
+  modalEl.dataset.collectionSectionResetMode = 'false'
+  const status = modalEl.querySelector('[data-collection-section-modal-status]')
+  if (status) status.textContent = 'Custom order pending. Save Order will write collection_section overrides.'
 }
 
 function ensureCollectionSectionModalRoot (modalEl) {
@@ -5669,6 +7479,7 @@ function renderCollectionSectionModalList (modalEl) {
     return entries
   }
   entries.forEach((entry, index) => list.appendChild(buildCollectionSectionListItem(entry, index + 1)))
+  modalEl.dataset.collectionSectionResetMode = 'false'
   if (status) status.textContent = `${entries.length} enabled collection default${entries.length === 1 ? '' : 's'} ready to reorder.`
   if (saveButton) saveButton.disabled = false
   refreshCollectionSectionPreviewNumbers(list)
@@ -5682,6 +7493,7 @@ function renderCollectionSectionModalList (modalEl) {
     delay: 180,
     touchStartThreshold: 6,
     onSort: function () {
+      markCollectionSectionModalCustomOrder(modalEl)
       refreshCollectionSectionPreviewNumbers(list)
     }
   })
@@ -5690,26 +7502,63 @@ function renderCollectionSectionModalList (modalEl) {
 
 function saveCollectionSectionModalOrder (modalEl) {
   if (!modalEl) return
+  modalEl = prepareCollectionSectionModal(modalEl)
+  const saveButton = modalEl.querySelector('[data-collection-section-save]')
+  setCollectionSectionActionBusy(saveButton, true)
   const list = modalEl.querySelector('[data-collection-section-sortable]')
   const items = Array.from(list ? list.children : [])
-  if (!items.length) return
-  items.forEach((item, index) => {
-    const inputId = item.dataset.inputId
-    const input = inputId ? document.getElementById(inputId) : null
-    if (!input) return
-    const nextValue = String((index + 1) * 10).padStart(3, '0')
-    input.value = nextValue
-    input.dispatchEvent(new Event('input', { bubbles: true }))
-    input.dispatchEvent(new Event('change', { bubbles: true }))
-    const current = item.querySelector('[data-collection-section-current]')
-    if (current) current.textContent = nextValue
-  })
-  if (typeof showToast === 'function') {
-    showToast('success', 'Collection section order updated.')
-  }
-  refreshCollectionSectionPreviewNumbers(list)
-  const modal = bootstrap && bootstrap.Modal ? bootstrap.Modal.getInstance(modalEl) : null
-  if (modal) modal.hide()
+  const resetMode = modalEl.dataset.collectionSectionResetMode === 'true'
+  window.setTimeout(() => {
+    if (!items.length) {
+      setCollectionSectionActionBusy(saveButton, false)
+      return
+    }
+    if (!resetMode) {
+      items.forEach((item, index) => {
+        const inputId = item.dataset.inputId
+        const input = inputId ? document.getElementById(inputId) : null
+        if (!input) return
+        const nextValue = String((index + 1) * 10).padStart(3, '0')
+        input.value = nextValue
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        input.dispatchEvent(new Event('change', { bubbles: true }))
+        const current = item.querySelector('[data-collection-section-current]')
+        if (current) current.textContent = nextValue
+      })
+    }
+    if (typeof showToast === 'function') {
+      showToast(resetMode ? 'info' : 'success', resetMode ? 'Collection section overrides cleared. JSON defaults will be used.' : 'Collection section order updated.')
+    }
+    refreshCollectionSectionPreviewNumbers(list)
+    const modal = typeof bootstrap !== 'undefined' && bootstrap.Modal ? bootstrap.Modal.getOrCreateInstance(modalEl) : null
+    if (modal) modal.hide()
+    setCollectionSectionActionBusy(saveButton, false)
+  }, 120)
+}
+
+function resetCollectionSectionModalOrder (modalEl) {
+  if (!modalEl) return
+  modalEl = prepareCollectionSectionModal(modalEl)
+  const resetButton = modalEl.querySelector('[data-collection-section-reset]')
+  setCollectionSectionActionBusy(resetButton, true)
+  const entries = getCollectionSectionEntries(modalEl.dataset.libraryId)
+  window.setTimeout(() => {
+    entries.forEach(entry => {
+      const input = entry.inputId ? document.getElementById(entry.inputId) : null
+      if (!input) return
+      input.value = ''
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+    renderCollectionSectionModalList(modalEl)
+    modalEl.dataset.collectionSectionResetMode = 'true'
+    const status = modalEl.querySelector('[data-collection-section-modal-status]')
+    if (status) status.textContent = 'Defaults pending. Save Order will clear collection_section overrides and use JSON defaults.'
+    if (typeof showToast === 'function') {
+      showToast('info', 'Collection section overrides cleared. Save Order to use JSON defaults.')
+    }
+    setCollectionSectionActionBusy(resetButton, false)
+  }, 120)
 }
 
 document.addEventListener('click', (event) => {
@@ -5727,7 +7576,7 @@ document.addEventListener('click', (event) => {
   const resetButton = event.target.closest('[data-collection-section-reset]')
   if (resetButton) {
     const modalEl = resetButton.closest('[data-collection-section-modal]')
-    renderCollectionSectionModalList(modalEl)
+    resetCollectionSectionModalOrder(modalEl)
     return
   }
 
@@ -5749,6 +7598,7 @@ document.addEventListener('click', (event) => {
     } else if (direction === 'down' && item.nextElementSibling) {
       list.insertBefore(item.nextElementSibling, item)
     }
+    markCollectionSectionModalCustomOrder(moveButton.closest('[data-collection-section-modal]'))
     refreshCollectionSectionPreviewNumbers(list)
   }
 })
@@ -5895,23 +7745,37 @@ function toggleOverlayTemplateSection (checkbox) {
 
   if (templateSection) {
     if (checkbox.checked) {
-      templateSection.style.display = 'none'
+      setDetailSectionExpanded(templateSection, detailsToggle, false)
       if (detailActions) {
         detailActions.classList.remove('d-none')
       }
-      if (detailsToggle) {
-        detailsToggle.textContent = 'Show Details'
-      }
     } else {
-      templateSection.style.display = 'none'
+      setDetailSectionExpanded(templateSection, detailsToggle, false)
       if (detailActions) {
         detailActions.classList.add('d-none')
       }
-      if (detailsToggle) {
-        detailsToggle.textContent = 'Show Details'
-      }
     }
   }
+  groupContainer?.querySelectorAll('[data-overlay-variable-section="true"]').forEach(section => {
+    updateOverlayVariableSectionSummary(section)
+  })
+}
+
+function toggleCollectionTemplateSection (parentToggle) {
+  const groupContainer = parentToggle?.closest('.template-toggle-group[data-collection-config="true"]')
+  const templateSection = groupContainer?.querySelector('.collection-template-section')
+  const detailsToggle = groupContainer?.querySelector('.collection-details-toggle')
+  const detailActions = groupContainer?.querySelector('.collection-detail-actions')
+
+  if (!templateSection) return
+
+  setDetailSectionExpanded(templateSection, detailsToggle, false)
+  if (detailActions) {
+    detailActions.classList.toggle('d-none', !parentToggle?.checked)
+  }
+  groupContainer?.querySelectorAll('[data-collection-variable-section="true"]').forEach(section => {
+    updateCollectionVariableSectionSummary(section)
+  })
 }
 
 function setupCustomStringListHandlers (prefix, scope) {
@@ -6044,26 +7908,18 @@ function setupMappingListHandlers (prefix, scope) {
   })
 }
 
-async function runCollectionGroupReset (btn, group) {
+async function runCollectionGroupReset (btn, group, options = {}) {
   if (!btn || !group || btn.dataset.resetBusy === 'true') return
 
   const idleLabel = btn.dataset.resetIdleLabel || btn.textContent.trim() || 'Reset to Defaults'
   btn.dataset.resetIdleLabel = idleLabel
   btn.dataset.resetBusy = 'true'
-  btn.disabled = true
-  btn.setAttribute('aria-busy', 'true')
-  btn.textContent = 'Resetting...'
+  setLibrariesButtonPersistentBusy(btn, true, 'Resetting...')
 
   const pauseForPaint = async () => {
     await new Promise(resolve => requestAnimationFrame(() => resolve()))
     await new Promise(resolve => window.setTimeout(resolve, 0))
   }
-  const escapeHtml = (value) => String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
   const getInputLabel = (input) => {
     if (!input) return 'Field'
     const describedBy = input.getAttribute('aria-describedby')
@@ -6124,11 +7980,11 @@ async function runCollectionGroupReset (btn, group) {
       return
     }
     const preview = changes.slice(0, 12)
-      .map(change => `${escapeHtml(change.label)}: ${escapeHtml(change.from)} → ${escapeHtml(change.to)}`)
-      .join('<br>')
+      .map(change => `${change.label}: ${change.from} -> ${change.to}`)
+      .join('\n')
     const extraCount = changes.length - 12
-    const suffix = extraCount > 0 ? `<br>...and ${extraCount} more field${extraCount === 1 ? '' : 's'}.` : ''
-    showToast('info', `Reset to defaults (${changes.length} field${changes.length === 1 ? '' : 's'}):<br>${preview}${suffix}`)
+    const suffix = extraCount > 0 ? `\n...and ${extraCount} more field${extraCount === 1 ? '' : 's'}.` : ''
+    showToast('info', `Reset to defaults (${changes.length} field${changes.length === 1 ? '' : 's'}):\n${preview}${suffix}`)
   }
 
   try {
@@ -6145,11 +8001,19 @@ async function runCollectionGroupReset (btn, group) {
       const from = getDisplayValue(input)
       const to = getDefaultDisplayValue(input, defaultValue)
       if (from !== to) {
-        changes.push({ label: getInputLabel(input), from, to })
+        const scheduleEquivalent = input.closest('[data-schedule-builder]') &&
+          normalizeScheduleOverrideValue(from) === normalizeScheduleOverrideValue(to)
+        if (!scheduleEquivalent) {
+          changes.push({ label: getInputLabel(input), from, to })
+        }
         return true
       }
       return false
     }
+
+    resetLibraryAssetDirectoryContainers(group, changes).forEach(input => {
+      pendingChangeInputs.add(input)
+    })
 
     const inputs = Array.from(group.querySelectorAll('input[data-default], select[data-default], textarea[data-default]'))
     for (let index = 0; index < inputs.length; index += 1) {
@@ -6167,11 +8031,17 @@ async function runCollectionGroupReset (btn, group) {
         if (changed) input.checked = nextChecked
       } else {
         changed = recordReset(input, defaultValue)
-        if (changed) input.value = defaultValue
+        if (changed) {
+          input.value = defaultValue
+          renderLibraryFileEditorForHiddenInput(input)
+        }
       }
 
-      if (changed && shouldDispatchCollectionChange(input)) {
-        pendingChangeInputs.add(input)
+      if (changed) {
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        if (shouldDispatchCollectionChange(input)) {
+          pendingChangeInputs.add(input)
+        }
       }
 
       if (index > 0 && index % 30 === 0) {
@@ -6190,19 +8060,18 @@ async function runCollectionGroupReset (btn, group) {
       trigger.dispatchEvent(new Event('change', { bubbles: true }))
     }
 
-    if (typeof EventHandler !== 'undefined' && typeof EventHandler.updateAccordionHighlights === 'function') {
-      EventHandler.updateAccordionHighlights()
-    }
+    refreshTemplateOverrideState(group.closest('.template-toggle-group') || group)
+    updateAccordionHighlights()
     if (typeof ValidationHandler !== 'undefined' && typeof ValidationHandler.updateValidationState === 'function') {
       ValidationHandler.updateValidationState()
     }
-    finalizeToast(changes)
+    if (!options.suppressToast) {
+      finalizeToast(changes)
+    }
   } finally {
     delete group.dataset.resetting
-    btn.disabled = false
-    btn.removeAttribute('aria-busy')
     btn.dataset.resetBusy = 'false'
-    btn.textContent = idleLabel
+    setLibrariesButtonPersistentBusy(btn, false)
   }
 }
 
@@ -6210,7 +8079,124 @@ function wireOffsetReset (scope) {
   const root = scope || document
   root.querySelectorAll('.reset-offset-btn').forEach(btn => {
     if (btn.dataset.listenerAdded) return
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
+      if (btn.dataset.collectionAllReset === 'true') {
+        const sectionBody = btn.closest('.accordion-body')
+        if (sectionBody) {
+          const card = btn.closest('.library-settings-card')
+          try {
+            markCollectionDefaultsReset(card)
+            clearLazyCollectionShellOverrideSummaries(sectionBody)
+            await runCollectionGroupReset(btn, sectionBody, { suppressToast: true })
+            setLibrariesButtonPersistentBusy(btn, true, 'Saving...')
+            refreshTemplateOverrideState(sectionBody.closest('.accordion-collapse') || sectionBody)
+            await autosaveActiveLibrary({ quiet: true })
+            if (typeof showToast === 'function') {
+              showToast('info', 'Collections reset to defaults.')
+            }
+          } catch (error) {
+            console.error('[collections reset failed]', error)
+            if (typeof showToast === 'function') {
+              showToast('error', 'Collections reset to defaults failed.')
+            }
+          } finally {
+            const marker = card?.querySelector('input[type="hidden"][name="__reset_collection_defaults"]')
+            if (marker) marker.value = 'false'
+            setLibrariesButtonPersistentBusy(btn, false)
+          }
+          return
+        }
+      }
+
+      if (btn.dataset.collectionParentReset === 'true') {
+        let sectionBody = btn.closest('.accordion-body')
+        if (!sectionBody) {
+          const groupShell = btn.closest('[data-collection-group-shell="true"]')
+          const lazyCollapse = groupShell?.querySelector('[data-collection-group-lazy-collapse="true"]')
+          if (lazyCollapse) {
+            try {
+              setLibrariesButtonPersistentBusy(btn, true)
+              const card = btn.closest('.library-settings-card')
+              const replacement = await loadLazyCollectionGroup(lazyCollapse, card)
+              const resetBtn = replacement?.querySelector('[data-collection-parent-reset="true"]')
+              sectionBody = replacement?.querySelector('.accordion-body')
+              if (sectionBody && resetBtn) {
+                await runCollectionGroupReset(resetBtn, sectionBody)
+                refreshTemplateOverrideState(sectionBody.closest('.accordion-collapse') || sectionBody)
+              }
+            } catch (error) {
+              console.error('[collection parent reset failed]', error)
+              if (typeof showToast === 'function') {
+                showToast('error', 'Collection group reset to defaults failed.')
+              }
+            } finally {
+              setLibrariesButtonPersistentBusy(btn, false)
+            }
+            return
+          }
+          sectionBody = btn.closest('.accordion')?.querySelector(':scope > .accordion-item > .accordion-collapse > .accordion-body')
+        }
+        if (sectionBody) {
+          runCollectionGroupReset(btn, sectionBody).then(() => {
+            refreshTemplateOverrideState(sectionBody.closest('.accordion-collapse') || sectionBody)
+          }).catch(error => {
+            console.error('[collection parent reset failed]', error)
+            if (typeof showToast === 'function') {
+              showToast('error', 'Collection group reset to defaults failed.')
+            }
+          })
+          return
+        }
+      }
+
+      if (btn.dataset.collectionVariableSectionReset === 'true') {
+        const section = btn.closest('[data-collection-variable-section="true"]')
+        const sectionBody = section?.querySelector('.collection-variable-section-body') || section
+        if (sectionBody) {
+          runCollectionGroupReset(btn, sectionBody).then(() => {
+            refreshTemplateOverrideState(section.closest('.template-toggle-group') || section)
+          }).catch(error => {
+            console.error('[collection section reset failed]', error)
+            if (typeof showToast === 'function') {
+              showToast('error', 'Section reset to defaults failed.')
+            }
+          })
+          return
+        }
+      }
+
+      if (btn.dataset.overlayVariableSectionReset === 'true') {
+        const section = btn.closest('[data-overlay-variable-section="true"]')
+        const sectionBody = section?.querySelector('.overlay-variable-section-body') || section
+        if (sectionBody) {
+          runCollectionGroupReset(btn, sectionBody).then(() => {
+            refreshTemplateOverrideState(section.closest('.template-toggle-group') || section)
+          }).catch(error => {
+            console.error('[overlay section reset failed]', error)
+            if (typeof showToast === 'function') {
+              showToast('error', 'Overlay section reset to defaults failed.')
+            }
+          })
+          return
+        }
+      }
+
+      if (btn.dataset.libraryOverrideReset === 'true') {
+        const section = btn.closest('[data-library-override-scope="true"]')
+        const sectionBody = getDirectAccordionBody(section)
+        if (sectionBody) {
+          runCollectionGroupReset(btn, sectionBody).then(() => {
+            refreshTemplateOverrideState(section.closest('.library-settings-card') || section)
+          }).catch(error => {
+            console.error('[library override reset failed]', error)
+            if (typeof showToast === 'function') {
+              showToast('error', 'Section reset to defaults failed.')
+            }
+          })
+          return
+        }
+      }
+
       const group = btn.closest('.template-toggle-group')
       if (group?.dataset?.collectionId) {
         runCollectionGroupReset(btn, group).catch(error => {
@@ -6221,18 +8207,26 @@ function wireOffsetReset (scope) {
         })
         return
       }
-      if (group) {
-        group.dataset.resetting = 'true'
+      setLibrariesButtonPersistentBusy(btn, true, 'Resetting...')
+      await new Promise(resolve => requestAnimationFrame(() => resolve()))
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+      const finishOverlayReset = () => {
+        if (group) {
+          refreshTemplateOverrideState(group)
+          updateAccordionHighlights()
+          if (typeof ValidationHandler !== 'undefined' && typeof ValidationHandler.updateValidationState === 'function') {
+            ValidationHandler.updateValidationState()
+          }
+        }
+        setLibrariesButtonPersistentBusy(btn, false)
       }
-      const changes = []
-      const touched = new Set()
-      const isRatingsOverlay = group?.dataset?.overlayId === 'overlay_ratings'
-      const escapeHtml = (value) => String(value ?? '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;')
+      try {
+        if (group) {
+          group.dataset.resetting = 'true'
+        }
+        const changes = []
+        const touched = new Set()
+        const isRatingsOverlay = group?.dataset?.overlayId === 'overlay_ratings'
       const getInputLabel = (input) => {
         if (!input) return 'Field'
         const describedBy = input.getAttribute('aria-describedby')
@@ -6345,6 +8339,7 @@ function wireOffsetReset (scope) {
           const changed = recordReset(input, defaultValue)
           if (changed) {
             input.value = defaultValue
+            renderLibraryFileEditorForHiddenInput(input)
             input.dispatchEvent(new Event('change', { bubbles: true }))
           }
         }
@@ -6364,7 +8359,10 @@ function wireOffsetReset (scope) {
             if (changed) input.checked = nextChecked
           } else {
             const changed = recordReset(input, defaultValue)
-            if (changed) input.value = defaultValue
+            if (changed) {
+              input.value = defaultValue
+              renderLibraryFileEditorForHiddenInput(input)
+            }
           }
           if (changes.length && touched.has(input)) {
             input.dispatchEvent(new Event('input', { bubbles: true }))
@@ -6405,32 +8403,42 @@ function wireOffsetReset (scope) {
       const finalizeToast = () => {
         if (changes.length && typeof showToast === 'function') {
           const details = changes
-            .map(change => `${escapeHtml(change.label)}: ${escapeHtml(change.from)} → ${escapeHtml(change.to)}`)
-            .join('<br>')
-          showToast('info', `Reset to defaults:<br>${details}`)
+            .map(change => `${change.label}: ${change.from} -> ${change.to}`)
+            .join('\n')
+          showToast('info', `Reset to defaults:\n${details}`)
         } else if (!changes.length && typeof showToast === 'function') {
           showToast('info', 'Already at defaults (no changes).')
         }
       }
 
-      if (isRatingsOverlay && group) {
-        group.dataset.ratingFontForce = 'true'
-        const ratingImageInputs = group.querySelectorAll('[name$="[rating1_image]"], [name$="[rating2_image]"], [name$="[rating3_image]"]')
-        ratingImageInputs.forEach(input => {
-          input.dispatchEvent(new Event('change', { bubbles: true }))
-        })
-        window.setTimeout(() => {
-          ratingFontInputs.forEach(input => {
-            const from = ratingFontBefore.get(input) || ''
-            const to = getDisplayValue(input)
-            if (from !== to) {
-              changes.push({ label: getInputLabel(input), from, to })
-            }
+        if (isRatingsOverlay && group) {
+          group.dataset.ratingFontForce = 'true'
+          const ratingImageInputs = group.querySelectorAll('[name$="[rating1_image]"], [name$="[rating2_image]"], [name$="[rating3_image]"]')
+          ratingImageInputs.forEach(input => {
+            input.dispatchEvent(new Event('change', { bubbles: true }))
           })
+          window.setTimeout(() => {
+            ratingFontInputs.forEach(input => {
+              const from = ratingFontBefore.get(input) || ''
+              const to = getDisplayValue(input)
+              if (from !== to) {
+                changes.push({ label: getInputLabel(input), from, to })
+              }
+            })
+            finalizeToast()
+            finishOverlayReset()
+          }, 0)
+        } else {
           finalizeToast()
-        }, 0)
-      } else {
-        finalizeToast()
+          finishOverlayReset()
+        }
+      } catch (error) {
+        console.error('[overlay reset failed]', error)
+        if (group) delete group.dataset.resetting
+        if (typeof showToast === 'function') {
+          showToast('error', 'Reset to defaults failed.')
+        }
+        finishOverlayReset()
       }
     })
     btn.dataset.listenerAdded = 'true'
@@ -6470,23 +8478,9 @@ function setupParentChildToggleVisibility (scope) {
         }
       })
       let parentChecked = parentToggle.checked
-      const wasChecked = parentToggle.dataset.wasChecked === 'true'
 
       if (!parentChecked) {
-        childrenToggles.forEach(child => {
-          child.dataset.lastChecked = child.checked ? 'true' : 'false'
-          child.checked = false
-          syncChildHidden(child)
-        })
-      } else if (parentChecked && !wasChecked) {
-        childrenToggles.forEach(child => {
-          if (child.dataset.lastChecked !== undefined) {
-            child.checked = child.dataset.lastChecked === 'true'
-          } else {
-            child.checked = child.dataset.initialChecked === 'true'
-          }
-          syncChildHidden(child)
-        })
+        childrenToggles.forEach(child => syncChildHidden(child))
       } else {
         childrenToggles.forEach(child => syncChildHidden(child))
       }
@@ -6540,7 +8534,7 @@ function setupParentChildToggleVisibility (scope) {
         wrapper.classList.remove('template-toggle-group-bordered')
       }
 
-      EventHandler.updateAccordionHighlights()
+      updateAccordionHighlights()
       ValidationHandler.updateValidationState()
       parentToggle.dataset.wasChecked = parentChecked ? 'true' : 'false'
     }
@@ -6967,6 +8961,7 @@ function wireRatingsOffsetSync (scope) {
     if (metricInputs.backPadding) metricInputs.backPadding.addEventListener('change', refreshDerivedOffsets)
 
     updateAdjustedIndicators()
+    refreshTemplateOverrideState(group)
     group.dataset.ratingsOffsetSyncBound = 'true'
   })
 }
@@ -7038,9 +9033,20 @@ function setupAddMissingDependencies (scope) {
   })
 }
 
-function wireOverlayDetailToggles (scope) {
+function setDetailSectionExpanded (section, toggle, expanded) {
+  if (!section) return
+  section.style.display = expanded ? 'block' : 'none'
+  section.dataset.detailVisible = expanded ? 'true' : 'false'
+  if (!toggle) return
+  const showLabel = String(toggle.dataset.showLabel || 'Show Details')
+  const hideLabel = String(toggle.dataset.hideLabel || 'Hide Details')
+  toggle.textContent = expanded ? hideLabel : showLabel
+  toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false')
+}
+
+function wireDetailToggles (selector, scope) {
   const root = scope || document
-  root.querySelectorAll('.overlay-details-toggle').forEach(btn => {
+  root.querySelectorAll(selector).forEach(btn => {
     if (btn.dataset.listenerAdded === 'true') return
     const targetId = btn.dataset.sectionId
     const section = targetId ? document.getElementById(targetId) : null
@@ -7048,14 +9054,653 @@ function wireOverlayDetailToggles (scope) {
 
     btn.addEventListener('click', () => {
       const isHidden = section.style.display === 'none'
-      section.style.display = isHidden ? 'block' : 'none'
-      btn.textContent = isHidden ? 'Hide Details' : 'Show Details'
-      if (typeof EventHandler !== 'undefined') {
-        EventHandler.updateAccordionHighlights()
-      }
+      setDetailSectionExpanded(section, btn, isHidden)
+      updateAccordionHighlights()
     })
 
+    const defaultOpen = section.dataset.detailVisible === 'true' || section.dataset.defaultOpen === 'true'
+    setDetailSectionExpanded(section, btn, defaultOpen)
     btn.dataset.listenerAdded = 'true'
+  })
+}
+
+function wireOverlayDetailToggles (scope) {
+  wireDetailToggles('.overlay-details-toggle', scope)
+}
+
+function wireOverlayVariableSectionToggles (scope) {
+  wireDetailToggles('.overlay-variable-section-toggle', scope)
+}
+
+function wireCollectionDetailToggles (scope) {
+  wireDetailToggles('.collection-details-toggle', scope)
+}
+
+function wireCollectionVariableSectionToggles (scope) {
+  wireDetailToggles('.collection-variable-section-toggle', scope)
+}
+
+function parseCollectionSectionStoredStringList (rawValue) {
+  const raw = String(rawValue || '').trim()
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed)) {
+      return parsed.map(item => String(item).trim()).filter(Boolean)
+    }
+  } catch {
+    // fall back to single-value handling
+  }
+  return [raw]
+}
+
+function parseCollectionSectionStoredMapping (rawValue) {
+  const raw = String(rawValue || '').trim()
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed
+    }
+  } catch {
+    // fall through to empty mapping
+  }
+  return {}
+}
+
+function normalizeScheduleOverrideValue (rawValue) {
+  const raw = String(rawValue || '').trim().toLowerCase()
+  if (!raw) return ''
+  const normalizeMonthDay = value => {
+    const match = String(value || '').trim().match(/^0*(\d{1,2})\/0*(\d{1,2})$/)
+    if (!match) return String(value || '').trim().toLowerCase()
+    return `${Number(match[1])}/${Number(match[2])}`
+  }
+  const normalizeDate = value => {
+    const match = String(value || '').trim().match(/^0*(\d{1,2})\/0*(\d{1,2})\/(\d{4})$/)
+    if (!match) return String(value || '').trim().toLowerCase()
+    return `${Number(match[1])}/${Number(match[2])}/${match[3]}`
+  }
+
+  const wrapperMatch = raw.match(/^([a-z_]+)\((.*)\)$/)
+  if (!wrapperMatch) return raw.replace(/\s+/g, '')
+  const mode = wrapperMatch[1]
+  const inner = wrapperMatch[2].trim()
+  if (mode === 'range' && !inner.includes('|')) {
+    const parts = inner.split('-').map(value => value.trim())
+    return `range(${normalizeMonthDay(parts[0])}-${normalizeMonthDay(parts[1])})`
+  }
+  if (mode === 'yearly') return `yearly(${normalizeMonthDay(inner)})`
+  if (mode === 'date') return `date(${normalizeDate(inner)})`
+  if (mode === 'weekly') {
+    return `weekly(${inner.split('|').map(value => value.trim().toLowerCase()).filter(Boolean).join('|')})`
+  }
+  return `${mode}(${inner.replace(/\s+/g, '')})`
+}
+
+function isInternalTemplateMetadataField (field) {
+  if (!field) return false
+  const name = String(field.name || '').trim()
+  return field.dataset?.skipOverrideCount === 'true' ||
+    field.dataset?.skipYaml === 'true' ||
+    field.dataset?.templateMetadata === 'lookup-labels' ||
+    name.includes('-library_service_') ||
+    name.endsWith('_hidden') ||
+    name.endsWith('__lookup_labels')
+}
+
+function isCollectionSectionFieldConfigured (fields) {
+  const enabledFields = Array.from(fields || []).filter(field => field && !field.disabled && !isInternalTemplateMetadataField(field))
+  if (!enabledFields.length) return false
+
+  const visibleFields = enabledFields.filter(field => field.type !== 'hidden')
+  const checkboxField = visibleFields.find(field => field.type === 'checkbox')
+  if (checkboxField) {
+    const defaultRaw = String(checkboxField.dataset.default || '').trim().toLowerCase()
+    const currentChecked = checkboxField.checked
+    if (defaultRaw) {
+      const normalizedValue = String(checkboxField.value || 'true').trim().toLowerCase()
+      const defaultChecked = defaultRaw === 'true' || defaultRaw === normalizedValue
+      return currentChecked !== defaultChecked
+    }
+    return currentChecked
+  }
+
+  const radioFields = visibleFields.filter(field => field.type === 'radio')
+  if (radioFields.length) {
+    return radioFields.some(field => field.checked)
+  }
+
+  const primaryField = visibleFields[0] || enabledFields[0]
+  if (!primaryField) return false
+
+  if (String(primaryField.name || '').endsWith('-attribute_asset_directory')) {
+    return visibleFields.some(field => String(field.value ?? '').trim())
+  }
+
+  if (primaryField.closest('[data-template-string-list]')) {
+    const values = parseCollectionSectionStoredStringList(primaryField.value)
+    const defaults = parseCollectionSectionStoredStringList(primaryField.dataset.default || '[]')
+    return JSON.stringify(values) !== JSON.stringify(defaults)
+  }
+
+  if (primaryField.closest('[data-template-mapping-list]')) {
+    const values = parseCollectionSectionStoredMapping(primaryField.value)
+    const defaults = parseCollectionSectionStoredMapping(primaryField.dataset.default || '{}')
+    return JSON.stringify(values) !== JSON.stringify(defaults)
+  }
+
+  const value = String(primaryField.value ?? '').trim()
+  const defaultValue = String(primaryField.dataset.default || '').trim()
+  if (primaryField.closest('[data-schedule-builder]')) {
+    return normalizeScheduleOverrideValue(value) !== normalizeScheduleOverrideValue(defaultValue)
+  }
+  if (!value) return false
+  return defaultValue ? value !== defaultValue : true
+}
+
+function formatTemplateOverrideCount (count) {
+  return count === 1 ? '1 override' : `${count} overrides`
+}
+
+function isTrueDatasetValue (value) {
+  return String(value || '').trim().toLowerCase() === 'true'
+}
+
+function checkboxCheckedDiffersFromDefault (field) {
+  if (!field || (field.type !== 'checkbox' && field.type !== 'radio')) return false
+  const defaultRaw = String(field.dataset?.default || '').trim().toLowerCase()
+  if (!defaultRaw) return field.checked
+  const normalizedValue = String(field.value || 'true').trim().toLowerCase()
+  const defaultChecked = defaultRaw === 'true' || defaultRaw === normalizedValue
+  return field.checked !== defaultChecked
+}
+
+function isTemplateGroupActiveForSignal (group) {
+  if (!group) return false
+  const toggle = group.querySelector('input[type="checkbox"][data-template-group], input[type="radio"][data-template-group], .overlay-toggle')
+  if (!toggle) return false
+  return checkboxCheckedDiffersFromDefault(toggle)
+}
+
+function getLazyElementSignalCount (element) {
+  return Number(element?.dataset?.lazyOverrideCount || '0') || 0
+}
+
+function getLazyElementHasSignal (element) {
+  return getLazyElementSignalCount(element) > 0 || isTrueDatasetValue(element?.dataset?.lazyActive)
+}
+
+function setOverrideSummaryBadge (badge, count) {
+  if (!badge) return
+  badge.textContent = count > 0 ? formatTemplateOverrideCount(count) : ''
+  badge.classList.toggle('d-none', count <= 0)
+}
+
+function findTemplateVariableFieldRow (field) {
+  if (!field) return null
+  return field.closest(
+    '[data-playlist-files-editor], ' +
+    '[data-collection-files-editor], ' +
+    '[data-metadata-files-editor], ' +
+    '[data-overlay-files-editor], ' +
+    '[data-playlist-key-toggle-group], ' +
+    '[data-playlist-user-picker], ' +
+    '[data-template-string-list], ' +
+    '[data-template-mapping-list], ' +
+    '[data-overlay-language-weight-builder], ' +
+    '[data-collection-field-wrapper], ' +
+    '.rgba-group, ' +
+    '.font-row, ' +
+    '.input-group'
+  )
+}
+
+function updateTemplateVariableFieldOverrideStates (body, fieldsByName) {
+  if (!body) return
+  clearTemplateVariableFieldOverrideStates(body)
+
+  fieldsByName.forEach(fields => {
+    if (!isCollectionSectionFieldConfigured(fields)) return
+    fields.forEach(field => {
+      if (isInternalTemplateMetadataField(field)) return
+      const row = findTemplateVariableFieldRow(field)
+      if (!row) return
+      row.classList.add('template-variable-field-has-override')
+      row.dataset.templateVariableFieldOverride = 'true'
+    })
+  })
+}
+
+function clearTemplateVariableFieldOverrideStates (scope) {
+  if (!scope) return
+  const rows = []
+  if (scope.classList?.contains('template-variable-field-has-override')) {
+    rows.push(scope)
+  }
+  scope.querySelectorAll?.('.template-variable-field-has-override').forEach(row => {
+    rows.push(row)
+  })
+  rows.forEach(row => {
+    row.classList.remove('template-variable-field-has-override')
+    row.removeAttribute('data-template-variable-field-override')
+  })
+}
+
+function getOrCreateTemplateOverrideBadge (group) {
+  if (!group) return null
+  let badge = group.querySelector('[data-template-group-override-summary]')
+  if (badge) return badge
+
+  badge = document.createElement('span')
+  badge.className = 'small template-override-summary ms-2 d-none'
+  badge.dataset.templateGroupOverrideSummary = 'true'
+
+  const target = group.querySelector('.overlay-toggle-row') || group.querySelector('.form-check > .d-flex') || group.querySelector('.form-check')
+  target?.appendChild(badge)
+  return badge
+}
+
+function getOrCreateAccordionOverrideBadge (header) {
+  if (!header) return null
+  let badge = header.querySelector('[data-accordion-override-summary]')
+  if (badge) return badge
+
+  const button = header.querySelector('.accordion-button')
+  if (!button) return null
+
+  badge = document.createElement('span')
+  badge.className = 'small accordion-override-summary ms-3 d-none'
+  badge.dataset.accordionOverrideSummary = 'true'
+  button.appendChild(badge)
+  return badge
+}
+
+function updateAncestorOverrideSummaries (element) {
+  let collapse = element?.closest('.accordion-collapse')
+  const seen = new Set()
+
+  while (collapse && !seen.has(collapse)) {
+    seen.add(collapse)
+    const accordionItem = collapse.closest('.accordion-item')
+    const header = accordionItem?.querySelector('.accordion-header')
+    const count = getAccordionCollapseOverrideCount(collapse)
+    const hasSignal = getAccordionCollapseHasActiveSignal(collapse)
+
+    accordionItem?.classList.toggle('template-variable-section-has-overrides', hasSignal)
+    header?.classList.toggle('template-variable-section-has-overrides', hasSignal)
+    setOverrideSummaryBadge(getOrCreateAccordionOverrideBadge(header), count)
+
+    collapse = accordionItem?.parentElement?.closest('.accordion-collapse')
+  }
+  updateLibraryAggregateOverrideSummaries(element?.closest('.library-settings-card'))
+}
+
+function updateLazySectionOverrideSummaries (scope) {
+  const root = scope || document
+  root.querySelectorAll?.('[data-library-lazy-section][data-lazy-override-count]').forEach(placeholder => {
+    const count = getLazyElementSignalCount(placeholder)
+    const hasSignal = getLazyElementHasSignal(placeholder)
+    const collapse = placeholder.closest('.accordion-collapse')
+    const item = collapse?.closest('.accordion-item')
+    const header = item?.querySelector(':scope > .accordion-header') || item?.querySelector('.accordion-header')
+
+    item?.classList.toggle('template-variable-section-has-overrides', hasSignal)
+    header?.classList.toggle('template-variable-section-has-overrides', hasSignal)
+    setOverrideSummaryBadge(getOrCreateAccordionOverrideBadge(header), count)
+  })
+  root.querySelectorAll?.('[data-collection-group-lazy-collapse][data-lazy-override-count]').forEach(collapse => {
+    const count = getLazyElementSignalCount(collapse)
+    const hasSignal = getLazyElementHasSignal(collapse)
+    const item = collapse.closest('.accordion-item')
+    const header = item?.querySelector(':scope > .accordion-header') || item?.querySelector('.accordion-header')
+
+    item?.classList.toggle('template-variable-section-has-overrides', hasSignal)
+    header?.classList.toggle('template-variable-section-has-overrides', hasSignal)
+    setOverrideSummaryBadge(getOrCreateAccordionOverrideBadge(header), count)
+  })
+}
+
+function clearLazyCollectionShellOverrideSummaries (scope) {
+  const root = scope || document
+  root.querySelectorAll?.('[data-collection-group-lazy-collapse][data-lazy-override-count]').forEach(collapse => {
+    collapse.dataset.lazyOverrideCount = '0'
+    collapse.dataset.lazyActive = 'false'
+    const item = collapse.closest('.accordion-item')
+    const header = item?.querySelector(':scope > .accordion-header') || item?.querySelector('.accordion-header')
+
+    item?.classList.remove('template-variable-section-has-overrides')
+    header?.classList.remove('template-variable-section-has-overrides')
+    setOverrideSummaryBadge(getOrCreateAccordionOverrideBadge(header), 0)
+  })
+}
+
+function isOverlayTemplateGroupActiveForCounts (group) {
+  const toggle = group?.querySelector('.overlay-toggle')
+  return !toggle || toggle.checked
+}
+
+function getDirectChildAccordionItems (collapse) {
+  return Array.from(collapse?.querySelectorAll?.(':scope > .accordion-body > .accordion > .accordion-item') || [])
+}
+
+function getAccordionCollapseOverrideCount (collapse) {
+  const explicitCount = Number(collapse?.dataset?.overrideCount || '')
+  if (Number.isFinite(explicitCount) && explicitCount > 0) return explicitCount
+
+  const lazyCount = Number(collapse?.querySelector?.('[data-library-lazy-section][data-lazy-override-count]')?.dataset?.lazyOverrideCount || '')
+  if (Number.isFinite(lazyCount) && lazyCount > 0) return lazyCount
+
+  const lazyGroupCount = Number(collapse?.dataset?.lazyOverrideCount || '')
+  if (collapse?.dataset?.collectionGroupLazyCollapse === 'true' && Number.isFinite(lazyGroupCount) && lazyGroupCount > 0) return lazyGroupCount
+
+  const childItems = getDirectChildAccordionItems(collapse)
+  if (childItems.length) {
+    return childItems.reduce((total, item) => total + getAccordionItemOverrideCount(item), 0)
+  }
+
+  return Array.from(collapse?.querySelectorAll?.('.template-toggle-group') || []).reduce((total, group) => {
+    if (!isOverlayTemplateGroupActiveForCounts(group)) return total
+    return total + (Number(group.dataset.overrideCount || '0') || 0)
+  }, 0)
+}
+
+function getAccordionCollapseHasActiveSignal (collapse) {
+  if (!collapse) return false
+  if (getAccordionCollapseOverrideCount(collapse) > 0) return true
+  const lazyPlaceholder = collapse.querySelector?.('[data-library-lazy-section][data-lazy-active="true"]')
+  if (lazyPlaceholder) return true
+  if (collapse.dataset?.collectionGroupLazyCollapse === 'true' && isTrueDatasetValue(collapse.dataset.lazyActive)) return true
+  return Array.from(collapse.querySelectorAll?.('.template-toggle-group') || []).some(group => {
+    return isOverlayTemplateGroupActiveForCounts(group) && isTemplateGroupActiveForSignal(group)
+  })
+}
+
+function getAccordionItemOverrideCount (item) {
+  if (!item) return 0
+  const collapse = Array.from(item.children).find(child => child.classList?.contains('accordion-collapse'))
+  return getAccordionCollapseOverrideCount(collapse)
+}
+
+function getLibrarySectionOverrideTotal (card, advanced) {
+  if (!card) return 0
+  const accordion = card.querySelector('.accordion')
+  const items = Array.from(accordion?.children || []).filter(item => item.classList?.contains('accordion-item'))
+  return items.reduce((total, item) => {
+    const isAdvanced = item.classList.contains('library-advanced-section')
+    if (advanced !== isAdvanced) return total
+    return total + getAccordionItemOverrideCount(item)
+  }, 0)
+}
+
+function getLibraryCardOverrideTotal (card) {
+  if (!card) return 0
+  return getLibrarySectionOverrideTotal(card, false) + getLibrarySectionOverrideTotal(card, true)
+}
+
+function syncDirectLibraryAccordionOverrideSignals (card) {
+  if (!card) return
+  const accordion = card.querySelector('.accordion')
+  const items = Array.from(accordion?.children || []).filter(item => item.classList?.contains('accordion-item'))
+  items.forEach(item => {
+    const collapse = Array.from(item.children).find(child => child.classList?.contains('accordion-collapse'))
+    const header = Array.from(item.children).find(child => child.classList?.contains('accordion-header')) || item.querySelector(':scope > .accordion-header')
+    const count = getAccordionCollapseOverrideCount(collapse)
+    const hasSignal = getAccordionCollapseHasActiveSignal(collapse)
+    item.classList.toggle('template-variable-section-has-overrides', hasSignal)
+    header?.classList.toggle('template-variable-section-has-overrides', hasSignal)
+    setOverrideSummaryBadge(getOrCreateAccordionOverrideBadge(header), count)
+  })
+}
+
+function getLibraryCardHasConfigurationSignal (card) {
+  if (!card) return false
+  if (getLibraryCardOverrideTotal(card) > 0) return true
+  if (card.querySelector('.template-variable-section-has-overrides, .template-variable-field-has-override')) return true
+  if (card.querySelector('[data-library-lazy-section][data-lazy-active="true"], [data-collection-group-lazy-collapse][data-lazy-active="true"]')) return true
+  return Array.from(card.querySelectorAll('[data-library-lazy-section][data-lazy-override-count], [data-collection-group-lazy-collapse][data-lazy-override-count]')).some(element => {
+    const count = Number(element.dataset.lazyOverrideCount || '0') || 0
+    return count > 0
+  })
+}
+
+function updateLibraryAggregateOverrideSummaries (card) {
+  if (!card) return
+  syncDirectLibraryAccordionOverrideSignals(card)
+  const coreCount = getLibrarySectionOverrideTotal(card, false)
+  const advancedCount = getLibrarySectionOverrideTotal(card, true)
+  setOverrideSummaryBadge(card.querySelector('[data-library-core-summary]'), coreCount)
+  setOverrideSummaryBadge(card.querySelector('[data-library-advanced-summary]'), advancedCount)
+  setOverrideSummaryBadge(card.querySelector('[data-library-total-summary]'), getLibraryCardOverrideTotal(card))
+}
+
+function updateTemplateGroupOverrideSummary (section) {
+  const group = section?.closest('.template-toggle-group')
+  if (!group) return
+
+  const sections = group.querySelectorAll('[data-collection-variable-section="true"], [data-overlay-variable-section="true"]')
+  const count = isOverlayTemplateGroupActiveForCounts(group)
+    ? Array.from(sections).reduce((total, item) => {
+        return total + (Number(item.dataset.overrideCount || '0') || 0)
+      }, 0)
+    : 0
+
+  group.dataset.overrideCount = String(count)
+  group.classList.toggle('template-variable-section-has-overrides', count > 0 || isTemplateGroupActiveForSignal(group))
+  setOverrideSummaryBadge(getOrCreateTemplateOverrideBadge(group), count)
+  updateAncestorOverrideSummaries(group)
+}
+
+function refreshTemplateOverrideState (scope) {
+  const root = scope || document
+  clearTemplateVariableFieldOverrideStates(root)
+  updateLazySectionOverrideSummaries(root)
+  root.querySelectorAll('[data-collection-variable-section="true"]').forEach(section => {
+    updateCollectionVariableSectionSummary(section)
+  })
+  root.querySelectorAll('[data-overlay-variable-section="true"]').forEach(section => {
+    updateOverlayVariableSectionSummary(section)
+  })
+  getLibraryOverrideScopes(root).forEach(section => {
+    updateLibraryOverrideScopeSummary(section)
+  })
+  root.querySelectorAll?.('.library-settings-card').forEach(card => {
+    updateLibraryAggregateOverrideSummaries(card)
+  })
+  if (root.matches?.('.library-settings-card')) {
+    updateLibraryAggregateOverrideSummaries(root)
+  }
+}
+
+window.QSLibraryValidation = {
+  hasConfiguredSignal: getLibraryCardHasConfigurationSignal,
+  refreshSummaries: refreshTemplateOverrideState
+}
+
+function getLibraryOverrideScopes (root) {
+  if (!root) return []
+  const scopes = []
+  if (root.matches?.('[data-library-override-scope="true"]')) {
+    scopes.push(root)
+  }
+  root.querySelectorAll?.('[data-library-override-scope="true"]').forEach(section => {
+    scopes.push(section)
+  })
+  return scopes
+}
+
+function getDirectAccordionHeader (scope) {
+  const item = scope?.closest('.accordion-item')
+  if (!item) return null
+  return Array.from(item.children).find(child => child.classList?.contains('accordion-header')) || item.querySelector(':scope > .accordion-header')
+}
+
+function getDirectAccordionBody (scope) {
+  if (!scope) return null
+  return Array.from(scope.children).find(child => child.classList?.contains('accordion-body')) || scope.querySelector(':scope > .accordion-body') || scope
+}
+
+function getLibraryOverrideScopeFields (scope) {
+  const body = getDirectAccordionBody(scope)
+  const fieldsByName = new Map()
+  if (!body) return fieldsByName
+  body.querySelectorAll('[name]').forEach(field => {
+    if (!field || field.disabled) return
+    if (isInternalTemplateMetadataField(field)) return
+    const name = String(field.name || '').trim()
+    if (!name) return
+    if (!fieldsByName.has(name)) fieldsByName.set(name, [])
+    fieldsByName.get(name).push(field)
+  })
+  return fieldsByName
+}
+
+function ensureLibraryOverrideResetButton (scope) {
+  const body = getDirectAccordionBody(scope)
+  if (!body || body.dataset.libraryOverrideResetPrepared === 'true') return
+  const label = scope.dataset.libraryOverrideLabel || getDirectAccordionHeader(scope)?.textContent?.trim() || 'Section'
+  const actions = document.createElement('div')
+  actions.className = 'd-flex justify-content-end mb-2'
+  actions.dataset.libraryOverrideResetActions = 'true'
+  actions.innerHTML = `
+    <button type="button" class="btn btn-outline-secondary btn-sm reset-offset-btn" data-library-override-reset="true">
+      Reset ${label}
+    </button>
+  `
+  body.prepend(actions)
+  body.dataset.libraryOverrideResetPrepared = 'true'
+}
+
+function updateLibraryOverrideScopeSummary (scope) {
+  if (!scope) return
+  const fieldsByName = getLibraryOverrideScopeFields(scope)
+  let configuredCount = 0
+  fieldsByName.forEach(fields => {
+    if (isCollectionSectionFieldConfigured(fields)) configuredCount += 1
+  })
+
+  const body = getDirectAccordionBody(scope)
+  updateTemplateVariableFieldOverrideStates(body, fieldsByName)
+
+  scope.dataset.overrideCount = String(configuredCount)
+  const item = scope.closest('.accordion-item')
+  const header = getDirectAccordionHeader(scope)
+  item?.classList.toggle('template-variable-section-has-overrides', configuredCount > 0)
+  header?.classList.toggle('template-variable-section-has-overrides', configuredCount > 0)
+  setOverrideSummaryBadge(getOrCreateAccordionOverrideBadge(header), configuredCount)
+  updateLibraryAggregateOverrideSummaries(scope.closest('.library-settings-card'))
+}
+
+function wireLibraryOverrideScopes (scope) {
+  const root = scope || document
+  getLibraryOverrideScopes(root).forEach(section => {
+    if (section.dataset.libraryOverrideScopeBound === 'true') return
+    ensureLibraryOverrideResetButton(section)
+    const refresh = () => updateLibraryOverrideScopeSummary(section)
+    section.addEventListener('input', refresh)
+    section.addEventListener('change', refresh)
+    refresh()
+    section.dataset.libraryOverrideScopeBound = 'true'
+  })
+}
+
+function updateCollectionVariableSectionSummary (section) {
+  if (!section) return
+  const summary = section.querySelector('[data-collection-section-summary]')
+  const body = section.querySelector('.collection-variable-section-body')
+  if (!summary || !body) return
+
+  const fieldsByName = new Map()
+  body.querySelectorAll('[name]').forEach(field => {
+    if (!field || field.disabled) return
+    if (isInternalTemplateMetadataField(field)) return
+    const name = String(field.name || '').trim()
+    if (!name) return
+    if (!fieldsByName.has(name)) fieldsByName.set(name, [])
+    fieldsByName.get(name).push(field)
+  })
+
+  let configuredCount = 0
+  fieldsByName.forEach(fields => {
+    if (isCollectionSectionFieldConfigured(fields)) configuredCount += 1
+  })
+
+  updateTemplateVariableFieldOverrideStates(body, fieldsByName)
+
+  summary.textContent = configuredCount === 0
+    ? 'Defaults'
+    : configuredCount === 1
+      ? '1 override'
+      : `${configuredCount} overrides`
+  section.classList.toggle('template-variable-section-has-overrides', configuredCount > 0)
+  section.dataset.overrideCount = String(configuredCount)
+  updateTemplateGroupOverrideSummary(section)
+}
+
+function updateOverlayVariableSectionSummary (section) {
+  if (!section) return
+  const summary = section.querySelector('[data-overlay-section-summary]')
+  const body = section.querySelector('.overlay-variable-section-body')
+  if (!summary || !body) return
+  const group = section.closest('.template-toggle-group')
+  const activeGroup = isOverlayTemplateGroupActiveForCounts(group)
+
+  const fieldsByName = new Map()
+  body.querySelectorAll('[name]').forEach(field => {
+    if (!field || field.disabled) return
+    if (isInternalTemplateMetadataField(field)) return
+    const name = String(field.name || '').trim()
+    if (!name) return
+    if (!fieldsByName.has(name)) fieldsByName.set(name, [])
+    fieldsByName.get(name).push(field)
+  })
+
+  let configuredCount = 0
+  if (activeGroup) {
+    fieldsByName.forEach(fields => {
+      if (isCollectionSectionFieldConfigured(fields)) configuredCount += 1
+    })
+  }
+
+  if (activeGroup) {
+    updateTemplateVariableFieldOverrideStates(body, fieldsByName)
+  }
+
+  summary.textContent = configuredCount === 0
+    ? 'Defaults'
+    : configuredCount === 1
+      ? '1 override'
+      : `${configuredCount} overrides`
+  section.classList.toggle('template-variable-section-has-overrides', configuredCount > 0)
+  section.dataset.overrideCount = String(configuredCount)
+  updateTemplateGroupOverrideSummary(section)
+}
+
+function wireOverlayVariableSections (scope) {
+  const root = scope || document
+  root.querySelectorAll('[data-overlay-variable-section="true"]').forEach(section => {
+    if (section.dataset.summaryBound === 'true') return
+
+    const refresh = () => updateOverlayVariableSectionSummary(section)
+    section.addEventListener('input', refresh)
+    section.addEventListener('change', refresh)
+    refresh()
+
+    section.dataset.summaryBound = 'true'
+  })
+}
+
+function wireCollectionVariableSections (scope) {
+  const root = scope || document
+  root.querySelectorAll('[data-collection-variable-section="true"]').forEach(section => {
+    if (section.dataset.summaryBound === 'true') return
+
+    const refresh = () => updateCollectionVariableSectionSummary(section)
+    section.addEventListener('input', refresh)
+    section.addEventListener('change', refresh)
+    refresh()
+
+    section.dataset.summaryBound = 'true'
   })
 }
 
@@ -7073,6 +9718,20 @@ function wireOverlayTemplateSections (scope) {
   if (typeof setupParentChildToggleSync === 'function') {
     setupParentChildToggleSync()
   }
+}
+
+function wireCollectionTemplateSections (scope) {
+  const root = scope || document
+  root.querySelectorAll('.template-toggle-group[data-collection-config="true"]').forEach(group => {
+    if (group.dataset.collectionTemplateBound === 'true') return
+    const parentToggle = group.querySelector('[data-template-group]')
+    if (!parentToggle) return
+    parentToggle.addEventListener('change', function () {
+      toggleCollectionTemplateSection(this)
+    })
+    toggleCollectionTemplateSection(parentToggle)
+    group.dataset.collectionTemplateBound = 'true'
+  })
 }
 
 function showZoomPreviewModal (imageSrc) {

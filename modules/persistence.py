@@ -4,6 +4,7 @@ import secrets
 import json
 import datetime
 import copy
+import re
 
 from flask import current_app as app
 from flask import has_request_context, session
@@ -25,6 +26,29 @@ TRANSIENT_FORM_FIELDS = {
     "newConfigName",
     "importMode",
 }
+
+KOMETA_INSTALL_SELECTION_FIELDS = (
+    "install_mode",
+    "existing_root",
+    "external_config_root",
+    "external_log_root",
+)
+
+
+def _normalize_plex_db_cache_value(value):
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return ""
+    match = re.search(r"\d+", text)
+    if match:
+        return int(match.group(0))
+    return value
 
 
 def _get_iso_reference_lists():
@@ -105,12 +129,19 @@ def retrieve_settings_for_config(config_name, target):
 def apply_validation_metadata(stored_data, status, reason=None, details=None, updated_at=None):
     if not isinstance(stored_data, dict):
         stored_data = {}
+    timestamp = updated_at or helpers.utc_now_iso()
     stored_data["validation_status"] = status
-    if reason is not None:
-        stored_data["validation_reason"] = reason
-    if details is not None:
-        stored_data["validation_details"] = details
-    stored_data["validation_updated_at"] = updated_at or helpers.utc_now_iso()
+    stored_data["validation_updated_at"] = timestamp
+    if status == "validated":
+        stored_data["validated"] = True
+        stored_data["validated_at"] = timestamp
+        stored_data.pop("validation_reason", None)
+        stored_data.pop("validation_details", None)
+    else:
+        if reason is not None:
+            stored_data["validation_reason"] = reason
+        if details is not None:
+            stored_data["validation_details"] = details
     return stored_data
 
 
@@ -152,6 +183,9 @@ def clean_form_data(form_data):
             clean_data[key] = None
 
         elif isinstance(value, str):
+            if key == "plex_db_cache":
+                clean_data[key] = _normalize_plex_db_cache_value(value)
+                continue
             if key.endswith("template_overlay_runtimes[text]") and value == "":
                 clean_data[key] = ""
                 continue
@@ -197,6 +231,40 @@ def clean_form_data(form_data):
     return clean_data
 
 
+def _preserve_kometa_install_selection(data, clean_data):
+    if not isinstance(data, dict):
+        return data
+    incoming_section = data.get("kometa")
+    if not isinstance(incoming_section, dict):
+        return data
+
+    # The Start page owns these fields through /save-kometa-install-mode.
+    # Generic Kometa-page saves often contain only final-page controls, so they
+    # must not reset an existing/external install back to the managed default.
+    if any(field in clean_data or field in incoming_section for field in KOMETA_INSTALL_SELECTION_FIELDS):
+        return data
+
+    try:
+        _validated, _user_entered, stored_payload = database.retrieve_section_data(session["config_name"], "kometa")
+    except Exception:
+        return data
+
+    stored_section = stored_payload.get("kometa", {}) if isinstance(stored_payload, dict) else {}
+    if not isinstance(stored_section, dict):
+        return data
+
+    preserved = {field: stored_section.get(field) for field in KOMETA_INSTALL_SELECTION_FIELDS if field in stored_section}
+    if not preserved:
+        return data
+
+    merged_section = dict(incoming_section)
+    for field, value in preserved.items():
+        if value is not None:
+            merged_section[field] = value
+    data["kometa"] = merged_section
+    return data
+
+
 def save_settings(raw_source, form_data):
     # Extract the source and source_name
     source, source_name = extract_names(raw_source)
@@ -238,6 +306,8 @@ def save_settings(raw_source, form_data):
         helpers.ts_log(f"Cleaned asset_directory: {clean_data['asset_directory']}", level="DEBUG")
 
     data = helpers.build_config_dict(source_name, clean_data)
+    if source_name == "kometa":
+        data = _preserve_kometa_install_selection(data, clean_data)
 
     if app.config["QS_DEBUG"]:
         helpers.ts_log(f"Final data structure to save: {data}", level="DEBUG")
@@ -258,26 +328,43 @@ def save_settings(raw_source, form_data):
             def _library_prefix(key):
                 if not isinstance(key, str) or not key.startswith(("mov-library_", "sho-library_")):
                     return None
-                if "-template_" in key:
-                    return key.split("-template_", 1)[0]
-                if "-attribute_" in key:
-                    return key.split("-attribute_", 1)[0]
-                if "-collection_" in key:
-                    return key.split("-collection_", 1)[0]
-                if "-overlay_" in key:
-                    return key.split("-overlay_", 1)[0]
-                if "-top_level_" in key:
-                    return key.split("-top_level_", 1)[0]
+                for marker in (
+                    "-movie-template_",
+                    "-show-template_",
+                    "-season-template_",
+                    "-episode-template_",
+                    "-movie-overlay_",
+                    "-show-overlay_",
+                    "-season-overlay_",
+                    "-episode-overlay_",
+                    "-template_",
+                    "-attribute_",
+                    "-collection_",
+                    "-overlay_",
+                    "-top_level_",
+                    "-library_service_",
+                ):
+                    if marker in key:
+                        return key.split(marker, 1)[0]
                 if key.endswith("-library"):
                     return key[: -len("-library")]
+                for suffix in ("-playlist", "-collection_files", "-metadata_files", "-overlay_files"):
+                    if key.endswith(suffix):
+                        return key[: -len(suffix)]
                 return None
 
             # Identify library prefixes present in this payload (e.g., mov-library_xxx, sho-library_yyy)
             prefixes = set()
-            for key in incoming_libraries:
+            for key, value in incoming_libraries.items():
                 prefix = _library_prefix(key)
-                if prefix:
-                    prefixes.add(prefix)
+                if not prefix:
+                    continue
+                # Lazy library cards can leave disabled/hidden false toggles in
+                # form payloads. A false include/playlist toggle alone is not
+                # enough evidence that this prefix was intentionally submitted.
+                if key in (f"{prefix}-library", f"{prefix}-playlist") and value in [None, False, "", "false"]:
+                    continue
+                prefixes.add(prefix)
 
             # Remove existing entries for the affected prefixes so we can replace them cleanly
             for prefix in prefixes:
@@ -461,6 +548,11 @@ def retrieve_settings(target):
             if isinstance(auth, dict) and "force_refresh" in auth and "force_refresh" not in section:
                 section["force_refresh"] = auth.pop("force_refresh")
             section.setdefault("force_refresh", False)
+
+    if source_name == "plex":
+        section = data[source_name]
+        if isinstance(section, dict) and "db_cache" in section:
+            section["db_cache"] = _normalize_plex_db_cache_value(section.get("db_cache"))
 
     # Only modify if the target is 'libraries'
     if source_name == "libraries":
