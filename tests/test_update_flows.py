@@ -1,9 +1,182 @@
 import io
+import shutil
 import zipfile
+from pathlib import Path
 
 import requests
 
 from modules import helpers
+from modules.helpers import _qs_update, _version
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE_TEMPLATE_PATH = ROOT / "templates" / "000-base.html"
+BASE_JS_PATH = ROOT / "static" / "local-js" / "000-base.js"
+
+
+class _RemoteResult:
+    def __init__(self, stdout):
+        self.stdout = stdout
+
+
+class _HttpResponse:
+    def __init__(self, text="", exc=None):
+        self.text = text
+        self.exc = exc
+
+    def raise_for_status(self):
+        if self.exc:
+            raise self.exc
+
+
+def test_quickstart_update_remote_prefers_official_remote(monkeypatch):
+    monkeypatch.setattr(_qs_update, "_run_git_remote", lambda *_args, **_kwargs: _RemoteResult("origin\nkometa-team\n"))
+
+    assert helpers.get_quickstart_update_remote() == "kometa-team"
+
+
+def test_quickstart_update_remote_falls_back_to_origin(monkeypatch):
+    monkeypatch.setattr(_qs_update, "_run_git_remote", lambda *_args, **_kwargs: _RemoteResult("origin\nfork\n"))
+
+    assert helpers.get_quickstart_update_remote() == "origin"
+
+
+def test_quickstart_update_command_matches_backend_update_flow():
+    command = helpers.build_quickstart_update_command("fix/plex-section-id-library-identity", remote="kometa-team")
+
+    assert command == (
+        "git fetch kometa-team --prune && "
+        "git switch -C fix/plex-section-id-library-identity --track kometa-team/fix/plex-section-id-library-identity && "
+        "git reset --hard kometa-team/fix/plex-section-id-library-identity && "
+        "python -m pip install --upgrade pip && "
+        "python -m pip install --no-cache-dir --upgrade -r requirements.txt"
+    )
+
+
+def test_quickstart_update_alert_uses_shared_update_command_contract():
+    template = BASE_TEMPLATE_PATH.read_text(encoding="utf-8")
+    script = BASE_JS_PATH.read_text(encoding="utf-8")
+
+    assert "{{ version_info.update_command }}" in template
+    assert 'qs_update_status == "build_pending"' in template
+    assert "info?.update_command" in script
+    assert "isQuickstartBuildPending" in script
+    assert "window.QS_renderQuickstartUpdateAlert = renderQuickstartUpdateAlert" in script
+    assert "git checkout ${branch}" not in script
+    assert "git fetch && git checkout {{ version_info.branch }}" not in template
+
+
+def test_develop_remote_version_is_unknown_when_buildnum_is_unavailable(monkeypatch):
+    def fake_get(url, **_kwargs):
+        if url.endswith("/VERSION"):
+            return _HttpResponse("0.10.6")
+        if url.endswith("/BUILDNUM"):
+            return _HttpResponse(exc=requests.RequestException("not published yet"))
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr(_version.requests, "get", fake_get)
+
+    assert helpers.get_remote_version("develop") is None
+    status = helpers.get_remote_version_status("develop")
+    assert status["status"] == "build_pending"
+    assert status["base_version"] == "0.10.6"
+    assert status["version"] is None
+
+
+def test_quickstart_update_ignores_lower_remote_develop_build(monkeypatch):
+    _qs_update._QS_UPDATE_CACHE.clear()
+    monkeypatch.setattr(_version, "get_branch", lambda: "develop")
+    monkeypatch.setattr(
+        _version,
+        "get_remote_version_status",
+        lambda _branch: {
+            "version": "0.10.6-build0",
+            "base_version": "0.10.6",
+            "buildnum": "0",
+            "status": "ok",
+            "message": "",
+        },
+    )
+    monkeypatch.setattr(_qs_update, "get_version", lambda _branch: "0.10.6-build29")
+    monkeypatch.setattr(_qs_update, "get_quickstart_update_remote", lambda *_args, **_kwargs: "origin")
+
+    info = _qs_update.check_for_update()
+
+    assert info["local_version"] == "0.10.6-build29"
+    assert info["remote_version"] == "0.10.6-build0"
+    assert info["update_available"] is False
+
+
+def test_quickstart_update_detects_higher_remote_develop_build(monkeypatch):
+    _qs_update._QS_UPDATE_CACHE.clear()
+    monkeypatch.setattr(_version, "get_branch", lambda: "develop")
+    monkeypatch.setattr(
+        _version,
+        "get_remote_version_status",
+        lambda _branch: {
+            "version": "0.10.6-build30",
+            "base_version": "0.10.6",
+            "buildnum": "30",
+            "status": "ok",
+            "message": "",
+        },
+    )
+    monkeypatch.setattr(_qs_update, "get_version", lambda _branch: "0.10.6-build29")
+    monkeypatch.setattr(_qs_update, "get_quickstart_update_remote", lambda *_args, **_kwargs: "origin")
+
+    info = _qs_update.check_for_update()
+
+    assert info["remote_version"] == "0.10.6-build30"
+    assert info["update_available"] is True
+
+
+def test_quickstart_update_ignores_develop_release_baseline_build_zero(monkeypatch):
+    _qs_update._QS_UPDATE_CACHE.clear()
+    monkeypatch.setattr(_version, "get_branch", lambda: "develop")
+    monkeypatch.setattr(
+        _version,
+        "get_remote_version_status",
+        lambda _branch: {
+            "version": "0.10.8-build0",
+            "base_version": "0.10.8",
+            "buildnum": "0",
+            "status": "ok",
+            "message": "",
+        },
+    )
+    monkeypatch.setattr(_qs_update, "get_version", lambda _branch: "0.10.7-build0")
+    monkeypatch.setattr(_qs_update, "get_quickstart_update_remote", lambda *_args, **_kwargs: "origin")
+
+    info = _qs_update.check_for_update()
+
+    assert info["remote_version"] == "0.10.8-build0"
+    assert info["remote_buildnum"] == "0"
+    assert info["update_available"] is False
+
+
+def test_quickstart_update_reports_pending_develop_build(monkeypatch):
+    _qs_update._QS_UPDATE_CACHE.clear()
+    monkeypatch.setattr(_version, "get_branch", lambda: "develop")
+    monkeypatch.setattr(
+        _version,
+        "get_remote_version_status",
+        lambda _branch: {
+            "version": None,
+            "base_version": "0.10.6",
+            "buildnum": None,
+            "status": "build_pending",
+            "message": "Quickstart build metadata is still publishing. Try again in a few minutes.",
+        },
+    )
+    monkeypatch.setattr(_qs_update, "get_version", lambda _branch: "0.10.6-build29")
+    monkeypatch.setattr(_qs_update, "get_quickstart_update_remote", lambda *_args, **_kwargs: "origin")
+
+    info = _qs_update.check_for_update()
+
+    assert info["remote_version"] is None
+    assert info["remote_base_version"] == "0.10.6"
+    assert info["update_available"] is False
+    assert info["update_check_status"] == "build_pending"
+    assert "publishing" in info["update_message"]
 
 
 def test_cached_kometa_update_reuses_lookup(tmp_path, monkeypatch):
@@ -11,7 +184,7 @@ def test_cached_kometa_update_reuses_lookup(tmp_path, monkeypatch):
     root.mkdir()
     (root / "VERSION").write_text("1.2.3", encoding="utf-8")
     (root / ".kometa_sha").write_text("localsha", encoding="utf-8")
-    (root / ".kometa_branch").write_text("nightly", encoding="utf-8")
+    (root / ".kometa_branch").write_text("develop", encoding="utf-8")
 
     helpers.invalidate_cached_kometa_update(root)
 
@@ -69,7 +242,7 @@ def test_check_quickstart_update_refreshes_cached_version(client, monkeypatch, q
         "local_version": "0.0.1",
         "remote_version": "9.9.9",
         "branch": "develop",
-        "kometa_branch": "nightly",
+        "kometa_branch": "develop",
         "update_available": True,
         "running_on": "Local-Windows",
         "file_ext": "",
@@ -169,7 +342,7 @@ def test_check_kometa_update_installed_uses_cached_lookup(client, isolated_confi
             "remote_version": "1.0.1",
             "update_available": True,
             "cached": True,
-            "branch": "nightly",
+            "branch": "develop",
         },
     )
 
@@ -237,8 +410,8 @@ def test_check_kometa_update_branch_override_uses_selected_branch(client, isolat
         captured["branch_override"] = branch_override
         return {
             "local_version": "1.0.0",
-            "local_branch": "nightly",
-            "local_sha": "abc123nightly",
+            "local_branch": "develop",
+            "local_sha": "abc123develop",
             "remote_version": "1.1.0-develop5",
             "remote_sha": "def456develop",
             "update_available": True,
@@ -313,7 +486,7 @@ def test_update_kometa_branch_override_uses_selected_branch(client, monkeypatch,
     monkeypatch.setattr(helpers, "detect_git_branch", lambda *_: "master", raising=False)
     captured = {"branch": None}
 
-    def fake_update(_config_root, branch="nightly", force=False, logs=None):
+    def fake_update(_config_root, branch="develop", force=False, logs=None):
         captured["branch"] = branch
         return {"success": True, "log": ["ok"], "up_to_date": False}
 
@@ -450,7 +623,7 @@ def test_get_upstream_sha_non_200(monkeypatch):
 
     monkeypatch.setattr(helpers.requests, "get", lambda *_args, **_kwargs: _Resp())
     logs = []
-    sha = helpers._get_upstream_sha("nightly", logs)
+    sha = helpers._get_upstream_sha("develop", logs)
     assert sha is None
     assert any("Resolving upstream SHA from:" in line for line in logs)
     assert any("GitHub API" in line for line in logs)
@@ -462,9 +635,9 @@ def test_download_zip_timeout(monkeypatch):
 
     monkeypatch.setattr(helpers.requests, "get", raise_timeout)
     logs = []
-    data = helpers._download_zip("nightly", logs)
+    data = helpers._download_zip("develop", logs)
     assert data is None
-    assert any("Downloading nightly.zip from:" in line for line in logs)
+    assert any("Downloading develop.zip from:" in line for line in logs)
     assert any("Exception during ZIP download" in line for line in logs)
 
 
@@ -531,7 +704,7 @@ def test_perform_kometa_update_zip_only_writes_branch_metadata(tmp_path, monkeyp
     kometa_dir = config_root / "kometa"
     kometa_dir.mkdir(parents=True, exist_ok=True)
 
-    def fake_perform_update(config_root, branch="nightly", force=False, logs=None):
+    def fake_perform_update(config_root, branch="develop", force=False, logs=None):
         from pathlib import Path
 
         kd = Path(config_root) / "kometa"
@@ -555,4 +728,44 @@ def test_perform_kometa_update_zip_only_writes_branch_metadata(tmp_path, monkeyp
     result = helpers.perform_kometa_update_zip_only(config_root, branch="develop", force=False)
     assert result["success"] is True
     assert (kometa_dir / ".kometa_sha").read_text(encoding="utf-8").strip() == "sha123"
+    assert (kometa_dir / ".kometa_branch").read_text(encoding="utf-8").strip() == "develop"
+
+
+def test_pip_install_requires_git_for_git_based_requirements(tmp_path, monkeypatch):
+    kometa_dir = tmp_path / "kometa"
+    kometa_dir.mkdir(parents=True, exist_ok=True)
+    requirements_txt = kometa_dir / "requirements.txt"
+    requirements_txt.write_text(
+        "requests==2.34.2\ngit+https://github.com/Velocidensity/serializd-py.git\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(shutil, "which", lambda tool: None if tool == "git" else "/usr/bin/python")
+    logs = []
+
+    from modules.helpers._zip_update import _pip_install
+
+    result = _pip_install(kometa_dir / "python", kometa_dir, logs)
+
+    assert result is False
+    assert any("Required tool not found: git" in line for line in logs)
+    assert any("Git is required to install Git-based dependencies" in line for line in logs)
+
+
+def test_kometa_branch_normalization_migrates_nightly():
+    assert helpers.normalize_kometa_branch_override("nightly") == "develop"
+
+
+def test_up_to_date_kometa_update_migrates_branch_metadata(tmp_path, monkeypatch):
+    config_root = tmp_path / "config"
+    kometa_dir = config_root / "kometa"
+    kometa_dir.mkdir(parents=True)
+    (kometa_dir / ".kometa_sha").write_text("same-sha", encoding="utf-8")
+    (kometa_dir / ".kometa_branch").write_text("nightly", encoding="utf-8")
+    monkeypatch.setattr("modules.helpers._zip_update._get_upstream_sha", lambda *_args: "same-sha")
+
+    result = helpers.perform_kometa_update_zip_only(config_root, branch="develop")
+
+    assert result["success"] is True
+    assert result["skipped"] is True
     assert (kometa_dir / ".kometa_branch").read_text(encoding="utf-8").strip() == "develop"

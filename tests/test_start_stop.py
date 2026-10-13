@@ -1,4 +1,104 @@
+import os
 import time
+
+
+def test_tail_log_stats_count_exact_level_markers(client, tmp_path, monkeypatch, qs_module):
+    log_dir = tmp_path / "kometa" / "config" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "meta.log").write_text(
+        "\n".join(
+            [
+                "loaded from cache",
+                "[CACHE] direct marker",
+                "DEBUG plain",
+                "[INFO] bracketed",
+                "[WARNING] marked warning",
+                "ERROR plain",
+                "[CRITICAL] marked critical",
+                "[TRACE] should not count as a trace marker",
+                "Traceback (most recent call last):",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    qs_module.LOG_STATS_CACHE.clear()
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_log_dir", lambda: log_dir)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_pid", lambda: None)
+
+    resp = client.get("/tail-log?size=all&stats=1")
+
+    assert resp.status_code == 200
+    stats = resp.get_json()["stats"]
+    assert stats["total_lines"] == 9
+    assert stats["cache"] == 2
+    assert stats["debug"] == 0
+    assert stats["info"] == 1
+    assert stats["warning"] == 1
+    assert stats["error"] == 0
+    assert stats["critical"] == 1
+    assert stats["trace"] == 1
+
+
+def test_tail_log_size_reads_only_requested_tail(client, tmp_path, monkeypatch, qs_module):
+    log_dir = tmp_path / "kometa" / "config" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "meta.log").write_text("".join(f"line {idx}\n" for idx in range(1, 51)), encoding="utf-8")
+    qs_module.LOG_STATS_CACHE.clear()
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_log_dir", lambda: log_dir)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_pid", lambda: None)
+
+    resp = client.get("/tail-log?size=5")
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["log"].splitlines() == ["line 46", "line 47", "line 48", "line 49", "line 50"]
+    assert payload["log_is_previous_run"] is True
+
+
+def test_tail_log_returns_queued_without_reading_old_meta_log(client, tmp_path, monkeypatch, qs_module):
+    kometa_root = tmp_path / "kometa"
+    log_dir = kometa_root / "config" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "meta.log").write_text("old completed run\n", encoding="utf-8")
+
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_root_path", lambda: kometa_root)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_log_dir", lambda: log_dir)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_pid", lambda: None)
+    monkeypatch.setattr(qs_module, "_find_running_kometa_process", lambda: None)
+
+    qs_module._set_pending_kometa_start("python kometa.py --times 07:00", "demo", start_mode="current")
+    try:
+        resp = client.get("/tail-log?size=all")
+    finally:
+        qs_module._clear_pending_kometa_start()
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["status"] == "queued"
+    assert payload["pending_start"] is True
+    assert payload["log"] == ""
+
+
+def test_tail_log_waits_for_fresh_log_when_running_log_is_stale(client, tmp_path, monkeypatch, qs_module):
+    log_dir = tmp_path / "kometa" / "config" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "meta.log"
+    log_path.write_text("previous run content\n", encoding="utf-8")
+    started_at = time.time()
+    os.utime(log_path, (started_at - 120, started_at - 120))
+
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_log_dir", lambda: log_dir)
+    monkeypatch.setattr(qs_module, "_peek_pending_kometa_start", lambda: None)
+    monkeypatch.setattr(qs_module, "_get_active_kometa_started_at_ts", lambda: started_at)
+
+    resp = client.get("/tail-log?size=all")
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["status"] == "waiting_for_log"
+    assert payload["log"] == ""
+    assert payload["log_is_stale"] is True
 
 
 def test_start_kometa_queues_during_maintenance(client, monkeypatch, qs_module):
@@ -16,6 +116,9 @@ def test_start_kometa_queues_during_maintenance(client, monkeypatch, qs_module):
     data = resp.get_json()
     assert data["status"] == "queued"
     assert data["maintenance_window"] == "01:00-02:00"
+    assert data["queued_start_local"]
+    assert data["scheduled_run_local"]
+    assert data["uses_default_schedule_time"] is True
     assert qs_module._peek_pending_kometa_start() is not None
 
     qs_module._clear_pending_kometa_start()
@@ -36,11 +139,129 @@ def test_start_kometa_queues_during_maintenance_preserves_start_mode(client, mon
     data = resp.get_json()
     assert data["status"] == "queued"
     assert data["start_mode"] == "recovery"
+    assert data["queued_start_local"]
     pending = qs_module._peek_pending_kometa_start()
     assert pending is not None
     assert pending["start_mode"] == "recovery"
 
     qs_module._clear_pending_kometa_start()
+
+
+def test_kometa_status_keeps_pending_start_queued_without_ingesting(client, monkeypatch, qs_module):
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_pid", lambda: None)
+    monkeypatch.setattr(qs_module, "_find_running_kometa_process", lambda: None)
+    monkeypatch.setattr(qs_module, "_get_maintenance_window_live", lambda: (60, 120, "01:00-02:00"))
+    ingest_calls = []
+    monkeypatch.setattr(qs_module, "_start_logscan_live_ingest", lambda tool: ingest_calls.append(tool) or True)
+
+    with qs_module.RUN_CONTEXT_LOCK:
+        qs_module.RUN_CONTEXT["command"] = "python kometa.py --times 07:00"
+        qs_module.RUN_CONTEXT["start_mode"] = "current"
+
+    qs_module._set_pending_kometa_start("python kometa.py --times 07:00", "demo", start_mode="current")
+    try:
+        resp = client.get("/kometa-status")
+        with qs_module.RUN_CONTEXT_LOCK:
+            command_after_status = qs_module.RUN_CONTEXT["command"]
+    finally:
+        qs_module._clear_pending_kometa_start()
+        qs_module._clear_run_context()
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["status"] == "queued"
+    assert data["pending_start"] is True
+    assert data["pending_command"] == "python kometa.py --times 07:00"
+    assert data["queued_start_local"]
+    assert data["scheduled_run_local"]
+    assert data["schedule_times"] == ["07:00"]
+    assert ingest_calls == []
+    assert command_after_status == "python kometa.py --times 07:00"
+
+
+def test_kometa_status_starts_visible_live_log_ingest_when_not_running(client, monkeypatch, qs_module):
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_pid", lambda: None)
+    monkeypatch.setattr(qs_module, "_find_running_kometa_process", lambda: None)
+    monkeypatch.setattr(qs_module, "_get_maintenance_window_live", lambda: (60, 120, "01:00-02:00"))
+    ingest_calls = []
+    monkeypatch.setattr(qs_module, "_start_logscan_live_ingest", lambda tool: ingest_calls.append(tool) or True)
+
+    with qs_module.RUN_CONTEXT_LOCK:
+        qs_module.RUN_CONTEXT["command"] = "python kometa.py --config config.yml"
+        qs_module.RUN_CONTEXT["start_mode"] = "current"
+
+    resp = client.get("/kometa-status")
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["status"] == "not started"
+    assert ingest_calls == ["kometa"]
+    with qs_module.RUN_CONTEXT_LOCK:
+        assert qs_module.RUN_CONTEXT["command"] is None
+
+
+def test_start_kometa_blocks_times_inside_maintenance(client, monkeypatch, qs_module):
+    monkeypatch.setattr(qs_module.helpers, "is_kometa_running", lambda: False)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_pid", lambda: None)
+    monkeypatch.setattr(qs_module, "_find_running_kometa_process", lambda: None)
+    monkeypatch.setattr(qs_module.helpers, "is_imagemaid_running", lambda: False)
+    monkeypatch.setattr(qs_module.helpers, "get_imagemaid_pid", lambda: None)
+    monkeypatch.setattr(qs_module, "_find_running_imagemaid_process", lambda: None)
+    monkeypatch.setattr(qs_module, "_get_maintenance_window_live", lambda: (240, 360, "04:00-06:00"))
+    monkeypatch.setattr(qs_module, "_is_within_maintenance_window", lambda *_: False)
+
+    resp = client.post("/start-kometa", json={"command": 'python kometa.py --times "05:00|17:00"'})
+
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert data["status"] == "blocked"
+    assert data["blocked_by"] == "maintenance_schedule"
+    assert data["schedule_conflict"]["times"] == ["05:00"]
+    assert "05:00" in data["error"]
+
+
+def test_start_kometa_blocks_default_schedule_inside_maintenance(client, monkeypatch, qs_module):
+    monkeypatch.setattr(qs_module.helpers, "is_kometa_running", lambda: False)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_pid", lambda: None)
+    monkeypatch.setattr(qs_module, "_find_running_kometa_process", lambda: None)
+    monkeypatch.setattr(qs_module.helpers, "is_imagemaid_running", lambda: False)
+    monkeypatch.setattr(qs_module.helpers, "get_imagemaid_pid", lambda: None)
+    monkeypatch.setattr(qs_module, "_find_running_imagemaid_process", lambda: None)
+    monkeypatch.setattr(qs_module, "_get_maintenance_window_live", lambda: (240, 360, "04:00-06:00"))
+    monkeypatch.setattr(qs_module, "_is_within_maintenance_window", lambda *_: False)
+
+    resp = client.post("/start-kometa", json={"command": "python kometa.py --config config.yml"})
+
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert data["status"] == "blocked"
+    assert data["blocked_by"] == "maintenance_schedule"
+    assert data["schedule_conflict"]["uses_default_schedule_time"] is True
+    assert data["schedule_conflict"]["times"] == ["05:00"]
+    assert "default scheduled time 05:00" in data["error"]
+
+
+def test_start_kometa_queues_run_inside_active_maintenance(client, monkeypatch, qs_module):
+    monkeypatch.setattr(qs_module.helpers, "is_kometa_running", lambda: False)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_pid", lambda: None)
+    monkeypatch.setattr(qs_module, "_find_running_kometa_process", lambda: None)
+    monkeypatch.setattr(qs_module.helpers, "is_imagemaid_running", lambda: False)
+    monkeypatch.setattr(qs_module.helpers, "get_imagemaid_pid", lambda: None)
+    monkeypatch.setattr(qs_module, "_find_running_imagemaid_process", lambda: None)
+    monkeypatch.setattr(qs_module, "_get_maintenance_window_live", lambda: (60, 120, "01:00-02:00"))
+    monkeypatch.setattr(qs_module, "_is_within_maintenance_window", lambda *_: True)
+
+    resp = client.post("/start-kometa", json={"command": "python kometa.py --run"})
+
+    try:
+        assert resp.status_code == 202
+        data = resp.get_json()
+        assert data["status"] == "queued"
+        assert data["schedule_times"] == []
+        assert data["scheduled_run_local"] is None
+        assert data["queued_start_local"]
+    finally:
+        qs_module._clear_pending_kometa_start()
 
 
 def test_start_kometa_starts_outside_maintenance(client, monkeypatch, qs_module):
@@ -151,6 +372,148 @@ def test_kometa_status_includes_active_command_and_start_mode(client, monkeypatc
     assert data["disk_write_mb"] == 128.2
     assert data["disk_read_rate_mb_s"] == 12.5
     assert data["disk_write_rate_mb_s"] == 3.75
+
+
+def test_kometa_status_reports_scheduled_waiting_after_finished_times_run(client, tmp_path, monkeypatch, qs_module):
+    log_dir = tmp_path / "kometa" / "config" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "meta.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[2026-09-12 07:42:41,000] [kometa.py:730] [INFO]     |================================== Mapping Movies Library ===================================|",
+                "[2026-09-12 07:42:47,627] [kometa.py:874] [INFO]     |                                            Finished 07:42 Run                                            |",
+                "[2026-09-12 07:42:47,627] [kometa.py:874] [INFO]     |   Start Time: 07:42:41 2026-09-12     Finished: 07:42:47 2026-09-12     Run Time: 0:00:06   |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    started_at_ts = time.time() - 120
+    os.utime(log_path, (time.time(), time.time()))
+
+    monkeypatch.setattr(qs_module, "_peek_pending_kometa_start", lambda: None)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_log_dir", lambda: log_dir)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_pid", lambda: 4321)
+    monkeypatch.setattr(qs_module, "_calculate_process_cpu_percent", lambda proc: 0.0)
+    monkeypatch.setattr(qs_module, "_calculate_system_cpu_percent", lambda: 0.0)
+    monkeypatch.setattr(qs_module, "_calculate_process_io_stats", lambda proc, cache_name: {})
+
+    class _FakeMemInfo:
+        rss = 64 * 1024 * 1024
+
+    class _FakeVM:
+        total = 8 * 1024 * 1024 * 1024
+        available = 6 * 1024 * 1024 * 1024
+        percent = 25.0
+
+    class _FakeProc:
+        pid = 4321
+
+        def is_running(self):
+            return True
+
+        def status(self):
+            return qs_module.psutil.STATUS_SLEEPING
+
+        def cmdline(self):
+            return ["python", "kometa.py", "--times", "05:00"]
+
+        def create_time(self):
+            return started_at_ts
+
+        def memory_info(self):
+            return _FakeMemInfo()
+
+        def children(self, recursive=True):
+            return []
+
+    monkeypatch.setattr(qs_module.psutil, "Process", lambda pid: _FakeProc())
+    monkeypatch.setattr(qs_module.psutil, "virtual_memory", lambda: _FakeVM())
+
+    with qs_module.RUN_CONTEXT_LOCK:
+        qs_module.RUN_CONTEXT["command"] = 'python kometa.py --times "07:42|07:44" --config config.yml'
+        qs_module.RUN_CONTEXT["start_mode"] = "current"
+
+    try:
+        resp = client.get("/kometa-status")
+    finally:
+        qs_module._clear_run_context()
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["status"] == "scheduled_waiting"
+    assert data["scheduled_waiting"] is True
+    assert data["active_command"] == 'python kometa.py --times "07:42|07:44" --config config.yml'
+    assert data["schedule_times"] == ["07:42", "07:44"]
+    assert data["scheduled_run_local"] == "2026-09-12 07:44 AM"
+    assert "waiting for the next scheduled time" in data["message"]
+
+
+def test_kometa_status_reports_scheduled_waiting_before_fresh_log(client, tmp_path, monkeypatch, qs_module):
+    log_dir = tmp_path / "kometa" / "config" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "meta.log"
+    log_path.write_text("previous run content\n", encoding="utf-8")
+    started_at_ts = time.time()
+    os.utime(log_path, (started_at_ts - 120, started_at_ts - 120))
+
+    monkeypatch.setattr(qs_module, "_peek_pending_kometa_start", lambda: None)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_log_dir", lambda: log_dir)
+    monkeypatch.setattr(qs_module.helpers, "get_kometa_pid", lambda: 4321)
+    monkeypatch.setattr(qs_module, "_calculate_process_cpu_percent", lambda proc: 0.0)
+    monkeypatch.setattr(qs_module, "_calculate_system_cpu_percent", lambda: 0.0)
+    monkeypatch.setattr(qs_module, "_calculate_process_io_stats", lambda proc, cache_name: {})
+
+    class _FakeMemInfo:
+        rss = 64 * 1024 * 1024
+
+    class _FakeVM:
+        total = 8 * 1024 * 1024 * 1024
+        available = 6 * 1024 * 1024 * 1024
+        percent = 25.0
+
+    class _FakeProc:
+        pid = 4321
+
+        def is_running(self):
+            return True
+
+        def status(self):
+            return qs_module.psutil.STATUS_SLEEPING
+
+        def cmdline(self):
+            return ["python", "kometa.py", "--times", "09:02|09:04"]
+
+        def create_time(self):
+            return started_at_ts
+
+        def memory_info(self):
+            return _FakeMemInfo()
+
+        def children(self, recursive=True):
+            return []
+
+    monkeypatch.setattr(qs_module.psutil, "Process", lambda pid: _FakeProc())
+    monkeypatch.setattr(qs_module.psutil, "virtual_memory", lambda: _FakeVM())
+
+    with qs_module.RUN_CONTEXT_LOCK:
+        qs_module.RUN_CONTEXT["command"] = 'python kometa.py --times "09:02|09:04" --config config.yml'
+        qs_module.RUN_CONTEXT["start_mode"] = "current"
+
+    try:
+        resp = client.get("/kometa-status")
+    finally:
+        qs_module._clear_run_context()
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["status"] == "scheduled_waiting"
+    assert data["scheduled_waiting"] is True
+    assert data["scheduled_waiting_reason"] == "waiting_for_log"
+    assert data["active_command"] == 'python kometa.py --times "09:02|09:04" --config config.yml'
+    assert data["schedule_times"] == ["09:02", "09:04"]
+    assert data["scheduled_run_local"]
+    assert "fresh meta.log" in data["message"]
 
 
 def test_imagemaid_status_clears_stale_run_context_when_not_running(client, monkeypatch, qs_module):
@@ -376,7 +739,7 @@ def test_launch_kometa_command_sets_branch_name_from_local_branch_metadata(tmp_p
     venv_dir.mkdir(parents=True, exist_ok=True)
     (kometa_root / "kometa.py").write_text("print('kometa')\n", encoding="utf-8")
     (venv_dir / ("python.exe" if is_win else "python3")).write_text("", encoding="utf-8")
-    (kometa_root / ".kometa_branch").write_text("nightly", encoding="utf-8")
+    (kometa_root / ".kometa_branch").write_text("develop", encoding="utf-8")
     pid_file = tmp_path / "kometa.pid"
     config_path = kometa_root / "config" / "config.yml"
     popen_calls = {}
@@ -407,7 +770,7 @@ def test_launch_kometa_command_sets_branch_name_from_local_branch_metadata(tmp_p
     assert pid_file.read_text(encoding="utf-8") == "4321"
     assert popen_calls["cwd"] == str(kometa_root)
     assert popen_calls["start_new_session"] is True
-    assert popen_calls["env"]["BRANCH_NAME"] == "nightly"
+    assert popen_calls["env"]["BRANCH_NAME"] == "develop"
 
 
 def test_launch_kometa_command_clears_inherited_branch_name_without_local_metadata(tmp_path, monkeypatch, qs_module):
@@ -1322,3 +1685,17 @@ def test_build_imagemaid_command_parts_only_adds_supported_optional_flags(tmp_pa
 
     assert "--no-verify-ssl" in parts
     assert "--overlays-only" in parts
+
+
+def test_nightly_kometa_runtime_branch_is_migrated_to_develop(tmp_path, monkeypatch):
+    from modules.process_lifecycle import _build_kometa_runtime_env
+
+    kometa_root = tmp_path / "kometa"
+    kometa_root.mkdir()
+    (kometa_root / ".kometa_branch").write_text("nightly", encoding="utf-8")
+    monkeypatch.setenv("BRANCH_NAME", "nightly")
+
+    env, branch = _build_kometa_runtime_env(kometa_root)
+
+    assert branch == "develop"
+    assert env["BRANCH_NAME"] == "develop"

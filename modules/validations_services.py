@@ -50,6 +50,7 @@ are consistent.
 from __future__ import annotations
 
 import re
+import json
 from html import unescape
 from json import JSONDecodeError
 
@@ -121,13 +122,13 @@ def validate_plex_server(data):
 
         # Retrieve library sections once. This can be expensive on large Plex servers.
         sections = plex.library.sections()
-        music_libraries = [section.title for section in sections if section.type == "artist"]
-        movie_libraries = [section.title for section in sections if section.type == "movie"]
-        show_libraries = [section.title for section in sections if section.type == "show"]
+        music_libraries = [{"id": section.key, "name": section.title} for section in sections if section.type == "artist"]
+        movie_libraries = [{"id": section.key, "name": section.title} for section in sections if section.type == "movie"]
+        show_libraries = [{"id": section.key, "name": section.title} for section in sections if section.type == "show"]
 
-        helpers.ts_log(f"Music libraries: {music_libraries}", level="INFO")
-        helpers.ts_log(f"Movie libraries: {movie_libraries}", level="INFO")
-        helpers.ts_log(f"Show libraries: {show_libraries}", level="INFO")
+        helpers.ts_log(f"Music libraries: {[lib['name'] for lib in music_libraries]}", level="INFO")
+        helpers.ts_log(f"Movie libraries: {[lib['name'] for lib in movie_libraries]}", level="INFO")
+        helpers.ts_log(f"Show libraries: {[lib['name'] for lib in show_libraries]}", level="INFO")
 
     except Exception as e:
         helpers.ts_log(f"Error validating Plex server: {str(e)}", level="ERROR")
@@ -721,6 +722,79 @@ def validate_mdblist_server(data):
         return jsonify({"valid": True, "message": "API key is valid!"})
     else:
         return jsonify({"valid": False, "message": "Invalid API key"})
+
+
+def validate_serializd_server(data):
+    email = str(data.get("serializd_email") or "").strip()
+    password = str(data.get("serializd_password") or "").strip()
+    try:
+        timeout = int(data.get("serializd_timeout") or 60)
+    except (TypeError, ValueError):
+        return jsonify({"valid": False, "error": "Serializd timeout must be a positive whole number."}), 400
+
+    if not email:
+        return jsonify({"valid": False, "error": "Serializd email is required."}), 400
+    if not password:
+        return jsonify({"valid": False, "error": "Serializd password is required."}), 400
+    if timeout < 1:
+        return jsonify({"valid": False, "error": "Serializd timeout must be a positive whole number."}), 400
+
+    try:
+        response = requests.post(
+            "https://serializd.onrender.com/api/login",
+            data=json.dumps({"email": email, "password": password}),
+            headers={
+                "Origin": "https://www.serializd.com",
+                "Referer": "https://www.serializd.com",
+                "X-Requested-With": "serializd_vercel",
+            },
+            timeout=timeout,
+        )
+        if response.ok:
+            payload = response.json()
+            if payload.get("token") and payload.get("username"):
+                return jsonify({"valid": True, "message": f"Serializd credentials are valid for {payload['username']}."})
+        return jsonify({"valid": False, "error": "Serializd email or password is invalid."}), 400
+    except (requests.RequestException, ValueError) as exc:
+        helpers.ts_log(f"Error validating Serializd credentials: {exc}", level="ERROR")
+        return jsonify({"valid": False, "error": f"Serializd connection error: {exc}"}), 400
+
+
+def validate_floppy_server(data):
+    floppy_url = str(data.get("floppy_url") or "").strip()
+    floppy_token = str(data.get("floppy_token") or "").strip()
+    require_token = helpers.booler(data.get("floppy_require_token", False))
+
+    ok, msg = _validate_service_url(floppy_url, "Floppy", allow_local=True)
+    if not ok:
+        return jsonify({"valid": False, "error": msg}), 400
+    if require_token and not floppy_token:
+        return jsonify({"valid": False, "error": "A Floppy API token is required by the selected ratings features."}), 400
+
+    floppy_url = floppy_url.rstrip("/")
+    try:
+        headers = {"X-API-Key": floppy_token} if floppy_token else None
+        response = requests.get(
+            f"{floppy_url}/api/v1/lists",
+            headers=headers,
+            params={"limit": 1},
+            timeout=10,
+        )
+        if response.status_code == 401:
+            message = "Floppy API token is invalid." if floppy_token else "Floppy requires an API token for this server."
+            return jsonify({"valid": False, "error": message}), 400
+        if response.status_code == 403:
+            return jsonify({"valid": False, "error": "Floppy API access was denied."}), 400
+        if response.status_code == 404:
+            return jsonify({"valid": False, "error": "Floppy API endpoint was not found."}), 400
+        response.raise_for_status()
+        response.json()
+        if floppy_token:
+            return jsonify({"valid": True, "message": "Floppy authenticated connection validated."})
+        return jsonify({"valid": True, "message": "Floppy public-list connection validated."})
+    except (requests.RequestException, ValueError) as exc:
+        helpers.ts_log(f"Error validating Floppy connection: {exc}", level="ERROR")
+        return jsonify({"valid": False, "error": f"Floppy connection error: {exc}"}), 400
 
 
 # ---------------------------------------------------------------------------

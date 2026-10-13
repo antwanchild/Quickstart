@@ -97,6 +97,27 @@ def test_prepare_import_payload_maps_playlist_files_to_library_toggles():
     assert any("libraries.Movies.playlist_files" in line for line in report.lines)
 
 
+def test_prepare_import_payload_matches_playlist_library_names_with_edge_spaces():
+    payload, report = importer.prepare_import_payload(
+        {
+            "libraries": {"  Movies ": {}},
+            "playlist_files": [
+                {
+                    "default": "playlist",
+                    "template_variables": {"libraries": ["  Movies "]},
+                }
+            ],
+        },
+        {"  Movies "},
+        set(),
+    )
+
+    libraries = payload["libraries"]["libraries"]
+    assert libraries["mov-library_movies-library"] == "  Movies "
+    assert libraries["mov-library_movies-playlist"] == "true"
+    assert any("libraries.  Movies .playlist_files" in line for line in report.lines)
+
+
 def test_prepare_import_payload_accepts_comma_separated_playlist_libraries():
     payload, report = importer.prepare_import_payload(
         {
@@ -166,7 +187,6 @@ def test_prepare_import_payload_maps_playlist_template_variables_into_libraries_
     assert libraries["playlist-template_variables[sonarr_add_missing]"] is False
     assert libraries["playlist-template_variables[sonarr_folder]"] == "/data/media/shows"
     assert json.loads(libraries["playlist-template_variables[sonarr_tag]"]) == ["playlist-show"]
-    assert json.loads(libraries["playlist-template_variables[trakt_list]"]) == ["https://trakt.tv/users/example/lists/default"]
     assert json.loads(libraries["playlist-template_variables[name_]"]) == {"mcu": "Marvel Timeline"}
     assert json.loads(libraries["playlist-template_variables[delete_playlist_]"]) == {"mcu": "true"}
     assert json.loads(libraries["playlist-template_variables[radarr_add_missing_]"]) == {"mcu": "true"}
@@ -175,7 +195,6 @@ def test_prepare_import_payload_maps_playlist_template_variables_into_libraries_
     assert json.loads(libraries["playlist-template_variables[sonarr_add_missing_]"]) == {"mcu": "false"}
     assert json.loads(libraries["playlist-template_variables[sonarr_folder_]"]) == {"mcu": "/data/media/shows/mcu"}
     assert json.loads(libraries["playlist-template_variables[sonarr_tag_]"]) == {"mcu": ["mcu-show"]}
-    assert json.loads(libraries["playlist-template_variables[trakt_list_]"]) == {"mcu": ["https://trakt.tv/users/example/lists/mcu"]}
     assert any("playlist_files[0].template_variables.name_mcu" in line for line in report.lines)
 
 
@@ -190,6 +209,12 @@ def test_prepare_import_payload_maps_direct_playlist_file_entries_into_libraries
                 },
                 {
                     "file": "config/extra_playlists.yml",
+                    "schedule": "weekly(friday)",
+                    "template_variables": {"custom_playlist_flag": True},
+                },
+                {
+                    "folder": "config/playlist_folder",
+                    "template_variables": {"custom_folder_flag": True},
                 },
                 {
                     "repo": "bullmoose20/playlists.yml",
@@ -202,11 +227,21 @@ def test_prepare_import_payload_maps_direct_playlist_file_entries_into_libraries
 
     libraries = payload["libraries"]["libraries"]
     assert json.loads(libraries["playlist_files_entries"]) == [
-        {"type": "file", "location": "config/extra_playlists.yml"},
+        {
+            "type": "file",
+            "location": "config/extra_playlists.yml",
+            "schedule": "weekly(friday)",
+            "template_variables": {"custom_playlist_flag": True},
+        },
+        {"type": "folder", "location": "config/playlist_folder", "template_variables": {"custom_folder_flag": True}},
         {"type": "repo", "location": "bullmoose20/playlists.yml"},
     ]
     assert any("playlist_files[1].file" in line for line in report.lines)
-    assert any("playlist_files[2].repo" in line for line in report.lines)
+    assert any("playlist_files[1].schedule" in line for line in report.lines)
+    assert any("playlist_files[1].template_variables" in line for line in report.lines)
+    assert any("playlist_files[2].folder" in line for line in report.lines)
+    assert any("playlist_files[2].template_variables" in line for line in report.lines)
+    assert any("playlist_files[3].repo" in line for line in report.lines)
 
 
 def test_annotate_yaml_with_report_unmapped_reason():
@@ -222,6 +257,23 @@ def test_prepare_import_payload_maps_apprise_config_to_location():
     assert payload["apprise"]["apprise"]["location"] == "/config/apprise.yml"
     assert any(line == "imported: apprise.config" for line in report.lines)
     assert report.counts["imported"] >= 1
+
+
+def test_prepare_import_payload_skips_redacted_credential_placeholders():
+    payload, report = importer.prepare_import_payload(
+        {
+            "plex": {"url": "(redacted)", "token": "(redacted)"},
+            "tmdb": {"apikey": "<redacted>"},
+        },
+        set(),
+        set(),
+    )
+
+    assert "plex" not in payload
+    assert "tmdb" not in payload
+    assert "skipped: plex.url :: Redacted credential placeholder ignored." in report.lines
+    assert "skipped: plex.token :: Redacted credential placeholder ignored." in report.lines
+    assert "skipped: tmdb.apikey :: Redacted credential placeholder ignored." in report.lines
 
 
 def test_annotate_yaml_marks_apprise_config_as_imported():

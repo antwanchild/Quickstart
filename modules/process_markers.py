@@ -63,6 +63,7 @@ working unchanged.
 
 from __future__ import annotations
 
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -191,6 +192,7 @@ def _flush_pending_marker_file(log_path, pending_paths, marker_label):
         if not log_path.exists() or not log_path.is_file():
             return {"flushed": False, "inserted": 0, "anchor": "missing_log"}
 
+        original_stats = log_path.stat()
         content = log_path.read_text(encoding="utf-8", errors="replace")
         existing_lines = {line.strip() for line in content.splitlines() if line.strip()}
         lines_to_insert = [line for line in pending_lines if line not in existing_lines]
@@ -234,6 +236,10 @@ def _flush_pending_marker_file(log_path, pending_paths, marker_label):
         if updated_text and not updated_text.endswith(newline):
             updated_text += newline
         log_path.write_text(updated_text, encoding="utf-8")
+        try:
+            os.utime(log_path, (original_stats.st_atime, original_stats.st_mtime))
+        except Exception:
+            pass
         _clear_marker_artifacts(*pending_paths)
         helpers.ts_log(
             f"Replayed {len(lines_to_insert)} pending {marker_label} marker(s) into {log_path.name} via {anchor_name}.",
@@ -371,7 +377,7 @@ def flush_imagemaid_pending_markers(imagemaid_root, log_path=None, require_proce
     )
 
 
-def write_quickstart_run_marker(kometa_root, config_name=None, start_mode="current", version_info=None):
+def write_quickstart_run_marker(kometa_root, config_name=None, start_mode="current", version_info=None, integrity_report=None):
     try:
         qs_version, qs_branch = _resolve_version_fields(version_info)
         safe_config = (config_name or "default").strip() or "default"
@@ -382,7 +388,13 @@ def write_quickstart_run_marker(kometa_root, config_name=None, start_mode="curre
             f"config={safe_config} quickstart={qs_version} branch={qs_branch} "
             f"maintenance_markers=1 start_mode={safe_start_mode}"
         )
-        return _write_quickstart_marker_line(kometa_root, marker, marker_kind="run")
+        written = _write_quickstart_marker_line(kometa_root, marker, marker_kind="run")
+        if integrity_report is not None:
+            from modules.kometa_integrity import format_integrity
+
+            for line in format_integrity(integrity_report):
+                written = _write_quickstart_marker_line(kometa_root, f"[Quickstart] {line}", marker_kind="integrity") and written
+        return written
     except Exception as exc:
         helpers.ts_log(f"Failed to write Quickstart run marker: {exc}", level="WARNING")
         return False
@@ -523,11 +535,11 @@ def write_quickstart_imagemaid_maintenance_marker(
         return False
 
 
-def schedule_quickstart_run_marker(kometa_root, config_name=None, timeout_seconds=20, start_mode="current"):
+def schedule_quickstart_run_marker(kometa_root, config_name=None, timeout_seconds=20, start_mode="current", integrity_report=None):
     version_info = dict(_get_version_info())
 
     def worker():
-        write_quickstart_run_marker(kometa_root, config_name, start_mode=start_mode, version_info=version_info)
+        write_quickstart_run_marker(kometa_root, config_name, start_mode=start_mode, version_info=version_info, integrity_report=integrity_report)
 
     threading.Thread(target=worker, daemon=True).start()
 

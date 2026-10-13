@@ -6,6 +6,14 @@ from modules import database, helpers, persistence, url_validation, validations
 bp = Blueprint("validation_routes", __name__)
 
 
+def _telemetry_with_validated_plex_pass(telemetry, plex_data):
+    """Keep Libraries telemetry aligned with the authoritative Plex validation result."""
+    normalized = dict(telemetry) if isinstance(telemetry, dict) else {}
+    if isinstance(plex_data, dict) and "has_plex_pass" in plex_data:
+        normalized["plex_pass"] = bool(plex_data.get("has_plex_pass"))
+    return normalized
+
+
 def _unpack_validation_result(result):
     """Normalise a validator return value into ``(flask_response, status_code)``.
 
@@ -97,6 +105,7 @@ def validate_plex():
     try:
         telemetry = helpers.get_plex_metadata(plex_url=data.get("plex_url"), plex_token=data.get("plex_token")) or {}
         if telemetry:
+            telemetry = _telemetry_with_validated_plex_pass(telemetry, plex_data)
             persistence.save_settings("plex_telemetry", telemetry)
             if config_name:
                 try:
@@ -111,6 +120,24 @@ def validate_plex():
                     helpers.ts_log(f"Failed to persist Plex telemetry during validation for {config_name}: {e}", level="WARNING")
     except Exception as e:
         helpers.ts_log(f"Failed to fetch Plex telemetry during validation: {e}", level="WARNING")
+
+    # Migrate existing library settings from name-based keys to Plex-ID keys.
+    all_libs = list(plex_data.get("movie_libraries") or []) + list(plex_data.get("show_libraries") or []) + list(plex_data.get("music_libraries") or [])
+    if config_name and all_libs and isinstance(all_libs[0], dict):
+        try:
+            persistence.migrate_library_keys_to_plex_ids(config_name, all_libs)
+        except Exception as e:
+            helpers.ts_log(f"Library key migration failed during validate_plex: {e}", level="WARNING")
+    try:
+        persistence.update_stored_plex_libraries(
+            "010-plex",
+            plex_data.get("movie_libraries", []),
+            plex_data.get("show_libraries", []),
+            plex_data.get("music_libraries", []),
+            plex_data.get("user_list", []),
+        )
+    except Exception as e:
+        helpers.ts_log(f"Failed to persist Plex library lists during validation: {e}", level="WARNING")
 
     # Keep validator fields authoritative for the Plex page contract. Telemetry
     # uses display strings like "2048 MB", while the page's db_cache input needs
@@ -147,6 +174,12 @@ def refresh_plex_libraries():
         cached_refresh = helpers.get_cached_plex_refresh(plex_url, plex_token)
         if cached_refresh:
             helpers.ts_log("Using cached Plex library refresh payload.", level="DEBUG")
+            cached_refresh = dict(cached_refresh)
+            if "has_plex_pass" in cached_refresh:
+                cached_refresh["plex_pass"] = bool(cached_refresh.get("has_plex_pass"))
+            all_libs = list(cached_refresh.get("movie_libraries") or []) + list(cached_refresh.get("show_libraries") or []) + list(cached_refresh.get("music_libraries") or [])
+            if all_libs and isinstance(all_libs[0], dict):
+                persistence.migrate_library_keys_to_plex_ids(config_name, all_libs)
             persistence.update_stored_plex_libraries(
                 "010-plex",
                 cached_refresh.get("movie_libraries", []),
@@ -167,6 +200,7 @@ def refresh_plex_libraries():
                     "has_plex_pass",
                 }
             }
+            cached_telemetry = _telemetry_with_validated_plex_pass(cached_telemetry, cached_refresh)
             persistence.save_settings("plex_telemetry", cached_telemetry)
             try:
                 database.save_section_data(
@@ -187,7 +221,10 @@ def refresh_plex_libraries():
         if not plex_data.get("validated"):
             return jsonify({"valid": False, "error": "Plex validation failed"}), 500
 
-        # Update stored libraries
+        # Migrate existing settings from name-based keys to Plex-ID keys, then store.
+        all_libs = list(plex_data.get("movie_libraries") or []) + list(plex_data.get("show_libraries") or []) + list(plex_data.get("music_libraries") or [])
+        if all_libs and isinstance(all_libs[0], dict):
+            persistence.migrate_library_keys_to_plex_ids(config_name, all_libs)
         persistence.update_stored_plex_libraries(
             "010-plex",
             plex_data.get("movie_libraries", []),
@@ -198,6 +235,7 @@ def refresh_plex_libraries():
 
         # Get fresh telemetry using helpers and store it
         telemetry = helpers.get_plex_metadata(plex_url=plex_url, plex_token=plex_token)
+        telemetry = _telemetry_with_validated_plex_pass(telemetry, plex_data)
         persistence.save_settings("plex_telemetry", telemetry)
         try:
             database.save_section_data(
@@ -235,155 +273,17 @@ def validate_tracearr():
 
 @bp.route("/validate_trakt", methods=["POST"])
 def validate_trakt():
-    data = request.json
-    return validations.validate_trakt_server(data)
+    return jsonify({"valid": False, "error": "Trakt support was removed in Kometa 2.4.9. Use MDBList, SIMKL, FlickList, TMDb, or IMDb instead."}), 410
+
+
+@bp.route("/import_trakt_yaml", methods=["POST"])
+def import_trakt_yaml():
+    return jsonify({"valid": False, "error": "Trakt support was removed in Kometa 2.4.9. Use MDBList, SIMKL, FlickList, TMDb, or IMDb instead."}), 410
 
 
 @bp.route("/validate_trakt_token", methods=["POST"])
 def validate_trakt_token():
-    data = request.get_json(silent=True) or {}
-    access_token = data.get("access_token")
-    client_id = data.get("client_id")
-    client_secret = data.get("client_secret")
-    refresh_token = data.get("refresh_token")
-    debug_enabled = helpers.booler(app.config.get("QS_DEBUG", False)) or helpers.booler(data.get("debug", False))
-
-    def is_blank(value):
-        if value is None:
-            return True
-        if isinstance(value, str):
-            trimmed = value.strip()
-            if trimmed == "" or trimmed.lower() in ("none", "null"):
-                return True
-        return False
-
-    if is_blank(access_token) or is_blank(client_id) or is_blank(client_secret) or is_blank(refresh_token):
-        settings = persistence.retrieve_settings("130-trakt") or {}
-        trakt_data = settings.get("trakt", {}) if isinstance(settings, dict) else {}
-        auth = trakt_data.get("authorization", {}) if isinstance(trakt_data, dict) else {}
-        if is_blank(access_token):
-            access_token = auth.get("access_token")
-        if is_blank(client_id):
-            client_id = trakt_data.get("client_id") or auth.get("client_id")
-        if is_blank(client_secret):
-            client_secret = trakt_data.get("client_secret") or auth.get("client_secret")
-        if is_blank(refresh_token):
-            refresh_token = auth.get("refresh_token")
-
-    if is_blank(access_token) or is_blank(client_id):
-        debug_payload = None
-        if debug_enabled:
-            settings = persistence.retrieve_settings("130-trakt") or {}
-            trakt_data = settings.get("trakt", {}) if isinstance(settings, dict) else {}
-            auth = trakt_data.get("authorization", {}) if isinstance(trakt_data, dict) else {}
-            debug_payload = {
-                "config_name": session.get("config_name"),
-                "request": {
-                    "access_token": not is_blank(data.get("access_token")),
-                    "client_id": not is_blank(data.get("client_id")),
-                    "client_secret": not is_blank(data.get("client_secret")),
-                    "refresh_token": not is_blank(data.get("refresh_token")),
-                },
-                "stored": {
-                    "access_token": not is_blank(auth.get("access_token")),
-                    "client_id": not is_blank(trakt_data.get("client_id") or auth.get("client_id")),
-                    "client_secret": not is_blank(trakt_data.get("client_secret") or auth.get("client_secret")),
-                    "refresh_token": not is_blank(auth.get("refresh_token")),
-                },
-            }
-        response = {"valid": False, "error": "Missing Trakt access token or client ID."}
-        if debug_payload:
-            response["debug"] = debug_payload
-        return jsonify(response), 400
-    try:
-        response = requests.get(
-            "https://api.trakt.tv/users/settings",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {access_token}",
-                "trakt-api-version": "2",
-                "trakt-api-key": client_id,
-            },
-            timeout=10,
-        )
-        if debug_enabled:
-            helpers.ts_log(f"Trakt token check status={response.status_code}", level="DEBUG")
-        if response.status_code == 200:
-            return jsonify({"valid": True})
-        if response.status_code == 423:
-            return jsonify({"valid": False, "error": "Account is locked; please contact Trakt Support."}), 400
-        if response.status_code in (401, 403):
-            if is_blank(refresh_token) or is_blank(client_secret):
-                return jsonify({"valid": False, "error": "Access token is invalid or expired."}), 400
-
-            refresh_response = requests.post(
-                "https://api.trakt.tv/oauth/token",
-                json={
-                    "refresh_token": refresh_token,
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
-                    "grant_type": "refresh_token",
-                },
-                headers={"Content-Type": "application/json"},
-                timeout=10,
-            )
-            if refresh_response.status_code != 200:
-                debug_payload = None
-                if debug_enabled:
-                    debug_payload = {
-                        "status": response.status_code,
-                        "refresh_status": refresh_response.status_code,
-                    }
-                response_body = {"valid": False, "error": "Access token is invalid or expired."}
-                if debug_payload:
-                    response_body["debug"] = debug_payload
-                return jsonify(response_body), 400
-
-            refreshed = refresh_response.json()
-            new_access = refreshed.get("access_token")
-            if is_blank(new_access):
-                return jsonify({"valid": False, "error": "Access token refresh failed."}), 400
-
-            config_name = session.get("config_name") or persistence.ensure_session_config_name()
-            stored_validated, user_entered, stored_data = database.retrieve_section_data(config_name, "trakt")
-            if not isinstance(stored_data, dict):
-                stored_data = {}
-            trakt_data = stored_data.get("trakt", {}) if isinstance(stored_data.get("trakt"), dict) else {}
-            auth = trakt_data.get("authorization", {}) if isinstance(trakt_data.get("authorization"), dict) else {}
-            auth["access_token"] = new_access
-            if refreshed.get("refresh_token"):
-                auth["refresh_token"] = refreshed.get("refresh_token")
-            if refreshed.get("token_type"):
-                auth["token_type"] = refreshed.get("token_type")
-            if refreshed.get("expires_in"):
-                auth["expires_in"] = refreshed.get("expires_in")
-            if refreshed.get("scope"):
-                auth["scope"] = refreshed.get("scope")
-            if refreshed.get("created_at"):
-                auth["created_at"] = refreshed.get("created_at")
-            trakt_data["authorization"] = auth
-            stored_data["trakt"] = trakt_data
-            stored_data["validated"] = True
-            stored_data["validated_at"] = helpers.utc_now_iso()
-            database.save_section_data(
-                name=config_name,
-                section="trakt",
-                validated=True,
-                user_entered=user_entered,
-                data=stored_data,
-            )
-            return jsonify({"valid": True, "refreshed": True, "authorization": auth})
-        response_body = {"valid": False, "error": f"Trakt validation failed ({response.status_code})."}
-        if debug_enabled:
-            response_body["debug"] = {"status": response.status_code}
-        return jsonify(response_body), 400
-    except requests.exceptions.RequestException as exc:
-        helpers.ts_log(f"Trakt validation error: {exc}", level="ERROR")
-        response_body = {"valid": False, "error": "Trakt validation error."}
-        if debug_enabled:
-            response_body["debug"] = {"status": "request_exception"}
-        return jsonify(response_body), 400
+    return jsonify({"valid": False, "error": "Trakt support was removed in Kometa 2.4.9. Use MDBList, SIMKL, FlickList, TMDb, or IMDb instead."}), 410
 
 
 @bp.route("/validate_mal", methods=["POST"])
@@ -508,6 +408,24 @@ def validate_mdblist():
 def validate_notifiarr():
     data = request.json
     result, status_code = _unpack_validation_result(validations.validate_notifiarr_server(data))
+    if result.get_json().get("valid"):
+        return jsonify(result.get_json())
+    return jsonify(result.get_json()), status_code or 400
+
+
+@bp.route("/validate_serializd", methods=["POST"])
+def validate_serializd():
+    data = request.get_json(silent=True) or {}
+    result, status_code = _unpack_validation_result(validations.validate_serializd_server(data))
+    if result.get_json().get("valid"):
+        return jsonify(result.get_json())
+    return jsonify(result.get_json()), status_code or 400
+
+
+@bp.route("/validate_floppy", methods=["POST"])
+def validate_floppy():
+    data = request.get_json(silent=True) or {}
+    result, status_code = _unpack_validation_result(validations.validate_floppy_server(data))
     if result.get_json().get("valid"):
         return jsonify(result.get_json())
     return jsonify(result.get_json()), status_code or 400

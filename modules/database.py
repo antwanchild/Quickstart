@@ -8,12 +8,34 @@ from contextlib import closing
 
 from modules import helpers
 
+LOG_LINE_COUNT_COLUMNS = (
+    "debug_count",
+    "info_count",
+    "warning_count",
+    "error_count",
+    "critical_count",
+    "trace_count",
+)
+
+
+def _coerce_count(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _compute_total_log_line_count(row):
+    return sum(_coerce_count(row.get(key) if isinstance(row, dict) else row[key]) for key in LOG_LINE_COUNT_COLUMNS)
+
+
 TRANSIENT_SECTION_KEYS = {
     "configSelector",
     "config_name",
     "newConfigName",
     "importMode",
 }
+RETIRED_TRAKT_VALUES = {"trakt", "trakt_user", "mdb_trakt", "mdb_trakt_rating"}
 
 
 def _strip_transient_section_keys(value):
@@ -22,7 +44,11 @@ def _strip_transient_section_keys(value):
     if isinstance(value, dict):
         cleaned = {}
         for key, item in value.items():
-            if key in TRANSIENT_SECTION_KEYS:
+            key_text = str(key).strip().lower()
+            if key in TRANSIENT_SECTION_KEYS or "trakt" in key_text:
+                changed = True
+                continue
+            if isinstance(item, str) and item.strip().lower() in RETIRED_TRAKT_VALUES:
                 changed = True
                 continue
             cleaned_item, item_changed = _strip_transient_section_keys(item)
@@ -33,6 +59,9 @@ def _strip_transient_section_keys(value):
     if isinstance(value, list):
         cleaned = []
         for item in value:
+            if isinstance(item, str) and item.strip().lower() in RETIRED_TRAKT_VALUES:
+                changed = True
+                continue
             cleaned_item, item_changed = _strip_transient_section_keys(item)
             cleaned.append(cleaned_item)
             changed = changed or item_changed
@@ -61,7 +90,8 @@ def save_section_data(section, validated, user_entered, data, name="default"):
         connection.row_factory = sqlite3.Row
         with closing(connection.cursor()) as cursor:
             cursor.execute(persisted_section_table_create())
-            pickled_data = pickle.dumps(data)
+            cleaned_data, _changed = _strip_transient_section_keys(data)
+            pickled_data = pickle.dumps(cleaned_data)
 
             cursor.execute(
                 """INSERT OR IGNORE INTO
@@ -147,6 +177,13 @@ def sanitize_all_section_data():
             cursor.execute("""SELECT name, section, data FROM section_data""")
             rows = cursor.fetchall()
             for row in rows:
+                if str(row["section"] or "").strip().lower() == "trakt":
+                    cursor.execute(
+                        "DELETE FROM section_data WHERE name == ? AND section == ?",
+                        (row["name"], row["section"]),
+                    )
+                    updated += 1
+                    continue
                 raw_data = row["data"]
                 if raw_data is None:
                     continue
@@ -499,6 +536,7 @@ def _decode_log_run_row(row):
     decoded["quickstart_branch"] = str(decoded.get("quickstart_branch") or "").strip() or None
     decoded["start_mode"] = str(decoded.get("start_mode") or "").strip().lower() or None
     decoded["tool_name"] = str(decoded.get("tool_name") or "kometa").strip().lower() or "kometa"
+    decoded["total_log_line_count"] = _compute_total_log_line_count(decoded)
     return decoded
 
 

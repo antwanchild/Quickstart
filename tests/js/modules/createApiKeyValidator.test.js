@@ -154,6 +154,27 @@ describe('createApiKeyValidator initial field state', () => {
     expect(document.getElementById('test_apikey').getAttribute('type')).toBe('text')
   })
 
+  it('can target a non-primary secret field with the visibility toggle', () => {
+    document.body.innerHTML = buildBaseHTML({
+      keyValue: 'https://example.com',
+      extraInputs: '<input id="test_token" type="password" value="secret">'
+    })
+    createApiKeyValidator(defaultConfig({
+      maskPrimaryField: false,
+      toggleFieldId: 'test_token'
+    }))
+
+    const primaryInput = document.getElementById('test_apikey')
+    const tokenInput = document.getElementById('test_token')
+    const toggleButton = document.getElementById('toggleApikeyVisibility')
+    expect(primaryInput.getAttribute('type')).toBe('text')
+    expect(tokenInput.getAttribute('type')).toBe('password')
+
+    toggleButton.click()
+    expect(tokenInput.getAttribute('type')).toBe('text')
+    expect(primaryInput.getAttribute('type')).toBe('text')
+  })
+
   it('treats whitespace-only credential as empty (still password initially, then text)', () => {
     document.body.innerHTML = buildBaseHTML({ keyValue: '   ' })
     createApiKeyValidator(defaultConfig())
@@ -666,6 +687,60 @@ describe('createApiKeyValidator multi-field wizards (additionalFieldIds)', () =>
     await new Promise(resolve => setTimeout(resolve, 0))
 
     expect(buildPayload).toHaveBeenCalledWith('mykey', {})
+  })
+})
+
+describe('createApiKeyValidator optional fields', () => {
+  it('includes an empty optional field in the payload without blocking validation', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({
+      json: () => Promise.resolve({ valid: true })
+    })))
+    document.body.innerHTML = `
+      <form id="configForm">
+        <input id="test_url" type="text" value="http://server">
+        <input id="test_token" type="password" value="">
+        <input id="test_validated" type="hidden" value="false">
+        <input id="test_validated_at" type="hidden" value="">
+        <button id="validateButton" type="button">Validate</button>
+        <div id="statusMessage" style="display:none"></div>
+      </form>
+    `
+    const buildPayload = vi.fn((url, extras) => ({ url, token: extras.test_token }))
+
+    createApiKeyValidator(defaultConfig({
+      fieldId: 'test_url',
+      optionalFieldIds: ['test_token'],
+      buildPayload,
+      maskPrimaryField: false
+    }))
+    document.getElementById('validateButton').click()
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(buildPayload).toHaveBeenCalledWith('http://server', { test_token: '' })
+    expect(fetch).toHaveBeenCalledOnce()
+  })
+
+  it('resets validation when an optional field changes', () => {
+    document.body.innerHTML = `
+      <form id="configForm">
+        <input id="test_url" type="text" value="http://server">
+        <input id="test_token" type="password" value="token">
+        <input id="test_validated" type="hidden" value="true">
+        <input id="test_validated_at" type="hidden" value="">
+        <button id="validateButton" type="button">Validate</button>
+        <div id="statusMessage" style="display:none"></div>
+      </form>
+    `
+
+    createApiKeyValidator(defaultConfig({
+      fieldId: 'test_url',
+      optionalFieldIds: ['test_token'],
+      maskPrimaryField: false
+    }))
+    document.getElementById('test_token').dispatchEvent(new Event('input'))
+
+    expect(document.getElementById('test_validated').value).toBe('false')
+    expect(document.getElementById('validateButton').disabled).toBe(false)
   })
 })
 

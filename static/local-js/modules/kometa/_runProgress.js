@@ -59,7 +59,7 @@
 //   module importable in test contexts.
 
 import { kometaState } from './_state.js'
-import { coerceRunSeconds, formatRunSeconds } from './_util.js'
+import { coerceRunSeconds, formatRunSeconds, nbspLeadingSpaces } from './_util.js'
 
 /**
  * Canonical phase order for the run-progress panel. Server can
@@ -94,6 +94,9 @@ export function renderRunProgress (payload) {
   }
 
   kometaState.lastRunProgressPayload = payload
+  if (typeof window !== 'undefined' && typeof window.QS_handleKometaRunProgress === 'function') {
+    window.QS_handleKometaRunProgress(payload)
+  }
   const libraries = payload.libraries
   const total = payload.total_count || libraries.length
   const completed = payload.completed_count != null
@@ -290,7 +293,7 @@ function renderLibraryRows (payload, visibleLibraries, phasesToShow, phaseIndexL
 
     return `
         <tr>
-          <td>${entry.name}</td>
+          <td><code>${nbspLeadingSpaces(entry.name)}</code></td>
           <td>${typeLabel}</td>
           <td><span class="badge ${klass}">${entry.status}</span></td>
           ${durationCells}
@@ -459,6 +462,10 @@ export function fetchRunProgress (forceFull = false) {
         } else {
           clearRunProgress(false)
         }
+        return
+      }
+      if (data.status === 'queued' || data.status === 'waiting_for_log' || data.pending_start) {
+        clearRunProgress(false)
         return
       }
       renderRunProgress(data)

@@ -2,6 +2,7 @@
 
 import copy
 import os
+import re
 import subprocess
 import sys
 import time
@@ -11,10 +12,44 @@ from pathlib import Path
 from modules.helpers._constants import BUILDNUM_FILE, QS_UPDATE_CACHE_TTL_SECONDS, VERSION_FILE, _QS_UPDATE_CACHE
 
 
+def _run_git_remote(qs_root):
+    qs_root = Path(qs_root or ".").resolve()
+    is_windows = sys.platform.startswith("win")
+    return subprocess.run(
+        ["git", "remote"],
+        cwd=qs_root,
+        capture_output=True,
+        text=True,
+        shell=is_windows,
+    )
+
+
+def get_quickstart_update_remote(qs_root=None):
+    try:
+        remotes_out = _run_git_remote(qs_root or ".")
+        remotes = (remotes_out.stdout or "").split()
+    except Exception:
+        remotes = []
+    return "kometa-team" if "kometa-team" in remotes else "origin"
+
+
+def build_quickstart_update_command(branch="master", qs_root=None, remote=None):
+    branch = str(branch or "master").strip() or "master"
+    remote = str(remote or get_quickstart_update_remote(qs_root)).strip() or "origin"
+    remote_ref = f"{remote}/{branch}"
+    return (
+        f"git fetch {remote} --prune && "
+        f"git switch -C {branch} --track {remote_ref} && "
+        f"git reset --hard {remote_ref} && "
+        "python -m pip install --upgrade pip && "
+        "python -m pip install --no-cache-dir --upgrade -r requirements.txt"
+    )
+
+
 def get_kometa_branch():
-    """Fetch the correct branch (master or nightly)."""
+    """Fetch the correct branch (master or develop)."""
     version_info = check_for_update()
-    return version_info.get("kometa_branch", "nightly")  # Default to nightly branch
+    return version_info.get("kometa_branch", "develop")  # Default to develop branch
 
 
 def get_version(branch):
@@ -32,9 +67,44 @@ def get_version(branch):
     return "unknown"
 
 
+def _parse_quickstart_version(value):
+    match = re.fullmatch(r"v?(\d+(?:\.\d+)*)(?:-build(\d+))?", str(value or "").strip(), re.IGNORECASE)
+    if not match:
+        return None
+    base = tuple(int(part) for part in match.group(1).split("."))
+    return base, int(match.group(2) or 0), bool(match.group(2))
+
+
+def _is_remote_quickstart_version_newer(local_version, remote_version):
+    if not remote_version:
+        return False
+    if str(local_version or "").strip().lower() in {"", "unknown"}:
+        return True
+
+    local = _parse_quickstart_version(local_version)
+    remote = _parse_quickstart_version(remote_version)
+    if not local or not remote:
+        return str(remote_version).strip() != str(local_version or "").strip()
+
+    local_base, local_build, local_has_build = local
+    remote_base, remote_build, remote_has_build = remote
+    max_len = max(len(local_base), len(remote_base))
+    padded_local_base = local_base + (0,) * (max_len - len(local_base))
+    padded_remote_base = remote_base + (0,) * (max_len - len(remote_base))
+    if padded_remote_base != padded_local_base:
+        return padded_remote_base > padded_local_base
+    if local_has_build or remote_has_build:
+        return remote_build > local_build
+    return False
+
+
+def _is_develop_release_baseline(branch, remote_status):
+    return str(branch or "").strip() == "develop" and str(remote_status.get("buildnum") or "").strip() == "0"
+
+
 def check_for_update():
     """Compare the local version with the remote version and determine Kometa branch."""
-    from modules.helpers._version import get_branch, get_remote_version
+    from modules.helpers._version import get_branch, get_remote_version_status
     from modules.helpers._os import get_running_os
 
     branch = get_branch()
@@ -46,21 +116,31 @@ def check_for_update():
         if age <= QS_UPDATE_CACHE_TTL_SECONDS:
             return copy.deepcopy(cached.get("payload") or {})
 
-    remote_version = get_remote_version(branch)
+    remote_status = get_remote_version_status(branch)
+    remote_version = remote_status.get("version")
 
-    update_available = remote_version and remote_version != local_version
+    update_available = False
+    if not _is_develop_release_baseline(branch, remote_status):
+        update_available = _is_remote_quickstart_version_newer(local_version, remote_version)
+    update_remote = get_quickstart_update_remote()
 
     # Determine Kometa branch
-    kometa_branch = "nightly"
+    kometa_branch = "master" if branch == "master" else "develop"
 
     os_name, os_ext = get_running_os()
 
     payload = {
         "local_version": local_version,
         "remote_version": remote_version,
+        "remote_base_version": remote_status.get("base_version"),
+        "remote_buildnum": remote_status.get("buildnum"),
         "branch": branch,
         "kometa_branch": kometa_branch,
         "update_available": update_available,
+        "update_check_status": remote_status.get("status") or "ok",
+        "update_message": remote_status.get("message") or "",
+        "update_remote": update_remote,
+        "update_command": build_quickstart_update_command(branch, remote=update_remote),
         "running_on": os_name,
         "file_ext": os_ext,
     }
@@ -88,16 +168,7 @@ def perform_quickstart_update(qs_root, branch="master"):
         qs_root = Path(qs_root).resolve()
         is_windows = sys.platform.startswith("win")
 
-        # pick upstream remote (prefer official)
-        remotes_out = subprocess.run(
-            ["git", "remote"],
-            cwd=qs_root,
-            capture_output=True,
-            text=True,
-            shell=is_windows,
-        )
-        remotes = (remotes_out.stdout or "").split()
-        upstream = "kometa-team" if "kometa-team" in remotes else "origin"
+        upstream = get_quickstart_update_remote(qs_root)
         logs.append(f"🔗 Using Quickstart remote: {upstream}")
         logs.append(f"⚙️ Target Quickstart branch: {branch}")
 

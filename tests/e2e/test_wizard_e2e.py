@@ -809,6 +809,104 @@ def test_plex_db_cache_mismatch_warning(page, live_server):
 
 
 @pytest.mark.e2e
+@pytest.mark.parametrize("step,service", [("020-tmdb", "tmdb"), ("060-mdblist", "mdblist"), ("050-omdb", "omdb"), ("070-notifiarr", "notifiarr")])
+def test_workspace_status_preserves_unsaved_validation_without_refresh_loop(page, live_server, step, service):
+    config_name = f"pytest_unsaved_{service}"
+    _seed_config(config_name)
+    _activate_config(page, live_server, config_name)
+    page.route(
+        f"**/validate_{service}",
+        lambda route: route.fulfill(status=200, json={"valid": True}),
+    )
+    _goto_step(page, live_server, step)
+    payload = page.evaluate("async () => (await fetch('/workspace_status')).json()")
+
+    page.locator(f"#{service}_apikey").fill("navigation-regression-key")
+    page.locator("#validateButton").click()
+    expect(page.locator(f"#{service}_validated")).to_have_value("true")
+
+    result = page.evaluate(
+        """({payload, step}) => {
+          const originalRefresh = window.QSWorkspaceStatus.refresh;
+          let refreshes = 0;
+          window.QSWorkspaceStatus.refresh = () => { refreshes++; };
+          try {
+            window.QSWorkspaceStatus.apply(payload);
+            return {
+              refreshes,
+              state: document.querySelector(`.qs-step-link[data-step-key="${step}"] .qs-step-link-state`).className
+            };
+          } finally {
+            window.QSWorkspaceStatus.refresh = originalRefresh;
+          }
+        }""",
+        {"payload": payload, "step": step},
+    )
+    assert result["refreshes"] == 0, "Applying saved status must not request another refresh for unsaved validation"
+    assert "qs-step-link-state--ok" in result["state"]
+
+
+@pytest.mark.e2e
+def test_workspace_status_does_not_move_unchanged_setup_buttons(page, live_server):
+    _seed_config("pytest_stable_sidebar")
+    _activate_config(page, live_server, "pytest_stable_sidebar")
+    _goto_step(page, live_server, "020-tmdb")
+    payload = page.evaluate("async () => (await fetch('/workspace_status')).json()")
+    moved_steps = page.evaluate(
+        """payload => {
+          window.QSWorkspaceStatus.apply(payload);
+          const observer = new MutationObserver(() => {});
+          observer.observe(document.querySelector('.qs-workspace-nav-panel'), {childList: true, subtree: true});
+          window.QSWorkspaceStatus.apply(payload);
+          const moved = observer.takeRecords().flatMap(record => Array.from(record.removedNodes))
+            .filter(node => node.matches?.('.qs-step-link')).map(node => node.dataset.stepKey);
+          observer.disconnect();
+          return moved;
+        }""",
+        payload,
+    )
+    assert moved_steps == [], "Unchanged Setup buttons must stay attached so status refreshes cannot interrupt clicks"
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("step,service", [("020-tmdb", "tmdb"), ("060-mdblist", "mdblist"), ("050-omdb", "omdb"), ("070-notifiarr", "notifiarr")])
+@pytest.mark.parametrize("width", [1366, 390])
+def test_setup_navigation_after_api_key_validation_and_revalidation(page, live_server, app, step, service, width):
+    import modules.database as database
+
+    page.set_viewport_size({"width": width, "height": 900})
+    config_name = f"pytest_navigation_{service}"
+    _seed_config(config_name)
+    _activate_config(page, live_server, config_name)
+    page.route(
+        f"**/validate_{service}",
+        lambda route: route.fulfill(status=200, json={"valid": True}),
+    )
+    _goto_step(page, live_server, step)
+
+    for target in ["010-plex", "150-settings"]:
+        key = page.locator(f"#{service}_apikey")
+        key.fill("navigation-regression-key-extra")
+        key.fill("navigation-regression-key")
+        page.locator("#validateButton").click()
+        expect(page.locator(f"#{service}_validated")).to_have_value("true")
+        page.evaluate("() => window.QSWorkspaceStatus.refresh({immediate: true})")
+        if service == "tmdb" and target == "010-plex":
+            Path("artifacts").mkdir(exist_ok=True)
+            page.screenshot(path=f"artifacts/validation-navigation-{width}.png", full_page=True)
+        target_link = page.locator(f'.qs-step-group[data-step-group] .qs-step-link[data-step-key="{target}"]')
+        target_link.evaluate("el => { el.closest('details').open = true; }")
+        target_link.click(delay=250)
+        expect(page).to_have_url(re.compile(f"/step/{target}$"))
+        with app.app_context():
+            validated, user_entered, data = database.retrieve_section_data(config_name, service)
+        assert validated is True
+        assert user_entered is True
+        assert data[service]["apikey"] == "navigation-regression-key"
+        _goto_step(page, live_server, step)
+
+
+@pytest.mark.e2e
 def test_tmdb_validator_success_enables_navigation_when_dropdowns_chosen(page, live_server):
     """TMDB gates the Next/JumpTo buttons LIVE on (api key validated)
     AND (language chosen) AND (region chosen). After validate succeeds,
@@ -893,122 +991,6 @@ def test_tmdb_dropdown_change_alone_does_not_enable_navigation(page, live_server
     # Even though both dropdowns now have valid values, the api key was
     # never validated, so navigation must stay disabled.
     expect(page.locator('button[data-nav-action="next"]')).to_be_disabled()
-
-
-# Trakt OAuth-PIN tests (#1334 Step 6 PR 4d). A real Trakt validate
-# requires `trakt_client_id` to be exactly 64 chars for the
-# updateTraktURL() function to generate a non-empty authorization URL.
-TRAKT_CLIENT_ID_64 = "a" * 64
-
-
-@pytest.mark.e2e
-def test_trakt_pin_validator_success_populates_six_token_fields(page, live_server):
-    """After a successful Trakt PIN validate, the six hidden
-    authorization fields must contain the values from the response,
-    the PIN+URL fields are cleared, the PIN-flow buttons disabled,
-    and the Check Token button enabled.
-    """
-
-    def handle_validate(route):
-        route.fulfill(
-            status=200,
-            json={
-                "valid": True,
-                "trakt_authorization_access_token": "AT-123",
-                "trakt_authorization_token_type": "Bearer",
-                "trakt_authorization_expires_in": 7200,
-                "trakt_authorization_refresh_token": "RT-456",
-                "trakt_authorization_scope": "public",
-                "trakt_authorization_created_at": 1700000000,
-            },
-        )
-
-    page.route("**/validate_trakt", handle_validate)
-    page.goto(f"{live_server}/step/130-trakt", wait_until="domcontentloaded")
-
-    page.locator("#trakt_client_id").fill(TRAKT_CLIENT_ID_64)
-    page.locator("#trakt_client_secret").fill("my-secret")
-    page.locator("#trakt_pin").fill("12345678")
-    page.locator("#validate_trakt_pin").click()
-
-    # All six access-token fields populated.
-    expect(page.locator("#access_token")).to_have_value("AT-123")
-    expect(page.locator("#token_type")).to_have_value("Bearer")
-    expect(page.locator("#expires_in")).to_have_value("7200")
-    expect(page.locator("#refresh_token")).to_have_value("RT-456")
-    expect(page.locator("#scope")).to_have_value("public")
-    expect(page.locator("#created_at")).to_have_value("1700000000")
-    # PIN + URL cleared.
-    expect(page.locator("#trakt_pin")).to_have_value("")
-    expect(page.locator("#trakt_url")).to_have_value("")
-    # PIN-flow buttons disabled, Check Token enabled.
-    expect(page.locator("#trakt_open_url")).to_be_disabled()
-    expect(page.locator("#validate_trakt_pin")).to_be_disabled()
-    expect(page.locator("#trakt_check_token")).to_be_enabled()
-    # Validated state flipped to true.
-    expect(page.locator("#trakt_validated")).to_have_value("true")
-    expect(page.locator("#statusMessage")).to_contain_text("Trakt credentials validated successfully!")
-
-
-@pytest.mark.e2e
-def test_trakt_pin_validator_missing_fields_shows_required_message(page, live_server):
-    """With one of id/secret/pin missing, the client-side guard short-
-    circuits before the network call and shows the static required-
-    fields message.
-    """
-    requests_made = {"n": 0}
-
-    def handle_validate(route):
-        requests_made["n"] += 1
-        route.fulfill(status=200, json={"valid": True})
-
-    page.route("**/validate_trakt", handle_validate)
-    page.goto(f"{live_server}/step/130-trakt", wait_until="domcontentloaded")
-
-    page.locator("#trakt_client_id").fill(TRAKT_CLIENT_ID_64)
-    page.locator("#trakt_client_secret").fill("my-secret")
-    # PIN is intentionally empty. The pin field's checkPinField() will
-    # have left the validate button disabled, so we force-enable it.
-    page.evaluate("document.getElementById('validate_trakt_pin').disabled = false")
-    page.locator("#validate_trakt_pin").click()
-
-    expect(page.locator("#statusMessage")).to_contain_text("ID, secret, and PIN are all required.")
-    assert requests_made["n"] == 0, "no network call should fire when fields are missing"
-
-
-@pytest.mark.e2e
-def test_trakt_url_button_enabled_when_client_id_is_exactly_64_chars(page, live_server):
-    """Verifies the updateTraktURL() inline handler builds the
-    authorization URL only when client_id.length === 64, and the
-    Retrieve PIN button enables itself when the URL is non-empty.
-    """
-    page.goto(f"{live_server}/step/130-trakt", wait_until="domcontentloaded")
-
-    # Initially disabled (page just loaded).
-    expect(page.locator("#trakt_open_url")).to_be_disabled()
-
-    # Wrong length: still disabled.
-    page.locator("#trakt_client_id").fill("a" * 32)
-    expect(page.locator("#trakt_url")).to_have_value("")
-    expect(page.locator("#trakt_open_url")).to_be_disabled()
-
-    # Right length: URL constructed, button enabled.
-    page.locator("#trakt_client_id").fill(TRAKT_CLIENT_ID_64)
-    expect(page.locator("#trakt_url")).to_contain_text("")  # readonly so use to_have_value
-    trakt_url_value = page.locator("#trakt_url").input_value()
-    assert "trakt.tv/oauth/authorize" in trakt_url_value
-    assert TRAKT_CLIENT_ID_64 in trakt_url_value
-    expect(page.locator("#trakt_open_url")).to_be_enabled()
-
-
-@pytest.mark.e2e
-def test_trakt_check_token_button_initially_disabled_when_no_access_token(page, live_server):
-    """isBlankTokenValue treats blank/None/Null as blank. On a fresh
-    page where access_token is empty (or the literal string 'None' from
-    the persisted state), the Check Token button must start disabled.
-    """
-    page.goto(f"{live_server}/step/130-trakt", wait_until="domcontentloaded")
-    expect(page.locator("#trakt_check_token")).to_be_disabled()
 
 
 # MAL OAuth tests. MAL's client_id must be exactly 32 chars for the
@@ -1109,24 +1091,6 @@ def test_mal_authorize_button_enabled_when_client_id_is_exactly_32_chars(page, l
 # oninput="checkPinField" / oninput="checkURLField" attributes in
 # the templates and are now driven by addEventListener('input', ...)
 # in the JS modules. (Inline-handler-cleanup follow-up to Step 6 PR 4d.)
-
-
-@pytest.mark.e2e
-def test_trakt_validate_button_enables_when_user_types_in_pin_field(page, live_server):
-    """Typing into the PIN field should enable the Validate PIN button;
-    clearing it should disable it again. Previously wired via inline
-    oninput="checkPinField(this)", now via addEventListener.
-    """
-    page.goto(f"{live_server}/step/130-trakt", wait_until="domcontentloaded")
-
-    # Initially disabled (the page just loaded with no PIN entered).
-    expect(page.locator("#validate_trakt_pin")).to_be_disabled()
-
-    page.locator("#trakt_pin").fill("12345678")
-    expect(page.locator("#validate_trakt_pin")).to_be_enabled()
-
-    page.locator("#trakt_pin").fill("")
-    expect(page.locator("#validate_trakt_pin")).to_be_disabled()
 
 
 @pytest.mark.e2e
@@ -1267,6 +1231,55 @@ def test_config_workspace_modal_changing_selector_shows_new_config_input(page, l
         selector.select_option(other_options[0])
         classes_after_other = page.locator("#newConfigInput").get_attribute("class") or ""
         assert "d-none" in classes_after_other, f"expected d-none ADDED after switching away from add_config; got class='{classes_after_other}'"
+
+
+@pytest.mark.e2e
+def test_import_config_modal_suggests_next_available_name(page, live_server):
+    """Import should never prefill the name of an existing config.
+
+    It reuses Duplicate's naming sequence so an active ``example`` config
+    becomes ``example_copy``, or ``example_copy_2`` when the first copy
+    already exists.
+    """
+    source_config = "pytest_import_source"
+    _seed_config(source_config)
+    _seed_config(f"{source_config}_copy")
+    _activate_config(page, live_server, source_config)
+    page.reload(wait_until="domcontentloaded")
+
+    # configSelector now lives inside the Manage Configs Bootstrap modal.
+    # Open the modal before interacting with the selector, matching the current UI.
+    page.locator(".config-badge-button").click()
+    expect(page.locator("#configSwitchModal")).to_be_visible()
+    page.locator("#configSelector").select_option(source_config)
+
+    page.evaluate("""() => {
+        document.getElementById('importConfigModal').dispatchEvent(new Event('show.bs.modal'))
+    }""")
+
+    expect(page.locator("#importConfigName")).to_have_value(f"{source_config}_copy_2")
+    expect(page.locator("#importConfigError")).to_be_hidden()
+
+
+@pytest.mark.e2e
+def test_config_workspace_modal_uses_clear_orphaned_bundle_labels(page, live_server):
+    """The orphaned-artifact workflow should use wording that matches the
+    underlying action of reviewing orphaned config bundles on disk.
+    """
+    page.goto(f"{live_server}/step/001-start", wait_until="domcontentloaded")
+
+    page.evaluate("""
+        const modalEl = document.getElementById('configSwitchModal')
+        if (modalEl) {
+            modalEl.classList.add('show')
+            modalEl.style.display = 'block'
+            modalEl.removeAttribute('aria-hidden')
+        }
+    """)
+
+    expect(page.locator("#orphanedArtifactsButton")).to_have_text("Review Orphaned Config Bundles")
+    expect(page.locator("#orphanedArtifactsModalLabel")).to_contain_text("Review Orphaned Config Bundles")
+    expect(page.locator("#cancelOrphanedArtifactsDelete")).to_have_text("Cancel")
 
 
 @pytest.mark.e2e
@@ -1881,7 +1894,7 @@ def test_imagemaid_page_loads_as_module(page, live_server):
     page.wait_for_timeout(500)
     state = page.evaluate("""() => {
             const scripts = Array.from(document.scripts)
-            const imagemaidScript = scripts.find(s => (s.src || '').endsWith('/915-imagemaid.js'))
+            const imagemaidScript = scripts.find(s => /[/]915-imagemaid(?:-[^/]+)?[.]js$/.test(s.src || ''))
             return {
                 pageMeta: !!document.getElementById('imagemaid-page-meta'),
                 scriptFound: !!imagemaidScript,
@@ -1889,7 +1902,7 @@ def test_imagemaid_page_loads_as_module(page, live_server):
             }
         }""")
     assert state["pageMeta"], "expected the ImageMaid page to render (precondition)"
-    assert state["scriptFound"], "expected /915-imagemaid.js to be referenced from the page"
+    assert state["scriptFound"], "expected the ImageMaid source or built bundle to be referenced from the page"
     assert state["scriptType"] == "module", f"expected the ImageMaid script to load as type='module' after conversion; got type={state['scriptType']!r}"
 
 
@@ -2030,15 +2043,28 @@ def test_analytics_local_escapehtml_does_not_clobber_global_shim(page, live_serv
 
 @pytest.mark.e2e
 def test_analytics_module_runs_without_console_errors(page, live_server):
-    """No JS console errors from the module conversion."""
-    errors = []
-    page.on("pageerror", lambda exc: errors.append(str(exc)))
-    page.on("console", lambda msg: errors.append(f"{msg.type}: {msg.text}") if msg.type == "error" else None)
+    """Analytics must complete its initial load without an uncaught JS error."""
+    page_errors = []
+    console_errors = []
+    page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+    page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
 
     page.goto(f"{live_server}/step/905-analytics", wait_until="domcontentloaded")
-    page.wait_for_timeout(1000)
-    relevant = [e for e in errors if any(kw in e.lower() for kw in ("analytics.js", "strict mode", "redeclar", "is not defined"))]
-    assert not relevant, f"module conversion introduced JS errors: {relevant}"
+    page.wait_for_function(
+        """() => {
+            const summary = document.querySelector('#logscan-trends-summary')
+            const text = (summary && summary.textContent || '').trim()
+            return text
+                && !text.startsWith('Loading')
+                && !text.startsWith('Rendering')
+                && !text.startsWith('Preparing')
+        }""",
+        timeout=15000,
+    )
+
+    relevant_console_errors = [error for error in console_errors if any(keyword in error.lower() for keyword in ("analytics.js", "strict mode", "redeclar", "is not defined"))]
+    assert not page_errors, f"Analytics page raised uncaught JavaScript errors: {page_errors}"
+    assert not relevant_console_errors, f"Analytics module logged JavaScript errors: {relevant_console_errors}"
 
 
 # ES module conversion of rgbaPicker.js (chore/convert-rgbapicker-to-module).

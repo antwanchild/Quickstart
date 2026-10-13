@@ -46,7 +46,7 @@ RUN echo "**** install system packages ****" \
  && apt-get update \
  && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y tzdata --no-install-recommends \
- && apt-get install -y gcc g++ libxml2-dev libxslt-dev libz-dev libjpeg62-turbo-dev zlib1g-dev wget curl ffmpeg libsm6 libxext6 \
+ && apt-get install -y gcc g++ libxml2-dev libxslt-dev libz-dev libjpeg62-turbo-dev zlib1g-dev wget curl git ffmpeg libsm6 libxext6 \
  && wget -O /tini https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini-"$(dpkg --print-architecture | awk -F- '{ print $NF }')" \
  && chmod +x /tini
 RUN echo "**** install python packages ****" \
@@ -67,4 +67,6 @@ COPY . /
 # in the final image.
 COPY --from=jsbuild /jsbuild/static/dist/ /static/dist/
 VOLUME /config
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+ CMD curl -fsS "http://127.0.0.1:${QS_PORT:-7171}/kometa-status" >/dev/null || exit 1
 ENTRYPOINT ["/tini", "-s", "python3", "quickstart.py", "--"]

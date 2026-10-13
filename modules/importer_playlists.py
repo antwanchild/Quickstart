@@ -13,7 +13,7 @@ library-processing code needs to know about:
                                        any playlist entry's
                                        template_variables.libraries.
 * ``file_entries``                  -- entries that point at a
-                                       file/url/git/repo location
+                                       file/folder/url/git/repo location
                                        instead of a template block.
 * ``template_field_values``         -- flat playlist-scoped template
                                        overrides keyed by field name.
@@ -55,7 +55,6 @@ PLAYLIST_SHARED_IMPORT_FIELDS: dict[str, str] = {
     "sonarr_add_missing": "boolean",
     "sonarr_folder": "string",
     "sonarr_tag": "string_list",
-    "trakt_list": "string_list",
     "imdb_list": "string_list",
     "mdblist_list": "string_list",
 }
@@ -79,7 +78,6 @@ PLAYLIST_KEYED_IMPORT_FIELDS: dict[str, str] = {
     "sonarr_folder_": "string",
     "sonarr_tag_": "string_list",
     "sync_to_users_": "string_list",
-    "trakt_list_": "string_list",
 }
 
 
@@ -96,6 +94,15 @@ class PlaylistImportState:
     def has_any_data(self) -> bool:
         """True if the parser found at least one usable playlist entry."""
         return bool(self.libraries or self.file_entries)
+
+
+def _coerce_playlist_library_names(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [item.strip() for item in text.split(",") if item.strip()]
 
 
 def parse_playlist_config(config_data: dict, report: ImportReport) -> PlaylistImportState:
@@ -122,21 +129,32 @@ def parse_playlist_config(config_data: dict, report: ImportReport) -> PlaylistIm
         # -- File-reference entry (file/url/git/repo) short-circuits --
         raw_entry_type = None
         raw_entry_location = None
-        for candidate in ("file", "url", "git", "repo"):
+        for candidate in ("file", "folder", "url", "git", "repo"):
             location = entry.get(candidate)
             if location:
                 raw_entry_type = candidate
                 raw_entry_location = str(location).strip()
                 break
         if raw_entry_type and raw_entry_location:
-            state.file_entries.append({"type": raw_entry_type, "location": raw_entry_location})
+            file_entry = {"type": raw_entry_type, "location": raw_entry_location}
+            schedule = str(entry.get("schedule") or "").strip()
+            if schedule:
+                file_entry["schedule"] = schedule
+            template_values = entry.get("template_variables")
+            if isinstance(template_values, dict) and template_values:
+                file_entry["template_variables"] = template_values
+            state.file_entries.append(file_entry)
             report.add("imported", f"playlist_files[{idx}]")
             report.add("imported", f"playlist_files[{idx}].{raw_entry_type}")
-            if entry.get("template_variables") not in (None, {}):
+            if schedule:
+                report.add("imported", f"playlist_files[{idx}].schedule")
+            if isinstance(template_values, dict) and template_values:
+                report.add("imported", f"playlist_files[{idx}].template_variables")
+            elif template_values not in (None, {}):
                 report.add(
                     "unmapped",
                     f"playlist_files[{idx}].template_variables",
-                    "Template variables for direct playlist file entries are not supported in Quickstart.",
+                    "Unsupported playlist file template_variables format.",
                 )
             continue
 
@@ -150,7 +168,7 @@ def parse_playlist_config(config_data: dict, report: ImportReport) -> PlaylistIm
             )
             continue
         libs = tv.get("libraries")
-        entry_libs = _coerce_import_string_list(libs)
+        entry_libs = _coerce_playlist_library_names(libs)
         if not entry_libs:
             report.add(
                 "unmapped",

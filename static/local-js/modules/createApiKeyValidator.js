@@ -16,7 +16,7 @@
 // and revalidateOnLoad to refresh those dropdowns when an already-
 // validated user returns to the page.
 //
-// Wizards with OAuth-PIN flows (010-plex, 130-trakt, 140-mal) are NOT
+// Wizards with OAuth-PIN flows (010-plex and 140-mal) are NOT
 // migrated to this factory; their multi-step flow is fundamentally
 // different from the "credential -> validate -> done" shape and they
 // belong in a separate helper (Step 6 PR 4 later slices).
@@ -70,9 +70,13 @@ const DEFAULT_MESSAGES = {
  *                                                   listeners that reset validation, and have
  *                                                   their values passed to buildPayload as the
  *                                                   second argument.
+ * @param {string[]} [config.optionalFieldIds=[]]    Element ids included in listeners and buildPayload
+ *                                                   without being required for validation.
  * @param {string} config.validatedFieldId       Element id of the hidden "<service>_validated" input.
  * @param {string} [config.validatedAtFieldId]   Element id of the hidden "<service>_validated_at" timestamp input.
  * @param {string} [config.toggleButtonId='toggleApikeyVisibility']  Id of the show/hide toggle button.
+ * @param {string} [config.toggleFieldId]        Optional non-primary secret field controlled by the toggle.
+ *                                               Defaults to fieldId when omitted.
  * @param {string} [config.validateButtonId='validateButton']        Id of the validate button.
  * @param {string} [config.statusMessageId='statusMessage']          Id of the status callout element.
  * @param {string} [config.formId='configForm']                      Id of the wrapping form (for submit reset).
@@ -128,9 +132,11 @@ export function createApiKeyValidator (config) {
   const {
     fieldId,
     additionalFieldIds = [],
+    optionalFieldIds = [],
     validatedFieldId,
     validatedAtFieldId,
     toggleButtonId = 'toggleApikeyVisibility',
+    toggleFieldId,
     validateButtonId = 'validateButton',
     statusMessageId = 'statusMessage',
     formId = 'configForm',
@@ -160,6 +166,7 @@ export function createApiKeyValidator (config) {
   const validatedAtInput = validatedAtFieldId ? document.getElementById(validatedAtFieldId) : null
   const validateButton = document.getElementById(validateButtonId)
   const toggleButton = document.getElementById(toggleButtonId)
+  const toggleInput = toggleFieldId ? document.getElementById(toggleFieldId) : apiKeyInput
   const form = document.getElementById(formId)
 
   // If the credential or validate button isn't on the page, this wizard
@@ -173,6 +180,10 @@ export function createApiKeyValidator (config) {
   const additionalElements = additionalFieldIds
     .map(id => ({ id, el: document.getElementById(id) }))
     .filter(entry => entry.el)
+  const optionalElements = optionalFieldIds
+    .map(id => ({ id, el: document.getElementById(id) }))
+    .filter(entry => entry.el)
+  const payloadElements = [...additionalElements, ...optionalElements]
 
   // ── initial visibility of the primary field ─────────────────────────
   if (!maskPrimaryField) {
@@ -183,6 +194,11 @@ export function createApiKeyValidator (config) {
   } else {
     apiKeyInput.setAttribute('type', 'password')
     if (toggleButton) setToggleButtonIcon(toggleButton, false)
+  }
+  if (toggleFieldId && toggleInput) {
+    const showPlainText = toggleInput.value.trim() === ''
+    toggleInput.setAttribute('type', showPlainText ? 'text' : 'password')
+    if (toggleButton) setToggleButtonIcon(toggleButton, showPlainText)
   }
 
   // ── initial button state ────────────────────────────────────────────
@@ -198,6 +214,9 @@ export function createApiKeyValidator (config) {
 
   apiKeyInput.addEventListener('input', resetValidation)
   for (const { el } of additionalElements) {
+    el.addEventListener('input', resetValidation)
+  }
+  for (const { el } of optionalElements) {
     el.addEventListener('input', resetValidation)
   }
 
@@ -222,7 +241,7 @@ export function createApiKeyValidator (config) {
 
   function collectAdditionalValues () {
     const out = {}
-    for (const { id, el } of additionalElements) {
+    for (const { id, el } of payloadElements) {
       out[id] = el.value
     }
     return out
@@ -314,10 +333,10 @@ export function createApiKeyValidator (config) {
   }
 
   // ── show/hide toggle for the credential field ───────────────────────
-  if (maskPrimaryField && toggleButton) {
+  if ((maskPrimaryField || toggleFieldId) && toggleButton && toggleInput) {
     toggleButton.addEventListener('click', function () {
-      const currentType = apiKeyInput.getAttribute('type')
-      apiKeyInput.setAttribute('type', currentType === 'password' ? 'text' : 'password')
+      const currentType = toggleInput.getAttribute('type')
+      toggleInput.setAttribute('type', currentType === 'password' ? 'text' : 'password')
       setToggleButtonIcon(this, currentType === 'password')
     })
   }
@@ -336,6 +355,9 @@ export function createApiKeyValidator (config) {
     form.addEventListener('submit', function (event) {
       if (!apiKeyInput.value) apiKeyInput.value = ''
       for (const { el } of additionalElements) {
+        if (!el.value) el.value = ''
+      }
+      for (const { el } of optionalElements) {
         if (!el.value) el.value = ''
       }
       if (typeof onPreSubmit === 'function' && onPreSubmit() === false) {

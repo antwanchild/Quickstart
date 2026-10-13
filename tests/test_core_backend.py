@@ -367,6 +367,146 @@ def test_library_fragment_lazy_overlay_count_ignores_inactive_overlay_values(cli
     assert 'data-lazy-override-count="0"' in html
 
 
+def test_collection_section_entries_endpoint_uses_server_data(client, monkeypatch, qs_module, library_routes_module):
+    monkeypatch.setattr(
+        library_routes_module,
+        "_build_library_lists",
+        lambda: ([{"id": "mov-library_movies", "name": "Movies", "type": "movie"}], [], {"plex_pass": True}),
+    )
+    monkeypatch.setattr(
+        library_routes_module.helpers,
+        "load_quickstart_config",
+        lambda _filename: [
+            {
+                "accordion": "Awards",
+                "collections": [
+                    {
+                        "id": "collection_oscars",
+                        "label": "Academy Awards",
+                        "media_types": ["movie"],
+                        "template_variables": [{"key": "collection_section", "type": "text_input", "default": "130"}],
+                    }
+                ],
+            },
+            {
+                "accordion": "Other",
+                "collections": [
+                    {
+                        "id": "collection_collectionless",
+                        "label": "Collectionless",
+                        "media_types": ["movie", "show"],
+                        "template_variables": [{"key": "collection_section", "type": "text_input", "default": "999"}],
+                    }
+                ],
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        qs_module.persistence,
+        "retrieve_settings",
+        lambda _target: {
+            "libraries": {
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-collection_collectionless": True,
+                "mov-library_movies-template_collection_collectionless_collection_section": "010",
+            }
+        },
+    )
+
+    resp = client.post(
+        "/library_fragment/mov-library_movies/collection_section_entries",
+        json={
+            "source_payload": {
+                "__loaded_sections": [],
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-collection_oscars": "true",
+                "mov-library_movies-template_collection_oscars_collection_section": "020",
+            }
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["success"] is True
+    assert [entry["collectionId"] for entry in payload["entries"]] == ["collection_collectionless", "collection_oscars"]
+    assert [entry["currentValue"] for entry in payload["entries"]] == ["010", "020"]
+
+
+def test_collection_section_order_endpoint_saves_and_resets_without_dom(client, isolated_config_dir, monkeypatch, app, library_routes_module):
+    from modules import database
+
+    config_name = "pytest_collection_section_order"
+    database.save_section_data(
+        section="libraries",
+        validated=False,
+        user_entered=True,
+        name=config_name,
+        data={
+            "libraries": {
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-collection_collectionless": True,
+                "mov-library_movies-collection_oscars": True,
+                "mov-library_movies-template_collection_collectionless_collection_section": "010",
+            },
+            "validated": False,
+        },
+    )
+    monkeypatch.setattr(
+        library_routes_module,
+        "_build_library_lists",
+        lambda: ([{"id": "mov-library_movies", "name": "Movies", "type": "movie"}], [], {"plex_pass": True}),
+    )
+    monkeypatch.setattr(
+        library_routes_module.helpers,
+        "load_quickstart_config",
+        lambda _filename: [
+            {
+                "accordion": "Awards",
+                "collections": [
+                    {
+                        "id": "collection_oscars",
+                        "label": "Academy Awards",
+                        "media_types": ["movie"],
+                        "template_variables": [{"key": "collection_section", "type": "text_input", "default": "130"}],
+                    },
+                    {
+                        "id": "collection_collectionless",
+                        "label": "Collectionless",
+                        "media_types": ["movie", "show"],
+                        "template_variables": [{"key": "collection_section", "type": "text_input", "default": "999"}],
+                    },
+                ],
+            }
+        ],
+    )
+    with client.session_transaction() as sess:
+        sess["config_name"] = config_name
+
+    resp = client.post(
+        "/library_fragment/mov-library_movies/collection_section_order",
+        json={"collection_ids": ["collection_oscars", "collection_collectionless"]},
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["success"] is True
+    _validated, _user_entered, stored = database.retrieve_section_data(config_name, "libraries")
+    libraries = stored["libraries"]
+    assert libraries["mov-library_movies-template_collection_oscars_collection_section"] == "010"
+    assert libraries["mov-library_movies-template_collection_collectionless_collection_section"] == "020"
+
+    reset_resp = client.post(
+        "/library_fragment/mov-library_movies/collection_section_order",
+        json={"collection_ids": ["collection_oscars", "collection_collectionless"], "reset": True},
+    )
+
+    assert reset_resp.status_code == 200
+    _validated, _user_entered, reset_stored = database.retrieve_section_data(config_name, "libraries")
+    reset_libraries = reset_stored["libraries"]
+    assert "mov-library_movies-template_collection_oscars_collection_section" not in reset_libraries
+    assert "mov-library_movies-template_collection_collectionless_collection_section" not in reset_libraries
+
+
 def test_lazy_overlay_count_uses_rendered_ratings_defaults(library_routes_module):
     library = {"id": "mov-library_movies", "name": "Movies", "type": "movie"}
     libraries_data = {
@@ -447,6 +587,11 @@ def test_lazy_overlay_count_uses_rendered_ratings_defaults(library_routes_module
     assert library_routes_module._count_overlay_overrides_for_library(library, libraries_data, overlay_config) == 6
 
 
+def test_lazy_override_count_ignores_none_sentinels(library_routes_module):
+    assert library_routes_module._template_value_is_configured("None", "") is False
+    assert library_routes_module._template_value_is_configured(" null ", "") is False
+
+
 def test_library_fragment_section_renders_requested_heavy_section(client, monkeypatch, qs_module, library_routes_module):
     monkeypatch.setattr(
         library_routes_module,
@@ -492,6 +637,7 @@ def test_library_fragment_section_renders_requested_heavy_section(client, monkey
 
     collections = client.get("/library_fragment/mov-library_movies/section/collections")
     collection_group = client.get("/library_fragment/mov-library_movies/section/collections/group/0")
+    collection_detail = client.get("/library_fragment/mov-library_movies/section/collections/group/0/detail/collection_award")
     overlays = client.get("/library_fragment/mov-library_movies/section/overlays")
 
     assert collections.status_code == 200
@@ -500,7 +646,11 @@ def test_library_fragment_section_renders_requested_heavy_section(client, monkey
     assert "Awards Default Row" not in collections.get_data(as_text=True)
     assert collection_group.status_code == 200
     assert "Awards Default Row" in collection_group.get_data(as_text=True)
-    assert 'data-template-variable-key="style"' in collection_group.get_data(as_text=True)
+    assert "data-collection-detail-lazy-placeholder" in collection_group.get_data(as_text=True)
+    assert 'data-template-variable-key="style"' not in collection_group.get_data(as_text=True)
+    assert collection_detail.status_code == 200
+    assert "Awards Default Row" in collection_detail.get_data(as_text=True)
+    assert 'data-template-variable-key="style"' in collection_detail.get_data(as_text=True)
     assert overlays.status_code == 200
     assert "Preview Overlays" in overlays.get_data(as_text=True)
 
@@ -2418,6 +2568,38 @@ def test_output_collection_file_entries_are_sorted():
     ]
 
 
+def test_output_file_entries_preserve_supported_schedules():
+    import json
+
+    from modules import output
+
+    raw = json.dumps(
+        [
+            {"type": "file", "location": "config/metadata.yml", "schedule": "weekly(friday)"},
+            {"type": "repo", "location": "custom/collections.yml", "schedule": "range(12/01-12/31)"},
+        ]
+    )
+
+    assert output._parse_metadata_file_entries(raw) == [
+        {"file": "config/metadata.yml", "schedule": "weekly(friday)"},
+        {"repo": "custom/collections.yml", "schedule": "range(12/01-12/31)"},
+    ]
+    assert output._parse_collection_file_block_entries(raw) == [
+        {"file": "config/metadata.yml", "schedule": "weekly(friday)"},
+        {"repo": "custom/collections.yml", "schedule": "range(12/01-12/31)"},
+    ]
+
+
+def test_output_overlay_file_entries_drop_unsupported_schedules():
+    import json
+
+    from modules import output
+
+    parsed = output._parse_overlay_file_block_entries(json.dumps([{"type": "file", "location": "config/overlays.yml", "schedule": "weekly(friday)"}]))
+
+    assert parsed == [{"file": "config/overlays.yml"}]
+
+
 def test_output_overlay_file_entries_are_sorted():
     import json
 
@@ -2535,6 +2717,154 @@ def test_build_libraries_section_emits_raw_overlay_files(app):
     assert list(libraries_section["libraries"]["Movies"].keys())[:2] == ["template_variables", "overlay_files"]
 
 
+@pytest.mark.parametrize(
+    "field,location",
+    [
+        ("metadata_files", "https://example.com/custom-metadata.yml"),
+        ("collection_files", "https://example.com/custom-collection.yml"),
+        ("overlay_files", "https://example.com/custom-overlay.yml"),
+    ],
+)
+def test_normalize_library_file_entries_preserves_template_variables(field, location):
+    import json
+
+    from modules.library_file_entries import _normalize_library_file_entries_payload
+
+    raw_entry = {
+        "type": "url",
+        "location": location,
+        "template_variables": {
+            "resolution_only": True,
+            "custom_text": "value",
+        },
+        "validated": True,
+    }
+
+    normalized, errors, changed = _normalize_library_file_entries_payload(
+        {f"mov-library_movies-{field}": json.dumps([raw_entry])},
+        config_name="pytest_file_template_vars",
+        validate_local=True,
+    )
+
+    assert errors == []
+    assert changed is False
+    entries = json.loads(normalized[f"mov-library_movies-{field}"])
+    assert entries == [raw_entry]
+
+
+def test_build_libraries_section_emits_overlay_file_template_variables(app):
+    import json
+
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_overlays={
+                "movies": {
+                    "mov-library_movies-overlay_files": json.dumps(
+                        [
+                            {
+                                "type": "file",
+                                "location": "config/overlays/media_info.yml",
+                                "template_variables": {
+                                    "resolution_only": True,
+                                    "horizontal_align": "left",
+                                    "use_gradient_bottom": False,
+                                },
+                            }
+                        ]
+                    )
+                }
+            },
+        )
+
+    assert libraries_section["libraries"]["Movies"]["overlay_files"] == [
+        {
+            "file": "config/overlays/media_info.yml",
+            "template_variables": {
+                "resolution_only": True,
+                "horizontal_align": "left",
+                "use_gradient_bottom": False,
+            },
+        }
+    ]
+
+
+def test_build_libraries_section_emits_metadata_file_template_variables(app):
+    import json
+
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_metadata_files={
+                "movies": {
+                    "mov-library_movies-metadata_files": json.dumps(
+                        [
+                            {
+                                "type": "file",
+                                "location": "config/metadata/custom_metadata.yml",
+                                "template_variables": {
+                                    "include_extras": True,
+                                    "label": "Imported",
+                                },
+                            }
+                        ]
+                    )
+                }
+            },
+        )
+
+    assert libraries_section["libraries"]["Movies"]["metadata_files"] == [
+        {
+            "file": "config/metadata/custom_metadata.yml",
+            "template_variables": {
+                "include_extras": True,
+                "label": "Imported",
+            },
+        }
+    ]
+
+
+def test_build_libraries_section_emits_collection_file_template_variables(app):
+    import json
+
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_collection_files={
+                "movies": {
+                    "mov-library_movies-collection_files": json.dumps(
+                        [
+                            {
+                                "type": "file",
+                                "location": "config/collections/custom_collection.yml",
+                                "template_variables": {
+                                    "radarr_add_missing": True,
+                                    "schedule_christmas": "range(12/01-12/31)",
+                                },
+                            }
+                        ]
+                    )
+                }
+            },
+        )
+
+    assert libraries_section["libraries"]["Movies"]["collection_files"] == [
+        {
+            "file": "config/collections/custom_collection.yml",
+            "template_variables": {
+                "radarr_add_missing": True,
+                "schedule_christmas": "range(12/01-12/31)",
+            },
+        }
+    ]
+
+
 def test_build_libraries_section_emits_collection_files(app):
     import json
 
@@ -2560,12 +2890,12 @@ def test_build_libraries_section_emits_collection_files(app):
         )
 
         assert libraries_section["libraries"]["Movies"]["collection_files"] == [
-            {"default": "collectionless"},
             {"file": "C:\\Users\\bullmoose20\\Community-Configs\\bullmoose20\\godzilla.yml"},
             {"folder": "config\\metadata\\movies"},
             {"git": "bullmoose20/collections/godzilla.yml"},
             {"repo": "custom/movies_meta.yml"},
             {"url": "https://example.com/movies_refresh.yml"},
+            {"default": "collectionless"},
         ]
 
 
@@ -2721,7 +3051,6 @@ def test_build_libraries_section_preserves_chart_builder_size_template_variables
     collection_entries = libraries_section["libraries"]["Movies"]["collection_files"]
 
     tautulli_entry = next((entry for entry in collection_entries if entry.get("default") == "tautulli"), None)
-    trakt_entry = next((entry for entry in collection_entries if entry.get("default") == "trakt"), None)
     tmdb_entry = next((entry for entry in collection_entries if entry.get("default") == "tmdb"), None)
     simkl_entry = next((entry for entry in collection_entries if entry.get("default") == "simkl"), None)
     anilist_entry = next((entry for entry in collection_entries if entry.get("default") == "anilist"), None)
@@ -2744,16 +3073,6 @@ def test_build_libraries_section_preserves_chart_builder_size_template_variables
     assert tautulli_entry["template_variables"]["sync_mode_watched"] == "append"
     assert tautulli_entry["template_variables"]["cache_builders_popular"] == "0"
     assert tautulli_entry["template_variables"]["collection_order_popular"] == "custom"
-    assert trakt_entry["template_variables"]["limit"] == "75"
-    assert trakt_entry["template_variables"]["limit_popular"] == "50"
-    assert trakt_entry["template_variables"]["limit_recommended"] == "30"
-    assert trakt_entry["template_variables"]["image"] == "chart/color/trakt"
-    assert trakt_entry["template_variables"]["url_logo_collected"] == "https://example.com/trakt-collected.png"
-    assert trakt_entry["template_variables"]["sync_mode_recommended"] == "append"
-    assert trakt_entry["template_variables"]["cache_builders_trending"] == "0"
-    assert trakt_entry["template_variables"]["collection_order_watched"] == "custom"
-    assert trakt_entry["template_variables"]["radarr_folder_collected"] == r"C:\Media\Movies"
-    assert trakt_entry["template_variables"]["sonarr_search_watched"] is False
     assert tmdb_entry["template_variables"]["limit"] == "60"
     assert tmdb_entry["template_variables"]["limit_airing"] == "20"
     assert tmdb_entry["template_variables"]["limit_trending"] == "40"
@@ -2918,6 +3237,64 @@ def test_runtime_config_schema_accepts_franchise_build_collection_and_title_over
     assert errors == []
 
 
+def test_runtime_config_schema_accepts_external_file_template_variables(isolated_config_dir):
+    import json
+
+    import jsonschema
+
+    schema_path = isolated_config_dir / ".schema" / "config-schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    sample = {
+        "plex": {"url": "http://example", "token": "x"},
+        "tmdb": {"apikey": "x"},
+        "playlist_files": [
+            {
+                "folder": "config/custom/playlists",
+                "template_variables": {
+                    "custom_playlist_flag": True,
+                    "custom_playlist_values": ["one", 2],
+                },
+            }
+        ],
+        "libraries": {
+            "Movies": {
+                "metadata_files": [
+                    {
+                        "file": "config/custom/metadata.yml",
+                        "template_variables": {
+                            "custom_metadata_flag": True,
+                            "custom_metadata_text": "anything",
+                        },
+                    }
+                ],
+                "collection_files": [
+                    {
+                        "folder": "config/custom/collections",
+                        "template_variables": {
+                            "custom_collection_flag": True,
+                            "custom_collection_values": ["one", 2],
+                        },
+                    }
+                ],
+                "overlay_files": [
+                    {
+                        "file": "config/custom/overlay.yml",
+                        "template_variables": {
+                            "video_only": True,
+                            "resolution_only": True,
+                            "custom_overlay_map": {"nested": True},
+                        },
+                    }
+                ],
+            }
+        },
+    }
+
+    errors = sorted(jsonschema.Draft7Validator(schema).iter_errors(sample), key=lambda err: list(err.path))
+
+    assert errors == []
+
+
 def test_runtime_config_schema_accepts_playlist_exclude_users_keyed_override(isolated_config_dir):
     import json
 
@@ -2937,6 +3314,35 @@ def test_runtime_config_schema_accepts_playlist_exclude_users_keyed_override(iso
                 },
             }
         ],
+    }
+
+    errors = sorted(jsonschema.Draft7Validator(schema).iter_errors(sample), key=lambda err: list(err.path))
+
+    assert errors == []
+
+
+def test_runtime_config_schema_accepts_seasonal_child_radarr_add_missing(isolated_config_dir):
+    import json
+
+    import jsonschema
+
+    schema_path = isolated_config_dir / ".schema" / "config-schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    sample = {
+        "plex": {"url": "http://example", "token": "x"},
+        "tmdb": {"apikey": "x"},
+        "libraries": {
+            "Movies": {
+                "collection_files": [
+                    {
+                        "default": "seasonal",
+                        "template_variables": {
+                            "radarr_add_missing_christmas": True,
+                        },
+                    }
+                ]
+            }
+        },
     }
 
     errors = sorted(jsonschema.Draft7Validator(schema).iter_errors(sample), key=lambda err: list(err.path))
@@ -2971,6 +3377,30 @@ def test_build_libraries_section_emits_collection_hub_priority(app):
     assert movie_entry["template_variables"]["hub_priority"] == "2"
     assert movie_entry["template_variables"]["visible_home_12A"] is True
     assert movie_entry["template_variables"]["hub_priority_12A"] == "1"
+
+
+def test_build_libraries_section_prunes_default_seasonal_schedule_and_keeps_child_radarr(app):
+    from modules import output
+
+    with app.app_context():
+        libraries_section = output.build_libraries_section(
+            movie_libraries={"mov-library_movies-library": "Movies"},
+            movie_collections={
+                "movies": {
+                    "mov-library_movies-collection_seasonal": True,
+                    "mov-library_movies-template_collection_seasonal_schedule_memorial": "range(05/18-06/07)",
+                    "mov-library_movies-template_collection_seasonal_radarr_add_missing_christmas": "true",
+                }
+            },
+        )
+
+    seasonal_entry = next(
+        (entry for entry in libraries_section["libraries"]["Movies"]["collection_files"] if entry.get("default") == "seasonal"),
+        None,
+    )
+
+    assert seasonal_entry is not None
+    assert seasonal_entry["template_variables"] == {"radarr_add_missing_christmas": True}
 
 
 def test_build_libraries_section_expands_franchise_dynamic_child_override_maps(app):
@@ -3124,7 +3554,6 @@ def test_build_libraries_section_preserves_collectionless_template_variables(app
     assert template_vars["imdb_list"] == ["ls123456789"]
     assert template_vars["plex_search"] == {"all": {"title": "Example"}}
     assert template_vars["mdblist_list"] == ["https://mdblist.com/lists/example/list"]
-    assert template_vars["trakt_list"] == ["https://trakt.tv/users/example/lists/list"]
     assert template_vars["exclude"] == ["Marvel Cinematic Universe"]
     assert template_vars["exclude_prefix"] == ["!", "~"]
 
@@ -3171,7 +3600,6 @@ def test_build_libraries_section_expands_geography_dynamic_child_override_maps(a
     show_country = next(entry for entry in show_entries if entry.get("default") == "country")
     show_region = next(entry for entry in show_entries if entry.get("default") == "region")
 
-    assert movie_country["template_variables"]["trakt_list"] == ["https://trakt.tv/users/example/lists/france"]
     assert movie_country["template_variables"]["name_France"] == "French Cinema"
     assert movie_country["template_variables"]["schedule_France"] == "weekly(sunday)"
     assert movie_country["template_variables"]["file_background_France"] == r"C:\Posters\france-bg.jpg"
@@ -3388,7 +3816,7 @@ def test_build_config_includes_saved_library_metadata_files(app, isolated_config
         output.helpers,
         "check_for_update",
         lambda: {
-            "kometa_branch": "nightly",
+            "kometa_branch": "develop",
             "branch": "develop",
             "local_version": "0.10.3-build2",
             "running_on": "Local-Windows",
@@ -3686,7 +4114,7 @@ def test_build_config_prunes_default_horizontal_ratings_offsets(app, monkeypatch
         output.helpers,
         "check_for_update",
         lambda: {
-            "kometa_branch": "nightly",
+            "kometa_branch": "develop",
             "branch": "develop",
             "local_version": "0.10.3-build2",
             "running_on": "Local-Windows",
@@ -4087,6 +4515,15 @@ def test_validate_all_services_flags_invalid_library_arr_overrides(client, monke
     assert libraries_result["status"] == "failed"
     assert libraries_result["reason"] == "invalid_arr_overrides"
     assert any("/bad-root" in detail for detail in libraries_result["details"])
+    assert payload["progress"]["phase"] == "complete"
+    assert payload["progress"]["completed"] == payload["progress"]["total"]
+    assert payload["progress"]["results"]["025-libraries"]["reason"] == "invalid_arr_overrides"
+
+    status = client.get(f"/validate_all_services/status?run_id={payload['run_id']}")
+    assert status.status_code == 200
+    status_payload = status.get_json()
+    assert status_payload["progress"]["run_id"] == payload["run_id"]
+    assert status_payload["progress"]["phase"] == "complete"
 
 
 def test_validate_all_services_flags_invalid_external_kometa_paths(client, monkeypatch, qs_module, tmp_path):
@@ -4131,6 +4568,8 @@ def test_validate_all_services_flags_invalid_external_kometa_paths(client, monke
     assert start_result["status"] == "failed"
     assert start_result["reason"] == "invalid_paths"
     assert any(str(missing_external) in detail for detail in start_result["details"])
+    assert payload["progress"]["phase"] == "complete"
+    assert payload["progress"]["results"]["001-start"]["reason"] == "invalid_paths"
 
 
 def test_step_post_from_libraries_rejects_invalid_collection_files(client, isolated_config_dir, monkeypatch, qs_module):
@@ -4183,6 +4622,39 @@ def test_helpers_extract_library_name_supports_metadata_files():
 
     assert helpers.extract_library_name("mov-library_movies-metadata_files") == "movies"
     assert helpers.extract_library_name("sho-library_tv_shows-metadata_files") == "tv_shows"
+
+
+def test_migrate_library_keys_to_plex_ids_migrates_overlay_levels_and_preserves_legacy_values(monkeypatch):
+    from modules import persistence
+
+    stored = {
+        "libraries": {
+            "mov-library_blockbusta-library": "Blockbusta",
+            "mov-library_blockbusta-movie-overlay_mediastinger": True,
+            "mov-library_96-movie-overlay_mediastinger": False,
+            "sho-library_tvshows-show-overlay_status": True,
+            "sho-library_tvshows-season-overlay_status": True,
+            "sho-library_tvshows-episode-overlay_status": True,
+        }
+    }
+    saved = {}
+
+    monkeypatch.setattr(persistence.database, "retrieve_section_data", lambda *_args: (True, False, stored))
+    monkeypatch.setattr(persistence.database, "save_section_data", lambda **kwargs: saved.update(kwargs))
+
+    count = persistence.migrate_library_keys_to_plex_ids(
+        "config",
+        [{"id": 96, "name": "Blockbusta"}, {"id": 12, "name": "TV Shows"}],
+    )
+
+    migrated = saved["data"]["libraries"]
+    assert count == 5
+    assert migrated["mov-library_96-library"] == "Blockbusta"
+    assert migrated["mov-library_96-movie-overlay_mediastinger"] is True
+    assert migrated["sho-library_12-show-overlay_status"] is True
+    assert migrated["sho-library_12-season-overlay_status"] is True
+    assert migrated["sho-library_12-episode-overlay_status"] is True
+    assert not any("blockbusta" in key or "tvshows" in key for key in migrated)
 
 
 def test_update_quickstart_settings_supports_independent_imagemaid_log_retention(client, qs_module, isolated_config_dir, monkeypatch):
@@ -4288,7 +4760,8 @@ def test_validate_plex_bad_token(client, monkeypatch, qs_module):
 
 
 def test_validate_plex_persists_telemetry_for_current_config(client, monkeypatch, qs_module):
-    calls = {"save_settings": 0, "save_section": 0}
+    calls = {"save_settings": 0, "save_section": 0, "update_libraries": 0}
+    captured = {}
 
     def fake_validate(_data):
         return qs_module.jsonify(
@@ -4297,13 +4770,14 @@ def test_validate_plex_persists_telemetry_for_current_config(client, monkeypatch
                 "db_cache": 2048,
                 "user_list": ["User One"],
                 "music_libraries": [],
-                "movie_libraries": ["Movies"],
-                "show_libraries": ["Shows"],
+                "movie_libraries": [{"id": 1, "name": "Movies"}],
+                "show_libraries": [{"id": 2, "name": "Shows"}],
                 "has_plex_pass": True,
             }
         )
 
     telemetry = {
+        "plex_pass": False,
         "server_name": "Test Plex",
         "db_cache": "2048 MB",
         "maintenance_window": "02:00 – 05:00",
@@ -4312,8 +4786,29 @@ def test_validate_plex_persists_telemetry_for_current_config(client, monkeypatch
 
     monkeypatch.setattr(qs_module.validations, "validate_plex_server", fake_validate)
     monkeypatch.setattr(qs_module.helpers, "get_plex_metadata", lambda **_kwargs: telemetry)
-    monkeypatch.setattr(qs_module.persistence, "save_settings", lambda *_args, **_kwargs: calls.__setitem__("save_settings", calls["save_settings"] + 1))
-    monkeypatch.setattr(qs_module.database, "save_section_data", lambda **_kwargs: calls.__setitem__("save_section", calls["save_section"] + 1))
+
+    def fake_save_settings(section_name, payload):
+        calls["save_settings"] += 1
+        captured["save_settings"] = {"section_name": section_name, "payload": payload}
+
+    def fake_save_section_data(**kwargs):
+        calls["save_section"] += 1
+        captured["save_section"] = kwargs
+
+    monkeypatch.setattr(qs_module.persistence, "save_settings", fake_save_settings)
+    monkeypatch.setattr(qs_module.database, "save_section_data", fake_save_section_data)
+
+    def fake_update_stored_plex_libraries(section_name, movie_libraries, show_libraries, music_libraries, user_list):
+        calls["update_libraries"] += 1
+        captured["update_libraries"] = {
+            "section_name": section_name,
+            "movie_libraries": movie_libraries,
+            "show_libraries": show_libraries,
+            "music_libraries": music_libraries,
+            "user_list": user_list,
+        }
+
+    monkeypatch.setattr(qs_module.persistence, "update_stored_plex_libraries", fake_update_stored_plex_libraries)
 
     with client.session_transaction() as sess:
         sess["config_name"] = "pytest_validate_plex"
@@ -4323,8 +4818,19 @@ def test_validate_plex_persists_telemetry_for_current_config(client, monkeypatch
     payload = resp.get_json()
     assert payload["validated"] is True
     assert payload["db_cache"] == 2048
+    assert payload["plex_pass"] is True
     assert payload["maintenance_window"] == "02:00 – 05:00"
-    assert calls == {"save_settings": 1, "save_section": 1}
+    assert calls == {"save_settings": 1, "save_section": 1, "update_libraries": 1}
+    assert captured["save_settings"]["section_name"] == "plex_telemetry"
+    assert captured["save_settings"]["payload"]["plex_pass"] is True
+    assert captured["save_section"]["data"]["plex_telemetry"]["plex_pass"] is True
+    assert captured["update_libraries"] == {
+        "section_name": "010-plex",
+        "movie_libraries": [{"id": 1, "name": "Movies"}],
+        "show_libraries": [{"id": 2, "name": "Shows"}],
+        "music_libraries": [],
+        "user_list": ["User One"],
+    }
 
 
 def test_plex_page_normalizes_formatted_db_cache_on_load(client, isolated_config_dir):
@@ -4358,6 +4864,82 @@ def test_plex_page_normalizes_formatted_db_cache_on_load(client, isolated_config
     assert match.group(1) == "2048"
 
 
+@pytest.mark.parametrize(
+    ("movie_ids", "show_ids"),
+    [("", ""), ("", "2"), ("1", ""), ("1", "2")],
+    ids=["both-missing", "movies-missing", "shows-missing", "both-present"],
+)
+def test_libraries_picker_falls_back_to_plex_telemetry_when_tmp_library_ids_missing(client, isolated_config_dir, monkeypatch, qs_module, movie_ids, show_ids):
+    from modules import database
+
+    config_name = "pytest_telemetry_library_picker"
+    with client.session_transaction() as sess:
+        sess["config_name"] = config_name
+
+    database.save_section_data(
+        name=config_name,
+        section="plex",
+        validated=True,
+        user_entered=True,
+        data={
+            "validated": True,
+            "plex": {
+                "url": "http://localhost:32400",
+                "token": "token",
+                "tmp_movie_libraries": movie_ids,
+                "tmp_show_libraries": show_ids,
+                "tmp_music_libraries": "",
+                "tmp_library_names": '{"1": "Movies", "2": "TV Shows"}',
+            },
+        },
+    )
+    database.save_section_data(
+        name=config_name,
+        section="plex_telemetry",
+        validated=True,
+        user_entered=False,
+        data={
+            "plex_telemetry": {
+                "plex_pass": True,
+                "server_name": "Test Plex",
+                "version": "1.0",
+                "platform": "Linux",
+                "update_channel": "Public update channel",
+                "libraries": {
+                    "1": {
+                        "name": "Movies",
+                        "type": "movie",
+                        "scanner": "Plex Movie",
+                        "agent": "tv.plex.agents.movie",
+                        "ratings_source": "Rotten Tomatoes",
+                        "movie_count": 10,
+                    },
+                    "2": {
+                        "name": "TV Shows",
+                        "type": "show",
+                        "scanner": "Plex TV Series",
+                        "agent": "tv.plex.agents.series",
+                        "ratings_source": "N/A",
+                        "show_count": 3,
+                        "episode_count": 12,
+                    },
+                },
+            }
+        },
+    )
+    monkeypatch.setattr(qs_module.helpers, "load_quickstart_config", lambda _filename: [])
+    monkeypatch.setattr(qs_module.helpers, "load_quickstart_overlay_config", lambda: [])
+
+    resp = client.get("/step/025-libraries")
+
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    assert html.count('value="mov-library_1"') == 1
+    assert "[Movies]" in html
+    assert html.count('value="sho-library_2"') == 1
+    assert "[TV Shows]" in html
+
+
 def test_validate_plex_fetches_sections_once(app, monkeypatch, qs_module):
     qs_module.helpers.clear_plex_discovery_cache()
     calls = {"sections": 0}
@@ -4379,17 +4961,18 @@ def test_validate_plex_fetches_sections_once(app, monkeypatch, qs_module):
             return [FakeUser()]
 
     class FakeSection:
-        def __init__(self, title, section_type):
+        def __init__(self, title, section_type, key=1):
             self.title = title
             self.type = section_type
+            self.key = key
 
     class FakeLibrary:
         def sections(self):
             calls["sections"] += 1
             return [
-                FakeSection("Movies", "movie"),
-                FakeSection("Shows", "show"),
-                FakeSection("Music", "artist"),
+                FakeSection("Movies", "movie", key=1),
+                FakeSection("Shows", "show", key=2),
+                FakeSection("Music", "artist", key=3),
             ]
 
     class FakePlex:
@@ -4414,9 +4997,9 @@ def test_validate_plex_fetches_sections_once(app, monkeypatch, qs_module):
 
     payload = resp.get_json()
     assert payload["validated"] is True
-    assert payload["movie_libraries"] == ["Movies"]
-    assert payload["show_libraries"] == ["Shows"]
-    assert payload["music_libraries"] == ["Music"]
+    assert payload["movie_libraries"] == [{"id": 1, "name": "Movies"}]
+    assert payload["show_libraries"] == [{"id": 2, "name": "Shows"}]
+    assert payload["music_libraries"] == [{"id": 3, "name": "Music"}]
     assert calls["sections"] == 1
 
 
@@ -4467,6 +5050,40 @@ def test_refresh_plex_libraries_reuses_short_lived_cache(client, monkeypatch, qs
     assert second.status_code == 200
     assert first.get_json() == second.get_json()
     assert calls == {"validate": 1, "metadata": 1, "update": 2, "save": 2}
+
+
+def test_refresh_plex_libraries_cached_payload_uses_validation_plex_pass(client, monkeypatch, qs_module):
+    cached_refresh = {
+        "validated": True,
+        "has_plex_pass": True,
+        "plex_pass": False,
+        "server_name": "Test Plex",
+        "movie_libraries": [{"id": 1, "name": "Movies"}],
+        "show_libraries": [],
+        "music_libraries": [],
+        "user_list": ["User One"],
+        "libraries": {"1": {"name": "Movies", "type": "movie"}},
+    }
+    saved = {}
+
+    monkeypatch.setattr(qs_module.persistence, "get_stored_plex_credentials", lambda _name: ("http://localhost:32400", "token"))
+    monkeypatch.setattr(qs_module.persistence, "get_dummy_data", lambda _name: {"url": "http://placeholder", "token": "placeholder"})
+    monkeypatch.setattr(qs_module.helpers, "get_cached_plex_refresh", lambda *_args, **_kwargs: cached_refresh)
+    monkeypatch.setattr(qs_module.persistence, "migrate_library_keys_to_plex_ids", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(qs_module.persistence, "update_stored_plex_libraries", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(qs_module.persistence, "save_settings", lambda section_name, payload: saved.update({"section_name": section_name, "payload": payload}))
+    monkeypatch.setattr(qs_module.database, "save_section_data", lambda **kwargs: saved.update({"section": kwargs}))
+
+    with client.session_transaction() as sess:
+        sess["config_name"] = "pytest_plex_cached_pass"
+
+    resp = client.post("/refresh_plex_libraries")
+
+    assert resp.status_code == 200
+    assert resp.get_json()["plex_pass"] is True
+    assert saved["section_name"] == "plex_telemetry"
+    assert saved["payload"]["plex_pass"] is True
+    assert saved["section"]["data"]["plex_telemetry"]["plex_pass"] is True
 
 
 def test_yaml_generation_sets_session_and_redacts(client, isolated_config_dir, monkeypatch, qs_module):
@@ -4703,7 +5320,7 @@ def test_import_config_preview_accepts_windows_wrapped_bundle_directories(client
         )
         archive.writestr(
             "bullmoose20_prod9_config_bundle (test)/bullmoose20_prod9/collection_files/mov-library_movies/config_collection_files_a8a07b81df/movies_refresh.yml",
-            "collections: {}\n",
+            "collections: {}\n# https://example.test/nightly/library.yml\n",
         )
         archive.writestr("bullmoose20_prod9_config_bundle (test)/bullmoose20_prod9/fonts/", b"")
         archive.writestr("bullmoose20_prod9_config_bundle (test)/bullmoose20_prod9/fonts/Poster.ttf", b"font")
@@ -4724,7 +5341,10 @@ def test_import_config_preview_accepts_windows_wrapped_bundle_directories(client
     with client.session_transaction() as sess:
         bundle_dir = Path(sess["import_preview_bundle_dir"])
 
-    assert (bundle_dir / "bullmoose20_prod9" / "collection_files" / "mov-library_movies" / "config_collection_files_a8a07b81df" / "movies_refresh.yml").exists()
+    library_file = bundle_dir / "bullmoose20_prod9" / "collection_files" / "mov-library_movies" / "config_collection_files_a8a07b81df" / "movies_refresh.yml"
+    assert library_file.exists()
+    assert "nightly" not in library_file.read_text(encoding="utf-8").lower()
+    assert "/develop/" in library_file.read_text(encoding="utf-8")
 
 
 def test_import_config_preview_handles_yaml_date_scalars_in_cache(client):
@@ -4796,6 +5416,104 @@ def test_import_config_preview_handles_tuple_validation_response(client, monkeyp
     payload = resp.get_json()
     assert payload["success"] is False
     assert "Bad Plex credentials from tuple response." in payload["message"]
+
+
+def test_import_config_preview_requests_all_missing_redacted_credentials(client, monkeypatch, qs_module):
+    import io
+
+    def _unexpected_plex_validation(_payload):
+        raise AssertionError("redacted Plex credentials should be treated as missing")
+
+    def _unexpected_tmdb_validation(_payload):
+        raise AssertionError("redacted TMDb credentials should be treated as missing")
+
+    monkeypatch.setattr(qs_module.validations, "validate_plex_server", _unexpected_plex_validation)
+    monkeypatch.setattr(qs_module.validations, "validate_tmdb_server", _unexpected_tmdb_validation)
+
+    yaml_text = (
+        "plex:\n" "  url: (redacted)\n" "  token: (redacted)\n" "tmdb:\n" "  apikey: (redacted)\n" "libraries:\n" "  Movies:\n" "    metadata_files:\n" "      - default: basic\n"
+    )
+
+    resp = client.post(
+        "/import-config/preview",
+        data={"config_name": "pytest_import_redacted_creds", "file": (io.BytesIO(yaml_text.encode("utf-8")), "config.yml")},
+        content_type="multipart/form-data",
+    )
+
+    assert resp.status_code == 400
+    payload = resp.get_json()
+    assert payload["success"] is False
+    assert payload["needs_plex_credentials"] is True
+    assert payload["needs_tmdb_credentials"] is True
+    assert payload["plex_url"] == ""
+    assert payload["plex_token"] == ""
+    assert payload["tmdb_apikey"] == ""
+
+
+def test_import_config_preview_merge_uses_base_credentials_over_redacted_import(client, isolated_config_dir, monkeypatch, qs_module):
+    import io
+    import json
+
+    from modules import database
+
+    base_name = "pytest_import_base_creds"
+    database.save_section_data(
+        name=base_name,
+        section="plex",
+        validated=True,
+        user_entered=True,
+        data={
+            "plex": {
+                "url": "http://base-plex.local",
+                "token": "base-plex-token",
+                "tmp_movie_libraries": "1",
+                "tmp_show_libraries": "",
+                "tmp_library_names": json.dumps({"1": "Movies"}),
+            }
+        },
+    )
+    database.save_section_data(
+        name=base_name,
+        section="tmdb",
+        validated=True,
+        user_entered=True,
+        data={"tmdb": {"apikey": "base-tmdb-key"}},
+    )
+
+    def _unexpected_plex_validation(_payload):
+        raise AssertionError("base Plex library cache should avoid a Plex credential prompt")
+
+    tmdb_payloads = []
+
+    monkeypatch.setattr(qs_module.validations, "validate_plex_server", _unexpected_plex_validation)
+    monkeypatch.setattr(
+        qs_module.validations,
+        "validate_tmdb_server",
+        lambda payload: tmdb_payloads.append(dict(payload)) or {"valid": True},
+    )
+
+    yaml_text = (
+        "plex:\n" "  url: (redacted)\n" "  token: (redacted)\n" "tmdb:\n" "  apikey: (redacted)\n" "libraries:\n" "  Movies:\n" "    metadata_files:\n" "      - default: basic\n"
+    )
+
+    resp = client.post(
+        "/import-config/preview",
+        data={
+            "config_name": "pytest_import_merge_redacted",
+            "merge_mode": "merge",
+            "base_config": base_name,
+            "file": (io.BytesIO(yaml_text.encode("utf-8")), "config.yml"),
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert resp.status_code == 200, resp.get_json()
+    payload = resp.get_json()
+    assert payload["success"] is True
+    assert payload.get("needs_plex_credentials") is None
+    assert payload.get("needs_tmdb_credentials") is None
+    assert tmdb_payloads == [{"tmdb_apikey": "base-tmdb-key"}]
+    assert "plex" not in payload["importable_sections"]
 
 
 def test_yaml_generation_missing_sections_shows_error(client, isolated_config_dir, monkeypatch, qs_module):
@@ -5696,7 +6414,7 @@ def test_copy_library_settings_mirrors_metadata_files(client, isolated_config_di
     assert target_file.read_text(encoding="utf-8") == managed_file.read_text(encoding="utf-8")
 
 
-def test_copy_library_settings_keeps_target_excluded_for_playlist_and_content_rating(client, isolated_config_dir, monkeypatch, app, library_routes_module):
+def test_copy_library_settings_keeps_target_excluded_when_source_is_excluded(client, isolated_config_dir, monkeypatch, app, library_routes_module):
     from modules import database
     from flask import session
 
@@ -5746,7 +6464,7 @@ def test_copy_library_settings_keeps_target_excluded_for_playlist_and_content_ra
             "source_library_id": "mov-library_movies",
             "target_library_ids": ["mov-library_target"],
             "source_payload": {
-                "mov-library_movies-library": "Movies",
+                "mov-library_movies-library": "false",
                 "mov-library_movies-playlist": "true",
                 "mov-library_movies-collection_content_rating_us": True,
                 "mov-library_movies-template_collection_content_rating_us_limit": "40",
@@ -5759,6 +6477,10 @@ def test_copy_library_settings_keeps_target_excluded_for_playlist_and_content_ra
     assert resp.status_code == 200
     payload = resp.get_json()
     assert payload["success"] is True
+    assert payload["source_included"] is False
+    assert payload["included_targets"] == []
+    assert payload["review_targets"] == []
+    assert payload["mirror_report"][0]["status"] == "source_excluded"
 
     _validated, _user_entered, stored = database.retrieve_section_data(config_name, "libraries")
     libraries = stored["libraries"]
@@ -5768,6 +6490,200 @@ def test_copy_library_settings_keeps_target_excluded_for_playlist_and_content_ra
     assert libraries["mov-library_target-template_collection_content_rating_us_limit"] == 40
     assert libraries["mov-library_target-movie-overlay_content_rating"] == "uk"
     assert libraries["mov-library_target-movie-template_overlay_content_rating_uk[color]"] == "white"
+
+
+def test_copy_library_settings_auto_includes_safe_targets_when_source_is_included(client, isolated_config_dir, monkeypatch, app, library_routes_module):
+    from modules import database
+    from flask import session
+
+    config_name = "pytest_copy_auto_include"
+    database.save_section_data(
+        section="libraries",
+        validated=False,
+        user_entered=True,
+        name=config_name,
+        data={
+            "libraries": {
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-collection_content_rating_us": True,
+                "mov-library_target-library": "",
+                "libraries": "Movies",
+            },
+            "validated": False,
+        },
+    )
+    monkeypatch.setattr(
+        library_routes_module,
+        "_build_library_lists",
+        lambda: (
+            [
+                {"id": "mov-library_movies", "name": "Movies"},
+                {"id": "mov-library_target", "name": "Other Movies"},
+            ],
+            [],
+            {},
+        ),
+    )
+
+    with app.test_request_context("/copy_library_settings"):
+        session["config_name"] = config_name
+
+    with client.session_transaction() as sess:
+        sess["config_name"] = config_name
+
+    resp = client.post(
+        "/copy_library_settings",
+        json={
+            "source_library_id": "mov-library_movies",
+            "target_library_ids": ["mov-library_target"],
+            "source_payload": {
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-collection_content_rating_us": True,
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["success"] is True
+    assert payload["source_included"] is True
+    assert payload["included_targets"] == ["mov-library_target"]
+    assert payload["review_targets"] == []
+    assert payload["mirror_report"][0]["status"] == "included"
+
+    _validated, _user_entered, stored = database.retrieve_section_data(config_name, "libraries")
+    libraries = stored["libraries"]
+    assert libraries["mov-library_target-library"] == "Other Movies"
+    assert "Other Movies" in libraries["libraries"]
+
+
+def test_copy_library_settings_preserves_explicit_blank_runtime_text(client, isolated_config_dir, monkeypatch, app, library_routes_module):
+    from modules import database
+    from flask import session
+
+    config_name = "pytest_copy_runtime_blank_text"
+    database.save_section_data(
+        section="libraries",
+        validated=False,
+        user_entered=True,
+        name=config_name,
+        data={
+            "libraries": {
+                "mov-library_movies-library": "Movies",
+                "mov-library_target-library": "",
+                "libraries": "Movies",
+            },
+            "validated": False,
+        },
+    )
+    monkeypatch.setattr(
+        library_routes_module,
+        "_build_library_lists",
+        lambda: (
+            [
+                {"id": "mov-library_movies", "name": "Movies"},
+                {"id": "mov-library_target", "name": "Other Movies"},
+            ],
+            [],
+            {},
+        ),
+    )
+
+    with app.test_request_context("/copy_library_settings"):
+        session["config_name"] = config_name
+
+    with client.session_transaction() as sess:
+        sess["config_name"] = config_name
+
+    resp = client.post(
+        "/copy_library_settings",
+        json={
+            "source_library_id": "mov-library_movies",
+            "target_library_ids": ["mov-library_target"],
+            "source_payload": {
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-movie-overlay_runtimes": "true",
+                "mov-library_movies-movie-template_overlay_runtimes[text]": None,
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["success"] is True
+
+    _validated, _user_entered, stored = database.retrieve_section_data(config_name, "libraries")
+    libraries = stored["libraries"]
+    assert libraries["mov-library_movies-movie-template_overlay_runtimes[text]"] == ""
+    assert libraries["mov-library_target-movie-template_overlay_runtimes[text]"] == ""
+
+
+def test_copy_library_settings_reports_placeholder_missing_from_target(client, isolated_config_dir, monkeypatch, app, qs_module, library_routes_module):
+    from modules import database
+    from flask import session
+
+    config_name = "pytest_copy_placeholder_report"
+    database.save_section_data(
+        section="libraries",
+        validated=False,
+        user_entered=True,
+        name=config_name,
+        data={
+            "libraries": {
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-attribute_use_separator": "gray",
+                "mov-library_movies-attribute_template_variables[placeholder_tmdb_movie]": "603",
+                "libraries": "Movies",
+            },
+            "validated": False,
+        },
+    )
+    monkeypatch.setattr(
+        library_routes_module,
+        "_build_library_lists",
+        lambda: (
+            [
+                {"id": "mov-library_movies", "name": "Movies"},
+                {"id": "mov-library_target", "name": "Movies 4K"},
+            ],
+            [],
+            {},
+        ),
+    )
+    monkeypatch.setattr(
+        qs_module,
+        "_lookup_tmdb_numeric_id",
+        lambda value, media_type="": {"valid": True, "verified": True, "label": "The Matrix", "result_type": "movie"},
+    )
+    monkeypatch.setattr(qs_module.helpers, "find_item_by_title", lambda library_name, title: None)
+
+    with app.test_request_context("/copy_library_settings"):
+        session["config_name"] = config_name
+
+    with client.session_transaction() as sess:
+        sess["config_name"] = config_name
+
+    resp = client.post(
+        "/copy_library_settings",
+        json={
+            "source_library_id": "mov-library_movies",
+            "target_library_ids": ["mov-library_target"],
+            "source_payload": {
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-attribute_use_separator": "gray",
+                "mov-library_movies-attribute_template_variables[placeholder_tmdb_movie]": "603",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["included_targets"] == []
+    assert payload["review_targets"] == ["mov-library_target"]
+    assert payload["mirror_report"][0]["status"] == "needs_review"
+    assert "The Matrix" in payload["mirror_report"][0]["issues"][0]
+
+    _validated, _user_entered, stored = database.retrieve_section_data(config_name, "libraries")
+    assert stored["libraries"]["mov-library_target-library"] == ""
 
 
 def test_copy_library_settings_preserves_unloaded_lazy_source_sections(client, isolated_config_dir, monkeypatch, app, library_routes_module):
@@ -5836,7 +6752,7 @@ def test_copy_library_settings_preserves_unloaded_lazy_source_sections(client, i
     assert libraries["mov-library_movies-attribute_language"] == "fr"
     assert libraries["mov-library_movies-template_collection_award_style"] == "signature"
     assert libraries["mov-library_movies-movie-template_overlay_resolution[horizontal_align]"] == "right"
-    assert libraries["mov-library_target-library"] == ""
+    assert libraries["mov-library_target-library"] == "Other Movies"
     assert libraries["mov-library_target-playlist"] is True
     assert libraries["mov-library_target-attribute_language"] == "fr"
     assert libraries["mov-library_target-collection_award"] is True
@@ -6151,6 +7067,158 @@ def test_import_config_confirm_rehomes_bundled_overlay_source_images(client, iso
     assert bundled_image.read_bytes() == b"\x89PNG\r\n\x1a\nimported-overlay"
 
 
+def test_parse_csv_or_list_to_id_map_handles_all_shapes():
+    from blueprints.import_config_helpers import _parse_csv_or_list_to_id_map
+
+    # list of dicts (fresh Plex validation response)
+    assert _parse_csv_or_list_to_id_map([{"id": 10, "name": "Movies"}, {"id": 11, "name": " Shows "}]) == {
+        "10": "Movies",
+        "11": " Shows ",
+    }
+    # list of plain strings (legacy stored data / mocked tests) -- self-mapped
+    assert _parse_csv_or_list_to_id_map(["Movies", "Shows"]) == {"Movies": "Movies", "Shows": "Shows"}
+    # JSON string of dicts
+    assert _parse_csv_or_list_to_id_map(json.dumps([{"id": 5, "name": "Movies"}])) == {"5": "Movies"}
+    # CSV string (legacy stored format)
+    assert _parse_csv_or_list_to_id_map("Movies, Shows") == {"Movies": "Movies", "Shows": "Shows"}
+    # empty / unrecognized input
+    assert _parse_csv_or_list_to_id_map([]) == {}
+    assert _parse_csv_or_list_to_id_map("") == {}
+
+
+def test_import_config_preview_plex_libraries_include_ids(client, monkeypatch, qs_module):
+    import io
+
+    monkeypatch.setattr(
+        qs_module.validations,
+        "validate_plex_server",
+        lambda _payload: {"validated": True, "movie_libraries": [{"id": 1, "name": "Movies"}], "show_libraries": [{"id": 2, "name": "Shows"}]},
+    )
+    monkeypatch.setattr(qs_module.validations, "validate_tmdb_server", lambda _payload: {"valid": True})
+
+    yaml_text = "plex:\n  url: http://plex.local\n  token: test-token\ntmdb:\n  apikey: test-key\n" "libraries:\n  Movies:\n    metadata_files:\n      - default: basic\n"
+    resp = client.post(
+        "/import-config/preview",
+        data={"config_name": "pytest_import_plex_ids", "file": (io.BytesIO(yaml_text.encode("utf-8")), "config.yml")},
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 200, resp.get_json()
+    payload = resp.get_json()
+    assert payload["plex_libraries"] == {
+        "movie": [{"id": "1", "name": "Movies"}],
+        "show": [{"id": "2", "name": "Shows"}],
+    }
+
+
+def _mock_import_id_mapping_deps(monkeypatch, qs_module, captured):
+    def _fake_prepare_import_payload(config_data, *_args, **_kwargs):
+        captured["libraries"] = config_data.get("libraries")
+
+        class _Report:
+            lines = ["imported: libraries.Movies.library"]
+
+            def summary(self):
+                return {"imported": 1, "unmapped": 0, "skipped": 0}
+
+        payload = {"libraries": {"libraries": {"mov-library_movies-library": "Movies"}}}
+        return payload, _Report()
+
+    monkeypatch.setattr(qs_module.importer, "prepare_import_payload", _fake_prepare_import_payload)
+    monkeypatch.setattr(
+        qs_module.validations,
+        "validate_plex_server",
+        lambda _payload: {"validated": True, "movie_libraries": [{"id": 1, "name": "Movies"}], "show_libraries": []},
+    )
+    monkeypatch.setattr(qs_module.validations, "validate_tmdb_server", lambda _payload: {"valid": True})
+
+
+def _post_import_id_mapping_preview(client, config_name):
+    import io
+
+    yaml_text = "plex:\n  url: http://plex.local\n  token: test-token\n" "tmdb:\n  apikey: test-key\n" "libraries:\n  My Movies:\n    metadata_files:\n      - default: basic\n"
+    return client.post(
+        "/import-config/preview",
+        data={"config_name": config_name, "file": (io.BytesIO(yaml_text.encode("utf-8")), "config.yml")},
+        content_type="multipart/form-data",
+    )
+
+
+def test_import_config_confirm_resolves_library_id_mapping(client, isolated_config_dir, monkeypatch, qs_module):
+    captured = {}
+    _mock_import_id_mapping_deps(monkeypatch, qs_module, captured)
+
+    config_name = "pytest_import_id_mapping_confirm"
+    preview = _post_import_id_mapping_preview(client, config_name)
+    assert preview.status_code == 200, preview.get_json()
+    token = preview.get_json()["token"]
+
+    # "My Movies" doesn't match the live Plex library "Movies" -- the user
+    # picks it from the dropdown, which posts its Plex section ID ("1"),
+    # not its name.
+    confirm = client.post("/import-config/confirm", json={"token": token, "library_mapping": {"My Movies": "1"}})
+    assert confirm.status_code == 200, confirm.get_json()
+    assert confirm.get_json()["success"] is True
+
+    # The ID must have been resolved to the current Plex display name
+    # before the library config was handed off for saving.
+    assert captured["libraries"] == {"Movies": {"metadata_files": [{"default": "basic"}]}}
+
+
+def test_import_config_preview_mapped_resolves_library_id_mapping(client, monkeypatch, qs_module):
+    captured = {}
+    _mock_import_id_mapping_deps(monkeypatch, qs_module, captured)
+
+    config_name = "pytest_import_id_mapping_preview_mapped"
+    preview = _post_import_id_mapping_preview(client, config_name)
+    assert preview.status_code == 200, preview.get_json()
+    token = preview.get_json()["token"]
+
+    resp = client.post("/import-config/preview-mapped", json={"token": token, "library_mapping": {"My Movies": "1"}})
+    assert resp.status_code == 200, resp.get_json()
+    payload = resp.get_json()
+    assert payload["success"] is True
+    assert payload["mapping_summary"]["mapped"] == 1
+    assert payload["mapping_summary"].get("missing", 0) == 0
+    assert payload["mapping_summary"].get("invalid", 0) == 0
+
+
+def test_import_config_confirm_rejects_unknown_library_mapping_id(client, monkeypatch, qs_module):
+    captured = {}
+    _mock_import_id_mapping_deps(monkeypatch, qs_module, captured)
+
+    config_name = "pytest_import_id_mapping_invalid"
+    preview = _post_import_id_mapping_preview(client, config_name)
+    assert preview.status_code == 200, preview.get_json()
+    token = preview.get_json()["token"]
+
+    confirm = client.post("/import-config/confirm", json={"token": token, "library_mapping": {"My Movies": "999"}})
+    assert confirm.status_code == 400
+    payload = confirm.get_json()
+    assert payload["success"] is False
+    assert "Invalid Plex libraries selected" in payload["message"]
+
+
+def test_import_config_confirm_resolves_legacy_name_only_library_mapping(client, isolated_config_dir, monkeypatch, qs_module):
+    """A mapping value that's a raw name (not an ID) still resolves.
+
+    Covers stored Plex settings predating the ID-keyed format (no
+    ``tmp_library_names``), where the id-map degrades to a name self-map,
+    and any stale client still posting name-valued mappings.
+    """
+    captured = {}
+    _mock_import_id_mapping_deps(monkeypatch, qs_module, captured)
+
+    config_name = "pytest_import_legacy_name_mapping"
+    preview = _post_import_id_mapping_preview(client, config_name)
+    assert preview.status_code == 200, preview.get_json()
+    token = preview.get_json()["token"]
+
+    confirm = client.post("/import-config/confirm", json={"token": token, "library_mapping": {"My Movies": "Movies"}})
+    assert confirm.status_code == 200, confirm.get_json()
+    assert confirm.get_json()["success"] is True
+    assert captured["libraries"] == {"Movies": {"metadata_files": [{"default": "basic"}]}}
+
+
 def test_build_libraries_section_emits_schedule_overlays(app):
     from modules import output
 
@@ -6373,6 +7441,134 @@ def test_prepare_import_payload_accepts_language_weight_override():
     assert libraries_payload["mov-library_movies-movie-template_overlay_languages_subtitles[languages]"] == ["en", "ja"]
     assert libraries_payload["mov-library_movies-movie-template_overlay_languages_subtitles[weight_ja]"] == 700
     assert report.summary()["imported"] > 0
+
+
+def test_prepare_import_payload_preserves_overlay_file_template_variables():
+    import json
+
+    from modules import importer
+
+    config_data = {
+        "libraries": {
+            "Movies": {
+                "overlay_files": [
+                    {
+                        "file": "config/overlays/media_info.yml",
+                        "template_variables": {
+                            "use_edition": False,
+                            "horizontal_align": "right",
+                            "vertical_align": "top",
+                        },
+                    }
+                ]
+            }
+        }
+    }
+
+    payload, report = importer.prepare_import_payload(
+        config_data,
+        plex_movie_names={"Movies"},
+        plex_show_names=set(),
+    )
+
+    raw_entries = payload["libraries"]["libraries"]["mov-library_movies-overlay_files"]
+    entries = json.loads(raw_entries)
+    assert entries == [
+        {
+            "type": "file",
+            "location": "config/overlays/media_info.yml",
+            "template_variables": {
+                "use_edition": False,
+                "horizontal_align": "right",
+                "vertical_align": "top",
+            },
+        }
+    ]
+    assert "imported: libraries.Movies.overlay_files[0].template_variables" in report.lines
+
+
+def test_prepare_import_payload_preserves_metadata_file_template_variables():
+    import json
+
+    from modules import importer
+
+    config_data = {
+        "libraries": {
+            "Movies": {
+                "metadata_files": [
+                    {
+                        "file": "config/metadata/custom_metadata.yml",
+                        "template_variables": {
+                            "include_extras": True,
+                            "label": "Imported",
+                        },
+                    }
+                ]
+            }
+        }
+    }
+
+    payload, report = importer.prepare_import_payload(
+        config_data,
+        plex_movie_names={"Movies"},
+        plex_show_names=set(),
+    )
+
+    raw_entries = payload["libraries"]["libraries"]["mov-library_movies-metadata_files"]
+    entries = json.loads(raw_entries)
+    assert entries == [
+        {
+            "type": "file",
+            "location": "config/metadata/custom_metadata.yml",
+            "template_variables": {
+                "include_extras": True,
+                "label": "Imported",
+            },
+        }
+    ]
+    assert "imported: libraries.Movies.metadata_files[0].template_variables" in report.lines
+
+
+def test_prepare_import_payload_preserves_collection_file_template_variables():
+    import json
+
+    from modules import importer
+
+    config_data = {
+        "libraries": {
+            "Movies": {
+                "collection_files": [
+                    {
+                        "file": "config/collections/custom_collection.yml",
+                        "template_variables": {
+                            "radarr_add_missing": True,
+                            "schedule_christmas": "range(12/01-12/31)",
+                        },
+                    }
+                ]
+            }
+        }
+    }
+
+    payload, report = importer.prepare_import_payload(
+        config_data,
+        plex_movie_names={"Movies"},
+        plex_show_names=set(),
+    )
+
+    raw_entries = payload["libraries"]["libraries"]["mov-library_movies-collection_files"]
+    entries = json.loads(raw_entries)
+    assert entries == [
+        {
+            "type": "file",
+            "location": "config/collections/custom_collection.yml",
+            "template_variables": {
+                "radarr_add_missing": True,
+                "schedule_christmas": "range(12/01-12/31)",
+            },
+        }
+    ]
+    assert "imported: libraries.Movies.collection_files[0].template_variables" in report.lines
 
 
 def test_prepare_import_payload_accepts_collection_include_and_exclude_with_warning():
@@ -6895,10 +8091,10 @@ def test_check_kometa_update_existing_mode_allows_status_check(client, tmp_path,
         lambda *_args, **_kwargs: {
             "local_version": "1.0.0",
             "remote_version": "1.1.0",
-            "branch": "nightly",
+            "branch": "develop",
             "cached": False,
             "update_available": True,
-            "local_branch": "nightly",
+            "local_branch": "develop",
             "local_sha": "abc123",
             "remote_sha": "def456",
             "comparison_basis": "version",
@@ -7095,3 +8291,82 @@ def test_normalize_generated_config_library_files_includes_failing_path(qs_modul
 
     assert len(errors) == 1
     assert r"Path: C:\does-not-exist\metadata" in errors[0]
+
+
+def test_logscan_trends_status_reports_active_request_phase(client, qs_module):
+    qs_module._update_logscan_trends_request_state(
+        "pytest-analytics-request",
+        reset=True,
+        status="running",
+        phase="loading_runs",
+        detail="Loading saved run rows from the Analytics database.",
+        total_runs=12,
+        loaded_runs=5,
+        limit="500",
+        lightweight=True,
+    )
+
+    resp = client.get("/logscan/trends/status?request_id=pytest-analytics-request")
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["status"] == "running"
+    assert data["phase"] == "loading_runs"
+    assert data["total_runs"] == 12
+    assert data["loaded_runs"] == 5
+    assert data["elapsed_seconds"] >= 0
+    assert "started_monotonic" not in data
+
+    stale = client.get("/logscan/trends/status?request_id=other-request").get_json()
+    assert stale["status"] == "unknown"
+
+
+def test_import_config_migrates_nightly_references():
+    from blueprints.import_config_bundle import extract_bundle_upload
+
+    result = extract_bundle_upload(
+        b"# yaml-language-server: $schema=https://example.test/nightly/schema.json\nbranch: NIGHTLY\n",
+        "config.yml",
+    )
+
+    assert "nightly" not in result.config_text.lower()
+    assert result.config_text.count("develop") == 2
+
+
+def test_probe_kometa_root_reports_legacy_nightly_branch(tmp_path, monkeypatch):
+    from modules.kometa_install import probe_kometa_root_state
+
+    kometa_root = tmp_path / "kometa"
+    kometa_root.mkdir()
+    (kometa_root / ".kometa_branch").write_text("nightly", encoding="utf-8")
+    monkeypatch.setattr("modules.kometa_install.helpers.is_kometa_running", lambda: False)
+
+    state = probe_kometa_root_state(kometa_root)
+
+    assert state["kometa_detected_branch"] == "nightly"
+    assert state["kometa_effective_branch"] == "develop"
+    assert state["kometa_legacy_nightly_branch"] is True
+
+
+def test_save_existing_nightly_install_returns_start_page_warning_state(client, tmp_path):
+    kometa_root = tmp_path / "kometa"
+    (kometa_root / "config").mkdir(parents=True)
+    (kometa_root / "kometa.py").write_text("", encoding="utf-8")
+    (kometa_root / "requirements.txt").write_text("requests\n", encoding="utf-8")
+    (kometa_root / ".kometa_branch").write_text("nightly", encoding="utf-8")
+
+    response = client.post(
+        "/save-kometa-install-mode",
+        json={
+            "config_name": "pytest_existing_nightly",
+            "install_mode": "existing",
+            "existing_root": str(kometa_root),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["kometa_detected_branch"] == "nightly"
+    assert payload["kometa_effective_branch"] == "develop"
+    assert payload["kometa_legacy_nightly_branch"] is True
+    assert "switch it to develop or master" in payload["message"].lower()

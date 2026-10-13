@@ -4,8 +4,15 @@ from pathlib import Path
 from ruamel.yaml import YAML
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURES_ROOT = ROOT / "tests" / "fixtures"
 QS_COLLECTIONS_PATH = ROOT / "static" / "json" / "quickstart_collections.json"
+
+# `config/kometa/defaults` is a gitignored local cache populated by a real Kometa
+# install. A fresh checkout does not have it, so fall back to the checked-in
+# fixtures so this contract remains reproducible in CI.
 SEASONAL_DEFAULT_PATH = ROOT / "config" / "kometa" / "defaults" / "movie" / "seasonal.yml"
+if not SEASONAL_DEFAULT_PATH.exists():
+    SEASONAL_DEFAULT_PATH = FIXTURES_ROOT / "kometa" / "defaults" / "movie" / "seasonal.yml"
 
 
 def _load_seasonal_collection():
@@ -50,7 +57,6 @@ def test_seasonal_exposes_yaml_verified_shared_fields_and_override_maps():
         "tmdb_movie": {"type": "string_list", "validation_preset": "numeric_id", "section": "builder_defaults"},
         "imdb_list": {"type": "string_list", "section": "builder_defaults"},
         "imdb_search": {"type": "text_input", "section": "builder_defaults"},
-        "trakt_list": {"type": "string_list", "section": "builder_defaults"},
         "mdblist_list": {"type": "string_list", "section": "builder_defaults"},
         "letterboxd_list": {"type": "string_list", "section": "builder_defaults"},
         "url_poster": {"type": "text_input", "validation_preset": "url", "section": "artwork"},
@@ -89,7 +95,6 @@ def test_seasonal_exposes_yaml_verified_shared_fields_and_override_maps():
         "child_tmdb_movie_overrides": ("tmdb_movie_", "string_list", "builder_override_maps", None, None),
         "child_imdb_list_overrides": ("imdb_list_", "string_list", "builder_override_maps", None, None),
         "child_imdb_search_overrides": ("imdb_search_", "json", "builder_override_maps", None, None),
-        "child_trakt_list_overrides": ("trakt_list_", "string_list", "builder_override_maps", None, None),
         "child_mdblist_list_overrides": ("mdblist_list_", "string_list", "builder_override_maps", None, None),
         "child_letterboxd_list_overrides": ("letterboxd_list_", "string_list", "builder_override_maps", None, None),
         "child_url_poster_overrides": ("url_poster_", "string", "artwork", "url", None),

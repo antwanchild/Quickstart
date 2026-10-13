@@ -50,9 +50,12 @@ Kometa Quickstart is more than just a YAML generator - it's a full interactive e
 - **Library Telemetry:** Pulls real Plex server data (Plex Pass status, library types, agent/scanner compatibility)
 - **Dynamic Toggles & Templates:** Rich UI for enabling collections, overlays, and builder template variables
 - **Organized Library Defaults:** Collections, overlays, attributes, and playlists are grouped into logical accordions with override counters, visual override indicators, and scoped reset-to-defaults actions.
+- **Lazy Library Rendering:** Library cards, heavy collection/overlay sections, collection groups, and collection detail controls load on demand so large Plex installs remain usable while preserving saved override counts.
+- **Bulk Child Toggles:** Long child/included-item sections such as languages, resolutions, content ratings, streaming services, and chart lists include scoped select-all and unselect-all controls.
 - **Library Mirroring:** Copy compatible library selections from one Plex library to another, then explicitly include the destination library in the generated config after validation.
 - **Dependency-Aware Optional Pages:** Optional pages such as GitHub, Tautulli, OMDb, MDBList, Notifiarr, Gotify, ntfy, Apprise, Yamtrack, Webhooks, AniDB, Radarr, Sonarr, Trakt, and MyAnimeList become required when selected library features need them
 - **TODO Sidebar:** Outstanding dependency and validation tasks are grouped into clickable cards that save the current page and open the affected setup page
+- **Active Work Sidebar:** Long-running work such as Validate All, Kometa runs, Kometa/ImageMaid install or update jobs, and Analytics reingest appears in the sidebar with current status and elapsed time.
 - **Library-Scoped Playlists:** Playlist file selection now lives on the Libraries page so playlists stay tied to the libraries included in the generated YAML
 - **Library Collection Files:** Add multiple raw `collection_files` entries per library with mixed `file`, `folder`, `url`, `git`, and `repo` sources, import them from existing configs, and validate that each entry resolves to non-empty YAML with a non-empty top-level `collections:` mapping before output
 - **Library Metadata Files:** Add multiple `metadata_files` entries per library with mixed `file`, `folder`, `url`, `git`, and `repo` sources, import them from existing configs, and validate that each entry resolves to non-empty YAML with a non-empty top-level `metadata:` mapping before output
@@ -90,11 +93,31 @@ Kometa Quickstart is more than just a YAML generator - it's a full interactive e
 - **Runtime Flags & Environment Variables:** Supported Kometa runtime flags are grouped on the final page, including validation/schema options, logging options, run modes, and related environment variable guidance.
 - **Validation Levels:** Kometa validation commands support `syntax`, `structure`, and `full` validate-level choices from the UI.
 - **Process Management:** In `managed` and `existing direct` modes, start, stop, and monitor Kometa runs directly from the web interface
+- **Health status endpoint:** `GET /kometa-status` returns lightweight JSON for Kometa runtime state, pending starts, maintenance state, and resource metrics when Kometa is running. The endpoint is safe for Docker/Unraid health polling because it does not create or write a browser session.
 - **Maintenance-Aware Runs:** Detects Plex maintenance windows, pauses active runs, and queues new runs until maintenance ends (with global UI badges and toasts)
 - **Incomplete Run Recovery:** If a Kometa run stops early, Quickstart preserves the run context and surfaces resume or recovery guidance when it can determine the affected scope
 - **Mode-aware final page:** In `managed` mode, the final Kometa page includes install/update controls and run controls. In `existing direct` mode, the same page can validate the install, check version/update availability, and launch runs, but updates must be done manually outside Quickstart. In `external` mode, the page becomes a sync/status view that shows the external config target, log availability, and mode limitations instead of runtime controls.
 
 This reduces the chance of Plex background maintenance colliding with long Kometa runs, keeps Plex more responsive during the window, and avoids wasting time starting a run that would immediately pause.
+
+Health/status checks:
+
+```bash
+curl -fsS http://localhost:7171/kometa-status
+wget -qO- http://localhost:7171/kometa-status
+```
+
+For Unraid, replace `localhost` with the host/IP and port mapped to the Quickstart container, for example:
+
+```bash
+curl -fsS http://192.168.1.10:7171/kometa-status
+```
+
+Quickstart's Docker images include a built-in container healthcheck against `http://127.0.0.1:${QS_PORT:-7171}/kometa-status`. This uses the container's internal port, so host mappings such as `8008:7171` do not affect the healthcheck. You can inspect Docker's health state with:
+
+```bash
+docker inspect --format='{{json .State.Health}}' quickstart
+```
 
 #### ImageMaid
 - **Prepare / install / update flow:** Quickstart can install or update ImageMaid in its own managed directory before running it
@@ -120,7 +143,7 @@ This reduces the chance of Plex background maintenance colliding with long Komet
 
 ### Automatic Updates
 - **Quickstart Self-Updater:** One-click update to latest master or develop branch
-- **Kometa Sync:** In `managed` mode, Quickstart can pull and update Kometa itself (nightly/master) before running. In `existing direct` mode, Quickstart only checks version/update availability and expects you to update that install manually outside Quickstart.
+- **Kometa Sync:** In `managed` mode, Quickstart can pull and update Kometa itself (develop/master) before running. In `existing direct` mode, Quickstart only checks version/update availability and expects you to update that install manually outside Quickstart.
 - **ImageMaid Sync:** Option to pull and update ImageMaid itself (develop/master) before running
 
 ### Themes & Personalization
@@ -162,6 +185,12 @@ How it works:
 - If a reingest is already running, Analytics reconnects to the active job instead of starting a second one.
 
 ### Logscan Analyzer & Analytics Page
+- **Manual support uploads:** The Kometa run panel can upload the current `meta.log` to `https://logscan.kometa.team`. Analytics also offers **Upload to Logscan** for historical Kometa and ImageMaid runs whose log files are still available. Quickstart compresses a fixed-length snapshot of plain logs before transmitting it; existing gzip archives are validated and uploaded without double compression. A filename such as `qs-Movies-meta.gz` uses the selected run's config name. Preparation, upload, and remote scan progress run in the background. Only the compressed log is submitted; local analytics/config history stay in Quickstart. Uploads are manual and require confirmation.
+- **Support and management links:** Upload progress, confirmation, and links appear directly beneath the selected run's **Upload to Logscan** button in Analytics, or in the Kometa Logscan panel for the current log. After the portal scans the log, Quickstart shows **Uploaded. Your support link is ready.** Analytics restores saved links for each uploaded run after navigation, refresh, or a Quickstart restart, until the result expires; the links remain available even if the local log is later removed. Older receipts without a run association are matched against available logs in the background locally, without uploading again. Copy the support result link to share with support. Keep the separate management link private: its fragment includes the upload's deletion token. The portal applies its normal retention policy. This initial integration uses the public upload API; it does not borrow browser Discord sessions or send an API key.
+- **Duplicate uploads:** Quickstart fingerprints the log contents, so a plain log and a gzip archive of the same content share one upload receipt. Re-uploading an unchanged log checks that the saved support result still exists, then returns **Already uploaded** and its links without sending the file again. A deleted result (HTTP 404/410) or expired receipt allows a new upload; an uncertain availability check does not send a duplicate. Confirmed receipts, including private management tokens, stay in `config/cache/logscan/upload_receipts.json` on this Quickstart installation and survive restart. If Logscan provides no expiry, receipts are reused for 24 hours. Failed or unconfirmed uploads are not recorded as successful.
+- **Selected uploads:** Analytics offers **Upload selected** for up to 500 selected, available Kometa and ImageMaid logs with one confirmation. Quickstart processes them sequentially in a local background queue and checks the content fingerprint before each send, including duplicates within the selection. Leaving Analytics does not interrupt the queue; **Stop remaining** lets the current log finish and prevents subsequent uploads. An uncertain response pauses the queue without an automatic retry. Each run shows its own result, and the **Logscan** filter shows all, uploaded, or not uploaded runs using this installation's currently valid saved receipts. The pre-upload duplicate check is local; the server can also reuse identical retained logs after receiving an upload. Restarting Quickstart stops any unfinished queue; confirmed receipts and links remain saved.
+- **ImageMaid support:** Analytics can also upload current and historical ImageMaid logs, including batch selections and `.log.gz` archives. Quickstart first checks the portal's advertised capabilities, so it will not send an ImageMaid log to a server that has not enabled ImageMaid scanning. The Logscan filter covers both supported tools. Receipt and selection deduplication remain local to this Quickstart installation; an upgraded Logscan server can additionally reuse retained scans by content across uploaders. Quickstart displays the returned **Already uploaded** result and links.
+- **Scope:** Uploads support current and historical Kometa and ImageMaid logs, including `.log.gz` archives. Retained Analytics summaries cannot be uploaded after their source log has been deleted. For an incomplete run, the upload contains the snapshot available at the time of the click. Uploads are anonymous; account-linked uploads, Discord OAuth handoff, and an opt-in automatic-upload setting remain follow-ups. Pending auxiliary marker journals are not appended to this upload. An in-progress upload can be recovered on either page in the same browser session while Quickstart remains running; restarting Quickstart loses its in-memory upload status.
 - **Logscan Analyzer:** Parses Quickstart-managed Kometa and ImageMaid runtime logs to surface errors, run summaries, and missing items.
 - **Analytics Page:** Interactive dashboard for cross-app run history, scope-first filters, and per-run recommendations.
 
@@ -291,7 +320,7 @@ There are five primary ways to install and run Quickstart, listed from simplest 
 
 - Go to the [Releases page](https://github.com/Kometa-Team/Quickstart/releases) and download the standalone file.
 
-- Choose the build you want (`master` or `develop`) and download the appropriate asset.
+- Choose the build you want (`master` or `develop`), then pick the asset matching your Mac's chip: `-arm64` for Apple Silicon (M1/M2/M3/M4) or `-x86_64` for Intel. Not sure which you have? Apple menu > About This Mac shows the chip.
 
 - Place the file in its own folder.
 
@@ -662,6 +691,22 @@ npm run lint:eslint    # ESLint over static/local-js/
 
 - You want to see the production bundle in your browser (path validation, cache-busting behavior, minification impact).
 - You want to verify your change doesn't break the Vite build before pushing (CI will catch this anyway, but faster locally).
+
+**Before pushing, use the repo-local CI gate:**
+
+```
+python scripts/run_local_ci_gate.py
+# or
+python -m pre_commit run repo-ci-gate --hook-stage manual
+```
+
+This mirrors the important GitHub checks locally: full repo pre-commit validation, the project unit-test runner, and the production Vite build. If you prefer the explicit raw commands, the equivalent checks are:
+
+```
+python -m pre_commit run --all-files --show-diff-on-failure --color=always
+python scripts/run_tests.py --unit
+npm run build
+```
 
 **When you can skip it:**
 

@@ -66,12 +66,17 @@
     window.QS_TRACEARR_REQUIREMENT_REASONS = {{ (tracearr_requirement_reasons if tracearr_requirement_reasons is defined else []) | tojson }};
     window.QS_OMDB_REQUIREMENT_REASONS = {{ (omdb_requirement_reasons if omdb_requirement_reasons is defined else []) | tojson }};
     window.QS_MDBLIST_REQUIREMENT_REASONS = {{ (mdblist_requirement_reasons if mdblist_requirement_reasons is defined else []) | tojson }};
+    window.QS_FLOPPY_REQUIREMENT_REASONS = {{ (floppy_requirement_reasons if floppy_requirement_reasons is defined else []) | tojson }};
+    window.QS_SERIALIZD_REQUIREMENT_REASONS = {{ (serializd_requirement_reasons if serializd_requirement_reasons is defined else []) | tojson }};
     window.QS_ANIDB_REQUIREMENT_REASONS = {{ (anidb_requirement_reasons if anidb_requirement_reasons is defined else []) | tojson }};
     window.QS_RADARR_REQUIREMENT_REASONS = {{ (radarr_requirement_reasons if radarr_requirement_reasons is defined else []) | tojson }};
     window.QS_SONARR_REQUIREMENT_REASONS = {{ (sonarr_requirement_reasons if sonarr_requirement_reasons is defined else []) | tojson }};
-    window.QS_TRAKT_REQUIREMENT_REASONS = {{ (trakt_requirement_reasons if trakt_requirement_reasons is defined else []) | tojson }};
     window.QS_MAL_REQUIREMENT_REASONS = {{ (mal_requirement_reasons if mal_requirement_reasons is defined else []) | tojson }};
   </script>
+  {% set _vite_origin = vite_dev_origin() %}
+  {% if _vite_origin %}
+  <script type="module" src="{{ _vite_origin }}/@vite/client"></script>
+  {% endif %}
   <script type="module" src="{{ asset_url('000-base') }}"></script>
   <script type="module" src="{{ asset_url('pathValidation') }}"></script>
   <script type="module" src="{{ asset_url('urlValidation') }}"></script>
@@ -84,7 +89,18 @@
     <div class="qs-page-container">
       <div class="content-wrapper qs-content-wrapper">
       <!-- New Version Available Message for user-->
-      {% if version_info and version_info.update_available %}
+      {% set qs_update_status = version_info.update_check_status | default('') if version_info else '' %}
+      {% if version_info and qs_update_status == "build_pending" %}
+      <div class="alert alert-warning text-center qs-wide-alert" id="quickstart-update-alert" data-qs-update-alert role="alert">
+        <i class="bi bi-hourglass-split"></i>
+        {{ version_info.update_message or "Quickstart build metadata is still publishing. Try again in a few minutes." }}
+        {% if version_info.remote_base_version %}
+        <br>
+        <span>Remote version detected: <strong>{{ version_info.remote_base_version }}</strong></span>
+        {% endif %}
+      </div>
+      <br data-qs-update-alert-spacer>
+      {% elif version_info and version_info.update_available %}
       <div class="alert alert-danger text-center qs-wide-alert" id="quickstart-update-alert" data-qs-update-alert role="alert">
         <i class="bi bi-arrow-up-circle"></i>
         A new version of Quickstart (<strong>{{ version_info.remote_version }}</strong>) is available!
@@ -99,13 +115,7 @@
         <br><br>
         <span>Update with:</span>
         <br>
-        {% if version_info.branch == "master" %}
-        <code>git pull && pip install -r requirements.txt</code>
-        {% elif version_info.branch == "develop" %}
-        <code>git fetch && git reset --hard kometa-team/develop && pip install -r requirements.txt</code>
-        {% else %}
-        <code>git fetch && git checkout {{ version_info.branch }} && pip install -r requirements.txt</code>
-        {% endif %}
+        <code>{{ version_info.update_command }}</code>
         <br>
         <button id="updateQuickstartBtn" class="btn btn-warning mt-2" data-branch="{{ version_info.branch }}">
           <i class="bi bi-arrow-clockwise"></i> Run Update Now
@@ -141,7 +151,7 @@
 
   <script type="module"
     src="{{ asset_url('001-start') }}"></script>
-  {% if page_info['template_name'] != '001-start' %}
+  {% if page_info['template_name'] != '001-start' and not page_info.get('suppress_page_script') %}
   {% if page_info.get('template_uses_module') %}
   <script type="module"
     src="{{ asset_url(page_info['template_name']) }}"></script>
@@ -186,6 +196,28 @@
 
   <!-- Global Toast Container -->
   <div class="toast-container position-fixed top-0 start-50 translate-middle-x p-3" id="toastContainer"></div>
+
+  <div class="modal fade" id="qs-confirm-modal" tabindex="-1" aria-labelledby="qs-confirm-title" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title d-flex align-items-center gap-2" id="qs-confirm-title">
+            <i class="bi bi-exclamation-triangle text-warning" id="qs-confirm-icon" aria-hidden="true"></i>
+            <span>Confirm action</span>
+          </h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <p class="mb-0" id="qs-confirm-message"></p>
+          <p class="text-muted small mt-3 mb-0 d-none" id="qs-confirm-details"></p>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" id="qs-confirm-cancel" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-primary" id="qs-confirm-confirm">Continue</button>
+        </div>
+      </div>
+    </div>
+  </div>
   {% if page_info and page_info.save_error %}
   <div id="qs-save-error" data-message="{{ page_info.save_error|e }}"></div>
   {% endif %}

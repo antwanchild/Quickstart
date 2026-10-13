@@ -186,7 +186,7 @@ container_class="border rounded p-3 mb-2", number_input=None
                             <input type="hidden" name="{{ library.id }}-attribute_{{ prefix }}_order"
                                 id="{{ library.id }}-attribute_{{ prefix }}_order"
                                 value='{{ data["libraries"].get(library.id ~ "-attribute_" ~ prefix ~ "_order", "[]") }}'
-                                data-default="[]">
+                                data-default="[]" data-skip-override-count="true">
                         </div>
                     </div>
                     {% endif %}
@@ -367,7 +367,7 @@ prefix if yml_location == "top_level" else
                 data-library-type="{{ library_media_type }}">
                 <div class="input-group mb-2">
                     <span class="input-group-text" id="{{ source_select_id }}_text">
-                        <a href="https://kometa.wiki/en/nightly/defaults/separators/#important-note" target="_blank"
+                        <a href="https://kometa.wiki/en/develop/defaults/separators/#important-note" target="_blank"
                             rel="noopener noreferrer">Placeholder Source</a>
                         <span class="text-{{ tooltip_variant }} ms-3" data-bs-toggle="tooltip" data-bs-html="true"
                             title="Choose exactly one placeholder source for separators in this library.">
@@ -390,7 +390,7 @@ prefix if yml_location == "top_level" else
                 </div>
                 <div class="input-group mb-2 separator-placeholder-field" data-placeholder-source="imdb">
                     <span class="input-group-text" id="{{ imdb_id }}_text">
-                        <a href="https://kometa.wiki/en/nightly/defaults/separators/#important-note" target="_blank"
+                        <a href="https://kometa.wiki/en/develop/defaults/separators/#important-note" target="_blank"
                             rel="noopener noreferrer">Placeholder IMDb ID</a>
                     </span>
                     <select class="form-select separator-placeholder-picklist" id="{{ imdb_id }}" name="{{ imdb_name }}"
@@ -415,7 +415,7 @@ prefix if yml_location == "top_level" else
                 {% if library_media_type == 'movie' %}
                 <div class="input-group mb-2 separator-placeholder-field d-none" data-placeholder-source="tmdb_movie">
                     <span class="input-group-text" id="{{ tmdb_id }}_text">
-                        <a href="https://kometa.wiki/en/nightly/defaults/separators/#important-note" target="_blank"
+                        <a href="https://kometa.wiki/en/develop/defaults/separators/#important-note" target="_blank"
                             rel="noopener noreferrer">Placeholder TMDb Movie ID</a>
                     </span>
                     <select class="form-select separator-placeholder-picklist" id="{{ tmdb_id }}" name="{{ tmdb_name }}"
@@ -440,7 +440,7 @@ prefix if yml_location == "top_level" else
                 {% else %}
                 <div class="input-group mb-2 separator-placeholder-field d-none" data-placeholder-source="tvdb_show">
                     <span class="input-group-text" id="{{ tvdb_id }}_text">
-                        <a href="https://kometa.wiki/en/nightly/defaults/separators/#important-note" target="_blank"
+                        <a href="https://kometa.wiki/en/develop/defaults/separators/#important-note" target="_blank"
                             rel="noopener noreferrer">Placeholder TVDb Show ID</a>
                     </span>
                     <select class="form-select separator-placeholder-picklist" id="{{ tvdb_id }}" name="{{ tvdb_name }}"
@@ -821,7 +821,7 @@ select_input.key if yml_location == "top_level" else
                             <input type="text" class="form-control"
                                 id="{{ library.id }}-attribute_{{ section.prefix }}_path"
                                 name="{{ library.id }}-attribute_{{ section.prefix }}_path"
-                                value="{{ data.libraries[library.id ~ '-attribute_' ~ section.prefix ~ '_path'] | default('') }}"
+                                value="{{ data.libraries[library.id ~ '-attribute_' ~ section.prefix ~ '_path'] | default('', true) if data.libraries[library.id ~ '-attribute_' ~ section.prefix ~ '_path'] | string | lower not in ['none', 'null'] else '' }}"
                                 data-default=""
                                 placeholder="{{ section.text_input.placeholder }}">
                         </div>
@@ -990,14 +990,17 @@ field_prefix ~ "_" ~ prefix if field_prefix else prefix) %}
         </div>
         <div class="schedule-builder-body">
             <div class="schedule-mode" data-schedule-mode="range">
-                <div class="schedule-grid">
-                    <input type="date" class="form-control" id="{{ full_id }}_schedule_range_start"
-                        data-schedule-range-start aria-label="Range start">
-                    <span class="schedule-range-sep">to</span>
-                    <input type="date" class="form-control" id="{{ full_id }}_schedule_range_end"
-                        data-schedule-range-end aria-label="Range end">
+                <div class="input-group">
+                    <input type="text" class="form-control" id="{{ full_id }}_schedule_range_values"
+                        data-schedule-range-values placeholder="12/01-12/31" aria-label="Date range values">
+                    <button class="btn nav-button" type="button" data-schedule-add-option>
+                        Add range
+                    </button>
                 </div>
-                <div class="form-text">Month/day are used; year is ignored.</div>
+                <div class="form-text">Enter one MM/DD-MM/DD range. Use Add range for another range.</div>
+                <div class="invalid-feedback d-none" data-schedule-feedback="range">
+                    Use valid date ranges like <code>12/01-12/31</code>.
+                </div>
             </div>
             <div class="schedule-mode" data-schedule-mode="weekly">
                 <div class="schedule-weekly">
@@ -1011,25 +1014,46 @@ field_prefix ~ "_" ~ prefix if field_prefix else prefix) %}
                 </div>
             </div>
             <div class="schedule-mode" data-schedule-mode="monthly">
-                <input type="number" class="form-control" id="{{ full_id }}_schedule_month_day" min="1" max="31"
-                    step="1" data-schedule-month-day placeholder="Day of month">
+                <div class="input-group">
+                    <input type="text" class="form-control" id="{{ full_id }}_schedule_month_values"
+                        data-schedule-month-values placeholder="1 or 1-7 or last">
+                    <button class="btn nav-button" type="button" data-schedule-add-option>
+                        Add option
+                    </button>
+                </div>
+                <div class="form-text">Enter one day, day range, or <code>last</code>. Use Add option for another value.</div>
+                <div class="invalid-feedback d-none" data-schedule-feedback="monthly">
+                    Use days 1-31, <code>last</code>, or ranges like <code>1-7</code> / <code>21-last</code>.
+                </div>
             </div>
             <div class="schedule-mode" data-schedule-mode="yearly">
-                <input type="date" class="form-control" id="{{ full_id }}_schedule_yearly" data-schedule-yearly
-                    aria-label="Yearly date">
-                <div class="form-text">Month/day are used; year is ignored.</div>
+                <div class="input-group">
+                    <input type="text" class="form-control" id="{{ full_id }}_schedule_year_values"
+                        data-schedule-year-values placeholder="01/30" aria-label="Yearly date values">
+                    <button class="btn nav-button" type="button" data-schedule-add-option>
+                        Add option
+                    </button>
+                </div>
+                <div class="form-text">Enter one MM/DD date. Use Add option for another date.</div>
+                <div class="invalid-feedback d-none" data-schedule-feedback="yearly">
+                    Use valid MM/DD dates like <code>01/30</code>.
+                </div>
             </div>
             <div class="schedule-mode" data-schedule-mode="date">
                 <input type="date" class="form-control" id="{{ full_id }}_schedule_date" data-schedule-date
                     aria-label="Exact date">
             </div>
             <div class="schedule-mode" data-schedule-mode="hourly">
-                <div class="schedule-grid">
-                    <input type="number" class="form-control" id="{{ full_id }}_schedule_hour_start" min="0" max="23"
-                        step="1" data-schedule-hour-start placeholder="Start hour">
-                    <span class="schedule-range-sep">to</span>
-                    <input type="number" class="form-control" id="{{ full_id }}_schedule_hour_end" min="0" max="23"
-                        step="1" data-schedule-hour-end placeholder="End hour (optional)">
+                <div class="input-group">
+                    <input type="text" class="form-control" id="{{ full_id }}_schedule_hour_values"
+                        data-schedule-hour-values placeholder="2 or 5-7">
+                    <button class="btn nav-button" type="button" data-schedule-add-option>
+                        Add option
+                    </button>
+                </div>
+                <div class="form-text">Enter one 24-hour value or range. Use Add option for another value.</div>
+                <div class="invalid-feedback d-none" data-schedule-feedback="hourly">
+                    Use hours 0-23 or ranges like <code>5-7</code> / <code>17-04</code>.
                 </div>
             </div>
             <div class="schedule-mode" data-schedule-mode="daily">
@@ -1122,12 +1146,13 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
 </div>
 {% endmacro %}
 
-{% macro collection_group_section(library, data, version_info, group, telemetry) %}
+{% macro collection_group_section(library, data, version_info, group, telemetry, group_index=none, defer_collection_details=false) %}
 {% set accordion_safe = group.accordion | replace(' ', '') %}
 <!-- Plex Pass: {{ telemetry.plex_pass }} -->
 <!-- {{ group.accordion }} Collection Accordion -->
 <div class="accordion mt-3" id="{{ library.id }}-{{ accordion_safe }}Accordion"
-    data-collection-group-shell="true" data-library-id="{{ library.id }}">
+    data-collection-group-shell="true" data-library-id="{{ library.id }}"
+    {% if group_index is not none %}data-collection-group-index="{{ group_index }}"{% endif %}>
     <div class="accordion-item">
         <h2 class="accordion-header overlay-accordion-header d-flex align-items-center">
             <button class="accordion-button collapsed flex-grow-1" type="button" data-bs-toggle="collapse"
@@ -1219,6 +1244,9 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                     </div>
 
                     {% if collection.template_variables %}
+                    {% set clean_id = collection.id.replace('collection_', '') %}
+                    {% set collection_details_id = library.id ~ '-template_collection_' ~ clean_id ~ '-details' %}
+                    {% if not defer_collection_details %}
                     {% set is_seasonal = collection.id == 'collection_seasonal' %}
                     {% set priority_use_key_collection_ids = [
                         'collection_oscars',
@@ -1245,7 +1273,6 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                         'collection_tautulli',
                         'collection_tracearr',
                         'collection_tmdb',
-                        'collection_trakt',
                         'collection_other_chart'
                     ] %}
                     {% set ordered_collection_items = collection.template_variables %}
@@ -1329,6 +1356,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                         'flat': true
                     }) %}
                     {% endif %}
+                    {% endif %}
                     <div class="child-toggle-wrapper ms-4 mt-2"
                         data-toggle-parent="{{ library.id }}-{{ collection.id }}" style="display: none;">
                         <div class="d-flex align-items-center gap-2 flex-wrap mb-2 collection-detail-actions">
@@ -1347,10 +1375,23 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                         <div class="collection-template-section mt-2"
                             id="{{ collection_details_id }}"
                             data-detail-section="true"
+                            data-collection-detail-lazy-section="{{ 'true' if defer_collection_details else 'false' }}"
+                            data-library-id="{{ library.id }}"
+                            data-collection-group-index="{{ group_index if group_index is not none else '' }}"
+                            data-collection-id="{{ collection.id }}"
                             style="display: none;">
+                        {% if defer_collection_details %}
+                            <div class="library-section-lazy-placeholder text-muted d-flex align-items-center gap-2"
+                                data-collection-detail-lazy-placeholder="true">
+                                <div class="spinner-border spinner-border-sm text-info d-none" role="status"
+                                    aria-hidden="true"></div>
+                                <span>Open details to load {{ collection.label }} settings.</span>
+                            </div>
+                        {% else %}
                         {% for render_group in render_groups.items %}
                         {% if not render_group.flat %}
                         {% set section_body_id = collection_details_id ~ '-section-' ~ render_group.id %}
+                        {% set has_child_bulk_actions = render_group.id in ['included_items', 'child_collections', 'child_defaults', 'child_override_maps'] %}
                         <div class="border rounded p-2 mb-3 collection-variable-section" data-collection-variable-section="true"
                             data-section-id="{{ render_group.id }}">
                             <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mb-2">
@@ -1375,7 +1416,19 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                 data-detail-section="true"
                                 data-default-open="{{ 'true' if render_group.default_open else 'false' }}"
                                 style="display: {{ 'block' if render_group.default_open else 'none' }};">
-                                <div class="d-flex justify-content-end mb-2">
+                                <div class="d-flex justify-content-end gap-2 flex-wrap mb-2">
+                                    {% if has_child_bulk_actions %}
+                                    <button type="button"
+                                        class="btn btn-sm btn-outline-secondary btn-overlay"
+                                        data-child-toggle-bulk-action="select">
+                                        Select all
+                                    </button>
+                                    <button type="button"
+                                        class="btn btn-sm btn-outline-secondary btn-overlay"
+                                        data-child-toggle-bulk-action="unselect">
+                                        Unselect all
+                                    </button>
+                                    {% endif %}
                                     <button type="button"
                                         class="btn btn-sm btn-outline-secondary btn-overlay reset-offset-btn"
                                         data-collection-variable-section-reset="true">
@@ -1725,18 +1778,18 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                             </div>
                             <div class="schedule-builder-body">
                                 <div class="schedule-mode" data-schedule-mode="range">
-                                    <div class="schedule-grid">
-                                        <input type="date" class="form-control"
-                                            id="{{ input_name }}_schedule_range_start"
-                                            data-schedule-range-start
-                                            aria-label="Range start" {% if disable_toggle %}disabled{% endif %}>
-                                        <span class="schedule-range-sep">to</span>
-                                        <input type="date" class="form-control"
-                                            id="{{ input_name }}_schedule_range_end"
-                                            data-schedule-range-end
-                                            aria-label="Range end" {% if disable_toggle %}disabled{% endif %}>
+                                    <div class="input-group">
+                                        <input type="text" class="form-control"
+                                            id="{{ input_name }}_schedule_range_values"
+                                            data-schedule-range-values placeholder="12/01-12/31" aria-label="Date range values" {% if disable_toggle %}disabled{% endif %}>
+                                        <button class="btn nav-button" type="button" data-schedule-add-option {% if disable_toggle %}disabled{% endif %}>
+                                            Add range
+                                        </button>
                                     </div>
-                                    <div class="form-text">Month/day are used; year is ignored.</div>
+                                    <div class="form-text">Enter one MM/DD-MM/DD range. Use Add range for another range.</div>
+                                    <div class="invalid-feedback d-none" data-schedule-feedback="range">
+                                        Use valid date ranges like <code>12/01-12/31</code>.
+                                    </div>
                                 </div>
                                 <div class="schedule-mode" data-schedule-mode="weekly">
                                     <div class="schedule-weekly">
@@ -1751,17 +1804,33 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                     </div>
                                 </div>
                                 <div class="schedule-mode" data-schedule-mode="monthly">
-                                    <input type="number" class="form-control"
-                                        id="{{ input_name }}_schedule_month_day"
-                                        min="1" max="31" step="1"
-                                        data-schedule-month-day placeholder="Day of month" {% if disable_toggle %}disabled{% endif %}>
+                                    <div class="input-group">
+                                        <input type="text" class="form-control"
+                                            id="{{ input_name }}_schedule_month_values"
+                                            data-schedule-month-values placeholder="1 or 1-7 or last" {% if disable_toggle %}disabled{% endif %}>
+                                        <button class="btn nav-button" type="button" data-schedule-add-option {% if disable_toggle %}disabled{% endif %}>
+                                            Add option
+                                        </button>
+                                    </div>
+                                    <div class="form-text">Enter one day, day range, or <code>last</code>. Use Add option for another value.</div>
+                                    <div class="invalid-feedback d-none" data-schedule-feedback="monthly">
+                                        Use days 1-31, <code>last</code>, or ranges like <code>1-7</code> / <code>21-last</code>.
+                                    </div>
                                 </div>
                                 <div class="schedule-mode" data-schedule-mode="yearly">
-                                    <input type="date" class="form-control"
-                                        id="{{ input_name }}_schedule_yearly"
-                                        data-schedule-yearly
-                                        aria-label="Yearly date" {% if disable_toggle %}disabled{% endif %}>
-                                    <div class="form-text">Month/day are used; year is ignored.</div>
+                                    <div class="input-group">
+                                        <input type="text" class="form-control"
+                                            id="{{ input_name }}_schedule_year_values"
+                                            data-schedule-year-values
+                                            placeholder="01/30" aria-label="Yearly date values" {% if disable_toggle %}disabled{% endif %}>
+                                        <button class="btn nav-button" type="button" data-schedule-add-option {% if disable_toggle %}disabled{% endif %}>
+                                            Add option
+                                        </button>
+                                    </div>
+                                    <div class="form-text">Enter one MM/DD date. Use Add option for another date.</div>
+                                    <div class="invalid-feedback d-none" data-schedule-feedback="yearly">
+                                        Use valid MM/DD dates like <code>01/30</code>.
+                                    </div>
                                 </div>
                                 <div class="schedule-mode" data-schedule-mode="date">
                                     <input type="date" class="form-control"
@@ -1770,16 +1839,17 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                         aria-label="Exact date" {% if disable_toggle %}disabled{% endif %}>
                                 </div>
                                 <div class="schedule-mode" data-schedule-mode="hourly">
-                                    <div class="schedule-grid">
-                                        <input type="number" class="form-control"
-                                            id="{{ input_name }}_schedule_hour_start"
-                                            min="0" max="23" step="1"
-                                            data-schedule-hour-start placeholder="Start hour" {% if disable_toggle %}disabled{% endif %}>
-                                        <span class="schedule-range-sep">to</span>
-                                        <input type="number" class="form-control"
-                                            id="{{ input_name }}_schedule_hour_end"
-                                            min="0" max="23" step="1"
-                                            data-schedule-hour-end placeholder="End hour (optional)" {% if disable_toggle %}disabled{% endif %}>
+                                    <div class="input-group">
+                                        <input type="text" class="form-control"
+                                            id="{{ input_name }}_schedule_hour_values"
+                                            data-schedule-hour-values placeholder="2 or 5-7" {% if disable_toggle %}disabled{% endif %}>
+                                        <button class="btn nav-button" type="button" data-schedule-add-option {% if disable_toggle %}disabled{% endif %}>
+                                            Add option
+                                        </button>
+                                    </div>
+                                    <div class="form-text">Enter one 24-hour value or range. Use Add option for another value.</div>
+                                    <div class="invalid-feedback d-none" data-schedule-feedback="hourly">
+                                        Use hours 0-23 or ranges like <code>5-7</code> / <code>17-04</code>.
                                     </div>
                                 </div>
                                 <div class="schedule-mode" data-schedule-mode="daily">
@@ -1830,7 +1900,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                 {% endif %}
                             </span>
                             <input type="{{ 'number' if is_number_input else 'text' }}" class="form-control" id="{{ input_name }}" name="{{ input_name }}"
-                                value="{{ data['libraries'].get(input_name, item.default) | default('', true) }}"
+                                value="{{ data['libraries'].get(input_name, item.default) | default('', true) if data['libraries'].get(input_name, item.default) | string | lower not in ['none', 'null'] else '' }}"
                                 data-default="{{ item.default | default('', true) }}"
                                 {% if item.key is defined %}data-template-variable-key="{{ item.key }}"{% endif %}
                                 {% if item.validation_preset %}data-template-scalar-lookup="true" data-library-name="{{ library.name }}" data-media-type="{{ library.type }}"{% endif %}
@@ -1876,6 +1946,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                         </div>
                         {% endif %}
                         {% endfor %}
+                        {% endif %}
                         </div>
                     </div>
                     {% endif %}
@@ -2229,6 +2300,7 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                 {% for render_group in overlay_render_groups %}
                                                 {% if not render_group.flat %}
                                                 {% set render_group_body_id = template_name ~ '-' ~ render_group.id ~ '-section-body' %}
+                                                {% set has_child_bulk_actions = render_group.id in ['included_items', 'child_collections', 'child_defaults', 'child_override_maps'] %}
                                                 <div class="border rounded p-2 mb-3 collection-variable-section overlay-variable-section"
                                                     data-overlay-variable-section="true"
                                                     data-overlay-variable-section-id="{{ render_group.id }}">
@@ -2254,7 +2326,19 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                         data-detail-section="true"
                                                         data-default-open="{{ 'true' if render_group.default_open else 'false' }}"
                                                         style="display: {{ 'block' if render_group.default_open else 'none' }};">
-                                                        <div class="d-flex justify-content-end mb-2">
+                                                        <div class="d-flex justify-content-end gap-2 flex-wrap mb-2">
+                                                            {% if has_child_bulk_actions %}
+                                                            <button type="button"
+                                                                class="btn btn-sm btn-outline-secondary btn-overlay"
+                                                                data-child-toggle-bulk-action="select">
+                                                                Select all
+                                                            </button>
+                                                            <button type="button"
+                                                                class="btn btn-sm btn-outline-secondary btn-overlay"
+                                                                data-child-toggle-bulk-action="unselect">
+                                                                Unselect all
+                                                            </button>
+                                                            {% endif %}
                                                             <button type="button"
                                                                 class="btn btn-sm btn-outline-secondary btn-overlay reset-offset-btn"
                                                                 data-overlay-variable-section-reset="true">
@@ -2275,6 +2359,9 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                 {% set skip_var = (var_name == 'builder_level') %}
                                                 {% set flat_key = template_name ~ '[' ~ var_name ~ ']' %}
                                                 {% set selected_value = data.libraries.get(flat_key, var_details.default) %}
+                                                {% if overlay.id == 'overlay_ratings' and var_name in ['rating1', 'rating1_image', 'rating2', 'rating2_image', 'rating3', 'rating3_image'] and flat_key in data.libraries and (selected_value is none or selected_value|string|lower == 'none') %}
+                                                {% set selected_value = '' %}
+                                                {% endif %}
                                                 {% if selected_value is boolean %}
                                                 {% set selected_value = 'true' if selected_value else 'false' %}
                                                 {% endif %}
@@ -2340,9 +2427,11 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                             {% set opt_value = option.value %}
                                                             {% set opt_label = option.label %}
                                                             {% endif %}
+                                                            {% if option is string or not option.media_types or type in option.media_types %}
                                                             <option value="{{ opt_value }}" {% if selected_value == opt_value %}selected{% endif %}>
                                                                 {{ opt_label }}
                                                             </option>
+                                                            {% endif %}
                                                             {% endfor %}
                                                             {% endif %}
                                                         </select>
@@ -2573,15 +2662,15 @@ tooltip_variant="info", container_class="border rounded p-3 mb-2") %}
                                                         data-language-input-id="{{ input_id }}"
                                                         data-options='{{ var_details.options | tojson }}'
                                                         data-existing='{{ weight_ns.values | tojson }}'>
-                                                        <label class="form-label fw-semibold mb-1">Weight Overrides</label>
+                                                        <label class="form-label fw-semibold mb-1">Weight Modifications</label>
                                                         <div class="form-text mb-2">
-                                                            Override priority for specific language flags. Default weights are omitted from YAML.
+                                                            Change priority for specific language flags. Default weights are omitted from YAML.
                                                         </div>
                                                         <div class="d-flex flex-column gap-2" data-overlay-language-weight-rows></div>
                                                         <div class="mt-2">
                                                             <button type="button" class="btn btn-outline-secondary btn-sm"
                                                                 data-overlay-language-weight-add>
-                                                                Add Weight Override
+                                                                Add Weight Modification
                                                             </button>
                                                         </div>
                                                         <div data-overlay-language-weight-hidden></div>

@@ -5,6 +5,8 @@
 // URL), so importing here is the same object EventHandler.updateAccordionHighlights
 // delegates to.
 import { updateAccordionHighlights } from '/static/local-js/modules/accordionHighlights.js'
+import { nbspLeadingSpaces } from '/static/local-js/modules/kometa/_util.js'
+import { applyLibraryFileServerErrors, libraryFileRowMatches } from '/static/local-js/modules/libraryFileErrors.js'
 
 // Load all helper modules in parallel. These publish their symbols
 // via window.* shims (same pattern as pathValidation.js).
@@ -29,13 +31,13 @@ const copyModalEl = document.getElementById('copyLibraryModal')
 const copyTargetsContainer = document.getElementById('copyLibraryTargets')
 const copySubtitle = document.getElementById('copyLibrarySubtitle')
 const copyWarning = document.getElementById('copyLibraryWarning')
+const copyReport = document.getElementById('copyLibraryReport')
 const copyConfirmBtn = document.getElementById('copyLibraryConfirm')
 const copySelectAllBtn = document.getElementById('copySelectAll')
 const copyDeselectAllBtn = document.getElementById('copyDeselectAll')
 const copyModal = copyModalEl ? new bootstrap.Modal(copyModalEl) : null
 let activeLibraryId = null
 let loadRequestId = 0
-let allowNextStepNavigation = false
 let lookupLabelAutosaveTimer = null
 let libraryCardInitializing = 0
 
@@ -118,6 +120,16 @@ const dependencyHintConfigs = {
     endpoint: '/libraries_mdblist_dependency_hint',
     windowKey: 'QS_MDBLIST_REQUIREMENT_REASONS'
   },
+  floppy: {
+    stepKey: '067-floppy',
+    endpoint: '/libraries_floppy_dependency_hint',
+    windowKey: 'QS_FLOPPY_REQUIREMENT_REASONS'
+  },
+  serializd: {
+    stepKey: '065-serializd',
+    endpoint: '/libraries_serializd_dependency_hint',
+    windowKey: 'QS_SERIALIZD_REQUIREMENT_REASONS'
+  },
   anidb: {
     stepKey: '100-anidb',
     endpoint: '/libraries_anidb_dependency_hint',
@@ -133,11 +145,6 @@ const dependencyHintConfigs = {
     endpoint: '/libraries_sonarr_dependency_hint',
     windowKey: 'QS_SONARR_REQUIREMENT_REASONS'
   },
-  trakt: {
-    stepKey: '130-trakt',
-    endpoint: '/libraries_trakt_dependency_hint',
-    windowKey: 'QS_TRAKT_REQUIREMENT_REASONS'
-  },
   mal: {
     stepKey: '140-mal',
     endpoint: '/libraries_mal_dependency_hint',
@@ -146,15 +153,20 @@ const dependencyHintConfigs = {
 }
 let dependencyHintRefreshTimer = null
 let dependencyHintRequestToken = 0
-const advancedVisibilityStorageKey = 'qsLibrariesAdvancedVisible'
 
 function normalizeMetadataFileEntry (entry) {
   if (!entry || typeof entry !== 'object') return null
   const type = String(entry.type || '').trim().toLowerCase()
   const location = String(entry.location || '').trim()
   const validated = entry.validated === true || String(entry.validated || '').trim().toLowerCase() === 'true'
+  const schedule = String(entry.schedule || '').trim()
+  const templateVariables = entry.template_variables
   if (!type && !location) return null
   const normalized = { type, location }
+  if (schedule) normalized.schedule = schedule
+  if (templateVariables && typeof templateVariables === 'object' && !Array.isArray(templateVariables) && Object.keys(templateVariables).length) {
+    normalized.template_variables = templateVariables
+  }
   if (validated) normalized.validated = true
   return normalized
 }
@@ -503,7 +515,7 @@ function getExternalYamlModal () {
   let modalEl = document.getElementById('externalYamlEditorModal')
   if (modalEl) return prepareLibrariesModal(modalEl)
   modalEl = document.createElement('div')
-  modalEl.className = 'modal fade'
+  modalEl.className = 'modal fade external-yaml-editor-modal'
   modalEl.id = 'externalYamlEditorModal'
   modalEl.tabIndex = -1
   modalEl.setAttribute('aria-hidden', 'true')
@@ -677,8 +689,8 @@ function syncExternalYamlEditorLineNumbers (modalEl) {
     const lineEl = document.createElement('button')
     lineEl.type = 'button'
     lineEl.className = 'external-yaml-editor-line'
-    lineEl.textContent = String(line)
     lineEl.dataset.externalYamlLine = String(line)
+    lineEl.setAttribute('aria-label', `Line ${line}`)
     if (markedLines.has(line)) lineEl.classList.add('external-yaml-editor-line--issue')
     gutter.appendChild(lineEl)
   }
@@ -1416,9 +1428,13 @@ function buildMetadataFileRow (entry = {}) {
             <option value="url">url</option>
           </select>
         </div>
-        <div class="col-md-7">
+        <div class="col-md-5">
           <label class="form-label small text-muted">Location</label>
           <input type="text" class="form-control form-control-sm" data-metadata-file-location placeholder="config/metadata.yml, config/metadata/, user/file.yml, or https://example.com/metadata.yml">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label small text-muted">Schedule</label>
+          <input type="text" class="form-control form-control-sm" data-metadata-file-schedule placeholder="weekly(friday)">
         </div>
         <div class="col-md-3 d-flex gap-2 flex-wrap justify-content-md-end">
           <button type="button" class="btn btn-success btn-sm" data-validate-metadata-file>Validate</button>
@@ -1427,15 +1443,35 @@ function buildMetadataFileRow (entry = {}) {
         </div>
       </div>
       <div class="mt-2 small d-none" data-metadata-file-status></div>
+      <details class="mt-3" data-metadata-file-template-variables-panel>
+        <summary class="small text-muted">External file template variables</summary>
+        <div class="mt-2">
+          <label class="form-label small text-muted">Template variables</label>
+          <textarea class="form-control form-control-sm font-monospace" rows="4" data-metadata-file-template-variables placeholder="variable_name: true&#10;custom_text: value&#10;weight: 50"></textarea>
+          <div class="form-text">One key: value per line. Use any template variable supported by this external metadata file.</div>
+          <div class="invalid-feedback d-none" data-metadata-file-template-variables-feedback></div>
+        </div>
+      </details>
     </div>
   `
   const typeSelect = wrapper.querySelector('[data-metadata-file-type]')
   const locationInput = wrapper.querySelector('[data-metadata-file-location]')
+  const scheduleInput = wrapper.querySelector('[data-metadata-file-schedule]')
+  const templateVariablesInput = wrapper.querySelector('[data-metadata-file-template-variables]')
   if (typeSelect && ['file', 'folder', 'git', 'repo', 'url'].includes(entry.type)) {
     typeSelect.value = entry.type
   }
   if (locationInput && entry.location) {
     locationInput.value = entry.location
+  }
+  if (scheduleInput && entry.schedule) {
+    scheduleInput.value = entry.schedule
+  }
+  if (templateVariablesInput && entry.template_variables) {
+    templateVariablesInput.value = formatOverlayFileTemplateVariables(entry.template_variables)
+  }
+  if (templateVariablesInput) {
+    templateVariablesInput.value = formatOverlayFileTemplateVariables(entry.template_variables)
   }
   if (entry.validated) {
     wrapper.dataset.metadataFileState = 'success'
@@ -1680,22 +1716,8 @@ function updateMetadataFilesAccordionState (editor) {
   }
 }
 
-function applyMetadataFileServerErrors (editor, errors) {
-  if (!editor || !Array.isArray(errors) || !errors.length) return false
-  const rows = Array.from(editor.querySelectorAll('[data-metadata-file-row]'))
-  rows.forEach(row => setMetadataFileStatus(row, '', ''))
-  let applied = false
-  errors.forEach(error => {
-    const text = String(error || '').trim()
-    const match = text.match(/metadata_files\[(\d+)\]:\s*(.+)$/i)
-    if (!match) return
-    const index = Number(match[1]) - 1
-    const message = match[2] || 'Validation failed.'
-    if (!Number.isInteger(index) || index < 0 || index >= rows.length) return
-    setMetadataFileStatus(rows[index], 'error', message)
-    applied = true
-  })
-  return applied
+function applyMetadataFileServerErrors (editor, errors, submittedEntries) {
+  return applyLibraryFileServerErrors(editor, errors, 'metadata_files', submittedEntries, setMetadataFileStatus)
 }
 
 function syncMetadataFilesEditor (editor, emitEvents = true) {
@@ -1706,8 +1728,18 @@ function syncMetadataFilesEditor (editor, emitEvents = true) {
   const entries = rows.map(row => {
     const type = row.querySelector('[data-metadata-file-type]')?.value
     const location = row.querySelector('[data-metadata-file-location]')?.value
+    const schedule = row.querySelector('[data-metadata-file-schedule]')?.value
     const validated = String(row.dataset.metadataFileState || '').trim().toLowerCase() === 'success'
-    return normalizeMetadataFileEntry({ type, location, validated })
+    const templateVariablesInput = row.querySelector('[data-metadata-file-template-variables]')
+    const templateVariables = parseOverlayFileTemplateVariables(templateVariablesInput?.value || '')
+    setLibraryFileTemplateVariablesFeedback(row, 'metadata-file-template-variables', templateVariables.errors)
+    return normalizeMetadataFileEntry({
+      type,
+      location,
+      schedule,
+      validated,
+      template_variables: templateVariables.errors.length ? {} : templateVariables.value
+    })
   }).filter(Boolean)
   hidden.value = JSON.stringify(entries)
   if (emitEvents) {
@@ -1765,9 +1797,13 @@ function buildCollectionFileRow (entry = {}) {
             <option value="url">url</option>
           </select>
         </div>
-        <div class="col-md-7">
+        <div class="col-md-5">
           <label class="form-label small text-muted">Location</label>
           <input type="text" class="form-control form-control-sm" data-collection-file-location placeholder="config/collections.yml, config/collections/, user/file.yml, or https://example.com/collections.yml">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label small text-muted">Schedule</label>
+          <input type="text" class="form-control form-control-sm" data-collection-file-schedule placeholder="weekly(friday)">
         </div>
         <div class="col-md-3 d-flex gap-2 flex-wrap justify-content-md-end">
           <button type="button" class="btn btn-success btn-sm" data-validate-collection-file>Validate</button>
@@ -1776,15 +1812,32 @@ function buildCollectionFileRow (entry = {}) {
         </div>
       </div>
       <div class="mt-2 small d-none" data-collection-file-status></div>
+      <details class="mt-3" data-collection-file-template-variables-panel>
+        <summary class="small text-muted">External file template variables</summary>
+        <div class="mt-2">
+          <label class="form-label small text-muted">Template variables</label>
+          <textarea class="form-control form-control-sm font-monospace" rows="4" data-collection-file-template-variables placeholder="variable_name: true&#10;custom_text: value&#10;weight: 50"></textarea>
+          <div class="form-text">One key: value per line. Use any template variable supported by this external collection file.</div>
+          <div class="invalid-feedback d-none" data-collection-file-template-variables-feedback></div>
+        </div>
+      </details>
     </div>
   `
   const typeSelect = wrapper.querySelector('[data-collection-file-type]')
   const locationInput = wrapper.querySelector('[data-collection-file-location]')
+  const scheduleInput = wrapper.querySelector('[data-collection-file-schedule]')
+  const templateVariablesInput = wrapper.querySelector('[data-collection-file-template-variables]')
   if (typeSelect && ['file', 'folder', 'git', 'repo', 'url'].includes(entry.type)) {
     typeSelect.value = entry.type
   }
   if (locationInput && entry.location) {
     locationInput.value = entry.location
+  }
+  if (scheduleInput && entry.schedule) {
+    scheduleInput.value = entry.schedule
+  }
+  if (templateVariablesInput) {
+    templateVariablesInput.value = formatOverlayFileTemplateVariables(entry.template_variables)
   }
   if (entry.validated) {
     wrapper.dataset.collectionFileState = 'success'
@@ -2026,22 +2079,8 @@ function updateCollectionFilesAccordionState (editor) {
   }
 }
 
-function applyCollectionFileServerErrors (editor, errors) {
-  if (!editor || !Array.isArray(errors) || !errors.length) return false
-  const rows = Array.from(editor.querySelectorAll('[data-collection-file-row]'))
-  rows.forEach(row => setCollectionFileStatus(row, '', ''))
-  let applied = false
-  errors.forEach(error => {
-    const text = String(error || '').trim()
-    const match = text.match(/collection_files\[(\d+)\]:\s*(.+)$/i)
-    if (!match) return
-    const index = Number(match[1]) - 1
-    const message = match[2] || 'Validation failed.'
-    if (!Number.isInteger(index) || index < 0 || index >= rows.length) return
-    setCollectionFileStatus(rows[index], 'error', message)
-    applied = true
-  })
-  return applied
+function applyCollectionFileServerErrors (editor, errors, submittedEntries) {
+  return applyLibraryFileServerErrors(editor, errors, 'collection_files', submittedEntries, setCollectionFileStatus)
 }
 
 function syncCollectionFilesEditor (editor, emitEvents = true) {
@@ -2052,8 +2091,18 @@ function syncCollectionFilesEditor (editor, emitEvents = true) {
   const entries = rows.map(row => {
     const type = row.querySelector('[data-collection-file-type]')?.value
     const location = row.querySelector('[data-collection-file-location]')?.value
+    const schedule = row.querySelector('[data-collection-file-schedule]')?.value
     const validated = String(row.dataset.collectionFileState || '').trim().toLowerCase() === 'success'
-    return normalizeMetadataFileEntry({ type, location, validated })
+    const templateVariablesInput = row.querySelector('[data-collection-file-template-variables]')
+    const templateVariables = parseOverlayFileTemplateVariables(templateVariablesInput?.value || '')
+    setLibraryFileTemplateVariablesFeedback(row, 'collection-file-template-variables', templateVariables.errors)
+    return normalizeMetadataFileEntry({
+      type,
+      location,
+      schedule,
+      validated,
+      template_variables: templateVariables.errors.length ? {} : templateVariables.value
+    })
   }).filter(Boolean)
   hidden.value = JSON.stringify(entries)
   if (emitEvents) {
@@ -2140,6 +2189,7 @@ document.addEventListener('click', async function (event) {
         })
       })
       const payload = await response.json().catch(() => ({}))
+      if (!row.isConnected || !libraryFileRowMatches(row, 'metadata_files', { type, location })) return
       if (!response.ok || !payload.valid) {
         setMetadataFileStatus(row, 'error', payload.error_details || {
           text: payload.error || 'Validation failed.',
@@ -2154,7 +2204,9 @@ document.addEventListener('click', async function (event) {
         syncMetadataFilesEditor(editor, false)
       }
     } catch {
-      setMetadataFileStatus(row, 'error', 'Validation request failed.')
+      if (row.isConnected && libraryFileRowMatches(row, 'metadata_files', { type, location })) {
+        setMetadataFileStatus(row, 'error', 'Validation request failed.')
+      }
     } finally {
       if (row.dataset.metadataFileState !== 'success' && row.dataset.metadataFileDependency !== 'repo-missing') {
         setMetadataFileButtonState(row, 'idle')
@@ -2166,7 +2218,7 @@ document.addEventListener('click', async function (event) {
 document.addEventListener('input', function (event) {
   const target = event.target
   if (!target || !target.closest('[data-metadata-files-editor]')) return
-  if (!target.matches('[data-metadata-file-type], [data-metadata-file-location]')) return
+  if (!target.matches('[data-metadata-file-type], [data-metadata-file-location], [data-metadata-file-schedule], [data-metadata-file-template-variables]')) return
   const row = target.closest('[data-metadata-file-row]')
   const editor = target.closest('[data-metadata-files-editor]')
   setMetadataFileStatus(row, '', '')
@@ -2177,7 +2229,7 @@ document.addEventListener('input', function (event) {
 document.addEventListener('change', function (event) {
   const target = event.target
   if (!target || !target.closest('[data-metadata-files-editor]')) return
-  if (!target.matches('[data-metadata-file-type], [data-metadata-file-location]')) return
+  if (!target.matches('[data-metadata-file-type], [data-metadata-file-location], [data-metadata-file-schedule], [data-metadata-file-template-variables]')) return
   const row = target.closest('[data-metadata-file-row]')
   const editor = target.closest('[data-metadata-files-editor]')
   setMetadataFileStatus(row, '', '')
@@ -2238,11 +2290,13 @@ document.addEventListener('click', async function (event) {
       })
       const payload = await response.json().catch(() => ({}))
       if (!response.ok || !payload.valid) {
+        if (!row.isConnected || !libraryFileRowMatches(row, 'collection_files', { type, location })) return
         setCollectionFileStatus(row, 'error', payload.error_details || {
           text: payload.error || 'Validation failed.',
           files: Array.isArray(payload.files) ? payload.files : []
         })
       } else {
+        if (!row.isConnected || !libraryFileRowMatches(row, 'collection_files', { type, location })) return
         applyNormalizedLibraryFileLocation(row, '[data-collection-file-location]', payload, editor, syncCollectionFilesEditor)
         setCollectionFileStatus(row, 'success', {
           text: payload.message || 'Collection source looks valid.',
@@ -2251,7 +2305,9 @@ document.addEventListener('click', async function (event) {
         syncCollectionFilesEditor(editor, false)
       }
     } catch {
-      setCollectionFileStatus(row, 'error', 'Validation request failed.')
+      if (row.isConnected && libraryFileRowMatches(row, 'collection_files', { type, location })) {
+        setCollectionFileStatus(row, 'error', 'Validation request failed.')
+      }
     } finally {
       if (row.dataset.collectionFileState !== 'success' && row.dataset.collectionFileDependency !== 'repo-missing') {
         setCollectionFileButtonState(row, 'idle')
@@ -2263,7 +2319,7 @@ document.addEventListener('click', async function (event) {
 document.addEventListener('input', function (event) {
   const target = event.target
   if (!target || !target.closest('[data-collection-files-editor]')) return
-  if (!target.matches('[data-collection-file-type], [data-collection-file-location]')) return
+  if (!target.matches('[data-collection-file-type], [data-collection-file-location], [data-collection-file-schedule], [data-collection-file-template-variables]')) return
   const row = target.closest('[data-collection-file-row]')
   const editor = target.closest('[data-collection-files-editor]')
   setCollectionFileStatus(row, '', '')
@@ -2274,7 +2330,7 @@ document.addEventListener('input', function (event) {
 document.addEventListener('change', function (event) {
   const target = event.target
   if (!target || !target.closest('[data-collection-files-editor]')) return
-  if (!target.matches('[data-collection-file-type], [data-collection-file-location]')) return
+  if (!target.matches('[data-collection-file-type], [data-collection-file-location], [data-collection-file-schedule], [data-collection-file-template-variables]')) return
   const row = target.closest('[data-collection-file-row]')
   const editor = target.closest('[data-collection-files-editor]')
   setCollectionFileStatus(row, '', '')
@@ -2286,6 +2342,73 @@ initCollectionFilesEditors(document)
 if (libraryContainer && typeof MutationObserver !== 'undefined') {
   const collectionObserver = new MutationObserver(() => initCollectionFilesEditors(libraryContainer))
   collectionObserver.observe(libraryContainer, { childList: true, subtree: true })
+}
+
+function coerceOverlayTemplateVariableValue (rawValue) {
+  const value = String(rawValue || '').trim()
+  if (!value) return ''
+  if (/^(true|false)$/i.test(value)) return value.toLowerCase() === 'true'
+  if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value)
+  if ((value.startsWith('[') && value.endsWith(']')) || (value.startsWith('{') && value.endsWith('}'))) {
+    try {
+      return JSON.parse(value)
+    } catch {
+      return value
+    }
+  }
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    return value.slice(1, -1)
+  }
+  return value
+}
+
+function parseOverlayFileTemplateVariables (rawValue) {
+  const parsed = {}
+  const errors = []
+  String(rawValue || '').split(/\r?\n/).forEach((line, index) => {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) return
+    const separator = trimmed.indexOf(':')
+    if (separator <= 0) {
+      errors.push(`Line ${index + 1}: use key: value.`)
+      return
+    }
+    const key = trimmed.slice(0, separator).trim()
+    if (!/^[A-Za-z0-9_]+$/.test(key)) {
+      errors.push(`Line ${index + 1}: keys can use letters, numbers, and underscores.`)
+      return
+    }
+    parsed[key] = coerceOverlayTemplateVariableValue(trimmed.slice(separator + 1))
+  })
+  return { value: parsed, errors }
+}
+
+function formatOverlayTemplateVariableValue (value) {
+  if (typeof value === 'boolean' || typeof value === 'number') return String(value)
+  if (Array.isArray(value) || (value && typeof value === 'object')) return JSON.stringify(value)
+  return String(value ?? '')
+}
+
+function formatOverlayFileTemplateVariables (value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  return Object.entries(value)
+    .map(([key, rawValue]) => `${key}: ${formatOverlayTemplateVariableValue(rawValue)}`)
+    .join('\n')
+}
+
+function setLibraryFileTemplateVariablesFeedback (row, dataAttribute, errors) {
+  if (!row || !dataAttribute) return
+  const input = row.querySelector(`[data-${dataAttribute}]`)
+  const feedback = row.querySelector(`[data-${dataAttribute}-feedback]`)
+  if (!input || !feedback) return
+  const hasErrors = Array.isArray(errors) && errors.length > 0
+  input.classList.toggle('is-invalid', hasErrors)
+  feedback.classList.toggle('d-none', !hasErrors)
+  feedback.textContent = hasErrors ? errors.join(' ') : ''
+}
+
+function setOverlayFileTemplateVariablesFeedback (row, errors) {
+  setLibraryFileTemplateVariablesFeedback(row, 'overlay-file-template-variables', errors)
 }
 
 function buildOverlayFileRow (entry = {}) {
@@ -2316,15 +2439,28 @@ function buildOverlayFileRow (entry = {}) {
         </div>
       </div>
       <div class="mt-2 small d-none" data-overlay-file-status></div>
+      <details class="mt-3" data-overlay-file-template-variables-panel>
+        <summary class="small text-muted">External file template variables</summary>
+        <div class="mt-2">
+          <label class="form-label small text-muted">Template variables</label>
+          <textarea class="form-control form-control-sm font-monospace" rows="4" data-overlay-file-template-variables placeholder="variable_name: true&#10;custom_text: value&#10;weight: 50"></textarea>
+          <div class="form-text">One key: value per line. Use any template variable supported by this external overlay file.</div>
+          <div class="invalid-feedback d-none" data-overlay-file-template-variables-feedback></div>
+        </div>
+      </details>
     </div>
   `
   const typeSelect = wrapper.querySelector('[data-overlay-file-type]')
   const locationInput = wrapper.querySelector('[data-overlay-file-location]')
+  const templateVariablesInput = wrapper.querySelector('[data-overlay-file-template-variables]')
   if (typeSelect && ['file', 'folder', 'git', 'repo', 'url'].includes(entry.type)) {
     typeSelect.value = entry.type
   }
   if (locationInput && entry.location) {
     locationInput.value = entry.location
+  }
+  if (templateVariablesInput) {
+    templateVariablesInput.value = formatOverlayFileTemplateVariables(entry.template_variables)
   }
   if (entry.validated) {
     wrapper.dataset.overlayFileState = 'success'
@@ -2566,22 +2702,8 @@ function updateOverlayFilesAccordionState (editor) {
   }
 }
 
-function applyOverlayFileServerErrors (editor, errors) {
-  if (!editor || !Array.isArray(errors) || !errors.length) return false
-  const rows = Array.from(editor.querySelectorAll('[data-overlay-file-row]'))
-  rows.forEach(row => setOverlayFileStatus(row, '', ''))
-  let applied = false
-  errors.forEach(error => {
-    const text = String(error || '').trim()
-    const match = text.match(/overlay_files\[(\d+)\]:\s*(.+)$/i)
-    if (!match) return
-    const index = Number(match[1]) - 1
-    const message = match[2] || 'Validation failed.'
-    if (!Number.isInteger(index) || index < 0 || index >= rows.length) return
-    setOverlayFileStatus(rows[index], 'error', message)
-    applied = true
-  })
-  return applied
+function applyOverlayFileServerErrors (editor, errors, submittedEntries) {
+  return applyLibraryFileServerErrors(editor, errors, 'overlay_files', submittedEntries, setOverlayFileStatus)
 }
 
 function syncOverlayFilesEditor (editor, emitEvents = true) {
@@ -2593,7 +2715,15 @@ function syncOverlayFilesEditor (editor, emitEvents = true) {
     const type = row.querySelector('[data-overlay-file-type]')?.value
     const location = row.querySelector('[data-overlay-file-location]')?.value
     const validated = String(row.dataset.overlayFileState || '').trim().toLowerCase() === 'success'
-    return normalizeMetadataFileEntry({ type, location, validated })
+    const templateVariablesInput = row.querySelector('[data-overlay-file-template-variables]')
+    const templateVariables = parseOverlayFileTemplateVariables(templateVariablesInput?.value || '')
+    setOverlayFileTemplateVariablesFeedback(row, templateVariables.errors)
+    return normalizeMetadataFileEntry({
+      type,
+      location,
+      validated,
+      template_variables: templateVariables.errors.length ? {} : templateVariables.value
+    })
   }).filter(Boolean)
   hidden.value = JSON.stringify(entries)
   if (emitEvents) {
@@ -2681,11 +2811,13 @@ document.addEventListener('click', async function (event) {
       })
       const payload = await response.json().catch(() => ({}))
       if (!response.ok || !payload.valid) {
+        if (!row.isConnected || !libraryFileRowMatches(row, 'overlay_files', { type, location })) return
         setOverlayFileStatus(row, 'error', payload.error_details || {
           text: payload.error || 'Validation failed.',
           files: Array.isArray(payload.files) ? payload.files : []
         })
       } else {
+        if (!row.isConnected || !libraryFileRowMatches(row, 'overlay_files', { type, location })) return
         applyNormalizedLibraryFileLocation(row, '[data-overlay-file-location]', payload, editor, syncOverlayFilesEditor)
         setOverlayFileStatus(row, 'success', {
           text: payload.message || 'Overlay source looks valid.',
@@ -2694,7 +2826,9 @@ document.addEventListener('click', async function (event) {
         syncOverlayFilesEditor(editor, false)
       }
     } catch {
-      setOverlayFileStatus(row, 'error', 'Validation request failed.')
+      if (row.isConnected && libraryFileRowMatches(row, 'overlay_files', { type, location })) {
+        setOverlayFileStatus(row, 'error', 'Validation request failed.')
+      }
     } finally {
       if (row.dataset.overlayFileState !== 'success' && row.dataset.overlayFileDependency !== 'repo-missing') {
         setOverlayFileButtonState(row, 'idle')
@@ -2706,7 +2840,7 @@ document.addEventListener('click', async function (event) {
 document.addEventListener('input', function (event) {
   const target = event.target
   if (!target || !target.closest('[data-overlay-files-editor]')) return
-  if (!target.matches('[data-overlay-file-type], [data-overlay-file-location]')) return
+  if (!target.matches('[data-overlay-file-type], [data-overlay-file-location], [data-overlay-file-template-variables]')) return
   const row = target.closest('[data-overlay-file-row]')
   const editor = target.closest('[data-overlay-files-editor]')
   setOverlayFileStatus(row, '', '')
@@ -2717,7 +2851,7 @@ document.addEventListener('input', function (event) {
 document.addEventListener('change', function (event) {
   const target = event.target
   if (!target || !target.closest('[data-overlay-files-editor]')) return
-  if (!target.matches('[data-overlay-file-type], [data-overlay-file-location]')) return
+  if (!target.matches('[data-overlay-file-type], [data-overlay-file-location], [data-overlay-file-template-variables]')) return
   const row = target.closest('[data-overlay-file-row]')
   const editor = target.closest('[data-overlay-files-editor]')
   setOverlayFileStatus(row, '', '')
@@ -2736,8 +2870,14 @@ function normalizePlaylistFileEntry (entry) {
   const type = String(entry.type || '').trim().toLowerCase()
   const location = String(entry.location || '').trim()
   const validated = entry.validated === true || String(entry.validated || '').trim().toLowerCase() === 'true'
+  const schedule = String(entry.schedule || '').trim()
+  const templateVariables = entry.template_variables
   if (!type && !location) return null
   const normalized = { type, location }
+  if (schedule) normalized.schedule = schedule
+  if (templateVariables && typeof templateVariables === 'object' && !Array.isArray(templateVariables) && Object.keys(templateVariables).length) {
+    normalized.template_variables = templateVariables
+  }
   if (validated) normalized.validated = true
   return normalized
 }
@@ -2766,14 +2906,19 @@ function buildPlaylistFileRow (entry = {}) {
           <label class="form-label small text-muted">Type</label>
           <select class="form-select form-select-sm" data-playlist-file-type>
             <option value="file">file</option>
+            <option value="folder">folder</option>
             <option value="git">git</option>
             <option value="repo">repo</option>
             <option value="url">url</option>
           </select>
         </div>
-        <div class="col-md-7">
+        <div class="col-md-5">
           <label class="form-label small text-muted">Location</label>
           <input type="text" class="form-control form-control-sm" data-playlist-file-location placeholder="config/playlists.yml, user/playlists.yml, or https://example.com/playlists.yml">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label small text-muted">Schedule</label>
+          <input type="text" class="form-control form-control-sm" data-playlist-file-schedule placeholder="weekly(friday)">
         </div>
         <div class="col-md-3 d-flex gap-2 flex-wrap justify-content-md-end">
           <button type="button" class="btn btn-outline-primary btn-sm" data-external-yaml-edit data-external-yaml-kind="playlist_files">Edit</button>
@@ -2781,16 +2926,32 @@ function buildPlaylistFileRow (entry = {}) {
           <button type="button" class="btn btn-danger btn-sm" data-remove-playlist-file>Remove</button>
         </div>
       </div>
+      <details class="mt-3" data-playlist-file-template-variables-panel>
+        <summary class="small text-muted">External file template variables</summary>
+        <div class="mt-2">
+          <textarea class="form-control form-control-sm font-monospace" rows="4" data-playlist-file-template-variables placeholder="variable_name: true&#10;custom_text: value&#10;weight: 50"></textarea>
+          <div class="form-text">One key: value per line. Use any template variable supported by this external playlist file.</div>
+          <div class="invalid-feedback d-none" data-playlist-file-template-variables-feedback></div>
+        </div>
+      </details>
       <div class="mt-2 small d-none" data-playlist-file-status></div>
     </div>
   `
   const typeSelect = wrapper.querySelector('[data-playlist-file-type]')
   const locationInput = wrapper.querySelector('[data-playlist-file-location]')
-  if (typeSelect && ['file', 'url', 'git', 'repo'].includes(entry.type)) {
+  const scheduleInput = wrapper.querySelector('[data-playlist-file-schedule]')
+  const templateVariablesInput = wrapper.querySelector('[data-playlist-file-template-variables]')
+  if (typeSelect && ['file', 'folder', 'url', 'git', 'repo'].includes(entry.type)) {
     typeSelect.value = entry.type
   }
   if (locationInput && entry.location) {
     locationInput.value = entry.location
+  }
+  if (scheduleInput && entry.schedule) {
+    scheduleInput.value = entry.schedule
+  }
+  if (templateVariablesInput) {
+    templateVariablesInput.value = formatOverlayFileTemplateVariables(entry.template_variables)
   }
   if (entry.validated) {
     wrapper.dataset.playlistFileState = 'success'
@@ -3011,8 +3172,18 @@ function syncPlaylistFilesEditor (editor, emitEvents = true) {
   const entries = rows.map(row => {
     const type = row.querySelector('[data-playlist-file-type]')?.value
     const location = row.querySelector('[data-playlist-file-location]')?.value
+    const schedule = row.querySelector('[data-playlist-file-schedule]')?.value
+    const templateVariablesInput = row.querySelector('[data-playlist-file-template-variables]')
+    const templateVariables = parseOverlayFileTemplateVariables(templateVariablesInput?.value || '')
+    setLibraryFileTemplateVariablesFeedback(row, 'playlist-file-template-variables', templateVariables.errors)
     const validated = String(row.dataset.playlistFileState || '').trim().toLowerCase() === 'success'
-    return normalizePlaylistFileEntry({ type, location, validated })
+    return normalizePlaylistFileEntry({
+      type,
+      location,
+      schedule,
+      template_variables: templateVariables.errors.length ? {} : templateVariables.value,
+      validated
+    })
   }).filter(Boolean)
   hidden.value = JSON.stringify(entries)
   if (emitEvents) {
@@ -3430,7 +3601,7 @@ function setupOverlayLanguageWeightBuilders (scope) {
       if (!weightText) return 'Using Kometa default weight'
       if (!/^-?\d+$/.test(weightText)) return 'Enter a whole number'
       if (defaultWeight !== null && Number(weightText) === defaultWeight) return 'Matches default weight, so it will not be emitted'
-      return 'Custom override will be emitted'
+      return 'Custom value will be emitted'
     }
 
     function currentOptionsForRow (row) {
@@ -3845,6 +4016,22 @@ function parseStepOrder (stepKey) {
 
 function insertStepByOrder (container, stepButton) {
   if (!container || !stepButton) return
+  if (container.querySelector('[data-step-keys]')) {
+    const stepKey = String(stepButton.dataset.stepKey || '')
+    const subgroup = Array.from(container.querySelectorAll('[data-step-keys]')).find((candidate) => {
+      return String(candidate.dataset.stepKeys || '').split(/\s+/).includes(stepKey)
+    })
+    const destination = subgroup?.querySelector('.qs-step-subgroup-list') || container.querySelector('[data-step-subgroup="other"] .qs-step-subgroup-list') || container
+    const orderedKeys = String(subgroup?.dataset.stepKeys || '').split(/\s+/).filter(Boolean)
+    const targetOrder = orderedKeys.indexOf(stepKey)
+    const siblings = Array.from(destination.querySelectorAll('.qs-step-link[data-step-key]')).filter(el => el !== stepButton)
+    const nextSibling = siblings.find(el => orderedKeys.indexOf(String(el.dataset.stepKey || '')) > targetOrder)
+    destination.insertBefore(stepButton, nextSibling || null)
+    container.querySelectorAll('.qs-step-subgroup').forEach((candidate) => {
+      candidate.classList.toggle('d-none', !candidate.querySelector('.qs-step-link[data-step-key]'))
+    })
+    return
+  }
   const targetOrder = parseStepOrder(stepButton.dataset.stepKey)
   const siblings = Array.from(container.querySelectorAll('.qs-step-link[data-step-key]')).filter(el => el !== stepButton)
   const nextSibling = siblings.find(el => parseStepOrder(el.dataset.stepKey) > targetOrder)
@@ -4185,13 +4372,18 @@ function initScheduleBuilders (scope) {
     const modeSelect = builder.querySelector('[data-schedule-mode-select]')
     const preview = builder.querySelector('[data-schedule-preview]')
     const rawInput = builder.querySelector('[data-schedule-raw]')
+    const addOptionButtons = Array.from(builder.querySelectorAll('[data-schedule-add-option]'))
     const modeSections = Array.from(builder.querySelectorAll('[data-schedule-mode]'))
+    const rangeValues = builder.querySelector('[data-schedule-range-values]')
     const rangeStart = builder.querySelector('[data-schedule-range-start]')
     const rangeEnd = builder.querySelector('[data-schedule-range-end]')
     const weeklyDays = Array.from(builder.querySelectorAll('[data-schedule-week-day]'))
+    const monthlyValues = builder.querySelector('[data-schedule-month-values]')
     const monthlyDay = builder.querySelector('[data-schedule-month-day]')
+    const yearlyValues = builder.querySelector('[data-schedule-year-values]')
     const yearlyInput = builder.querySelector('[data-schedule-yearly]')
     const dateInput = builder.querySelector('[data-schedule-date]')
+    const hourValues = builder.querySelector('[data-schedule-hour-values]')
     const hourStart = builder.querySelector('[data-schedule-hour-start]')
     const hourEnd = builder.querySelector('[data-schedule-hour-end]')
     const defaultValue = String(builder.dataset.defaultValue || '').trim()
@@ -4234,15 +4426,15 @@ function initScheduleBuilders (scope) {
 
     function parseSchedule (rawValue) {
       const raw = String(rawValue || '').trim()
-      if (!raw) return { mode: 'range', raw: '' }
+      if (!raw || ['none', 'null'].includes(raw.toLowerCase())) return { mode: 'range', raw: '' }
       const lower = raw.toLowerCase()
       if (['daily', 'never', 'non_existing'].includes(lower)) {
         return { mode: lower, raw }
       }
       if (lower.startsWith('hourly(') && lower.endsWith(')')) {
         const inner = raw.slice(7, -1).trim()
-        const parts = inner.split('-').map(val => val.trim())
-        return { mode: 'hourly', hourStart: parts[0] || '', hourEnd: parts[1] || '', raw }
+        const parts = inner.includes('|') ? [] : inner.split('-').map(val => val.trim())
+        return { mode: 'hourly', hourValues: inner, hourStart: parts[0] || '', hourEnd: parts[1] || '', raw }
       }
       if (lower.startsWith('weekly(') && lower.endsWith(')')) {
         const inner = raw.slice(7, -1).trim()
@@ -4253,11 +4445,11 @@ function initScheduleBuilders (scope) {
       }
       if (lower.startsWith('monthly(') && lower.endsWith(')')) {
         const inner = raw.slice(8, -1).trim()
-        return { mode: 'monthly', day: inner, raw }
+        return { mode: 'monthly', monthValues: inner, day: inner, raw }
       }
       if (lower.startsWith('yearly(') && lower.endsWith(')')) {
         const inner = raw.slice(7, -1).trim()
-        return { mode: 'yearly', monthDay: inner, raw }
+        return { mode: 'yearly', yearValues: inner, monthDay: inner, raw }
       }
       if (lower.startsWith('date(') && lower.endsWith(')')) {
         const inner = raw.slice(5, -1).trim()
@@ -4265,11 +4457,9 @@ function initScheduleBuilders (scope) {
       }
       if (lower.startsWith('range(') && lower.endsWith(')')) {
         const inner = raw.slice(6, -1).trim()
-        if (inner.includes('|')) {
-          return { mode: 'custom', raw }
-        }
-        const parts = inner.split('-').map(val => val.trim())
-        return { mode: 'range', start: parts[0] || '', end: parts[1] || '', raw }
+        const firstRange = inner.split('|')[0] || ''
+        const parts = firstRange.split('-').map(val => val.trim())
+        return { mode: 'range', rangeValues: inner, start: parts[0] || '', end: parts[1] || '', raw }
       }
       if (lower.startsWith('all[')) {
         return { mode: 'custom', raw }
@@ -4285,8 +4475,124 @@ function initScheduleBuilders (scope) {
       })
     }
 
+    function setScheduleFieldValidity (input, valid, message = '') {
+      if (!input) return
+      input.classList.toggle('is-invalid', !valid)
+      input.setAttribute('aria-invalid', valid ? 'false' : 'true')
+      const feedback = input.closest('[data-schedule-mode]')?.querySelector('[data-schedule-feedback]')
+      if (feedback) {
+        feedback.classList.toggle('d-none', valid)
+        if (message) feedback.textContent = message
+      }
+    }
+
+    function uniquePipeValues (value) {
+      const seen = new Set()
+      const parts = String(value || '').split('|').map(part => part.trim()).filter(Boolean)
+      const unique = []
+      parts.forEach(part => {
+        const key = part.toLowerCase()
+        if (seen.has(key)) return
+        seen.add(key)
+        unique.push(part)
+      })
+      return unique.join('|')
+    }
+
+    function simplifyScheduleValuesInput (input) {
+      if (!input) return ''
+      const simplified = uniquePipeValues(input.value)
+      if (simplified !== String(input.value || '').trim()) {
+        input.value = simplified
+      }
+      return simplified
+    }
+
+    function isValidMonthlyDayToken (token) {
+      const value = String(token || '').trim().toLowerCase()
+      if (value === 'last') return true
+      if (!/^\d+$/.test(value)) return false
+      const day = Number(value)
+      return Number.isInteger(day) && day >= 1 && day <= 31
+    }
+
+    function isValidHourlyToken (token) {
+      const value = String(token || '').trim()
+      if (!/^\d+$/.test(value)) return false
+      const hour = Number(value)
+      return Number.isInteger(hour) && hour >= 0 && hour <= 23
+    }
+
+    function isValidScheduleMonthDay (value) {
+      const match = String(value || '').trim().match(/^(\d{1,2})\/(\d{1,2})$/)
+      if (!match) return false
+      const month = Number(match[1])
+      const day = Number(match[2])
+      if (!Number.isInteger(month) || month < 1 || month > 12) return false
+      const monthDays = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+      return Number.isInteger(day) && day >= 1 && day <= monthDays[month - 1]
+    }
+
+    function isValidRangeScheduleValues (value) {
+      const text = String(value || '').trim()
+      if (!text) return true
+      const ranges = text.split('|').map(part => part.trim())
+      if (!ranges.length || ranges.some(part => !part)) return false
+      return ranges.every(range => {
+        const parts = range.split('-').map(part => part.trim())
+        return parts.length === 2 && isValidScheduleMonthDay(parts[0]) && isValidScheduleMonthDay(parts[1])
+      })
+    }
+
+    function isValidYearlyScheduleValues (value) {
+      const text = String(value || '').trim()
+      if (!text) return true
+      const dates = text.split('|').map(part => part.trim())
+      return dates.length > 0 && dates.every(date => date && isValidScheduleMonthDay(date))
+    }
+
+    function isValidHourlyScheduleValues (value) {
+      const text = String(value || '').trim()
+      if (!text) return true
+      const parts = text.split('|').map(part => part.trim())
+      if (!parts.length || parts.some(part => !part)) return false
+      return parts.every(part => {
+        if (!part.includes('-')) return isValidHourlyToken(part)
+        const rangeParts = part.split('-').map(rangePart => rangePart.trim())
+        return rangeParts.length === 2 && isValidHourlyToken(rangeParts[0]) && isValidHourlyToken(rangeParts[1])
+      })
+    }
+
+    function isValidMonthlyScheduleValues (value) {
+      const text = String(value || '').trim().toLowerCase()
+      if (!text) return true
+      const parts = text.split('|').map(part => part.trim())
+      if (!parts.length || parts.some(part => !part)) return false
+      return parts.every(part => {
+        if (!part.includes('-')) return isValidMonthlyDayToken(part)
+        const rangeParts = part.split('-').map(rangePart => rangePart.trim())
+        if (rangeParts.length !== 2) return false
+        const [start, end] = rangeParts
+        if (!/^\d+$/.test(start) || !isValidMonthlyDayToken(start) || !isValidMonthlyDayToken(end)) return false
+        if (end === 'last') return true
+        return Number(start) <= Number(end)
+      })
+    }
+
     function buildValueFromInputs (mode) {
+      setScheduleFieldValidity(monthlyValues, true)
+      setScheduleFieldValidity(hourValues, true)
+      setScheduleFieldValidity(rangeValues, true)
+      setScheduleFieldValidity(yearlyValues, true)
       if (mode === 'range') {
+        const values = String(rangeValues?.value || '').trim()
+        if (values) {
+          const valid = isValidRangeScheduleValues(values)
+          setScheduleFieldValidity(rangeValues, valid, 'Use valid date ranges like 12/01-12/31.')
+          if (!valid) return ''
+          const simplified = simplifyScheduleValuesInput(rangeValues)
+          return `range(${simplified})`
+        }
         const start = formatMonthDay(rangeStart?.value)
         const end = formatMonthDay(rangeEnd?.value)
         if (start && end) return `range(${start}-${end})`
@@ -4296,10 +4602,26 @@ function initScheduleBuilders (scope) {
         if (selected.length) return `weekly(${selected.join('|')})`
       }
       if (mode === 'monthly') {
+        const values = String(monthlyValues?.value || '').trim()
+        if (values) {
+          const valid = isValidMonthlyScheduleValues(values)
+          setScheduleFieldValidity(monthlyValues, valid, 'Use days 1-31, last, or ranges like 1-7 / 21-last.')
+          if (!valid) return ''
+          const simplified = simplifyScheduleValuesInput(monthlyValues)
+          return `monthly(${simplified})`
+        }
         const day = String(monthlyDay?.value || '').trim()
         if (day) return `monthly(${day})`
       }
       if (mode === 'yearly') {
+        const values = String(yearlyValues?.value || '').trim()
+        if (values) {
+          const valid = isValidYearlyScheduleValues(values)
+          setScheduleFieldValidity(yearlyValues, valid, 'Use valid MM/DD dates like 01/30.')
+          if (!valid) return ''
+          const simplified = simplifyScheduleValuesInput(yearlyValues)
+          return `yearly(${simplified})`
+        }
         const md = formatMonthDay(yearlyInput?.value)
         if (md) return `yearly(${md})`
       }
@@ -4308,6 +4630,14 @@ function initScheduleBuilders (scope) {
         if (dateVal) return `date(${dateVal})`
       }
       if (mode === 'hourly') {
+        const values = String(hourValues?.value || '').trim()
+        if (values) {
+          const valid = isValidHourlyScheduleValues(values)
+          setScheduleFieldValidity(hourValues, valid, 'Use hours 0-23 or ranges like 5-7 / 17-04.')
+          if (!valid) return ''
+          const simplified = simplifyScheduleValuesInput(hourValues)
+          return `hourly(${simplified})`
+        }
         const start = String(hourStart?.value || '').trim()
         const end = String(hourEnd?.value || '').trim()
         if (start && end) return `hourly(${start}-${end})`
@@ -4324,6 +4654,18 @@ function initScheduleBuilders (scope) {
 
     function updatePreview (value) {
       if (preview) preview.textContent = value || ''
+    }
+
+    function appendScheduleOptionSeparator (input) {
+      if (!input || input.disabled) return
+      const nextValue = String(input.value || '').replace(/\s+$/g, '')
+      input.value = nextValue && !nextValue.endsWith('|') ? `${nextValue}|` : nextValue
+      input.focus()
+      if (typeof input.setSelectionRange === 'function') {
+        input.setSelectionRange(input.value.length, input.value.length)
+      }
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new Event('change', { bubbles: true }))
     }
 
     function updateFromBuilder () {
@@ -4346,6 +4688,7 @@ function initScheduleBuilders (scope) {
       const mode = parsed.mode || 'custom'
       setMode(mode)
       if (mode === 'range') {
+        if (rangeValues) rangeValues.value = parsed.rangeValues || ''
         setMonthDayInput(rangeStart, parsed.start)
         setMonthDayInput(rangeEnd, parsed.end)
       } else if (mode === 'weekly') {
@@ -4354,12 +4697,15 @@ function initScheduleBuilders (scope) {
           day.checked = selected.has(day.value)
         })
       } else if (mode === 'monthly') {
+        if (monthlyValues) monthlyValues.value = parsed.monthValues || ''
         if (monthlyDay) monthlyDay.value = parsed.day || ''
       } else if (mode === 'yearly') {
+        if (yearlyValues) yearlyValues.value = parsed.yearValues || parsed.monthDay || ''
         setMonthDayInput(yearlyInput, parsed.monthDay)
       } else if (mode === 'date') {
         setDateInput(dateInput, parsed.date)
       } else if (mode === 'hourly') {
+        if (hourValues) hourValues.value = parsed.hourValues || ''
         if (hourStart) hourStart.value = parsed.hourStart || ''
         if (hourEnd) hourEnd.value = parsed.hourEnd || ''
       }
@@ -4367,20 +4713,37 @@ function initScheduleBuilders (scope) {
       updatePreview(parsed.raw || '')
     }
 
-    const initialRaw = String(hidden.value || defaultValue || '').trim()
+    const rawHiddenValue = String(hidden.value || '').trim()
+    const initialRaw = ['none', 'null'].includes(rawHiddenValue.toLowerCase())
+      ? String(defaultValue || '').trim()
+      : (rawHiddenValue || String(defaultValue || '').trim())
     const parsed = parseSchedule(initialRaw)
     applyParsed(parsed)
     updateFromBuilder()
 
     modeSelect.addEventListener('change', () => updateFromBuilder())
+    addOptionButtons.forEach(button => {
+      button.addEventListener('click', () => {
+        const input = button.closest('.input-group')?.querySelector('[data-schedule-range-values], [data-schedule-hour-values], [data-schedule-month-values], [data-schedule-year-values]')
+        appendScheduleOptionSeparator(input)
+      })
+    })
+    if (rangeValues) rangeValues.addEventListener('input', () => updateFromBuilder())
+    if (rangeValues) rangeValues.addEventListener('change', () => updateFromBuilder())
     if (rangeStart) rangeStart.addEventListener('change', () => updateFromBuilder())
     if (rangeEnd) rangeEnd.addEventListener('change', () => updateFromBuilder())
     weeklyDays.forEach(day => {
       day.addEventListener('change', () => updateFromBuilder())
     })
+    if (monthlyValues) monthlyValues.addEventListener('input', () => updateFromBuilder())
+    if (monthlyValues) monthlyValues.addEventListener('change', () => updateFromBuilder())
     if (monthlyDay) monthlyDay.addEventListener('input', () => updateFromBuilder())
+    if (yearlyValues) yearlyValues.addEventListener('input', () => updateFromBuilder())
+    if (yearlyValues) yearlyValues.addEventListener('change', () => updateFromBuilder())
     if (yearlyInput) yearlyInput.addEventListener('change', () => updateFromBuilder())
     if (dateInput) dateInput.addEventListener('change', () => updateFromBuilder())
+    if (hourValues) hourValues.addEventListener('input', () => updateFromBuilder())
+    if (hourValues) hourValues.addEventListener('change', () => updateFromBuilder())
     if (hourStart) hourStart.addEventListener('input', () => updateFromBuilder())
     if (hourEnd) hourEnd.addEventListener('input', () => updateFromBuilder())
 
@@ -6019,11 +6382,75 @@ function updateConfiguredCounts () {
 function refreshPickerLabels () {
   if (!libraryPicker) return
   libraryPicker.querySelectorAll('option[value]').forEach(opt => {
-    const base = opt.dataset.label || opt.textContent.replace(/\s+\(configured\)$/, '')
+    const base = opt.dataset.label || opt.textContent.replace(/\s+\(configured\)$/, '').replace(/^\[|\]$/g, '')
     const configured = opt.dataset.configured === 'true'
-    opt.textContent = configured ? `${base} (configured)` : base
+    const displayBase = `[${nbspLeadingSpaces(base)}]`
+    opt.title = base
+    opt.textContent = configured ? `${displayBase} (configured)` : displayBase
   })
   updateConfiguredCounts()
+}
+
+function clearCopyLibraryReport () {
+  if (!copyReport) return
+  copyReport.classList.add('d-none')
+  copyReport.replaceChildren()
+}
+
+function renderCopyLibraryReport (data) {
+  if (!copyReport) return false
+  clearCopyLibraryReport()
+  const report = Array.isArray(data?.mirror_report) ? data.mirror_report : []
+  if (!report.length) return false
+
+  const included = report.filter(item => item && item.status === 'included')
+  const sourceExcluded = report.filter(item => item && item.status === 'source_excluded')
+  const needsReview = report.filter(item => item && item.status === 'needs_review')
+  const heading = document.createElement('div')
+  heading.className = 'fw-semibold mb-2'
+  if (sourceExcluded.length && !included.length && !needsReview.length) {
+    heading.textContent = 'Mirror complete. Targets stayed excluded because the source library is excluded.'
+  } else {
+    const parts = []
+    if (included.length) parts.push(`${included.length} included`)
+    if (needsReview.length) parts.push(`${needsReview.length} need review`)
+    heading.textContent = `Mirror complete: ${parts.join(', ') || 'no target changes'}.`
+  }
+  copyReport.appendChild(heading)
+
+  report.forEach(item => {
+    const row = document.createElement('div')
+    row.className = 'mb-2'
+    const label = document.createElement('div')
+    label.className = 'fw-semibold'
+    const name = item?.target_name || item?.target_id || 'Target library'
+    if (item?.status === 'included') {
+      label.textContent = `${name}: included in config`
+    } else if (item?.status === 'source_excluded') {
+      label.textContent = `${name}: left excluded`
+    } else {
+      label.textContent = `${name}: needs review`
+    }
+    row.appendChild(label)
+
+    const issues = Array.isArray(item?.issues) ? item.issues.filter(Boolean) : []
+    issues.slice(0, 4).forEach(issue => {
+      const issueEl = document.createElement('div')
+      issueEl.className = 'small text-muted'
+      issueEl.textContent = issue
+      row.appendChild(issueEl)
+    })
+    if (issues.length > 4) {
+      const more = document.createElement('div')
+      more.className = 'small text-muted'
+      more.textContent = `${issues.length - 4} more issue(s).`
+      row.appendChild(more)
+    }
+    copyReport.appendChild(row)
+  })
+
+  copyReport.classList.remove('d-none')
+  return needsReview.length > 0 || sourceExcluded.length > 0
 }
 
 function isLibraryCardInitializing (card) {
@@ -6146,30 +6573,28 @@ function setAdvancedVisibility (card, visible) {
   })
   const toggle = card.querySelector('.library-advanced-toggle')
   if (toggle) {
-    toggle.textContent = visible ? 'Hide Advanced' : 'Show Advanced'
+    toggle.checked = !!visible
     toggle.setAttribute('aria-expanded', visible ? 'true' : 'false')
   }
   card.dataset.advancedVisible = visible ? 'true' : 'false'
 }
 
+function getPreferredAdvancedVisibility (card) {
+  return hasConfiguredAdvancedValues(card)
+}
+
 function wireAdvancedToggle (card) {
-  if (!card || card.dataset.advancedToggleBound === 'true') return
+  if (!card) return
   const toggle = card.querySelector('.library-advanced-toggle')
   if (!toggle) return
 
-  let persisted = null
-  try {
-    persisted = window.localStorage ? window.localStorage.getItem(advancedVisibilityStorageKey) : null
-  } catch {}
-  const initialVisible = persisted === 'true' || (persisted !== 'false' && hasConfiguredAdvancedValues(card))
-  setAdvancedVisibility(card, initialVisible)
+  setAdvancedVisibility(card, getPreferredAdvancedVisibility(card))
 
-  toggle.addEventListener('click', () => {
-    const nextVisible = card.dataset.advancedVisible !== 'true'
+  if (card.dataset.advancedToggleBound === 'true') return
+
+  toggle.addEventListener('change', () => {
+    const nextVisible = toggle.checked
     setAdvancedVisibility(card, nextVisible)
-    try {
-      if (window.localStorage) window.localStorage.setItem(advancedVisibilityStorageKey, nextVisible ? 'true' : 'false')
-    } catch {}
   })
 
   card.dataset.advancedToggleBound = 'true'
@@ -6214,7 +6639,7 @@ function updateLibraryServiceValidateButton (card, serviceName, state = null) {
   if (effectiveState === 'loading') {
     button.disabled = true
     button.classList.add('btn-secondary')
-    button.textContent = `Validating ${serviceName === 'radarr' ? 'Radarr' : 'Sonarr'} Overrides...`
+    button.textContent = `Validating ${serviceName === 'radarr' ? 'Radarr' : 'Sonarr'} Modifications...`
     return
   }
 
@@ -6227,7 +6652,7 @@ function updateLibraryServiceValidateButton (card, serviceName, state = null) {
 
   button.disabled = false
   button.classList.add('btn-success')
-  button.textContent = `Validate ${serviceName === 'radarr' ? 'Radarr' : 'Sonarr'} Overrides`
+  button.textContent = `Validate ${serviceName === 'radarr' ? 'Radarr' : 'Sonarr'} Modifications`
 }
 
 function setLibraryServiceValidatedState (card, serviceName, isValidated) {
@@ -6318,7 +6743,7 @@ function validateLibraryServiceOverrides (button) {
 
   const payload = buildPayloadFromCard(card)
   updateLibraryServiceValidateButton(card, serviceName, 'loading')
-  setLibraryServiceStatus(card, serviceName, 'info', `Validating ${serviceName} overrides...`)
+  setLibraryServiceStatus(card, serviceName, 'info', `Validating ${serviceName} modifications...`)
 
   fetch(`/validate_library_service_overrides/${encodeURIComponent(libraryId)}`, {
     method: 'POST',
@@ -6345,7 +6770,7 @@ function validateLibraryServiceOverrides (button) {
       }
       setAdvancedVisibility(card, true)
       setLibraryServiceValidatedState(card, serviceName, true)
-      setLibraryServiceStatus(card, serviceName, 'success', `${serviceName === 'radarr' ? 'Radarr' : 'Sonarr'} overrides validated.`)
+      setLibraryServiceStatus(card, serviceName, 'success', `${serviceName === 'radarr' ? 'Radarr' : 'Sonarr'} modifications validated.`)
     })
     .catch((error) => {
       setAdvancedVisibility(card, true)
@@ -6404,6 +6829,9 @@ function initializeLibraryCardControls (card, libraryId) {
   libraryCardInitializing += 1
   if (card) card.dataset.libraryInitializing = 'true'
   try {
+    if (typeof EventHandler !== 'undefined' && EventHandler.restoreTemplateVariableSelects) {
+      EventHandler.restoreTemplateVariableSelects(card)
+    }
     initPlaylistKeyToggleGroups(card)
     initPlaylistUserPickers(card)
     initPlaylistFilesEditors(card)
@@ -6423,6 +6851,7 @@ function initializeLibraryCardControls (card, libraryId) {
     initRelativeYearInputs(card)
     initScheduleBuilders(card)
     initLibraryAssetDirectoryInputs(card)
+    wireChildToggleBulkActions(card)
     wireOffsetReset(card)
     wireRatingsOffsetSync(card)
     initSortablesInScope(card)
@@ -6546,6 +6975,19 @@ function loadedCollectionGroupMarker (card) {
   return marker
 }
 
+function loadedCollectionDetailMarker (card) {
+  if (!card) return null
+  let marker = card.querySelector('input[type="hidden"][name="__loaded_collection_details"]')
+  if (marker) return marker
+
+  marker = document.createElement('input')
+  marker.type = 'hidden'
+  marker.name = '__loaded_collection_details'
+  marker.value = ''
+  card.appendChild(marker)
+  return marker
+}
+
 function resetCollectionDefaultsMarker (card) {
   if (!card) return null
   let marker = card.querySelector('input[type="hidden"][name="__reset_collection_defaults"]')
@@ -6572,9 +7014,27 @@ function markLazyCollectionGroupLoaded (card, groupIndex) {
   marker.value = Array.from(values).sort((a, b) => Number(a) - Number(b)).join(',')
 }
 
-function loadLazyCollectionGroup (collapse, card) {
+function markLazyCollectionDetailLoaded (card, collectionId) {
+  const marker = loadedCollectionDetailMarker(card)
+  if (!marker) return
+  const values = new Set(String(marker.value || '').split(',').map(value => value.trim()).filter(Boolean))
+  values.add(String(collectionId))
+  marker.value = Array.from(values).sort().join(',')
+}
+
+function escapeDomId (id) {
+  if (window.CSS && typeof window.CSS.escape === 'function') {
+    return window.CSS.escape(id)
+  }
+  return String(id || '').replace(/([ #.;?%&,.+*~':"!^$[\]()=>|/@])/g, '\\$1')
+}
+
+function loadLazyCollectionGroup (collapse, card, options = {}) {
   if (!collapse || collapse.dataset?.collectionGroupLazyCollapse !== 'true') {
     return Promise.resolve(collapse?.closest('[data-collection-group-shell="true"]') || null)
+  }
+  if (collapse._collectionGroupLoadPromise) {
+    return collapse._collectionGroupLoadPromise
   }
   if (collapse.dataset.lazyState === 'loading') {
     return Promise.reject(new Error('Collection group is already loading.'))
@@ -6594,7 +7054,7 @@ function loadLazyCollectionGroup (collapse, card) {
   spinner?.classList.remove('d-none')
   if (status) status.textContent = 'Loading collection group settings...'
 
-  return fetch(`/library_fragment/${encodeURIComponent(libraryId)}/section/collections/group/${encodeURIComponent(groupIndex)}`, {
+  const loadPromise = fetch(`/library_fragment/${encodeURIComponent(libraryId)}/section/collections/group/${encodeURIComponent(groupIndex)}`, {
     credentials: 'same-origin'
   })
     .then(res => {
@@ -6612,20 +7072,96 @@ function loadLazyCollectionGroup (collapse, card) {
       replacement.dataset.collectionGroupIndex = String(groupIndex)
       const replacementCollapse = replacement.querySelector('.accordion-collapse')
       const replacementButton = replacement.querySelector('.accordion-button')
-      if (replacementCollapse) {
+      const expand = options.expand !== false
+      if (replacementCollapse && expand) {
         replacementCollapse.classList.add('show')
         replacementCollapse.dataset.collectionGroupLoaded = 'true'
         replacementCollapse.dataset.collectionGroupIndex = String(groupIndex)
       }
-      if (replacementButton) {
+      if (replacementButton && expand) {
         replacementButton.classList.remove('collapsed')
         replacementButton.setAttribute('aria-expanded', 'true')
+      }
+      if (replacementCollapse && !expand) {
+        replacementCollapse.dataset.collectionGroupLoaded = 'true'
+        replacementCollapse.dataset.collectionGroupIndex = String(groupIndex)
       }
       markLazyCollectionGroupLoaded(card, groupIndex)
       initializeLibraryCardControls(card, libraryId)
       refreshTemplateOverrideState(card)
       return replacement
     })
+    .finally(() => {
+      delete collapse._collectionGroupLoadPromise
+    })
+
+  collapse._collectionGroupLoadPromise = loadPromise
+  return loadPromise
+}
+
+function loadLazyCollectionDetail (section, toggle, card) {
+  if (!section || section.dataset?.collectionDetailLazySection !== 'true') {
+    return Promise.resolve(section)
+  }
+  if (section.dataset.lazyState === 'loaded') {
+    return Promise.resolve(section)
+  }
+  if (section._collectionDetailLoadPromise) {
+    return section._collectionDetailLoadPromise
+  }
+  if (section.dataset.lazyState === 'loading') {
+    return Promise.reject(new Error('Collection details are already loading.'))
+  }
+
+  const libraryId = section.dataset.libraryId || card?.dataset?.libraryId || activeLibraryId
+  const groupIndex = section.dataset.collectionGroupIndex
+  const collectionId = section.dataset.collectionId
+  if (!libraryId || groupIndex === undefined || !collectionId) {
+    return Promise.reject(new Error('Missing collection detail identifiers.'))
+  }
+
+  const placeholder = section.querySelector('[data-collection-detail-lazy-placeholder]')
+  const spinner = placeholder?.querySelector('.spinner-border')
+  const status = placeholder?.querySelector('span')
+  section.dataset.lazyState = 'loading'
+  spinner?.classList.remove('d-none')
+  if (status) status.textContent = 'Loading collection detail settings...'
+  if (toggle) toggle.disabled = true
+
+  const loadPromise = fetch(`/library_fragment/${encodeURIComponent(libraryId)}/section/collections/group/${encodeURIComponent(groupIndex)}/detail/${encodeURIComponent(collectionId)}`, {
+    credentials: 'same-origin'
+  })
+    .then(res => {
+      if (!res.ok) throw new Error(`Failed to load collection details (${res.status})`)
+      return res.text()
+    })
+    .then(html => {
+      const template = document.createElement('template')
+      template.innerHTML = String(html || '').trim()
+      const loadedSection = template.content.querySelector(`#${escapeDomId(section.id)}`)
+      if (!loadedSection) throw new Error('Empty collection detail fragment')
+      section.innerHTML = loadedSection.innerHTML
+      section.dataset.collectionDetailLazySection = 'false'
+      section.dataset.lazyState = 'loaded'
+      section.dataset.collectionDetailLoaded = 'true'
+      markLazyCollectionDetailLoaded(card, collectionId)
+      initializeLibraryCardControls(card, libraryId)
+      refreshTemplateOverrideState(section.closest('.template-toggle-group') || section)
+      return section
+    })
+    .catch(err => {
+      section.dataset.lazyState = 'error'
+      spinner?.classList.add('d-none')
+      if (status) status.textContent = 'Unable to load these collection details. Try again.'
+      throw err
+    })
+    .finally(() => {
+      if (toggle) toggle.disabled = false
+      delete section._collectionDetailLoadPromise
+    })
+
+  section._collectionDetailLoadPromise = loadPromise
+  return loadPromise
 }
 
 function wireLazyCollectionGroups (card) {
@@ -6705,6 +7241,11 @@ function isUncheckedTemplateParentToggle (field) {
 
 function shouldOmitDefaultFieldFromLibraryPayload (field) {
   if (!field || !field.dataset || field.dataset.default === undefined) return false
+  if (/-(?:collection_files|metadata_files|overlay_files)$/.test(String(field.name || ''))) return false
+  if (/-template_overlay_runtimes\[text\]$/.test(String(field.name || '')) && String(field.value ?? '') === '') return false
+  // These UI defaults differ from Kometa's disabled defaults; save each slot
+  // and badge explicitly so pruning cannot remove untouched ratings.
+  if (/-template_overlay_ratings\[rating[123](?:_image)?\]$/.test(String(field.name || ''))) return false
   if (field.classList?.contains('include-library-toggle') || field.classList?.contains('playlist-library-toggle')) return false
   if (String(field.name || '').endsWith('-library') || String(field.name || '').endsWith('-playlist')) return false
   if (isInternalTemplateMetadataField(field)) return false
@@ -6735,6 +7276,23 @@ function buildPayloadFromCard (card) {
   payload.__loaded_collection_groups = Array.from(loadedCollectionGroups)
     .filter(Boolean)
     .sort((a, b) => Number(a) - Number(b))
+  const loadedCollectionDetails = new Set()
+  const collectionDetailMarker = card.querySelector('input[type="hidden"][name="__loaded_collection_details"]')
+  String(collectionDetailMarker?.value || '').split(',').forEach(value => {
+    const trimmed = value.trim()
+    if (trimmed) loadedCollectionDetails.add(trimmed)
+  })
+  card.querySelectorAll('[data-collection-detail-loaded="true"][data-collection-id]').forEach(section => {
+    loadedCollectionDetails.add(String(section.dataset.collectionId || '').trim())
+  })
+  card.querySelectorAll('.collection-template-section[data-collection-id]').forEach(section => {
+    if (section.dataset.collectionDetailLazySection !== 'true') {
+      loadedCollectionDetails.add(String(section.dataset.collectionId || '').trim())
+    }
+  })
+  payload.__loaded_collection_details = Array.from(loadedCollectionDetails)
+    .filter(Boolean)
+    .sort()
   const resetCollectionDefaults = card.querySelector('input[type="hidden"][name="__reset_collection_defaults"]')
   if (resetCollectionDefaults && resetCollectionDefaults.value === 'true') {
     payload.__reset_collection_defaults = 'true'
@@ -6757,7 +7315,7 @@ function buildPayloadFromCard (card) {
   })
   card.querySelectorAll('input, select, textarea').forEach(el => {
     if (!el.name || el.disabled) return
-    if (el.name === '__loaded_collection_groups' || el.name === '__reset_collection_defaults') return
+    if (el.name === '__loaded_collection_groups' || el.name === '__loaded_collection_details' || el.name === '__reset_collection_defaults') return
     if (el.dataset && el.dataset.skipYaml === 'true') return
     if (el.type === 'file') return
 
@@ -6979,6 +7537,7 @@ function autosaveActiveLibrary (options = {}) {
   }
 
   const payload = lookupLabelsOnly ? buildLookupLabelPayloadFromCard(card) : buildPayloadFromCard(card)
+  const submittedPayload = JSON.stringify(payload)
   const collectionEditor = card.querySelector('[data-collection-files-editor]')
   const metadataEditor = card.querySelector('[data-metadata-files-editor]')
   const overlayEditor = card.querySelector('[data-overlay-files-editor]')
@@ -6993,15 +7552,18 @@ function autosaveActiveLibrary (options = {}) {
   })
     .then(res => {
       if (!res.ok) {
+        if (!lookupLabelsOnly && (card !== libraryContainer.firstElementChild || JSON.stringify(buildPayloadFromCard(card)) !== submittedPayload)) {
+          return { success: false, stale: true }
+        }
         return res.json().catch(() => ({})).then(body => {
           if (collectionEditor) {
-            applyCollectionFileServerErrors(collectionEditor, body && body.errors)
+            applyCollectionFileServerErrors(collectionEditor, body && body.errors, parseMetadataFilesValue(payload[`${collectionEditor.dataset.libraryId}-collection_files`]))
           }
           if (metadataEditor) {
-            applyMetadataFileServerErrors(metadataEditor, body && body.errors)
+            applyMetadataFileServerErrors(metadataEditor, body && body.errors, parseMetadataFilesValue(payload[`${metadataEditor.dataset.libraryId}-metadata_files`]))
           }
           if (overlayEditor) {
-            applyOverlayFileServerErrors(overlayEditor, body && body.errors)
+            applyOverlayFileServerErrors(overlayEditor, body && body.errors, parseMetadataFilesValue(payload[`${overlayEditor.dataset.libraryId}-overlay_files`]))
           }
           const message = body && body.error ? body.error : `Autosave failed: ${res.status}`
           throw new Error(message)
@@ -7031,6 +7593,7 @@ function autosaveActiveLibrary (options = {}) {
 function openCopyModal (sourceId, sourceName, sourceType) {
   if (!copyModal) return
   copyWarning.style.display = 'none'
+  clearCopyLibraryReport()
   copySubtitle.textContent = `Mirror settings from "${sourceName}" to other ${sourceType === 'movie' ? 'movie' : 'show'} libraries`
   copyTargetsContainer.replaceChildren()
 
@@ -7064,7 +7627,10 @@ function openCopyModal (sourceId, sourceName, sourceType) {
   }
 
   const checkboxes = () => Array.from(copyTargetsContainer.querySelectorAll('.copy-target-checkbox'))
-  const clearWarning = () => { copyWarning.style.display = 'none' }
+  const clearWarning = () => {
+    copyWarning.style.display = 'none'
+    clearCopyLibraryReport()
+  }
   checkboxes().forEach(cb => cb.addEventListener('change', clearWarning))
 
   if (copySelectAllBtn) {
@@ -7083,6 +7649,7 @@ function openCopyModal (sourceId, sourceName, sourceType) {
   copyModal.show()
 
   const onConfirm = () => {
+    let keepCopyModalOpen = false
     const selected = Array.from(copyTargetsContainer.querySelectorAll('.copy-target-checkbox:checked')).map(cb => cb.value)
     const prefix = sourceType === 'movie' ? 'mov-' : 'sho-'
     const filtered = selected.filter(id => id.startsWith(prefix))
@@ -7122,9 +7689,11 @@ function openCopyModal (sourceId, sourceName, sourceType) {
         return res.json()
       })
       .then((data) => {
+        keepCopyModalOpen = renderCopyLibraryReport(data)
         // Clear all cached cards to avoid stale data
         libraryCache.replaceChildren()
 
+        const includedTargets = new Set(Array.isArray(data?.included_targets) ? data.included_targets : [])
         filtered.forEach(id => {
           const cached = libraryCache.querySelector(`[data-library-id="${id}"]`)
           if (cached && cached.parentElement === libraryCache) {
@@ -7135,7 +7704,7 @@ function openCopyModal (sourceId, sourceName, sourceType) {
           }
           const opt = libraryPicker.querySelector(`option[value="${id}"]`)
           if (opt) {
-            opt.dataset.configured = 'false'
+            opt.dataset.configured = includedTargets.has(id) ? 'true' : 'false'
           }
         })
         refreshPickerLabels()
@@ -7146,7 +7715,15 @@ function openCopyModal (sourceId, sourceName, sourceType) {
         refreshTemplateOverrideState(libraryContainer?.firstElementChild || document)
         if (typeof showToast === 'function') {
           const label = filtered.length === 1 ? 'library' : 'libraries'
-          showToast('success', `Mirrored settings to ${filtered.length} ${label}.`)
+          const reviewCount = Array.isArray(data?.review_targets) ? data.review_targets.length : 0
+          const includedCount = includedTargets.size
+          if (data?.source_included === false) {
+            showToast('success', `Mirrored settings to ${filtered.length} ${label}; targets stayed excluded.`)
+          } else if (reviewCount > 0) {
+            showToast('warning', `Mirrored settings to ${filtered.length} ${label}; included ${includedCount}, ${reviewCount} need review.`)
+          } else {
+            showToast('success', `Mirrored settings to ${filtered.length} ${label}; included ${includedCount}.`)
+          }
         }
         scheduleDependencyRequirementHintRefresh(0)
         document.dispatchEvent(new CustomEvent('qs:workspace-data-changed', { detail: { source: 'libraries-copy', delayMs: 80 } }))
@@ -7161,7 +7738,9 @@ function openCopyModal (sourceId, sourceName, sourceType) {
         if (copyConfirmBtn && typeof copyConfirmBtn.blur === 'function') {
           copyConfirmBtn.blur()
         }
-        copyModal.hide()
+        if (!keepCopyModalOpen) {
+          copyModal.hide()
+        }
       })
   }
 
@@ -7251,10 +7830,6 @@ if (libraryPicker) {
 
 document.addEventListener('qs:before-step-navigation', (event) => {
   const detail = (event && event.detail) || {}
-  if (allowNextStepNavigation) {
-    allowNextStepNavigation = false
-    return
-  }
   if (!activeLibraryId || !libraryContainer || !libraryContainer.firstElementChild) return
   if (!detail.targetPage || detail.targetPage === '025-libraries') return
 
@@ -7262,12 +7837,9 @@ document.addEventListener('qs:before-step-navigation', (event) => {
 
   autosaveActiveLibrary()
     .then(() => {
-      allowNextStepNavigation = true
-      jumpTo(detail.targetPage, detail.targetLabel)
+      window.location.assign(`/step/${encodeURIComponent(detail.targetPage)}`)
     })
-    .catch(() => {
-      allowNextStepNavigation = false
-    })
+    .catch(() => {})
 })
 
 if (typeof setupParentChildToggleSync === 'function') {
@@ -7307,6 +7879,7 @@ wireOverlayTemplateSections()
 wireCollectionTemplateSections()
 wireOverlayVariableSections()
 wireCollectionVariableSections()
+wireChildToggleBulkActions()
 wireRatingsOffsetSync()
 
 document.addEventListener('click', (e) => {
@@ -7362,6 +7935,70 @@ function getCollectionSectionEntries (libraryId) {
   return entries
 }
 
+function getActiveLibraryCardForId (libraryId) {
+  const container = document.getElementById(`${libraryId}-container`)
+  return container?.closest('.library-settings-card') ||
+    (activeLibraryId === libraryId ? libraryContainer?.querySelector('.library-settings-card') : null)
+}
+
+function fetchCollectionSectionEntries (libraryId) {
+  const card = getActiveLibraryCardForId(libraryId)
+  const sourcePayload = card ? buildPayloadFromCard(card) : {}
+  return fetch(`/library_fragment/${encodeURIComponent(libraryId)}/collection_section_entries`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source_payload: sourcePayload })
+  })
+    .then(res => {
+      if (!res.ok) {
+        return res.json().catch(() => ({})).then(body => {
+          throw new Error(body?.error || `Failed to load collection order (${res.status})`)
+        })
+      }
+      return res.json()
+    })
+    .then(data => {
+      if (!data || data.success !== true || !Array.isArray(data.entries)) {
+        throw new Error(data?.error || 'Invalid collection order response.')
+      }
+      return data.entries
+    })
+}
+
+function saveCollectionSectionOrderToServer (libraryId, collectionIds, reset) {
+  return fetch(`/library_fragment/${encodeURIComponent(libraryId)}/collection_section_order`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ collection_ids: collectionIds, reset })
+  })
+    .then(res => {
+      if (!res.ok) {
+        return res.json().catch(() => ({})).then(body => {
+          throw new Error(body?.error || `Failed to save collection order (${res.status})`)
+        })
+      }
+      return res.json()
+    })
+    .then(data => {
+      if (!data || data.success !== true) {
+        throw new Error(data?.error || 'Invalid collection order save response.')
+      }
+      return Array.isArray(data.entries) ? data.entries : []
+    })
+}
+
+function syncHydratedCollectionSectionInputs (entries) {
+  ;(entries || []).forEach(entry => {
+    const input = entry.inputId ? document.getElementById(entry.inputId) : null
+    if (!input) return
+    input.value = String(entry.currentValue || '')
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+}
+
 function buildCollectionSectionListItem (entry, position) {
   const li = document.createElement('li')
   li.className = 'list-group-item sortable-item d-flex justify-content-between align-items-center gap-3'
@@ -7410,7 +8047,7 @@ function markCollectionSectionModalCustomOrder (modalEl) {
   if (!modalEl) return
   modalEl.dataset.collectionSectionResetMode = 'false'
   const status = modalEl.querySelector('[data-collection-section-modal-status]')
-  if (status) status.textContent = 'Custom order pending. Save Order will write collection_section overrides.'
+  if (status) status.textContent = 'Custom order pending. Save Order will write collection_section modifications.'
 }
 
 function ensureCollectionSectionModalRoot (modalEl) {
@@ -7470,13 +8107,14 @@ function prepareCollectionSectionModal (modalEl) {
   return modalEl
 }
 
-function renderCollectionSectionModalList (modalEl) {
+function renderCollectionSectionModalList (modalEl, providedEntries = null) {
   if (!modalEl) return []
   const libraryId = modalEl.dataset.libraryId
   const list = modalEl.querySelector('[data-collection-section-sortable]')
   const status = modalEl.querySelector('[data-collection-section-modal-status]')
   const saveButton = modalEl.querySelector('[data-collection-section-save]')
-  const entries = getCollectionSectionEntries(libraryId)
+  const entries = Array.isArray(providedEntries) ? providedEntries : getCollectionSectionEntries(libraryId)
+  modalEl._collectionSectionEntries = entries
   list.replaceChildren()
   if (!entries.length) {
     if (status) status.textContent = 'No enabled collections with a collection_section field are available to reorder in this library.'
@@ -7505,40 +8143,37 @@ function renderCollectionSectionModalList (modalEl) {
   return entries
 }
 
-function saveCollectionSectionModalOrder (modalEl) {
+async function saveCollectionSectionModalOrder (modalEl) {
   if (!modalEl) return
   modalEl = prepareCollectionSectionModal(modalEl)
+  const libraryId = modalEl.dataset.libraryId
   const saveButton = modalEl.querySelector('[data-collection-section-save]')
   setCollectionSectionActionBusy(saveButton, true)
   const list = modalEl.querySelector('[data-collection-section-sortable]')
   const items = Array.from(list ? list.children : [])
   const resetMode = modalEl.dataset.collectionSectionResetMode === 'true'
-  window.setTimeout(() => {
+  try {
     if (!items.length) {
-      setCollectionSectionActionBusy(saveButton, false)
       return
     }
-    if (!resetMode) {
-      items.forEach((item, index) => {
-        const inputId = item.dataset.inputId
-        const input = inputId ? document.getElementById(inputId) : null
-        if (!input) return
-        const nextValue = String((index + 1) * 10).padStart(3, '0')
-        input.value = nextValue
-        input.dispatchEvent(new Event('input', { bubbles: true }))
-        input.dispatchEvent(new Event('change', { bubbles: true }))
-        const current = item.querySelector('[data-collection-section-current]')
-        if (current) current.textContent = nextValue
-      })
-    }
+    const orderedIds = items.map(item => item.dataset.collectionId).filter(Boolean)
+    const savedEntries = await saveCollectionSectionOrderToServer(libraryId, orderedIds, resetMode)
+    syncHydratedCollectionSectionInputs(savedEntries)
     if (typeof showToast === 'function') {
-      showToast(resetMode ? 'info' : 'success', resetMode ? 'Collection section overrides cleared. JSON defaults will be used.' : 'Collection section order updated.')
+      showToast(resetMode ? 'info' : 'success', resetMode ? 'Collection section modifications cleared. JSON defaults will be used.' : 'Collection section order updated.')
     }
-    refreshCollectionSectionPreviewNumbers(list)
     const modal = typeof bootstrap !== 'undefined' && bootstrap.Modal ? bootstrap.Modal.getOrCreateInstance(modalEl) : null
     if (modal) modal.hide()
+    refreshTemplateOverrideState(getActiveLibraryCardForId(libraryId) || document)
+    document.dispatchEvent(new CustomEvent('qs:workspace-data-changed', { detail: { source: 'collection-section-order', delayMs: 80 } }))
+  } catch (error) {
+    console.error('[Libraries] Failed to save collection section order', error)
+    if (typeof showToast === 'function') {
+      showToast('error', error.message || 'Unable to save collection section order.')
+    }
+  } finally {
     setCollectionSectionActionBusy(saveButton, false)
-  }, 120)
+  }
 }
 
 function resetCollectionSectionModalOrder (modalEl) {
@@ -7546,35 +8181,53 @@ function resetCollectionSectionModalOrder (modalEl) {
   modalEl = prepareCollectionSectionModal(modalEl)
   const resetButton = modalEl.querySelector('[data-collection-section-reset]')
   setCollectionSectionActionBusy(resetButton, true)
-  const entries = getCollectionSectionEntries(modalEl.dataset.libraryId)
   window.setTimeout(() => {
-    entries.forEach(entry => {
-      const input = entry.inputId ? document.getElementById(entry.inputId) : null
-      if (!input) return
-      input.value = ''
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })
-    renderCollectionSectionModalList(modalEl)
+    const entries = Array.from(modalEl._collectionSectionEntries || [])
+      .map(entry => ({
+        ...entry,
+        currentValue: '',
+        effectiveValue: String(entry.defaultValue || '').trim()
+      }))
+      .sort((left, right) => {
+        const byValue = compareCollectionSectionValues(left.effectiveValue, right.effectiveValue)
+        if (byValue !== 0) return byValue
+        return (Number(left.groupIndex || 0) - Number(right.groupIndex || 0)) ||
+          (Number(left.collectionIndex || 0) - Number(right.collectionIndex || 0))
+      })
+    renderCollectionSectionModalList(modalEl, entries)
     modalEl.dataset.collectionSectionResetMode = 'true'
     const status = modalEl.querySelector('[data-collection-section-modal-status]')
-    if (status) status.textContent = 'Defaults pending. Save Order will clear collection_section overrides and use JSON defaults.'
+    if (status) status.textContent = 'Defaults pending. Save Order will clear collection_section modifications and use JSON defaults.'
     if (typeof showToast === 'function') {
-      showToast('info', 'Collection section overrides cleared. Save Order to use JSON defaults.')
+      showToast('info', 'Collection section modifications cleared. Save Order to use JSON defaults.')
     }
     setCollectionSectionActionBusy(resetButton, false)
   }, 120)
 }
 
-document.addEventListener('click', (event) => {
+document.addEventListener('click', async (event) => {
   const trigger = event.target.closest('[data-collection-section-modal-trigger]')
   if (trigger) {
     const libraryId = trigger.dataset.libraryId
     let modalEl = libraryId ? document.getElementById(`${libraryId}-collection-section-modal`) : null
     if (!modalEl || !bootstrap || !bootstrap.Modal) return
     modalEl = prepareCollectionSectionModal(modalEl)
-    renderCollectionSectionModalList(modalEl)
-    bootstrap.Modal.getOrCreateInstance(modalEl).show()
+    const status = modalEl.querySelector('[data-collection-section-modal-status]')
+    try {
+      setCollectionSectionActionBusy(trigger, true)
+      if (status) status.textContent = 'Loading collection defaults...'
+      const entries = await fetchCollectionSectionEntries(libraryId)
+      renderCollectionSectionModalList(modalEl, entries)
+      bootstrap.Modal.getOrCreateInstance(modalEl).show()
+    } catch (error) {
+      console.error('[Libraries] Failed to load collection section order', error)
+      if (status) status.textContent = 'Unable to load all collection defaults. Try again.'
+      if (typeof showToast === 'function') {
+        showToast('error', error.message || 'Unable to load collection defaults for reordering. Try again.')
+      }
+    } finally {
+      setCollectionSectionActionBusy(trigger, false)
+    }
     return
   }
 
@@ -8078,6 +8731,70 @@ async function runCollectionGroupReset (btn, group, options = {}) {
     btn.dataset.resetBusy = 'false'
     setLibrariesButtonPersistentBusy(btn, false)
   }
+}
+
+async function runChildToggleBulkAction (btn, checked) {
+  if (!btn || btn.dataset.bulkBusy === 'true') return
+
+  const section = btn.closest('[data-collection-variable-section="true"], [data-overlay-variable-section="true"]')
+  const sectionBody = section?.querySelector('.collection-variable-section-body, .overlay-variable-section-body') || section
+  if (!sectionBody) return
+
+  const toggles = Array.from(sectionBody.querySelectorAll('input.template-child-toggle[type="checkbox"]'))
+    .filter(input => !input.disabled)
+  if (!toggles.length) return
+
+  const sectionLabel = section?.querySelector('.fw-semibold')?.textContent?.trim() || 'section'
+  const idleLabel = btn.dataset.bulkIdleLabel || btn.textContent.trim()
+  btn.dataset.bulkIdleLabel = idleLabel
+  btn.dataset.bulkBusy = 'true'
+  setLibrariesButtonPersistentBusy(btn, true, checked ? 'Selecting...' : 'Clearing...')
+
+  try {
+    await new Promise(resolve => requestAnimationFrame(() => resolve()))
+
+    const changed = []
+    for (let index = 0; index < toggles.length; index += 1) {
+      const input = toggles[index]
+      if (input.checked === checked) continue
+      input.checked = checked
+      changed.push(input)
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+      if (index > 0 && index % 25 === 0) {
+        await new Promise(resolve => window.setTimeout(resolve, 0))
+      }
+    }
+
+    refreshTemplateOverrideState(section.closest('.template-toggle-group') || section)
+    updateAccordionHighlights()
+    if (typeof ValidationHandler !== 'undefined' && typeof ValidationHandler.updateValidationState === 'function') {
+      ValidationHandler.updateValidationState()
+    }
+    if (typeof showToast === 'function') {
+      const action = checked ? 'Selected' : 'Unselected'
+      showToast('info', `${action} ${changed.length} item${changed.length === 1 ? '' : 's'} in ${sectionLabel}.`)
+    }
+  } finally {
+    btn.dataset.bulkBusy = 'false'
+    setLibrariesButtonPersistentBusy(btn, false)
+  }
+}
+
+function wireChildToggleBulkActions (scope) {
+  const root = scope || document
+  root.querySelectorAll('[data-child-toggle-bulk-action]').forEach(btn => {
+    if (btn.dataset.listenerAdded === 'true') return
+    btn.addEventListener('click', () => {
+      runChildToggleBulkAction(btn, btn.dataset.childToggleBulkAction === 'select').catch(error => {
+        console.error('[child toggle bulk action failed]', error)
+        if (typeof showToast === 'function') {
+          showToast('error', 'Bulk toggle action failed.')
+        }
+      })
+    })
+    btn.dataset.listenerAdded = 'true'
+  })
 }
 
 function wireOffsetReset (scope) {
@@ -9078,7 +9795,40 @@ function wireOverlayVariableSectionToggles (scope) {
 }
 
 function wireCollectionDetailToggles (scope) {
-  wireDetailToggles('.collection-details-toggle', scope)
+  const root = scope || document
+  root.querySelectorAll('.collection-details-toggle').forEach(btn => {
+    if (btn.dataset.listenerAdded === 'true') return
+    const targetId = btn.dataset.sectionId
+    const section = targetId ? document.getElementById(targetId) : null
+    if (!section) return
+
+    btn.addEventListener('click', () => {
+      const isHidden = section.style.display === 'none'
+      if (!isHidden) {
+        setDetailSectionExpanded(section, btn, false)
+        updateAccordionHighlights()
+        return
+      }
+
+      const card = btn.closest('.library-settings-card') || libraryContainer?.firstElementChild || document
+      loadLazyCollectionDetail(section, btn, card)
+        .then(() => {
+          setDetailSectionExpanded(section, btn, true)
+          updateAccordionHighlights()
+        })
+        .catch(err => {
+          console.error('[Libraries] Failed to load lazy collection details', err)
+          setDetailSectionExpanded(section, btn, false)
+          if (typeof showToast === 'function') {
+            showToast('error', 'Unable to load collection details. Try again.')
+          }
+        })
+    })
+
+    const defaultOpen = section.dataset.detailVisible === 'true' || section.dataset.defaultOpen === 'true'
+    setDetailSectionExpanded(section, btn, defaultOpen)
+    btn.dataset.listenerAdded = 'true'
+  })
 }
 
 function wireCollectionVariableSectionToggles (scope) {
@@ -9154,6 +9904,10 @@ function isInternalTemplateMetadataField (field) {
     name.endsWith('__lookup_labels')
 }
 
+function isBlankSavedSentinel (value) {
+  return ['none', 'null'].includes(String(value ?? '').trim().toLowerCase())
+}
+
 function isCollectionSectionFieldConfigured (fields) {
   const enabledFields = Array.from(fields || []).filter(field => field && !field.disabled && !isInternalTemplateMetadataField(field))
   if (!enabledFields.length) return false
@@ -9197,6 +9951,7 @@ function isCollectionSectionFieldConfigured (fields) {
 
   const value = String(primaryField.value ?? '').trim()
   const defaultValue = String(primaryField.dataset.default || '').trim()
+  if (isBlankSavedSentinel(value)) return false
   if (primaryField.closest('[data-schedule-builder]')) {
     return normalizeScheduleOverrideValue(value) !== normalizeScheduleOverrideValue(defaultValue)
   }
@@ -9205,7 +9960,7 @@ function isCollectionSectionFieldConfigured (fields) {
 }
 
 function formatTemplateOverrideCount (count) {
-  return count === 1 ? '1 override' : `${count} overrides`
+  return count === 1 ? '1 modification' : `${count} modifications`
 }
 
 function isTrueDatasetValue (value) {
@@ -9632,11 +10387,7 @@ function updateCollectionVariableSectionSummary (section) {
 
   updateTemplateVariableFieldOverrideStates(body, fieldsByName)
 
-  summary.textContent = configuredCount === 0
-    ? 'Defaults'
-    : configuredCount === 1
-      ? '1 override'
-      : `${configuredCount} overrides`
+  summary.textContent = configuredCount === 0 ? 'Defaults' : formatTemplateOverrideCount(configuredCount)
   section.classList.toggle('template-variable-section-has-overrides', configuredCount > 0)
   section.dataset.overrideCount = String(configuredCount)
   updateTemplateGroupOverrideSummary(section)
@@ -9671,11 +10422,7 @@ function updateOverlayVariableSectionSummary (section) {
     updateTemplateVariableFieldOverrideStates(body, fieldsByName)
   }
 
-  summary.textContent = configuredCount === 0
-    ? 'Defaults'
-    : configuredCount === 1
-      ? '1 override'
-      : `${configuredCount} overrides`
+  summary.textContent = configuredCount === 0 ? 'Defaults' : formatTemplateOverrideCount(configuredCount)
   section.classList.toggle('template-variable-section-has-overrides', configuredCount > 0)
   section.dataset.overrideCount = String(configuredCount)
   updateTemplateGroupOverrideSummary(section)

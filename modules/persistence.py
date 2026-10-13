@@ -2,7 +2,6 @@ import namesgenerator
 import os
 import secrets
 import json
-import datetime
 import copy
 import re
 
@@ -155,6 +154,9 @@ def clean_form_data(form_data):
     for key, value in form_data.items():
         if key in TRANSIENT_FORM_FIELDS:
             continue
+        if _is_runtime_overlay_text_key(key) and value is None:
+            clean_data[key] = ""
+            continue
         # Handle asset_directory as a list
         if key == "asset_directory" or key.endswith("-attribute_asset_directory"):
             if isinstance(value, list):
@@ -186,7 +188,7 @@ def clean_form_data(form_data):
             if key == "plex_db_cache":
                 clean_data[key] = _normalize_plex_db_cache_value(value)
                 continue
-            if key.endswith("template_overlay_runtimes[text]") and value == "":
+            if _is_runtime_overlay_text_key(key) and value == "":
                 clean_data[key] = ""
                 continue
             if url_validation.is_url_key(key):
@@ -199,12 +201,24 @@ def clean_form_data(form_data):
                     except Exception:
                         value = value
             lc_value = value.lower().strip()
-            if len(value) == 0 or lc_value == "none":
+            if (
+                lc_value in {"", "none"}
+                and "-template_overlay_ratings[" in key
+                and key.endswith(("[rating1]", "[rating1_image]", "[rating2]", "[rating2_image]", "[rating3]", "[rating3_image]"))
+            ):
+                # Rating selectors need an explicit disabled sentinel. Treating
+                # "none" as absent makes the UI restore the template default
+                # when this library is loaded again.
+                clean_data[key] = "none"
+            elif len(value) == 0 or lc_value == "none":
                 clean_data[key] = None
             elif lc_value in ["true", "on"]:
                 clean_data[key] = True
             elif lc_value == "false":
                 clean_data[key] = False
+            elif key.endswith("-library"):
+                # Library display names from Plex — preserve exactly (leading/trailing spaces are significant)
+                clean_data[key] = value
             else:
                 clean_data[key] = value.strip()
 
@@ -229,6 +243,10 @@ def clean_form_data(form_data):
             clean_data[key] = default_value
 
     return clean_data
+
+
+def _is_runtime_overlay_text_key(key):
+    return isinstance(key, str) and "-template_overlay_runtimes[text]" in key
 
 
 def _preserve_kometa_install_selection(data, clean_data):
@@ -407,7 +425,7 @@ def save_settings(raw_source, form_data):
             except Exception:
                 existing_validated_at = None
         if helpers.booler(data.get("validated")) and not existing_validated_at:
-            data["validated_at"] = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+            data["validated_at"] = helpers.utc_now_iso()
         elif existing_validated_at and "validated_at" not in data:
             data["validated_at"] = existing_validated_at
 
@@ -423,7 +441,7 @@ def save_settings(raw_source, form_data):
             data["validated"] = user_entered
     validated = data.get("validated", False)
     if source_name == "anidb" and validated and not data.get("validated_at"):
-        data["validated_at"] = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+        data["validated_at"] = helpers.utc_now_iso()
 
     # Save to DB
     database.save_section_data(
@@ -461,8 +479,142 @@ def get_stored_plex_credentials(name):
     return None, None
 
 
+def decode_library_ids(value):
+    """Decode a stored library-ID list into a list of string IDs.
+
+    Handles three forms:
+    - Already a list of dicts  → extract 'id' field from each
+    - Already a list           → returned as-is (strings or ints → coerced to str)
+    - CSV string of integers   → split on comma (current format)
+    - JSON string              → parsed; if it's a list of dicts, extract 'id'
+    - Legacy JSON of names     → returned as-is (old pre-ID format; callers
+                                 should detect non-integer items and treat as names)
+    """
+    if isinstance(value, list):
+        if value and isinstance(value[0], dict):
+            return [str(item["id"]) for item in value if "id" in item]
+        return [str(v) for v in value if v or v == 0]
+    if not isinstance(value, str) or not value:
+        return []
+    try:
+        result = json.loads(value)
+        if isinstance(result, list):
+            if result and isinstance(result[0], dict):
+                return [str(item["id"]) for item in result if "id" in item]
+            return [str(v) for v in result if v or v == 0]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return [v for v in value.split(",") if v]
+
+
+def get_library_names(config_name="010-plex"):
+    """Return the stored Plex section-ID → display-name mapping.
+
+    Returns a dict like ``{"10": " Movies L", "3": "TV Shows"}``.
+    Keys are string-coerced Plex section IDs.  Returns an empty dict
+    when no mapping has been stored yet (fresh install, pre-validation).
+    """
+    plex_data = retrieve_settings(config_name).get("plex", {})
+    raw = plex_data.get("tmp_library_names", "")
+    if not raw:
+        return {}
+    try:
+        result = json.loads(raw)
+        if isinstance(result, dict):
+            return {str(k): v for k, v in result.items()}
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return {}
+
+
+def migrate_library_keys_to_plex_ids(config_name, all_plex_libraries):
+    """Rekey existing settings from normalised-name keys to Plex section-ID keys.
+
+    Runs once at Plex validation time.  ``all_plex_libraries`` is a flat list
+    of ``{"id": int, "name": str}`` dicts covering all library types.
+
+    Returns the number of keys that were renamed (0 = already migrated or
+    no matching keys found).
+    """
+    from modules.helpers._misc import normalize_id  # local import to avoid circularity
+
+    # Build normalised-name → Plex-ID lookup using the same dedup logic that
+    # originally created the keys.
+    existing_ids: set = set()
+    norm_to_plex_id: dict = {}
+    for lib in all_plex_libraries:
+        norm = normalize_id(lib["name"].strip(), existing_ids)
+        norm_to_plex_id[norm] = str(lib["id"])
+
+    try:
+        _validated, _user_entered, stored_payload = database.retrieve_section_data(config_name, "libraries")
+    except Exception:
+        return 0
+    libraries = stored_payload.get("libraries", {}) if isinstance(stored_payload, dict) else {}
+    if not libraries:
+        return 0
+
+    prefix_migrations = []
+    for normalized_name, plex_id in norm_to_plex_id.items():
+        for media_prefix in ("mov", "sho"):
+            old_prefix = f"{media_prefix}-library_{normalized_name}-"
+            new_prefix = f"{media_prefix}-library_{plex_id}-"
+            if old_prefix != new_prefix:
+                prefix_migrations.append((old_prefix, new_prefix))
+
+    # Seed with existing numeric/default values, then apply legacy values so a
+    # user's saved choice wins when both forms already exist.
+    new_libraries = dict(libraries)
+    migrated_values = {}
+    rename_count = 0
+    for key, value in libraries.items():
+        for old_prefix, new_prefix in prefix_migrations:
+            if isinstance(key, str) and key.startswith(old_prefix):
+                new_key = f"{new_prefix}{key[len(old_prefix):]}"
+                new_libraries.pop(key, None)
+                migrated_values[new_key] = value
+                rename_count += 1
+                break
+
+    new_libraries.update(migrated_values)
+
+    if rename_count > 0:
+        try:
+            database.save_section_data(
+                name=config_name,
+                section="libraries",
+                validated=True,
+                user_entered=False,
+                data={"libraries": new_libraries},
+            )
+        except Exception as e:
+            helpers.ts_log(f"Library key migration failed: {e}", level="WARNING")
+            return 0
+
+    return rename_count
+
+
+def update_stored_plex_token(config_name, token):
+    """Save an approved token without replacing other Plex settings or validating the server."""
+    _validated, _user_entered, stored = database.retrieve_section_data(config_name, "plex")
+    data = dict(stored) if isinstance(stored, dict) else {}
+    plex = dict(data.get("plex") or get_dummy_data("plex"))
+    plex["token"] = token
+    data["plex"] = plex
+    data["validated"] = False
+    for key in ("validated_at", "validation_status", "validation_updated_at", "validation_reason", "validation_details"):
+        data.pop(key, None)
+    database.save_section_data(name=config_name, section="plex", validated=False, user_entered=True, data=data)
+
+
 def update_stored_plex_libraries(name, movie_libraries, show_libraries, music_libraries, user_list=None):
-    """Update stored Plex cache fields in the database and preserve `validated`."""
+    """Update stored Plex cache fields in the database and preserve `validated`.
+
+    ``movie_libraries``, ``show_libraries``, and ``music_libraries`` are lists
+    of ``{"id": int|str, "name": str}`` dicts as returned by the Plex validation
+    endpoint.  IDs are stored as a simple comma-separated list of integers;
+    the display-name lookup is stored as a JSON dict keyed by string ID.
+    """
     try:
         # Fetch existing settings from DB before updating
         settings_before = retrieve_settings(name)
@@ -476,10 +628,23 @@ def update_stored_plex_libraries(name, movie_libraries, show_libraries, music_li
         validated_before = settings_before.get("validated", True)
         validated_at_before = settings_before.get("validated_at")
 
-        # Update library data
-        settings_before["plex"]["tmp_movie_libraries"] = ",".join(movie_libraries) if movie_libraries else ""
-        settings_before["plex"]["tmp_show_libraries"] = ",".join(show_libraries) if show_libraries else ""
-        settings_before["plex"]["tmp_music_libraries"] = ",".join(music_libraries) if music_libraries else ""
+        # Store library IDs as simple CSV (integers — no encoding issues).
+        # Store the name lookup as a JSON dict so display names are preserved
+        # exactly as Plex provides them (leading spaces, commas, etc. all safe).
+        # Accept both new format ({id, name} dicts) and legacy format (name strings).
+        def _lib_id(lib):
+            return lib["id"] if isinstance(lib, dict) else lib
+
+        def _lib_name(lib):
+            return lib["name"] if isinstance(lib, dict) else str(lib)
+
+        all_libs = list(movie_libraries) + list(show_libraries) + list(music_libraries)
+        name_lookup = {str(_lib_id(lib)): _lib_name(lib) for lib in all_libs}
+
+        settings_before["plex"]["tmp_movie_libraries"] = ",".join(str(_lib_id(lib)) for lib in movie_libraries)
+        settings_before["plex"]["tmp_show_libraries"] = ",".join(str(_lib_id(lib)) for lib in show_libraries)
+        settings_before["plex"]["tmp_music_libraries"] = ",".join(str(_lib_id(lib)) for lib in music_libraries)
+        settings_before["plex"]["tmp_library_names"] = json.dumps(name_lookup)
         if user_list is not None:
             cleaned_users = [str(user).strip() for user in user_list if str(user).strip()]
             settings_before["plex"]["tmp_user_list"] = ",".join(cleaned_users)

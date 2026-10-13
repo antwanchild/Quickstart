@@ -37,23 +37,25 @@ from flask import has_request_context, url_for  # noqa: F401 (kept for parity wi
 from modules import database, helpers
 from modules.dependency_reasons import (
     QS_ANIDB_REQUIRED_STEP_KEY,
+    QS_FLOPPY_REQUIRED_STEP_KEY,
     QS_MAL_REQUIRED_STEP_KEY,
     QS_MDBLIST_REQUIRED_STEP_KEY,
     QS_OMDB_REQUIRED_STEP_KEY,
     QS_RADARR_REQUIRED_STEP_KEY,
     QS_SONARR_REQUIRED_STEP_KEY,
+    QS_SERIALIZD_REQUIRED_STEP_KEY,
     QS_TAUTULLI_REQUIRED_STEP_KEY,
     QS_TRACEARR_REQUIRED_STEP_KEY,
-    QS_TRAKT_REQUIRED_STEP_KEY,
     _config_anidb_dependency_reasons,
+    _config_floppy_dependency_reasons,
     _config_mal_dependency_reasons,
     _config_mdblist_dependency_reasons,
     _config_omdb_dependency_reasons,
     _config_radarr_dependency_reasons,
     _config_sonarr_dependency_reasons,
+    _config_serializd_dependency_reasons,
     _config_tautulli_dependency_reasons,
     _config_tracearr_dependency_reasons,
-    _config_trakt_dependency_reasons,
 )
 from modules.imagemaid import (
     get_imagemaid_settings_section as _get_imagemaid_settings_section,
@@ -62,6 +64,7 @@ from modules.imagemaid import (
 )
 from modules.kometa_install import (
     build_kometa_install_context as _build_kometa_install_context,
+    probe_kometa_root_state as _probe_kometa_root_state,
 )
 
 # Constants extracted to modules.workspace_status_constants. Re-exported here.
@@ -150,14 +153,44 @@ def _build_workspace_app_readiness_from_status(config_name, workspace_status, te
         detail = "Open Kometa to validate, review, download, prepare, or run this config."
         if install_context.get("kometa_is_external_install"):
             detail = "Open Kometa to validate, review, download, and sync this config for your external Kometa install."
-        kometa.update(
-            state="ready",
-            summary="Ready",
-            detail=detail,
-            action_label="Open Kometa",
-            href=_step_href("900-kometa"),
-            target_step="900-kometa",
-        )
+            kometa.update(
+                state="review",
+                summary="Sync config",
+                detail=detail,
+                action_label="Open Kometa",
+                href=_step_href("900-kometa"),
+                target_step="900-kometa",
+                installed=False,
+                prepared=False,
+            )
+        else:
+            root_path = install_context.get("kometa_selected_root") or install_context.get("kometa_primary_path")
+            runtime_state = {}
+            if root_path:
+                try:
+                    runtime_state = _probe_kometa_root_state(root_path)
+                except Exception:
+                    runtime_state = {}
+            installed = bool(runtime_state.get("kometa_installed"))
+            prepared = bool(runtime_state.get("venv_python_exists"))
+            kometa.update(
+                state="ready" if installed and prepared else "needs_prepare",
+                summary="Ready to run" if installed and prepared else ("Prepare Kometa" if installed else "Install Kometa"),
+                detail=(
+                    "Open Kometa to review the command preview and run this config."
+                    if installed and prepared
+                    else (
+                        "Open Kometa to prepare the Python environment before running this config."
+                        if installed
+                        else "Open Kometa to download/install Kometa before running this config."
+                    )
+                ),
+                action_label="Open Kometa",
+                href=_step_href("900-kometa"),
+                target_step="900-kometa",
+                installed=installed,
+                prepared=prepared,
+            )
 
     imagemaid_settings, imagemaid_section = _get_imagemaid_settings_section(config_name)
     imagemaid_state = _probe_imagemaid_root_state(helpers.get_imagemaid_root_path())
@@ -256,10 +289,11 @@ def _build_workspace_status_context(config_name, template_list, available_config
     tracearr_requirement_reasons = _config_tracearr_dependency_reasons(section_rows) if QS_TRACEARR_REQUIRED_STEP_KEY in template_keys else []
     omdb_requirement_reasons = _config_omdb_dependency_reasons(section_rows) if QS_OMDB_REQUIRED_STEP_KEY in template_keys else []
     mdblist_requirement_reasons = _config_mdblist_dependency_reasons(section_rows) if QS_MDBLIST_REQUIRED_STEP_KEY in template_keys else []
+    floppy_requirement_reasons = _config_floppy_dependency_reasons(section_rows) if QS_FLOPPY_REQUIRED_STEP_KEY in template_keys else []
+    serializd_requirement_reasons = _config_serializd_dependency_reasons(section_rows) if QS_SERIALIZD_REQUIRED_STEP_KEY in template_keys else []
     anidb_requirement_reasons = _config_anidb_dependency_reasons(section_rows) if QS_ANIDB_REQUIRED_STEP_KEY in template_keys else []
     radarr_requirement_reasons = _config_radarr_dependency_reasons(section_rows) if QS_RADARR_REQUIRED_STEP_KEY in template_keys else []
     sonarr_requirement_reasons = _config_sonarr_dependency_reasons(section_rows) if QS_SONARR_REQUIRED_STEP_KEY in template_keys else []
-    trakt_requirement_reasons = _config_trakt_dependency_reasons(section_rows) if QS_TRAKT_REQUIRED_STEP_KEY in template_keys else []
     mal_requirement_reasons = _config_mal_dependency_reasons(section_rows) if QS_MAL_REQUIRED_STEP_KEY in template_keys else []
     if QS_TAUTULLI_REQUIRED_STEP_KEY in template_keys and tautulli_requirement_reasons:
         required_seed.add(QS_TAUTULLI_REQUIRED_STEP_KEY)
@@ -269,14 +303,16 @@ def _build_workspace_status_context(config_name, template_list, available_config
         required_seed.add(QS_OMDB_REQUIRED_STEP_KEY)
     if QS_MDBLIST_REQUIRED_STEP_KEY in template_keys and mdblist_requirement_reasons:
         required_seed.add(QS_MDBLIST_REQUIRED_STEP_KEY)
+    if QS_FLOPPY_REQUIRED_STEP_KEY in template_keys and floppy_requirement_reasons:
+        required_seed.add(QS_FLOPPY_REQUIRED_STEP_KEY)
+    if QS_SERIALIZD_REQUIRED_STEP_KEY in template_keys and serializd_requirement_reasons:
+        required_seed.add(QS_SERIALIZD_REQUIRED_STEP_KEY)
     if QS_ANIDB_REQUIRED_STEP_KEY in template_keys and anidb_requirement_reasons:
         required_seed.add(QS_ANIDB_REQUIRED_STEP_KEY)
     if QS_RADARR_REQUIRED_STEP_KEY in template_keys and radarr_requirement_reasons:
         required_seed.add(QS_RADARR_REQUIRED_STEP_KEY)
     if QS_SONARR_REQUIRED_STEP_KEY in template_keys and sonarr_requirement_reasons:
         required_seed.add(QS_SONARR_REQUIRED_STEP_KEY)
-    if QS_TRAKT_REQUIRED_STEP_KEY in template_keys and trakt_requirement_reasons:
-        required_seed.add(QS_TRAKT_REQUIRED_STEP_KEY)
     if QS_MAL_REQUIRED_STEP_KEY in template_keys and mal_requirement_reasons:
         required_seed.add(QS_MAL_REQUIRED_STEP_KEY)
     review_seed = set(QS_REVIEW_STEP_KEYS)
@@ -309,10 +345,11 @@ def _build_workspace_status_context(config_name, template_list, available_config
             "tracearr_requirement_reasons": tracearr_requirement_reasons,
             "omdb_requirement_reasons": omdb_requirement_reasons,
             "mdblist_requirement_reasons": mdblist_requirement_reasons,
+            "floppy_requirement_reasons": floppy_requirement_reasons,
+            "serializd_requirement_reasons": serializd_requirement_reasons,
             "anidb_requirement_reasons": anidb_requirement_reasons,
             "radarr_requirement_reasons": radarr_requirement_reasons,
             "sonarr_requirement_reasons": sonarr_requirement_reasons,
-            "trakt_requirement_reasons": trakt_requirement_reasons,
             "mal_requirement_reasons": mal_requirement_reasons,
         }
         app_readiness = _build_workspace_app_readiness_from_status(config_name, provisional_status, template_list=template_list)
@@ -404,10 +441,11 @@ def _build_workspace_status_context(config_name, template_list, available_config
         "tracearr_requirement_reasons": tracearr_requirement_reasons,
         "omdb_requirement_reasons": omdb_requirement_reasons,
         "mdblist_requirement_reasons": mdblist_requirement_reasons,
+        "floppy_requirement_reasons": floppy_requirement_reasons,
+        "serializd_requirement_reasons": serializd_requirement_reasons,
         "anidb_requirement_reasons": anidb_requirement_reasons,
         "radarr_requirement_reasons": radarr_requirement_reasons,
         "sonarr_requirement_reasons": sonarr_requirement_reasons,
-        "trakt_requirement_reasons": trakt_requirement_reasons,
         "mal_requirement_reasons": mal_requirement_reasons,
         "readiness": readiness,
     }

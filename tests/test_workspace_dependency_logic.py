@@ -1,4 +1,13 @@
+from pathlib import Path
+
 import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE_JS_PATH = ROOT / "static" / "local-js" / "000-base.js"
+START_TEMPLATE_PATH = ROOT / "templates" / "001-start.html"
+IMAGEMAID_JS_PATH = ROOT / "static" / "local-js" / "915-imagemaid.js"
+KOMETA_VALIDATE_JS_PATH = ROOT / "static" / "local-js" / "modules" / "kometa" / "_validateRoot.js"
+KOMETA_TEMPLATE_PATH = ROOT / "templates" / "900-kometa.html"
 
 TAUTULLI_COLLECTION_KEY = "mov-library_movies-collection_tautulli"
 TRAKT_COLLECTION_KEY = "sho-library_tv-collection_trakt"
@@ -54,6 +63,25 @@ def _section_row(section, *, validated=False, user_entered=False, data=None):
     }
 
 
+def test_kometa_run_command_accordion_allows_multiple_panels_open():
+    template = KOMETA_TEMPLATE_PATH.read_text(encoding="utf-8")
+    start = template.index('id="run-command-accordion"')
+    end = template.index('id="run-command-output-accordion"', start)
+    run_command_markup = template[start:end]
+
+    for collapse_id in [
+        "collapse-mode",
+        "collapse-runopt",
+        "collapse-modeflags",
+        "collapse-logflags",
+        "collapse-validationflags",
+        "collapse-otherflags",
+    ]:
+        collapse_start = run_command_markup.index(f'id="{collapse_id}"')
+        collapse_snippet = run_command_markup[collapse_start : collapse_start + 220]
+        assert 'data-bs-parent="#run-command-accordion"' not in collapse_snippet
+
+
 @pytest.mark.parametrize(
     "libraries_data, expected_required, expected_fragment",
     # Add future optional-step dependency vectors here (e.g., other optional pages
@@ -82,6 +110,7 @@ def _section_row(section, *, validated=False, user_entered=False, data=None):
                 "sho-library_anime-library": "Anime Shows",
                 MAL_OVERLAY_ENABLED_KEY: True,
                 MAL_OVERLAY_IMAGE_KEY: "mal",
+                MAL_OVERLAY_IMAGE_KEY.replace("_image]", "]"): "mal",
             },
             True,
             "show ratings overlay uses mal",
@@ -174,6 +203,7 @@ def test_mal_dependency_reason_cases(qs_module, libraries_data, expected_require
                 "mov-library_movies-library": "Movies",
                 MDBLIST_OVERLAY_ENABLED_KEY: True,
                 MDBLIST_OVERLAY_IMAGE_KEY: "mdb",
+                MDBLIST_OVERLAY_IMAGE_KEY.replace("_image]", "]"): "mdb",
             },
             True,
             "movie ratings overlay uses mdb",
@@ -205,6 +235,7 @@ def test_mal_dependency_reason_cases(qs_module, libraries_data, expected_require
                 "sho-library_anime-library": "Anime Shows",
                 ANIDB_OVERLAY_ENABLED_KEY: True,
                 ANIDB_OVERLAY_IMAGE_KEY: "anidb",
+                ANIDB_OVERLAY_IMAGE_KEY.replace("_image]", "]"): "anidb",
             },
             True,
             "show ratings overlay uses anidb",
@@ -218,17 +249,6 @@ def test_mal_dependency_reason_cases(qs_module, libraries_data, expected_require
             False,
             "",
             id="anidb_ignores_inactive_library",
-        ),
-        pytest.param(
-            "_libraries_data_trakt_dependency_reasons",
-            {
-                "sho-library_tv-library": "TV Shows",
-                TRAKT_OVERLAY_ENABLED_KEY: True,
-                TRAKT_OVERLAY_IMAGE_KEY: "trakt",
-            },
-            True,
-            "episode ratings overlay uses trakt",
-            id="trakt_overlay_enabled",
         ),
         pytest.param(
             "_libraries_data_radarr_dependency_reasons",
@@ -319,25 +339,6 @@ def test_mal_dependency_reason_cases(qs_module, libraries_data, expected_require
             True,
             "sonarr_add_missing_metacritic enabled",
             id="sonarr_metacritic_template_collection_enabled",
-        ),
-        pytest.param(
-            "_libraries_data_trakt_dependency_reasons",
-            {
-                "sho-library_tv-library": "TV Shows",
-                TRAKT_COLLECTION_KEY: True,
-            },
-            True,
-            "Trakt Charts collection enabled",
-            id="trakt_collection_enabled",
-        ),
-        pytest.param(
-            "_libraries_data_trakt_dependency_reasons",
-            {
-                TRAKT_COLLECTION_KEY: False,
-            },
-            False,
-            "",
-            id="trakt_collection_disabled",
         ),
     ],
 )
@@ -518,7 +519,6 @@ def test_workspace_status_route_returns_all_dependency_reasons(client, monkeypat
     assert payload["anidb_requirement_reasons"]
     assert payload["radarr_requirement_reasons"]
     assert payload["sonarr_requirement_reasons"]
-    assert payload["trakt_requirement_reasons"]
     assert payload["mal_requirement_reasons"]
     assert "110-radarr" in payload["required_keys"]
     assert "120-sonarr" in payload["required_keys"]
@@ -602,7 +602,20 @@ def test_workspace_app_readiness_kometa_freshness_stays_ready(monkeypatch, qs_mo
             "todo_blockers": [],
         },
     )
-    monkeypatch.setattr(workspace_status_module, "_build_kometa_install_context", lambda _name: {})
+    monkeypatch.setattr(
+        workspace_status_module,
+        "_build_kometa_install_context",
+        lambda _name: {
+            "kometa_selected_root": "/srv/kometa",
+            "kometa_primary_path": "/srv/kometa",
+            "kometa_is_external_install": False,
+        },
+    )
+    monkeypatch.setattr(
+        workspace_status_module,
+        "_probe_kometa_root_state",
+        lambda _path: {"kometa_installed": True, "venv_python_exists": True},
+    )
     monkeypatch.setattr(workspace_status_module, "_get_imagemaid_settings_section", lambda _name: ({}, {}))
     monkeypatch.setattr(qs_module.helpers, "get_imagemaid_root_path", lambda: "")
     monkeypatch.setattr(workspace_status_module, "_probe_imagemaid_root_state", lambda _path: {})
@@ -612,9 +625,73 @@ def test_workspace_app_readiness_kometa_freshness_stays_ready(monkeypatch, qs_mo
     payload = qs_module._build_workspace_app_readiness("cfg")
 
     assert payload["kometa"]["state"] == "ready"
-    assert payload["kometa"]["summary"] == "Ready"
+    assert payload["kometa"]["summary"] == "Ready to run"
+    assert payload["kometa"]["installed"] is True
+    assert payload["kometa"]["prepared"] is True
     assert payload["kometa"]["action_label"] == "Open Kometa"
     assert payload["kometa"]["href"] == "/step/900-kometa"
+
+
+def test_workspace_app_readiness_kometa_managed_not_installed_says_install(monkeypatch, qs_module, workspace_status_module):
+    monkeypatch.setattr(qs_module.helpers, "get_menu_list", _template_list)
+    monkeypatch.setattr(qs_module.database, "get_unique_config_names", lambda: ["cfg"])
+    monkeypatch.setattr(workspace_status_module, "_build_workspace_status_context", lambda *_args, **_kwargs: {"readiness": {}})
+    monkeypatch.setattr(
+        workspace_status_module,
+        "_build_final_gate",
+        lambda *_args, **_kwargs: {
+            "stage": "freshness",
+            "todo_count": 0,
+            "todo_blockers": [],
+        },
+    )
+    monkeypatch.setattr(
+        workspace_status_module,
+        "_build_kometa_install_context",
+        lambda _name: {
+            "kometa_selected_root": "/srv/kometa",
+            "kometa_primary_path": "/srv/kometa",
+            "kometa_is_external_install": False,
+        },
+    )
+    monkeypatch.setattr(
+        workspace_status_module,
+        "_probe_kometa_root_state",
+        lambda _path: {"kometa_installed": False, "venv_python_exists": False},
+    )
+    monkeypatch.setattr(workspace_status_module, "_get_imagemaid_settings_section", lambda _name: ({}, {}))
+    monkeypatch.setattr(qs_module.helpers, "get_imagemaid_root_path", lambda: "")
+    monkeypatch.setattr(workspace_status_module, "_probe_imagemaid_root_state", lambda _path: {})
+    monkeypatch.setattr(qs_module.database, "retrieve_section_data", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace_status_module, "_validate_imagemaid_settings", lambda *_args, **_kwargs: (False, "", ""))
+
+    payload = qs_module._build_workspace_app_readiness("cfg")
+
+    assert payload["kometa"]["state"] == "needs_prepare"
+    assert payload["kometa"]["summary"] == "Install Kometa"
+    assert payload["kometa"]["installed"] is False
+    assert payload["kometa"]["prepared"] is False
+    assert "download/install Kometa" in payload["kometa"]["detail"]
+    assert payload["kometa"]["href"] == "/step/900-kometa"
+
+
+def test_workspace_status_context_marks_prepare_needed_apps_warn(monkeypatch, qs_module, workspace_status_module):
+    monkeypatch.setattr(qs_module.database, "retrieve_config_sections", lambda _name: [])
+    monkeypatch.setattr(qs_module.database, "get_unique_config_names", lambda: ["cfg"])
+    template_list = _template_list() + [("915-imagemaid.html", "ImageMaid")]
+
+    def fake_app_readiness(_config_name, workspace_status, template_list=None):
+        return {
+            "kometa": {"state": "needs_prepare"},
+            "imagemaid": {"state": "needs_prepare"},
+        }
+
+    monkeypatch.setattr(workspace_status_module, "_build_workspace_app_readiness_from_status", fake_app_readiness)
+
+    ctx = qs_module._build_workspace_status_context("cfg", template_list, available_configs=["cfg"])
+
+    assert ctx["step_statuses"]["900-kometa"] == "warn"
+    assert ctx["step_statuses"]["915-imagemaid"] == "warn"
 
 
 def test_workspace_status_context_aligns_app_steps_with_app_readiness(monkeypatch, qs_module, workspace_status_module):
@@ -660,7 +737,34 @@ def test_workspace_app_readiness_route_returns_app_payload(client, monkeypatch, 
     assert payload["apps"]["imagemaid"]["summary"] == "Prepare ImageMaid"
 
 
-def test_workspace_context_promotes_trakt_to_required(monkeypatch, qs_module):
+def test_app_readiness_menu_uses_available_and_app_summaries():
+    script = BASE_JS_PATH.read_text(encoding="utf-8")
+    start_template = START_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    assert "return `${name}: ${summary || 'available'}`" in script
+    assert "return `${name}: ${summary || 'needs preparation'}`" in script
+    assert "entries.map(qsFormatAppReadinessSnippet).join('; ')" in script
+    assert "`${availableEntries.length} Available`" in script
+    assert "const prepareEntries = entries.filter(entry => qsGetAppReadinessState(entry) === 'needs_prepare')" in script
+    assert "groupMetaText = validationEntries.length > 0 ? 'Validate' : 'Prepare'" in script
+    assert "Apps: ${entries[0].name} is ready" not in script
+    assert "Apps: ${entries.map(entry => entry.name).join(' and ')} are ready" not in script
+    assert "{{ 'Available' if kometa_ready else 'Setup needed' }}" in start_template
+    assert "{{ 'Ready to run' if imagemaid_ready else 'Setup needed' }}" in start_template
+
+
+def test_app_install_flows_refresh_sidebar_readiness():
+    base_script = BASE_JS_PATH.read_text(encoding="utf-8")
+    imagemaid_script = IMAGEMAID_JS_PATH.read_text(encoding="utf-8")
+    kometa_validate_script = KOMETA_VALIDATE_JS_PATH.read_text(encoding="utf-8")
+
+    assert "fetch(`/workspace_app_readiness?_=${Date.now()}`" in base_script
+    assert "qsRefreshWorkspaceStatus({" in base_script
+    assert "window.QS_refreshAppReadiness({ fetch: true })" in imagemaid_script
+    assert "window.QS_refreshAppReadiness({ fetch: true })" in kometa_validate_script
+
+
+def test_workspace_context_does_not_promote_retired_trakt(monkeypatch, qs_module):
     rows = [
         _section_row(
             "libraries",
@@ -676,9 +780,8 @@ def test_workspace_context_promotes_trakt_to_required(monkeypatch, qs_module):
     monkeypatch.setattr(qs_module.database, "retrieve_config_sections", lambda _name: rows)
     ctx = qs_module._build_workspace_status_context("cfg", _template_list(), available_configs=["cfg"])
 
-    assert "130-trakt" in ctx["required_keys"]
-    assert "130-trakt" not in ctx["optional_keys"]
-    assert ctx["trakt_requirement_reasons"]
+    assert "130-trakt" not in ctx["required_keys"]
+    assert "130-trakt" in ctx["optional_keys"]
 
 
 def test_workspace_context_promotes_mal_to_required(monkeypatch, qs_module):
@@ -711,6 +814,7 @@ def test_workspace_context_promotes_mal_to_required_from_overlay(monkeypatch, qs
                     "sho-library_anime-library": "Anime Shows",
                     MAL_OVERLAY_ENABLED_KEY: True,
                     MAL_OVERLAY_IMAGE_KEY: "mal",
+                    MAL_OVERLAY_IMAGE_KEY.replace("_image]", "]"): "mal",
                 }
             },
         )
@@ -881,10 +985,9 @@ def test_workspace_context_keeps_trakt_optional_without_dependency(monkeypatch, 
 
     assert "130-trakt" not in ctx["required_keys"]
     assert "130-trakt" in ctx["optional_keys"]
-    assert ctx["trakt_requirement_reasons"] == []
 
 
-def test_trakt_optional_token_only_residue_stays_unknown(qs_module):
+def test_retired_trakt_token_residue_does_not_receive_special_status(qs_module):
     section_rows = {
         "trakt": {
             "validated": False,
@@ -907,7 +1010,7 @@ def test_trakt_optional_token_only_residue_stays_unknown(qs_module):
     }
 
     state = qs_module._derive_step_status("130-trakt", "optional", section_rows, config_exists=True)
-    assert state == "unknown"
+    assert state == "warn"
 
 
 def test_optional_skipped_without_changes_stays_unknown(qs_module):
@@ -940,6 +1043,44 @@ def test_optional_skipped_with_user_input_stays_unknown(qs_module):
 
     state = qs_module._derive_step_status("030-tautulli", "optional", section_rows, config_exists=True)
     assert state == "unknown"
+
+
+def test_required_no_libraries_skip_beats_stale_validated_flag(qs_module):
+    section_rows = {
+        "libraries": {
+            "validated": True,
+            "user_entered": True,
+            "data": {
+                "validation_status": "skipped",
+                "validation_reason": "no_libraries",
+                "validated_at": "2026-04-20T10:00:00Z",
+            },
+        }
+    }
+
+    state = qs_module._derive_step_status("025-libraries", "required", section_rows, config_exists=True)
+    assert state == "error"
+
+
+def test_validated_step_stays_ok_when_skip_metadata_is_stale(qs_module):
+    section_rows = {
+        "tautulli": {
+            "validated": True,
+            "user_entered": True,
+            "data": {
+                "validation_status": "skipped",
+                "validation_reason": "missing_credentials",
+                "validated_at": "2026-04-20T10:00:00Z",
+                "tautulli": {
+                    "url": "https://tautulli.example.com",
+                    "apikey": "secret",
+                },
+            },
+        }
+    }
+
+    state = qs_module._derive_step_status("030-tautulli", "optional", section_rows, config_exists=True)
+    assert state == "ok"
 
 
 def test_anidb_enabled_and_bulk_validated_is_ok(qs_module):
@@ -1070,7 +1211,7 @@ def test_github_optional_placeholder_stays_unknown_even_with_failed_marker(qs_mo
     assert state == "unknown"
 
 
-def test_github_optional_with_token_and_failed_marker_is_error(qs_module):
+def test_github_optional_with_token_and_failed_marker_is_warn(qs_module):
     section_rows = {
         "github": {
             "validated": False,
@@ -1086,7 +1227,7 @@ def test_github_optional_with_token_and_failed_marker_is_error(qs_module):
     }
 
     state = qs_module._derive_step_status("040-github", "optional", section_rows, config_exists=True)
-    assert state == "error"
+    assert state == "warn"
 
 
 def test_webhooks_optional_provider_selection_counts_as_configured(qs_module):
@@ -1262,6 +1403,7 @@ def test_libraries_mal_dependency_hint_endpoint_overlay_returns_reasons(client, 
                 "sho-library_anime-library": "Anime Shows",
                 MAL_OVERLAY_ENABLED_KEY: "true",
                 MAL_OVERLAY_IMAGE_KEY: "mal",
+                MAL_OVERLAY_IMAGE_KEY.replace("_image]", "]"): "mal",
             },
         },
     )
@@ -1387,6 +1529,7 @@ def test_libraries_mdblist_dependency_hint_endpoint_overlay_returns_reasons(clie
                 "mov-library_movies-library": "Movies",
                 MDBLIST_OVERLAY_ENABLED_KEY: "true",
                 MDBLIST_OVERLAY_IMAGE_KEY: "letterboxd",
+                MDBLIST_OVERLAY_IMAGE_KEY.replace("_image]", "]"): "mdb_letterboxd",
             },
         },
     )
@@ -1395,7 +1538,7 @@ def test_libraries_mdblist_dependency_hint_endpoint_overlay_returns_reasons(clie
     payload = resp.get_json()
     assert payload["success"] is True
     assert payload["required"] is True
-    assert any("movie ratings overlay uses letterboxd" in reason for reason in payload["reasons"])
+    assert any("movie ratings overlay uses mdb_letterboxd" in reason for reason in payload["reasons"])
 
 
 def test_libraries_mdblist_dependency_hint_endpoint_non_matching_source_returns_empty(client, monkeypatch, qs_module):
@@ -1451,6 +1594,7 @@ def test_libraries_anidb_dependency_hint_endpoint_overlay_returns_reasons(client
                 "sho-library_anime-library": "Anime Shows",
                 ANIDB_OVERLAY_ENABLED_KEY: "true",
                 ANIDB_OVERLAY_IMAGE_KEY: "anidb",
+                ANIDB_OVERLAY_IMAGE_KEY.replace("_image]", "]"): "anidb",
             },
         },
     )
@@ -1513,6 +1657,37 @@ def test_libraries_radarr_dependency_hint_endpoint_template_collection_returns_r
             "source_payload": {
                 "mov-library_movies-library": "Movies",
                 RADARR_TEMPLATE_COLLECTION_KEY: "true",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["success"] is True
+    assert payload["required"] is True
+    assert any("radarr_add_missing_best_picture enabled" in reason for reason in payload["reasons"])
+
+
+def test_libraries_radarr_dependency_hint_preserves_unloaded_lazy_collection_values(client, monkeypatch, qs_module):
+    monkeypatch.setattr(
+        qs_module.persistence,
+        "retrieve_settings",
+        lambda _target: {
+            "libraries": {
+                "mov-library_movies-library": "Movies",
+                RADARR_TEMPLATE_COLLECTION_KEY: "true",
+            }
+        },
+    )
+
+    resp = client.post(
+        "/libraries_radarr_dependency_hint",
+        json={
+            "source_library_id": "mov-library_movies",
+            "source_payload": {
+                "__loaded_sections": [],
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-playlist": "true",
             },
         },
     )
@@ -1607,68 +1782,9 @@ def test_libraries_sonarr_dependency_hint_endpoint_disabled_payload_returns_empt
     assert payload["reasons"] == []
 
 
-def test_libraries_trakt_dependency_hint_endpoint_returns_reasons(client, monkeypatch, qs_module):
-    monkeypatch.setattr(qs_module.persistence, "retrieve_settings", lambda _target: {"libraries": {}})
-
-    resp = client.post(
-        "/libraries_trakt_dependency_hint",
-        json={
-            "source_library_id": "sho-library_tv",
-            "source_payload": {
-                "sho-library_tv-library": "TV Shows",
-                TRAKT_COLLECTION_KEY: "true",
-            },
-        },
-    )
-
-    assert resp.status_code == 200
-    payload = resp.get_json()
-    assert payload["success"] is True
-    assert payload["required"] is True
-    assert any("Trakt Charts collection enabled" in reason for reason in payload["reasons"])
-
-
-def test_libraries_trakt_dependency_hint_endpoint_overlay_returns_reasons(client, monkeypatch, qs_module):
-    monkeypatch.setattr(qs_module.persistence, "retrieve_settings", lambda _target: {"libraries": {}})
-
-    resp = client.post(
-        "/libraries_trakt_dependency_hint",
-        json={
-            "source_library_id": "sho-library_tv",
-            "source_payload": {
-                "sho-library_tv-library": "TV Shows",
-                TRAKT_OVERLAY_ENABLED_KEY: "true",
-                TRAKT_OVERLAY_IMAGE_KEY: "trakt",
-            },
-        },
-    )
-
-    assert resp.status_code == 200
-    payload = resp.get_json()
-    assert payload["success"] is True
-    assert payload["required"] is True
-    assert any("episode ratings overlay uses trakt" in reason for reason in payload["reasons"])
-
-
-def test_libraries_trakt_dependency_hint_endpoint_disabled_collection_returns_empty(client, monkeypatch, qs_module):
-    monkeypatch.setattr(qs_module.persistence, "retrieve_settings", lambda _target: {"libraries": {}})
-
-    resp = client.post(
-        "/libraries_trakt_dependency_hint",
-        json={
-            "source_library_id": "sho-library_tv",
-            "source_payload": {
-                "sho-library_tv-library": "TV Shows",
-                TRAKT_COLLECTION_KEY: "false",
-            },
-        },
-    )
-
-    assert resp.status_code == 200
-    payload = resp.get_json()
-    assert payload["success"] is True
-    assert payload["required"] is False
-    assert payload["reasons"] == []
+def test_libraries_trakt_dependency_hint_endpoint_is_removed(client):
+    resp = client.post("/libraries_trakt_dependency_hint", json={})
+    assert resp.status_code == 404
 
 
 def test_libraries_mal_dependency_hint_endpoint_non_mal_source_returns_empty(client, monkeypatch, qs_module):
@@ -1719,7 +1835,12 @@ def test_live_validation_rollup_many_skipped_optional_steps_stays_green():
 
     rollup = _build_live_validation_rollup(step_statuses, template_keys)
 
-    assert rollup["counts"] == {"validated": 5, "failed": 0, "skipped": 15, "unknown": 0}
+    assert rollup["counts"] == {
+        "validated": len(validated_keys),
+        "failed": 0,
+        "skipped": len(template_keys) - len(validated_keys),
+        "unknown": 0,
+    }
     assert rollup["state"] == "ok"
 
 

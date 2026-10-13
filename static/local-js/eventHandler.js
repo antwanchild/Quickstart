@@ -22,6 +22,18 @@ function queryScopedElements (scope, selector) {
 }
 
 const EventHandler = {
+  restoreTemplateVariableSelects: function (scope = document) {
+    queryScopedElements(scope, 'select.template-variable-select').forEach(select => {
+      if (select.dataset.templateSelectRestored === 'true') return
+      const selectedValue = select.dataset.selected
+      if (selectedValue !== undefined && selectedValue !== null) {
+        select.value = selectedValue
+        console.debug(`[RESTORE] Select value set: ${select.name} = ${selectedValue}`)
+      }
+      select.dataset.templateSelectRestored = 'true'
+    })
+  },
+
   attachLibraryListeners: function (scope = document) {
     queryScopedElements(scope, '.library-checkbox').forEach((checkbox) => {
       const libraryId = checkbox.id.replace(/-(library|card-container)$/, '')
@@ -412,13 +424,7 @@ callValidationHandler('restoreSelectedLibraries')
 callValidationHandler('updateValidationState')
 installRatingSubmitGuard()
 
-document.querySelectorAll('select.template-variable-select').forEach(select => {
-  const selectedValue = select.dataset.selected
-  if (selectedValue !== undefined && selectedValue !== null) {
-    select.value = selectedValue
-    console.debug(`[RESTORE] Select value set: ${select.name} = ${selectedValue}`)
-  }
-})
+EventHandler.restoreTemplateVariableSelects()
 
 // =============================
 // Mapping List Handler

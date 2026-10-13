@@ -11,14 +11,15 @@ from modules.assets import build_preview_image_data as _build_preview_image_data
 from modules.dependency_reasons import (
     _is_truthy_setting_value,
     _libraries_data_anidb_dependency_reasons,
+    _libraries_data_floppy_dependency_reasons,
     _libraries_data_mal_dependency_reasons,
     _libraries_data_mdblist_dependency_reasons,
     _libraries_data_omdb_dependency_reasons,
     _libraries_data_radarr_dependency_reasons,
     _libraries_data_sonarr_dependency_reasons,
+    _libraries_data_serializd_dependency_reasons,
     _libraries_data_tautulli_dependency_reasons,
     _libraries_data_tracearr_dependency_reasons,
-    _libraries_data_trakt_dependency_reasons,
     _library_prefix_from_key,
 )
 
@@ -115,32 +116,212 @@ def _build_library_lists():
     if not isinstance(telemetry_data, dict) or "plex_pass" not in telemetry_data:
         telemetry_data = telemetry.get("plex_telemetry", {})
 
-    movie_raw = plex_data.get("tmp_movie_libraries", "") if isinstance(plex_data.get("tmp_movie_libraries"), str) else ""
-    show_raw = plex_data.get("tmp_show_libraries", "") if isinstance(plex_data.get("tmp_show_libraries"), str) else ""
-
-    existing_ids = set()
+    lib_name_map = persistence.get_library_names("010-plex")
 
     movie_libraries = [
         {
-            "id": f"mov-library_{helpers.normalize_id(lib, existing_ids)}",
-            "name": lib,
+            "id": f"mov-library_{lib_id}",
+            "name": lib_name_map.get(str(lib_id), f"Library {lib_id}"),
             "type": "movie",
         }
-        for lib in movie_raw.split(",")
-        if lib
+        for lib_id in persistence.decode_library_ids(plex_data.get("tmp_movie_libraries", ""))
+        if lib_id
     ]
 
     show_libraries = [
         {
-            "id": f"sho-library_{helpers.normalize_id(lib, existing_ids)}",
-            "name": lib,
+            "id": f"sho-library_{lib_id}",
+            "name": lib_name_map.get(str(lib_id), f"Library {lib_id}"),
             "type": "show",
         }
-        for lib in show_raw.split(",")
-        if lib
+        for lib_id in persistence.decode_library_ids(plex_data.get("tmp_show_libraries", ""))
+        if lib_id
     ]
 
+    if not movie_libraries or not show_libraries:
+        telemetry_movies, telemetry_shows = _library_lists_from_telemetry(telemetry_data)
+        if not movie_libraries:
+            movie_libraries = telemetry_movies
+        if not show_libraries:
+            show_libraries = telemetry_shows
+
     return movie_libraries, show_libraries, telemetry_data
+
+
+def _library_lists_from_telemetry(telemetry_data):
+    """Build picker library descriptors from Plex telemetry when tmp IDs are missing."""
+    libraries = telemetry_data.get("libraries", {}) if isinstance(telemetry_data, dict) else {}
+    if not isinstance(libraries, dict):
+        return [], []
+
+    movie_libraries = []
+    show_libraries = []
+    for lib_id, lib_info in libraries.items():
+        if not isinstance(lib_info, dict):
+            continue
+        lib_type = str(lib_info.get("type") or "").strip().lower()
+        if lib_type not in {"movie", "show"}:
+            continue
+        name = str(lib_info.get("name") or lib_id).strip() or str(lib_id)
+        entry = {
+            "id": f"{'mov' if lib_type == 'movie' else 'sho'}-library_{lib_id}",
+            "name": name,
+            "type": lib_type,
+        }
+        if lib_type == "movie":
+            movie_libraries.append(entry)
+        else:
+            show_libraries.append(entry)
+
+    return movie_libraries, show_libraries
+
+
+def _normalize_library_toggle_names(libraries_data):
+    """Replace selected checkbox placeholder values with exact Plex names."""
+    if not isinstance(libraries_data, dict):
+        return {}
+
+    try:
+        library_names = persistence.get_library_names("010-plex")
+    except Exception:
+        library_names = {}
+    library_names = library_names if isinstance(library_names, dict) else {}
+
+    normalized = dict(libraries_data)
+    for key, value in list(normalized.items()):
+        if not isinstance(key, str) or not key.endswith("-library"):
+            continue
+        if not _is_truthy_setting_value(value):
+            continue
+        text = str(value).strip().lower()
+        if value is not True and text not in {"true", "yes", "on", "1"}:
+            continue
+        prefix = key[: -len("-library")]
+        library_id = prefix.split("_", 1)[1] if "_" in prefix else ""
+        if library_id in library_names:
+            normalized[key] = library_names[library_id]
+    return normalized
+
+
+def _is_blank_library_value(value):
+    if value is None:
+        return True
+    if value is False:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"", "none", "null"}
+    return False
+
+
+def _find_library_value(libraries_data, library_id, suffixes):
+    if not isinstance(libraries_data, dict):
+        return None
+    for suffix in suffixes:
+        direct = f"{library_id}-{suffix}"
+        if direct in libraries_data:
+            return libraries_data.get(direct)
+    for key, value in libraries_data.items():
+        if not isinstance(key, str) or not key.startswith(f"{library_id}-"):
+            continue
+        if any(key.endswith(suffix) for suffix in suffixes):
+            return value
+    return None
+
+
+def _mirror_separator_placeholder_issues(libraries_data, library_id, library_name, source_type, quickstart_module):
+    use_separator = _find_library_value(
+        libraries_data,
+        library_id,
+        ["template_variables[use_separator]", "attribute_use_separator"],
+    )
+    if not _is_truthy_setting_value(use_separator):
+        return []
+
+    media_type = "movie" if source_type == "mov" else "show"
+    placeholder_keys = [
+        "attribute_template_variables[placeholder_imdb_id]",
+        "template_variables[placeholder_imdb_id]",
+    ]
+    if media_type == "movie":
+        placeholder_keys = [
+            "attribute_template_variables[placeholder_tmdb_movie]",
+            "template_variables[placeholder_tmdb_movie]",
+        ] + placeholder_keys
+    else:
+        placeholder_keys = [
+            "attribute_template_variables[placeholder_tvdb_show]",
+            "template_variables[placeholder_tvdb_show]",
+        ] + placeholder_keys
+
+    placeholder = _find_library_value(libraries_data, library_id, placeholder_keys)
+    if _is_blank_library_value(placeholder):
+        return [f"{library_name}: separator placeholders are enabled but no placeholder ID is selected."]
+
+    placeholder_text = str(placeholder).strip()
+    if media_type == "show" and placeholder_text.isdigit():
+        return [f"{library_name}: TVDb placeholder {placeholder_text} cannot be verified automatically against Plex; review this library before including it."]
+
+    if placeholder_text.isdigit():
+        try:
+            tmdb_result = quickstart_module._lookup_tmdb_numeric_id(placeholder_text, media_type=media_type)
+        except Exception as exc:
+            return [f"{library_name}: TMDb placeholder {placeholder_text} could not be verified: {exc}."]
+        if not tmdb_result.get("valid") or not tmdb_result.get("verified"):
+            message = str(tmdb_result.get("message") or "").strip()
+            return [f"{library_name}: TMDb placeholder {placeholder_text} could not be verified. {message}".strip()]
+        result_type = str(tmdb_result.get("result_type") or "").strip().lower()
+        if result_type and result_type != media_type:
+            return [f"{library_name}: TMDb placeholder {placeholder_text} resolves to {result_type}, not {media_type}."]
+        tmdb_label = str(tmdb_result.get("label") or "").strip()
+        if tmdb_label:
+            try:
+                plex_match = quickstart_module.helpers.find_item_by_title(library_name, tmdb_label)
+            except Exception as exc:
+                return [f"{library_name}: Plex lookup for placeholder '{tmdb_label}' failed: {exc}."]
+            if plex_match and plex_match.get("title"):
+                return []
+        return [f"{library_name}: placeholder '{tmdb_label or placeholder_text}' was not found in this Plex library."]
+
+    try:
+        tmdb_result = quickstart_module._lookup_tmdb_by_imdb_id(placeholder_text, media_type=media_type)
+    except Exception:
+        tmdb_result = {}
+    tmdb_label = str(tmdb_result.get("label") or "").strip()
+    try:
+        plex_match = quickstart_module.helpers.find_item_by_imdb_id(library_name, placeholder_text, media_type, fallback_title=tmdb_label)
+    except TypeError:
+        plex_match = quickstart_module.helpers.find_item_by_imdb_id(library_name, placeholder_text, media_type)
+    except Exception as exc:
+        return [f"{library_name}: Plex lookup for placeholder {placeholder_text} failed: {exc}."]
+    if plex_match and plex_match.get("title"):
+        return []
+    if tmdb_result.get("valid") and tmdb_result.get("verified"):
+        return [f"{library_name}: placeholder '{tmdb_label or placeholder_text}' was not found in this Plex library."]
+    return [f"{library_name}: placeholder {placeholder_text} could not be verified against Plex."]
+
+
+def _build_mirror_include_report(libraries_data, target_id, target_name, source_type, quickstart_module):
+    candidate = dict(libraries_data)
+    candidate[f"{target_id}-library"] = target_name
+    target_items = {k: v for k, v in candidate.items() if isinstance(k, str) and k.startswith(f"{target_id}-")}
+    issues = []
+    issues.extend(path_validation.validate_payload(target_items))
+    issues.extend(quickstart_module._validate_library_collection_files(candidate, [target_id]))
+    issues.extend(quickstart_module._validate_library_metadata_files(candidate, [target_id]))
+    issues.extend(quickstart_module._validate_library_overlay_files(candidate, [target_id]))
+    issues.extend(quickstart_module._validate_library_auto_sort_hubs(candidate, [target_id]))
+    override_result = quickstart_module._validate_library_service_overrides(target_id, candidate)
+    if not override_result.get("valid") and not override_result.get("skipped"):
+        issues.extend(list(override_result.get("errors") or []))
+    issues.extend(_mirror_separator_placeholder_issues(candidate, target_id, target_name, source_type, quickstart_module))
+
+    return {
+        "target_id": target_id,
+        "target_name": target_name,
+        "included": not issues,
+        "status": "included" if not issues else "needs_review",
+        "issues": issues,
+    }
 
 
 def _legacy_playlist_library_names():
@@ -150,7 +331,7 @@ def _legacy_playlist_library_names():
         playlist_payload = playlist_payload.get("playlist_files", {})
     raw_libraries = playlist_payload.get("libraries", "") if isinstance(playlist_payload, dict) else ""
     if isinstance(raw_libraries, list):
-        return {str(item).strip() for item in raw_libraries if str(item).strip()}
+        return {str(item) for item in raw_libraries if str(item).strip()}
     return {item.strip() for item in str(raw_libraries or "").split(",") if item.strip()}
 
 
@@ -304,6 +485,16 @@ def _coerce_loaded_collection_groups(raw_value):
     return loaded
 
 
+def _coerce_loaded_collection_details(raw_value):
+    values = raw_value
+    if isinstance(raw_value, str):
+        values = raw_value.split(",")
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+
+    return {str(item).strip() for item in values if str(item).strip()}
+
+
 def _loaded_sections_with_payload_evidence(library_id, incoming_libraries, loaded_sections):
     """Ignore lazy-section loaded markers when their form fields are absent.
 
@@ -358,7 +549,11 @@ def _loaded_sections_with_payload_evidence(library_id, incoming_libraries, loade
 
 
 def _has_saved_value(value):
-    return value not in [None, "", [], {}, "[]", "{}"]
+    if value in [None, "", [], {}, "[]", "{}"]:
+        return False
+    if isinstance(value, str) and value.strip().lower() in {"none", "null"}:
+        return False
+    return True
 
 
 def _coerce_bool(value):
@@ -466,6 +661,75 @@ def _collection_group_active_states_for_library(library, libraries_data, collect
 
 def _has_active_collection_selection_for_library(library, libraries_data, collection_config):
     return any(_collection_group_active_states_for_library(library, libraries_data, collection_config).values())
+
+
+def _collection_section_sort_key(value):
+    value = str(value or "").strip()
+    if value.isdigit():
+        return (0, int(value), "")
+    if value:
+        return (1, 0, value)
+    return (2, 0, "")
+
+
+def _collection_section_reorder_entries(library, libraries_data, collection_config=None):
+    if not isinstance(library, dict) or not isinstance(libraries_data, dict):
+        return []
+    library_id = library.get("id")
+    library_type = library.get("type")
+    if not library_id or not library_type:
+        return []
+
+    collection_config = collection_config if isinstance(collection_config, list) else helpers.load_quickstart_config("quickstart_collections.json")
+    entries = []
+    for group_index, group in enumerate(collection_config or []):
+        collections = group.get("collections", []) if isinstance(group, dict) else []
+        for collection_index, collection in enumerate(collections):
+            if not isinstance(collection, dict):
+                continue
+            media_types = collection.get("media_types") or []
+            if media_types and library_type not in media_types:
+                continue
+            collection_id = str(collection.get("id") or "").strip()
+            if not collection_id:
+                continue
+            if not _is_truthy_setting_value(libraries_data.get(f"{library_id}-{collection_id}")):
+                continue
+
+            section_item = None
+            for item in collection.get("template_variables", []) or []:
+                if isinstance(item, dict) and item.get("key") == "collection_section":
+                    section_item = item
+                    break
+            if not section_item:
+                continue
+
+            clean_id = collection_id.replace("collection_", "")
+            input_name = f"{library_id}-template_collection_{clean_id}_collection_section"
+            current_value = str(libraries_data.get(input_name) or "").strip()
+            default_value = str(section_item.get("default") or "").strip()
+            effective_value = current_value or default_value
+            entries.append(
+                {
+                    "collectionId": collection_id,
+                    "label": collection.get("label") or collection_id,
+                    "inputId": input_name,
+                    "inputName": input_name,
+                    "defaultValue": default_value,
+                    "currentValue": current_value,
+                    "effectiveValue": effective_value,
+                    "groupIndex": group_index,
+                    "collectionIndex": collection_index,
+                }
+            )
+
+    entries.sort(key=lambda entry: (_collection_section_sort_key(entry["effectiveValue"]), entry["groupIndex"], entry["collectionIndex"]))
+    return entries
+
+
+def _library_for_id(library_id):
+    movie_libraries, show_libraries, _telemetry_data = _build_library_lists()
+    return {lib["id"]: lib for lib in movie_libraries + show_libraries}.get(library_id)
 
 
 def _iter_overlay_template_items(template_variables):
@@ -712,11 +976,36 @@ def _collection_key_group_indexes(library_id, collection_config, library_type):
     return indexes_by_key
 
 
+def _collection_detail_key_indexes(library_id, collection_config, library_type):
+    indexes_by_key = {}
+    if not library_id or not isinstance(collection_config, list):
+        return indexes_by_key
+    for group_index, group in enumerate(collection_config):
+        for collection in group.get("collections", []) if isinstance(group, dict) else []:
+            if library_type not in collection.get("media_types", []):
+                continue
+            collection_id = str(collection.get("id", "")).strip()
+            if not collection_id:
+                continue
+            clean_id = collection_id.replace("collection_", "")
+            indexes_by_key[f"{library_id}-template_collection_{clean_id}_"] = (group_index, collection_id)
+    return indexes_by_key
+
+
 def _collection_key_belongs_to_unloaded_group(key, collection_key_indexes, loaded_collection_groups):
     if loaded_collection_groups is None:
         return False
     for prefix, group_index in collection_key_indexes.items():
         if (key == prefix or key.startswith(prefix)) and group_index not in loaded_collection_groups:
+            return True
+    return False
+
+
+def _collection_key_belongs_to_unloaded_detail(key, collection_detail_indexes, loaded_collection_groups, loaded_collection_details):
+    if loaded_collection_details is None:
+        return False
+    for prefix, (group_index, collection_id) in collection_detail_indexes.items():
+        if key.startswith(prefix) and group_index in loaded_collection_groups and collection_id not in loaded_collection_details:
             return True
     return False
 
@@ -737,7 +1026,7 @@ def _merge_active_library_payload_with_saved_libraries(library_id, incoming_libr
     """Merge one active-card autosave with the full persisted libraries map.
 
     The browser only posts the mounted library card during lazy switching. The
-    backend must validate and save against the whole libraries map or unrelated
+    backend must save against the whole libraries map or unrelated
     libraries lose their ``*-library`` selection flags and disappear from final
     output.
     """
@@ -763,7 +1052,7 @@ def _merge_active_library_payload_with_saved_libraries(library_id, incoming_libr
             continue
         merged[key] = value
 
-    return merged
+    return _normalize_library_toggle_names(merged)
 
 
 def _is_library_file_entry_key(library_id, key):
@@ -774,15 +1063,22 @@ def _is_library_file_entry_key(library_id, key):
     }
 
 
-def _preserve_unloaded_lazy_section_values(library_id, incoming_libraries, loaded_sections, loaded_collection_groups=None):
+def _preserve_unloaded_lazy_section_values(
+    library_id,
+    incoming_libraries,
+    loaded_sections,
+    loaded_collection_groups=None,
+    loaded_collection_details=None,
+):
     """Keep persisted values for omitted lazy/partial library sections."""
     incoming_libraries = incoming_libraries if isinstance(incoming_libraries, dict) else {}
     unloaded_sections = {"collections", "overlays"} - set(loaded_sections or set())
     should_preserve_unloaded_collection_groups = "collections" in set(loaded_sections or set()) and loaded_collection_groups is not None
+    should_preserve_unloaded_collection_details = should_preserve_unloaded_collection_groups and loaded_collection_details is not None
     missing_partial_fields = {
         f"{library_id}-{suffix}" for suffix in ("collection_files", "metadata_files", "overlay_files", "playlist") if f"{library_id}-{suffix}" not in incoming_libraries
     }
-    if not unloaded_sections and not should_preserve_unloaded_collection_groups and not missing_partial_fields:
+    if not unloaded_sections and not should_preserve_unloaded_collection_groups and not should_preserve_unloaded_collection_details and not missing_partial_fields:
         return incoming_libraries
 
     settings = persistence.retrieve_settings("025-libraries")
@@ -794,12 +1090,20 @@ def _preserve_unloaded_lazy_section_values(library_id, incoming_libraries, loade
     prefix = f"{library_id}-"
     library_type = "movie" if str(library_id).startswith("mov-") else "show"
     collection_key_indexes = {}
+    collection_detail_indexes = {}
     if should_preserve_unloaded_collection_groups:
+        collection_config = helpers.load_quickstart_config("quickstart_collections.json")
         collection_key_indexes = _collection_key_group_indexes(
             library_id,
-            helpers.load_quickstart_config("quickstart_collections.json"),
+            collection_config,
             library_type,
         )
+        if should_preserve_unloaded_collection_details:
+            collection_detail_indexes = _collection_detail_key_indexes(
+                library_id,
+                collection_config,
+                library_type,
+            )
 
     def should_preserve(key):
         if not isinstance(key, str) or not key.startswith(prefix):
@@ -807,6 +1111,13 @@ def _preserve_unloaded_lazy_section_values(library_id, incoming_libraries, loade
         if key in missing_partial_fields and (_is_library_file_entry_key(library_id, key) or key == f"{library_id}-playlist"):
             return True
         if should_preserve_unloaded_collection_groups and _collection_key_belongs_to_unloaded_group(key, collection_key_indexes, loaded_collection_groups):
+            return True
+        if should_preserve_unloaded_collection_details and _collection_key_belongs_to_unloaded_detail(
+            key,
+            collection_detail_indexes,
+            loaded_collection_groups,
+            loaded_collection_details,
+        ):
             return True
         if "collections" in unloaded_sections and _is_collection_default_key(library_id, key):
             return True
@@ -929,7 +1240,125 @@ def library_fragment_collection_group(library_id, group_index):
 
     context = dict(context)
     context["group"] = collection_config[group_index]
+    context["group_index"] = group_index
+    context["defer_collection_details"] = True
     return render_template("partials/_collection_group_fragment.html", **context)
+
+
+@bp.route("/library_fragment/<library_id>/section/collections/group/<int:group_index>/detail/<collection_id>")
+def library_fragment_collection_detail(library_id, group_index, collection_id):
+    """Return one collection detail fragment on demand."""
+    context = _library_fragment_context(
+        library_id,
+        include_attributes=False,
+        include_collections=True,
+        include_overlays=False,
+    )
+
+    if not context:
+        return jsonify({"error": "Library not found"}), 404
+
+    collection_config = context.get("collection_config") or []
+    if group_index < 0 or group_index >= len(collection_config):
+        return jsonify({"error": "Collection group not found"}), 404
+
+    group = collection_config[group_index]
+    collections = group.get("collections", []) if isinstance(group, dict) else []
+    collection = next((item for item in collections if str(item.get("id", "")).strip() == collection_id), None)
+    if not collection:
+        return jsonify({"error": "Collection not found"}), 404
+
+    context = dict(context)
+    context["group"] = {**group, "collections": [collection]}
+    context["group_index"] = group_index
+    context["defer_collection_details"] = False
+    return render_template("partials/_collection_group_fragment.html", **context)
+
+
+@bp.route("/library_fragment/<library_id>/collection_section_entries", methods=["GET", "POST"])
+def library_collection_section_entries(library_id):
+    """Return enabled collection-section rows without hydrating lazy accordions."""
+    library = _library_for_id(library_id)
+    if not library:
+        return jsonify({"success": False, "error": "Library not found"}), 404
+
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        source_payload = payload.get("source_payload") if isinstance(payload.get("source_payload"), dict) else {}
+        libraries_data = _build_merged_libraries_hint_payload(
+            {
+                "source_library_id": library_id,
+                "source_payload": source_payload,
+            }
+        )
+    else:
+        settings = persistence.retrieve_settings("025-libraries")
+        libraries_data = settings.get("libraries", {}) if isinstance(settings, dict) else {}
+    entries = _collection_section_reorder_entries(library, libraries_data)
+    return jsonify({"success": True, "entries": entries})
+
+
+@bp.route("/library_fragment/<library_id>/collection_section_order", methods=["POST"])
+def save_library_collection_section_order(library_id):
+    """Persist collection_section order without requiring hidden DOM sections."""
+    library = _library_for_id(library_id)
+    if not library:
+        return jsonify({"success": False, "error": "Library not found"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    reset = helpers.booler(payload.get("reset"))
+    ordered_ids = payload.get("collection_ids") or []
+    if not reset and not isinstance(ordered_ids, list):
+        return jsonify({"success": False, "error": "Invalid collection order payload."}), 400
+
+    settings = persistence.retrieve_settings("025-libraries")
+    libraries_data = settings.get("libraries", {}) if isinstance(settings, dict) else {}
+    if not isinstance(libraries_data, dict):
+        libraries_data = {}
+
+    entries = _collection_section_reorder_entries(library, libraries_data)
+    entries_by_id = {entry["collectionId"]: entry for entry in entries}
+    if not reset:
+        ordered_ids = [str(item or "").strip() for item in ordered_ids if str(item or "").strip()]
+        missing_ids = sorted(set(entries_by_id) - set(ordered_ids))
+        unknown_ids = sorted(set(ordered_ids) - set(entries_by_id))
+        if missing_ids or unknown_ids:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "Collection order does not match the enabled collection set.",
+                        "missing": missing_ids,
+                        "unknown": unknown_ids,
+                    }
+                ),
+                400,
+            )
+
+    updated_libraries = dict(libraries_data)
+    if reset:
+        for entry in entries:
+            updated_libraries.pop(entry["inputName"], None)
+    else:
+        for index, collection_id in enumerate(ordered_ids, start=1):
+            updated_libraries[entries_by_id[collection_id]["inputName"]] = f"{index * 10:03d}"
+
+    config_name = persistence.resolve_request_config_name(payload if isinstance(payload, dict) else {})
+    database.save_section_data(
+        name=config_name,
+        section="libraries",
+        validated=helpers.booler(settings.get("validated", False)) if isinstance(settings, dict) else False,
+        user_entered=True,
+        data={
+            "libraries": updated_libraries,
+            "validated": helpers.booler(settings.get("validated", False)) if isinstance(settings, dict) else False,
+            "validated_at": settings.get("validated_at") if isinstance(settings, dict) else None,
+        },
+    )
+    refreshed_settings = persistence.retrieve_settings("025-libraries")
+    refreshed_libraries = refreshed_settings.get("libraries", {}) if isinstance(refreshed_settings, dict) else updated_libraries
+    refreshed_entries = _collection_section_reorder_entries(library, refreshed_libraries)
+    return jsonify({"success": True, "entries": refreshed_entries, "reset": reset})
 
 
 @bp.route("/autosave_library/<library_id>", methods=["POST"])
@@ -946,6 +1375,8 @@ def autosave_library(library_id):
         loaded_sections = _coerce_loaded_library_sections(incoming.get("__loaded_sections") if hasattr(incoming, "get") else None)
         loaded_collection_groups_raw = incoming.get("__loaded_collection_groups") if hasattr(incoming, "get") else None
         loaded_collection_groups = _coerce_loaded_collection_groups(loaded_collection_groups_raw) if loaded_collection_groups_raw is not None else None
+        loaded_collection_details_raw = incoming.get("__loaded_collection_details") if hasattr(incoming, "get") else None
+        loaded_collection_details = _coerce_loaded_collection_details(loaded_collection_details_raw) if loaded_collection_details_raw is not None else None
         reset_collection_defaults = helpers.booler(incoming.get("__reset_collection_defaults") if hasattr(incoming, "get") else None)
         config_name = persistence.resolve_request_config_name(incoming if isinstance(incoming, dict) else {})
         errors = path_validation.validate_payload(incoming)
@@ -955,6 +1386,7 @@ def autosave_library(library_id):
         if isinstance(clean_source, dict):
             clean_source.pop("__loaded_sections", None)
             clean_source.pop("__loaded_collection_groups", None)
+            clean_source.pop("__loaded_collection_details", None)
             clean_source.pop("__reset_collection_defaults", None)
         clean_payload = persistence.clean_form_data(MultiDict(clean_source))
         incoming_libraries = helpers.build_config_dict("libraries", clean_payload).get("libraries", {})
@@ -962,17 +1394,24 @@ def autosave_library(library_id):
         if reset_collection_defaults:
             loaded_sections.add("collections")
             incoming_libraries = _drop_collection_default_keys(library_id, incoming_libraries)
-        incoming_libraries = _preserve_unloaded_lazy_section_values(library_id, incoming_libraries, loaded_sections, loaded_collection_groups)
+        incoming_libraries = _preserve_unloaded_lazy_section_values(
+            library_id,
+            incoming_libraries,
+            loaded_sections,
+            loaded_collection_groups,
+            loaded_collection_details,
+        )
         if reset_collection_defaults:
             incoming_libraries = _drop_collection_default_keys(library_id, incoming_libraries)
         settings = persistence.retrieve_settings("025-libraries")
         existing_libraries = settings.get("libraries", {}) if isinstance(settings, dict) else {}
         merged_libraries = _merge_active_library_payload_with_saved_libraries(library_id, incoming_libraries, existing_libraries)
-        selected_library_ids = _qs._selected_library_ids_from_libraries_data(merged_libraries)
-        collection_errors = _qs._validate_library_collection_files(merged_libraries, selected_library_ids)
-        metadata_errors = _qs._validate_library_metadata_files(merged_libraries, selected_library_ids)
-        overlay_errors = _qs._validate_library_overlay_files(merged_libraries, selected_library_ids)
-        auto_sort_hubs_errors = _qs._validate_library_auto_sort_hubs(merged_libraries, selected_library_ids)
+        active_libraries = {key: value for key, value in merged_libraries.items() if key.startswith(f"{library_id}-")}
+        selected_library_ids = [lib_id for lib_id in _qs._selected_library_ids_from_libraries_data(active_libraries) if lib_id == library_id]
+        collection_errors = _qs._validate_library_collection_files(active_libraries, selected_library_ids)
+        metadata_errors = _qs._validate_library_metadata_files(active_libraries, selected_library_ids)
+        overlay_errors = _qs._validate_library_overlay_files(active_libraries, selected_library_ids)
+        auto_sort_hubs_errors = _qs._validate_library_auto_sort_hubs(active_libraries, selected_library_ids)
         if collection_errors:
             return jsonify({"success": False, "error": "Invalid collection files.", "errors": collection_errors}), 400
         if metadata_errors:
@@ -981,13 +1420,15 @@ def autosave_library(library_id):
             return jsonify({"success": False, "error": "Invalid overlay files.", "errors": overlay_errors}), 400
         if auto_sort_hubs_errors:
             return jsonify({"success": False, "error": "Invalid library settings.", "errors": auto_sort_hubs_errors}), 400
-        normalized_libraries, normalization_errors, changed = _qs._normalize_library_file_entries_payload(
-            merged_libraries,
+        normalized_active, normalization_errors, changed = _qs._normalize_library_file_entries_payload(
+            active_libraries,
             config_name,
             validate_local=False,
         )
         if normalization_errors:
             return jsonify({"success": False, "error": "Unable to organize library files.", "errors": normalization_errors}), 400
+        normalized_libraries = dict(merged_libraries)
+        normalized_libraries.update(normalized_active)
         save_payload = dict(normalized_libraries)
         save_payload["config_name"] = config_name
         persistence.save_settings("025-libraries", save_payload)
@@ -1011,7 +1452,14 @@ def _build_merged_libraries_hint_payload(payload):
     if not source_payload:
         return merged
 
-    clean_payload = persistence.clean_form_data(MultiDict(source_payload))
+    source_payload_for_merge = dict(source_payload)
+    loaded_sections = _coerce_loaded_library_sections(source_payload_for_merge.pop("__loaded_sections", []))
+    loaded_collection_groups_raw = source_payload_for_merge.pop("__loaded_collection_groups", None)
+    loaded_collection_groups = _coerce_loaded_collection_groups(loaded_collection_groups_raw) if loaded_collection_groups_raw is not None else None
+    loaded_collection_details_raw = source_payload_for_merge.pop("__loaded_collection_details", None)
+    loaded_collection_details = _coerce_loaded_collection_details(loaded_collection_details_raw) if loaded_collection_details_raw is not None else None
+
+    clean_payload = persistence.clean_form_data(MultiDict(source_payload_for_merge))
     incoming_dict = helpers.build_config_dict("libraries", clean_payload).get("libraries", {})
     incoming_dict = incoming_dict if isinstance(incoming_dict, dict) else {}
 
@@ -1025,6 +1473,16 @@ def _build_merged_libraries_hint_payload(payload):
         prefix = _library_prefix_from_key(key)
         if prefix:
             prefixes.add(prefix)
+
+    for prefix in list(prefixes):
+        prefix_loaded_sections = _loaded_sections_with_payload_evidence(prefix, incoming_dict, loaded_sections)
+        incoming_dict = _preserve_unloaded_lazy_section_values(
+            prefix,
+            incoming_dict,
+            prefix_loaded_sections,
+            loaded_collection_groups,
+            loaded_collection_details,
+        )
 
     for prefix in prefixes:
         for existing_key in list(merged.keys()):
@@ -1052,10 +1510,11 @@ _DEPENDENCY_HINT_ROUTES = (
     ("Tracearr", "tracearr", _libraries_data_tracearr_dependency_reasons),
     ("OMDb", "omdb", _libraries_data_omdb_dependency_reasons),
     ("MDBList", "mdblist", _libraries_data_mdblist_dependency_reasons),
+    ("Floppy", "floppy", _libraries_data_floppy_dependency_reasons),
+    ("Serializd", "serializd", _libraries_data_serializd_dependency_reasons),
     ("AniDB", "anidb", _libraries_data_anidb_dependency_reasons),
     ("Radarr", "radarr", _libraries_data_radarr_dependency_reasons),
     ("Sonarr", "sonarr", _libraries_data_sonarr_dependency_reasons),
-    ("Trakt", "trakt", _libraries_data_trakt_dependency_reasons),
     ("MAL", "mal", _libraries_data_mal_dependency_reasons),
 )
 
@@ -1139,6 +1598,8 @@ def copy_library_settings():
             loaded_sections = _coerce_loaded_library_sections(source_payload_for_merge.pop("__loaded_sections", []))
             loaded_collection_groups_raw = source_payload_for_merge.pop("__loaded_collection_groups", None)
             loaded_collection_groups = _coerce_loaded_collection_groups(loaded_collection_groups_raw) if loaded_collection_groups_raw is not None else None
+            loaded_collection_details_raw = source_payload_for_merge.pop("__loaded_collection_details", None)
+            loaded_collection_details = _coerce_loaded_collection_details(loaded_collection_details_raw) if loaded_collection_details_raw is not None else None
             payload_errors = path_validation.validate_payload(source_payload_for_merge)
             if payload_errors:
                 return (
@@ -1154,6 +1615,24 @@ def copy_library_settings():
             try:
                 clean_payload = persistence.clean_form_data(MultiDict(source_payload_for_merge))
                 incoming_dict = helpers.build_config_dict("libraries", clean_payload).get("libraries", {})
+                for raw_key, raw_value in source_payload_for_merge.items():
+                    if not isinstance(raw_key, str) or not raw_key.startswith(f"{source_prefix}-"):
+                        continue
+                    if not raw_key.endswith(("-attribute_use_separator", "-template_variables[use_separator]")):
+                        continue
+                    if isinstance(raw_value, str):
+                        raw_text = raw_value.strip()
+                        raw_lc = raw_text.lower()
+                        if raw_lc in {"", "none", "null"}:
+                            incoming_dict[raw_key] = None
+                        elif raw_lc in {"false", "off", "0"}:
+                            incoming_dict[raw_key] = False
+                        elif raw_lc in {"true", "on", "1"}:
+                            incoming_dict[raw_key] = True
+                        else:
+                            incoming_dict[raw_key] = raw_value
+                    else:
+                        incoming_dict[raw_key] = raw_value
                 normalized_incoming, normalization_errors, _ = _qs._normalize_library_file_entries_payload(
                     incoming_dict,
                     session.get("config_name") or source_payload_for_merge.get("config_name"),
@@ -1176,6 +1655,7 @@ def copy_library_settings():
                     normalized_incoming,
                     loaded_sections,
                     loaded_collection_groups,
+                    loaded_collection_details,
                 )
 
                 merged = libraries_data.copy()
@@ -1265,6 +1745,7 @@ def copy_library_settings():
         if not source_items:
             helpers.ts_log(f"Copy aborted: no saved settings found for source {source_prefix}", level="ERROR")
             return jsonify({"success": False, "error": "No saved settings found for source library"}), 404
+        source_included = _is_truthy_setting_value(source_items.get(f"{source_prefix}-library"))
 
         movie_libraries, show_libraries, _telemetry = _build_library_lists()
         name_map = {lib["id"]: lib["name"] for lib in (movie_libraries + show_libraries)}
@@ -1303,12 +1784,11 @@ def copy_library_settings():
                 if existing_key.startswith(f"{target_id}-"):
                     merged.pop(existing_key, None)
 
+            if target_id != source_prefix:
+                merged[f"{target_id}-library"] = ""
+
             for key, value in source_items.items():
                 if target_id != source_prefix and key.endswith("-library"):
-                    # Do not opt target libraries into YAML automatically.
-                    # Mirrored settings remain saved and become active if the
-                    # user explicitly includes the target later.
-                    merged[f"{target_id}-library"] = ""
                     continue
                 new_key = key.replace(source_prefix, target_id, 1)
                 new_value = value
@@ -1322,6 +1802,42 @@ def copy_library_settings():
                     elif key.endswith("-overlay_files"):
                         new_value = _qs._clone_library_file_entries_for_target("overlay_files", value, config_name, target_id)
                 merged[new_key] = new_value
+
+        mirror_report = []
+        included_targets = []
+        review_targets = []
+        for target_id in filtered_targets:
+            if target_id == source_prefix:
+                continue
+            target_name = name_map.get(target_id, "")
+            if not source_included:
+                mirror_report.append(
+                    {
+                        "target_id": target_id,
+                        "target_name": target_name,
+                        "included": False,
+                        "status": "source_excluded",
+                        "issues": ["Source library is excluded, so the mirrored target was left excluded."],
+                    }
+                )
+                continue
+            if not target_name:
+                report = {
+                    "target_id": target_id,
+                    "target_name": target_id,
+                    "included": False,
+                    "status": "needs_review",
+                    "issues": ["Target library name could not be resolved from Plex."],
+                }
+            else:
+                report = _build_mirror_include_report(merged, target_id, target_name, source_type, _qs)
+            if report.get("included"):
+                merged[f"{target_id}-library"] = target_name
+                included_targets.append(target_id)
+            else:
+                merged[f"{target_id}-library"] = ""
+                review_targets.append(target_id)
+            mirror_report.append(report)
 
         # Update the aggregated libraries list to include all configured library names
         configured_names = []
@@ -1344,7 +1860,16 @@ def copy_library_settings():
             level="DEBUG",
         )
 
-        return jsonify({"success": True, "updated": target_ids})
+        return jsonify(
+            {
+                "success": True,
+                "updated": filtered_targets,
+                "source_included": source_included,
+                "included_targets": included_targets,
+                "review_targets": review_targets,
+                "mirror_report": mirror_report,
+            }
+        )
 
     except Exception as e:
         helpers.ts_log(f"Failed to copy library settings: {e}", level="ERROR")

@@ -1,4 +1,8 @@
 import { getAppConfig, setAppConfig } from './modules/appConfig.js'
+import {
+  findYamlMajorSections,
+  renderLogRows
+} from './modules/kometa/_util.js'
 
 (function () {
   const isDebug = String(getAppConfig('QS_DEBUG', false)).toLowerCase() === 'true'
@@ -537,6 +541,88 @@ function qsShowQueuedFlashToast () {
 }
 
 // Function to show toast messages
+function qsConfirmAction (options = {}) {
+  const title = String(options.title || 'Confirm action')
+  const message = String(options.message || 'Continue?')
+  const details = String(options.details || '').trim()
+  const confirmText = String(options.confirmText || 'Continue')
+  const cancelText = String(options.cancelText || 'Cancel')
+  const confirmClass = String(options.confirmClass || 'btn-primary')
+  const iconClass = String(options.iconClass || 'bi bi-exclamation-triangle text-warning')
+  const modalEl = document.getElementById('qs-confirm-modal')
+
+  const fallback = () => {
+    const fallbackMessage = [title, '', message, details ? `\n${details}` : ''].filter((part) => part !== '').join('\n')
+    return Promise.resolve(typeof window.confirm === 'function' ? window.confirm(fallbackMessage) : true)
+  }
+  if (!modalEl || typeof bootstrap === 'undefined' || !bootstrap.Modal) return fallback()
+
+  const titleEl = document.getElementById('qs-confirm-title')
+  const titleText = titleEl ? titleEl.querySelector('span') : null
+  const iconEl = document.getElementById('qs-confirm-icon')
+  const messageEl = document.getElementById('qs-confirm-message')
+  const detailsEl = document.getElementById('qs-confirm-details')
+  const confirmBtn = document.getElementById('qs-confirm-confirm')
+  const cancelBtn = document.getElementById('qs-confirm-cancel')
+  if (!titleEl || !messageEl || !confirmBtn || !cancelBtn) return fallback()
+
+  if (titleText) titleText.textContent = title
+  else titleEl.textContent = title
+  if (iconEl) iconEl.className = iconClass
+  messageEl.textContent = message
+  if (detailsEl) {
+    detailsEl.textContent = details
+    detailsEl.classList.toggle('d-none', !details)
+  }
+  confirmBtn.textContent = confirmText
+  cancelBtn.textContent = cancelText
+  confirmBtn.className = `btn ${confirmClass}`
+
+  return new Promise((resolve) => {
+    const modal = bootstrap.Modal.getOrCreateInstance(modalEl)
+    let settled = false
+    let shown = false
+    let approved = false
+    let closing = false
+    const cleanup = () => {
+      confirmBtn.removeEventListener('click', onConfirm)
+      cancelBtn.removeEventListener('click', onCancel)
+      modalEl.removeEventListener('hidden.bs.modal', onHidden)
+      modalEl.removeEventListener('shown.bs.modal', onShown)
+    }
+    const settle = (value) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(value)
+    }
+    const onConfirm = () => {
+      if (closing) return
+      approved = true
+      closing = true
+      if (shown) modal.hide()
+    }
+    const onCancel = () => {
+      if (closing) return
+      closing = true
+      if (shown) modal.hide()
+    }
+    // Bootstrap ignores hide requests while its opening transition is active.
+    const onShown = () => {
+      shown = true
+      if (closing) modal.hide()
+    }
+    const onHidden = () => settle(approved)
+    confirmBtn.addEventListener('click', onConfirm)
+    cancelBtn.addEventListener('click', onCancel)
+    modalEl.addEventListener('hidden.bs.modal', onHidden)
+    modalEl.addEventListener('shown.bs.modal', onShown)
+    modal.show()
+  })
+}
+
+window.QS_confirmAction = qsConfirmAction
+
 function showToast (type, message) {
   const toastId = `toast-${Date.now()}` // Unique ID for each toast
   const toastContainer = document.querySelector('.toast-container')
@@ -596,6 +682,8 @@ let qsLastMaintenancePaused = false
 let qsLastQueuedStartedAt = null
 const QS_LOGSCAN_REINGEST_POLL_INTERVAL_MS = 15000
 const QS_BACKGROUND_JOBS_POLL_INTERVAL_MS = 15000
+const QS_BULK_VALIDATION_POLL_INTERVAL_MS = 7000
+const QS_KOMETA_PROGRESS_POLL_INTERVAL_MS = 15000
 const qsCurrentTemplate = String(window.QS_CURRENT_TEMPLATE || document.documentElement.dataset.qsTemplate || '').trim()
 const qsSkipMaintenancePoll = qsCurrentTemplate === '900-kometa'
 const qsSkipImageMaidPoll = qsCurrentTemplate === '915-imagemaid'
@@ -604,12 +692,17 @@ const QS_APP_READINESS_POLL_INTERVAL_MS = 12000
 let qsLatestKometaStatus = null
 let qsLatestImageMaidStatus = null
 let qsLatestAppReadiness = null
+let qsLatestBulkValidationProgress = null
+let qsLatestKometaRunProgress = null
 let qsActiveBackgroundJobs = []
 let qsMaintenancePollInFlight = false
 let qsLogscanReingestPollInFlight = false
 let qsImageMaidPollInFlight = false
 let qsBackgroundJobsPollInFlight = false
 let qsAppReadinessPollInFlight = false
+let qsAppReadinessRequest = null
+let qsBulkValidationPollInFlight = false
+let qsKometaProgressPollInFlight = false
 
 function qsShouldPollBackgroundState () {
   return !document.hidden
@@ -650,6 +743,121 @@ function qsFormatElapsedLabel (seconds) {
   return parts.join(' ')
 }
 
+function qsFormatActiveNumber (value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return ''
+  return numeric.toLocaleString()
+}
+
+function qsFormatActivePercent (value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return ''
+  return `${numeric.toFixed(1)}%`
+}
+
+function qsFormatActiveMb (value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return ''
+  if (numeric >= 1024) return `${(numeric / 1024).toFixed(1)} GB`
+  return `${numeric.toFixed(1)} MB`
+}
+
+function qsFormatActiveRate (value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return ''
+  return `${Math.max(0, numeric).toFixed(2)} MB/s`
+}
+
+function qsPushActiveDetail (details, label, value) {
+  const text = String(value || '').trim()
+  if (!text) return
+  details.push(label ? `${label}: ${text}` : text)
+}
+
+function qsBuildRuntimeActiveDetails (data, processLabel) {
+  const details = []
+  const cpu = qsFormatActivePercent(data.cpu_percent)
+  const memory = qsFormatActiveMb(data.memory_rss_mb)
+  if (cpu || memory) qsPushActiveDetail(details, processLabel, [cpu ? `CPU ${cpu}` : '', memory ? `RAM ${memory}` : ''].filter(Boolean).join(' | '))
+
+  const systemCpu = qsFormatActivePercent(data.system_cpu_percent)
+  const systemMemoryUsed = qsFormatActiveMb(data.system_memory_used_mb)
+  const systemMemoryTotal = qsFormatActiveMb(data.system_memory_total_mb)
+  if (systemCpu || systemMemoryUsed || systemMemoryTotal) {
+    const memoryText = systemMemoryUsed && systemMemoryTotal ? `${systemMemoryUsed}/${systemMemoryTotal}` : (systemMemoryUsed || systemMemoryTotal)
+    qsPushActiveDetail(details, 'System', [systemCpu ? `CPU ${systemCpu}` : '', memoryText ? `RAM ${memoryText}` : ''].filter(Boolean).join(' | '))
+  }
+
+  const readRate = qsFormatActiveRate(data.disk_read_rate_mb_s)
+  const writeRate = qsFormatActiveRate(data.disk_write_rate_mb_s)
+  if (readRate || writeRate) qsPushActiveDetail(details, 'Disk rate', [readRate ? `R ${readRate}` : '', writeRate ? `W ${writeRate}` : ''].filter(Boolean).join(' | '))
+
+  const readTotal = qsFormatActiveMb(data.disk_read_mb)
+  const writeTotal = qsFormatActiveMb(data.disk_write_mb)
+  if (readTotal || writeTotal) qsPushActiveDetail(details, 'Disk total', [readTotal ? `${readTotal} read` : '', writeTotal ? `${writeTotal} written` : ''].filter(Boolean).join(' | '))
+
+  if (data.started_at) qsPushActiveDetail(details, 'Started', qsFormatTimestamp(data.started_at))
+  if (Number.isFinite(Number(data.log_age_seconds))) {
+    const age = qsFormatElapsedLabel(data.log_age_seconds)
+    qsPushActiveDetail(details, data.log_is_stale ? 'Log stale' : 'Log updated', age ? `${age} ago` : '')
+  }
+  return details
+}
+
+function qsBuildActiveTitleAttr (label, meta, details) {
+  return [label, meta, ...(Array.isArray(details) ? details : [])].filter(Boolean).join(' | ')
+}
+
+function qsFormatKometaPhaseLabel (phase) {
+  const normalized = String(phase || '').trim().toLowerCase()
+  const labels = {
+    operations: 'Operations',
+    metadata: 'Metadata',
+    collections: 'Collections',
+    overlays: 'Overlays',
+    playlists: 'Playlists'
+  }
+  return labels[normalized] || (normalized ? normalized.replaceAll('_', ' ') : '')
+}
+
+function qsBuildKometaProgressDetails () {
+  const progress = qsLatestKometaRunProgress
+  if (!progress || typeof progress !== 'object') return []
+
+  const details = []
+  const currentLibrary = String(progress.current_library || '').trim()
+  const phase = qsFormatKometaPhaseLabel(progress.phase_current)
+  const totalCount = Number(progress.total_count || 0)
+  const completedCount = Number(progress.completed_count || 0)
+  const phaseOrder = Array.isArray(progress.phase_order) && progress.phase_order.length
+    ? progress.phase_order
+    : ['operations', 'metadata', 'collections', 'overlays', 'playlists']
+  const phaseIndex = progress.phase_current ? Math.max(0, phaseOrder.indexOf(progress.phase_current)) : 0
+  const totalSteps = totalCount > 0 ? totalCount * Math.max(1, phaseOrder.length) : 0
+  const completedSteps = currentLibrary && totalSteps > 0
+    ? Math.min(totalSteps, (Math.max(0, completedCount) * Math.max(1, phaseOrder.length)) + phaseIndex)
+    : Math.max(0, completedCount) * Math.max(1, phaseOrder.length)
+
+  if (currentLibrary) {
+    qsPushActiveDetail(details, 'Current', phase ? `${currentLibrary} | ${phase}` : currentLibrary)
+  } else if (progress.playlist_running) {
+    qsPushActiveDetail(details, 'Current', 'Playlists')
+  } else if (phase) {
+    qsPushActiveDetail(details, 'Current phase', phase)
+  }
+  if (totalCount > 0) qsPushActiveDetail(details, 'Libraries', `${Math.min(Math.max(0, completedCount), totalCount)}/${totalCount} complete`)
+  if (totalSteps > 0) qsPushActiveDetail(details, 'Matrix step', `${completedSteps}/${totalSteps}`)
+  if (Number.isFinite(Number(progress.current_phase_elapsed_seconds))) {
+    const elapsed = qsFormatElapsedLabel(progress.current_phase_elapsed_seconds)
+    qsPushActiveDetail(details, 'Phase elapsed', elapsed)
+  }
+  if (Number.isFinite(Number(progress.preparation_elapsed_seconds))) {
+    const elapsed = qsFormatElapsedLabel(progress.preparation_elapsed_seconds)
+    qsPushActiveDetail(details, 'Preparation', elapsed)
+  }
+  return details
+}
+
 function qsBuildKometaActiveWorkEntry () {
   const data = qsLatestKometaStatus
   if (!data || typeof data !== 'object') return null
@@ -658,63 +866,87 @@ function qsBuildKometaActiveWorkEntry () {
   const href = '/step/900-kometa'
   const status = String(data.status || '').trim().toLowerCase()
   const running = status === 'running'
-  const unavailableBlocksWork = Boolean(data.window_unavailable) && (Boolean(data.pending_start) || Boolean(data.maintenance_paused) || running)
+  const scheduledWaiting = status === 'scheduled_waiting'
+  const runtimeDetails = qsBuildRuntimeActiveDetails(data, 'Kometa')
+  const progressDetails = qsBuildKometaProgressDetails()
+  const unavailableBlocksWork = Boolean(data.window_unavailable) && (Boolean(data.pending_start) || Boolean(data.maintenance_paused) || running || scheduledWaiting)
 
   if (unavailableBlocksWork) {
     const since = data.window_unavailable_since ? `Since ${qsFormatTimestamp(data.window_unavailable_since)}` : 'Maintenance window data unavailable'
+    const details = [...progressDetails, ...runtimeDetails]
+    if (windowLabel) qsPushActiveDetail(details, 'Window', windowLabel)
     return {
       key: 'kometa-window-unavailable',
       title: 'Maintenance window data unavailable',
       chip: 'Waiting',
       state: 'warn',
       meta: windowLabel ? `${since} • Window ${windowLabel}` : since,
+      details,
       href,
-      titleAttr: windowLabel
-        ? `Quickstart cannot read the configured Plex maintenance window ${windowLabel} while work is active.`
-        : 'Quickstart cannot read the configured Plex maintenance window while work is active.'
+      titleAttr: qsBuildActiveTitleAttr('Quickstart cannot read the configured Plex maintenance window while work is active.', since, details)
     }
   }
 
   if (data.pending_start) {
     const requested = data.pending_requested_at ? `Requested ${qsFormatTimestamp(data.pending_requested_at)}` : 'Queued for next available window'
+    const details = []
+    if (windowLabel) qsPushActiveDetail(details, 'Window', windowLabel)
     return {
       key: 'kometa-queued',
       title: 'Kometa queued',
       chip: 'Queued',
       state: 'warn',
       meta: windowLabel ? `${requested} • Window ${windowLabel}` : requested,
+      details,
       href,
-      titleAttr: windowLabel
-        ? `Kometa will start automatically when the maintenance window ${windowLabel} opens.`
-        : 'Kometa start has been queued.'
+      titleAttr: qsBuildActiveTitleAttr('Kometa start has been queued.', requested, details)
     }
   }
 
   if (data.maintenance_paused) {
     const pausedSince = data.maintenance_paused_since ? `Paused ${qsFormatTimestamp(data.maintenance_paused_since)}` : 'Paused for Plex maintenance'
+    const details = [...progressDetails, ...runtimeDetails]
+    if (windowLabel) qsPushActiveDetail(details, 'Window', windowLabel)
     return {
       key: 'kometa-paused',
       title: 'Kometa run',
       chip: 'Paused',
       state: 'warn',
       meta: windowLabel ? `${pausedSince} • Window ${windowLabel}` : pausedSince,
+      details,
       href,
-      titleAttr: windowLabel
-        ? `Kometa is paused for Plex maintenance during ${windowLabel}.`
-        : 'Kometa is paused for Plex maintenance.'
+      titleAttr: qsBuildActiveTitleAttr('Kometa is paused for Plex maintenance.', pausedSince, details)
+    }
+  }
+
+  if (scheduledWaiting) {
+    const details = [...progressDetails, ...runtimeDetails]
+    if (data.scheduled_run_local) qsPushActiveDetail(details, 'Next run', data.scheduled_run_local)
+    if (Array.isArray(data.schedule_times) && data.schedule_times.length) qsPushActiveDetail(details, 'Schedule', data.schedule_times.join(' | '))
+    return {
+      key: 'kometa-scheduled-waiting',
+      title: 'Kometa scheduler',
+      chip: 'Waiting',
+      state: 'warn',
+      meta: data.scheduled_run_local ? `Next run ${data.scheduled_run_local}` : 'Current run finished; waiting for the next scheduled time.',
+      details,
+      href,
+      titleAttr: qsBuildActiveTitleAttr('Kometa scheduler', data.scheduled_run_local ? `Next run ${data.scheduled_run_local}` : 'Current run finished; waiting for the next scheduled time.', details)
     }
   }
 
   if (running) {
     const elapsed = qsFormatElapsedLabel(data.elapsed_seconds)
+    const details = [...progressDetails, ...runtimeDetails]
     return {
       key: 'kometa-running',
       title: 'Kometa run',
       chip: 'Running',
       state: 'unknown',
       meta: elapsed ? `Elapsed ${elapsed}` : 'Kometa is currently running.',
+      details,
       href,
-      titleAttr: elapsed ? `Kometa has been running for ${elapsed}.` : 'Kometa is currently running.'
+      titleAttr: qsBuildActiveTitleAttr('Kometa run', elapsed ? `Elapsed ${elapsed}` : 'Kometa is currently running.', details)
     }
   }
 
@@ -724,17 +956,57 @@ function qsBuildKometaActiveWorkEntry () {
 function qsBuildImageMaidActiveWorkEntry () {
   const data = qsLatestImageMaidStatus
   if (!data || typeof data !== 'object') return null
-  if (String(data.status || '').trim().toLowerCase() !== 'running') return null
+  const status = String(data.status || '').trim().toLowerCase()
+  if (status !== 'running' && status !== 'starting') return null
 
   const elapsed = qsFormatElapsedLabel(data.elapsed_seconds)
+  const details = qsBuildRuntimeActiveDetails(data, 'ImageMaid')
   return {
     key: 'imagemaid-running',
     title: 'ImageMaid run',
-    chip: 'Running',
+    chip: status === 'starting' ? 'Starting' : 'Running',
     state: 'unknown',
-    meta: elapsed ? `Elapsed ${elapsed}` : 'ImageMaid is currently running.',
+    meta: elapsed ? `Elapsed ${elapsed}` : (status === 'starting' ? 'ImageMaid is starting.' : 'ImageMaid is currently running.'),
+    details,
     href: '/step/915-imagemaid',
-    titleAttr: elapsed ? `ImageMaid has been running for ${elapsed}.` : 'ImageMaid is currently running.'
+    titleAttr: qsBuildActiveTitleAttr('ImageMaid run', elapsed ? `Elapsed ${elapsed}` : '', details)
+  }
+}
+
+function qsBuildBulkValidationActiveWorkEntry () {
+  const progress = qsLatestBulkValidationProgress
+  if (!progress || typeof progress !== 'object') return null
+  const phase = String(progress.phase || '').trim().toLowerCase()
+  if (phase !== 'running' && phase !== 'queued' && phase !== 'starting') return null
+
+  const total = Number(progress.total || 0)
+  const completed = Number(progress.completed || 0)
+  const currentLabel = String(progress.current_label || '').trim()
+  const currentStatus = String(progress.current_status || '').trim().toLowerCase()
+  const summary = progress.summary && typeof progress.summary === 'object' ? progress.summary : {}
+  const safeCompleted = Number.isFinite(completed) ? Math.max(0, completed) : 0
+  const safeTotal = Number.isFinite(total) ? Math.max(0, total) : 0
+  const pct = safeTotal > 0 ? Math.max(0, Math.min(100, Math.round((safeCompleted / safeTotal) * 100))) : null
+  const counts = qsGetBulkSummaryCounts(summary)
+  const details = []
+
+  if (currentLabel) qsPushActiveDetail(details, 'Current', currentStatus && currentStatus !== 'running' ? `${currentLabel} (${currentStatus})` : currentLabel)
+  if (safeTotal > 0) qsPushActiveDetail(details, 'Steps', `${Math.min(safeCompleted, safeTotal)}/${safeTotal}${pct !== null ? ` (${pct}%)` : ''}`)
+  qsPushActiveDetail(details, 'Results', `Validated ${counts.validated} | Failed ${counts.failed} | Skipped ${counts.skipped}`)
+  if (progress.updated_at) qsPushActiveDetail(details, 'Updated', qsFormatTimestamp(progress.updated_at))
+
+  const meta = safeTotal > 0
+    ? `Validating ${Math.min(safeCompleted, safeTotal)}/${safeTotal}${currentLabel ? ` - ${currentLabel}` : ''}`
+    : (currentLabel ? `Validating ${currentLabel}` : 'Validating services')
+  return {
+    key: `bulk-validation-${progress.run_id || 'active'}`,
+    title: 'Validate All',
+    chip: phase === 'queued' ? 'Queued' : 'Validating',
+    state: 'unknown',
+    meta,
+    details,
+    href: '/step/900-kometa',
+    titleAttr: qsBuildActiveTitleAttr('Validate All', meta, details)
   }
 }
 
@@ -742,6 +1014,7 @@ function qsGetBackgroundJobLabel (job) {
   const jobType = String(job && job.job_type ? job.job_type : '').trim()
   const trigger = String(job && job.trigger ? job.trigger : '').trim()
   if (jobType === 'logscan_reingest') {
+    if (trigger.endsWith('_run_complete')) return 'Analytics ingest'
     return trigger === 'startup_migration' ? 'Analytics migration' : 'Analytics reingest'
   }
   if (jobType === 'kometa_update') return 'Kometa update'
@@ -788,10 +1061,21 @@ function qsGetBackgroundJobMeta (job) {
   if (!job || typeof job !== 'object') return ''
 
   const parts = []
+  const jobType = String(job.job_type || '').trim()
   const pct = Number(job.pct)
   const text = String(job.text || '').trim()
   const currentFile = String(job.current_file || '').trim()
   const summary = job.summary && typeof job.summary === 'object' ? job.summary : {}
+
+  if (jobType === 'kometa_update') {
+    if (job.force) parts.push('Forced update')
+    else parts.push('Standard update')
+    if (job.kometa_branch) parts.push(`Branch ${job.kometa_branch}`)
+  } else if (jobType === 'imagemaid_update') {
+    if (job.force) parts.push('Forced update')
+    else parts.push('Standard update')
+    if (job.imagemaid_branch) parts.push(`Branch ${job.imagemaid_branch}`)
+  }
 
   if (text) parts.push(text)
   if (currentFile) parts.push(`File ${currentFile}`)
@@ -807,6 +1091,63 @@ function qsGetBackgroundJobMeta (job) {
   return parts.filter(Boolean).slice(0, 3).join(' • ')
 }
 
+function qsGetLastBackgroundJobLogLine (job) {
+  const logs = Array.isArray(job && job.logs) ? job.logs : []
+  for (let index = logs.length - 1; index >= 0; index -= 1) {
+    const line = String(logs[index] || '').trim()
+    if (line) return line
+  }
+  return ''
+}
+
+function qsGetBackgroundJobDetails (job) {
+  if (!job || typeof job !== 'object') return []
+
+  const details = []
+  const jobType = String(job.job_type || '').trim()
+  const phase = String(job.phase || '').trim()
+  const trigger = String(job.trigger || '').trim()
+  const pct = Number(job.pct)
+  const started = job.started_at || (Number.isFinite(Number(job.started_epoch)) ? new Date(Number(job.started_epoch) * 1000).toISOString() : '')
+
+  if (phase) qsPushActiveDetail(details, 'Phase', phase.replaceAll('_', ' '))
+  if (Number.isFinite(pct)) qsPushActiveDetail(details, 'Progress', `${Math.max(0, Math.min(100, Math.round(pct)))}%`)
+  if (trigger && trigger !== 'manual') qsPushActiveDetail(details, 'Trigger', trigger.replaceAll('_', ' '))
+  if (started) qsPushActiveDetail(details, 'Started', qsFormatTimestamp(started))
+
+  if (jobType === 'logscan_reingest') {
+    if (Number.isFinite(Number(job.scanned)) && Number.isFinite(Number(job.total))) {
+      qsPushActiveDetail(details, 'Scanned', `${qsFormatActiveNumber(job.scanned)}/${qsFormatActiveNumber(job.total)}`)
+    }
+    qsPushActiveDetail(details, 'Ingested', qsFormatActiveNumber(job.ingested))
+    if (Number(job.archived || 0) > 0) qsPushActiveDetail(details, 'Archived', qsFormatActiveNumber(job.archived))
+    qsPushActiveDetail(details, 'Duplicates', qsFormatActiveNumber(job.duplicates))
+    const skipped = Number(job.skipped_incomplete || 0) + Number(job.skipped_invalid || 0)
+    if (skipped > 0) qsPushActiveDetail(details, 'Skipped', qsFormatActiveNumber(skipped))
+    if (job.current_file) qsPushActiveDetail(details, 'File', job.current_file)
+  } else if (jobType === 'kometa_update') {
+    qsPushActiveDetail(details, 'Mode', job.force ? 'Forced update' : 'Standard update')
+    qsPushActiveDetail(details, 'Kometa branch', job.kometa_branch)
+    qsPushActiveDetail(details, 'Quickstart branch', job.qs_branch)
+    qsPushActiveDetail(details, 'Last log', qsGetLastBackgroundJobLogLine(job))
+  } else if (jobType === 'imagemaid_update') {
+    qsPushActiveDetail(details, 'Mode', job.force ? 'Forced update' : 'Standard update')
+    qsPushActiveDetail(details, 'ImageMaid branch', job.imagemaid_branch)
+    qsPushActiveDetail(details, 'Last log', qsGetLastBackgroundJobLogLine(job))
+  } else if (jobType === 'test_library_install') {
+    if (Number.isFinite(Number(job.downloaded)) && Number.isFinite(Number(job.total))) {
+      qsPushActiveDetail(details, 'Download', `${qsFormatActiveMb(Number(job.downloaded) / (1024 * 1024))}/${qsFormatActiveMb(Number(job.total) / (1024 * 1024))}${job.estimated ? ' estimated' : ''}`)
+    }
+    if (Number.isFinite(Number(job.files_done)) && Number.isFinite(Number(job.files_total))) {
+      qsPushActiveDetail(details, 'Files', `${qsFormatActiveNumber(job.files_done)}/${qsFormatActiveNumber(job.files_total)}`)
+    }
+    qsPushActiveDetail(details, 'Target', job.target_path)
+  }
+
+  if (job.error) qsPushActiveDetail(details, 'Error', job.error)
+  return details.filter(Boolean).slice(0, 6)
+}
+
 function qsBuildBackgroundJobEntries () {
   if (!Array.isArray(qsActiveBackgroundJobs)) return []
   return qsActiveBackgroundJobs
@@ -816,6 +1157,7 @@ function qsBuildBackgroundJobEntries () {
       const chip = qsGetBackgroundJobChip(job)
       const meta = qsGetBackgroundJobMeta(job)
       const href = String(job.target_page || '').trim() || '#'
+      const details = qsGetBackgroundJobDetails(job)
       return {
         key: `job-${job.job_id || label}`,
         jobId: String(job.job_id || '').trim() || null,
@@ -824,8 +1166,9 @@ function qsBuildBackgroundJobEntries () {
         state: qsGetBackgroundJobState(job),
         badgeClasses: qsGetBackgroundJobBadgeClasses(job),
         meta: meta || 'In progress.',
+        details,
         href,
-        titleAttr: meta ? `${label}: ${meta}` : label
+        titleAttr: qsBuildActiveTitleAttr(label, meta || 'In progress.', details)
       }
     })
 }
@@ -855,6 +1198,8 @@ function qsRenderActiveWorkCard () {
   if (kometaEntry) entries.push(kometaEntry)
   const imageMaidEntry = qsBuildImageMaidActiveWorkEntry()
   if (imageMaidEntry) entries.push(imageMaidEntry)
+  const bulkValidationEntry = qsBuildBulkValidationActiveWorkEntry()
+  if (bulkValidationEntry) entries.push(bulkValidationEntry)
   entries.push(...qsBuildBackgroundJobEntries())
 
   const rollupState = qsComputeActiveWorkRollupState(entries)
@@ -892,6 +1237,10 @@ function qsRenderActiveWorkCard () {
       : ' href="#"'
     const titleAttr = entry.titleAttr ? ` title="${escapeHtml(entry.titleAttr)}"` : ''
     const targetLabelAttr = ` data-qs-target-label="${escapeHtml(entry.title)}"`
+    const detailRows = Array.isArray(entry.details)
+      ? entry.details.filter(Boolean).slice(0, 6).map((line) => `<div class="qs-active-work-detail-line">${escapeHtml(line)}</div>`).join('')
+      : ''
+    const detailsHtml = detailRows ? `<div class="qs-active-work-detail-list">${detailRows}</div>` : ''
     return `
       <a class="qs-active-work-item qs-active-work-item--${escapeHtml(entry.state)}"${hrefAttr}${titleAttr}${targetLabelAttr}>
         <div class="qs-active-work-item-head">
@@ -899,6 +1248,7 @@ function qsRenderActiveWorkCard () {
           <span class="qs-active-work-chip qs-active-work-chip--${escapeHtml(entry.state)}">${escapeHtml(entry.chip)}</span>
         </div>
         <div class="qs-active-work-item-meta">${escapeHtml(entry.meta || '')}</div>
+        ${detailsHtml}
       </a>`
   }).join('')
 }
@@ -931,6 +1281,9 @@ function qsRenderBackgroundJobPills () {
 function qsHandleMaintenanceStatus (data) {
   if (!data) return
   qsLatestKometaStatus = data
+  const activeStatus = String(data.status || '').trim().toLowerCase()
+  const active = activeStatus === 'running' || activeStatus === 'scheduled_waiting' || Boolean(data.maintenance_paused)
+  if (!active) qsLatestKometaRunProgress = null
   const paused = Boolean(data.maintenance_paused)
   const windowLabel = data.maintenance_window ? ` (${data.maintenance_window})` : ''
   const status = String(data.status || '').trim().toLowerCase()
@@ -944,7 +1297,7 @@ function qsHandleMaintenanceStatus (data) {
   const queuedBadge = document.getElementById('qs-queued-badge')
 
   if (runningBadge) {
-    if (data.status === 'running') {
+    if (data.status === 'running' || data.status === 'scheduled_waiting') {
       const elapsed = typeof data.elapsed_seconds === 'number' ? data.elapsed_seconds : null
       let elapsedLabel = ''
       if (elapsed !== null) {
@@ -960,7 +1313,11 @@ function qsHandleMaintenanceStatus (data) {
       runningBadge.classList.remove('d-none')
       const label = runningBadge.querySelector('span')
       if (label) {
-        label.innerHTML = `<i class="bi bi-play-circle me-1"></i> Kometa running${elapsedLabel}`
+        if (data.status === 'scheduled_waiting') {
+          label.innerHTML = '<i class="bi bi-hourglass-split me-1"></i> Kometa scheduler waiting'
+        } else {
+          label.innerHTML = `<i class="bi bi-play-circle me-1"></i> Kometa running${elapsedLabel}`
+        }
       }
     } else {
       runningBadge.classList.add('d-none')
@@ -1036,6 +1393,13 @@ function qsHandleMaintenanceStatus (data) {
 
 window.QS_handleMaintenanceStatus = qsHandleMaintenanceStatus
 window.QS_formatTimestamp = qsFormatTimestamp
+
+function qsHandleKometaRunProgress (data) {
+  qsLatestKometaRunProgress = data && typeof data === 'object' ? data : null
+  qsRenderActiveWorkCard()
+}
+
+window.QS_handleKometaRunProgress = qsHandleKometaRunProgress
 
 function qsHandleImageMaidStatus (data) {
   qsLatestImageMaidStatus = data
@@ -1126,24 +1490,25 @@ function qsHydrateImageMaidReadiness (entry) {
 function qsFormatAppReadinessSnippet (entry) {
   const state = qsGetAppReadinessState(entry)
   const name = String((entry && entry.name) || 'App').trim()
+  const summary = String((entry && entry.summary) || '').trim()
   switch (state) {
     case 'ready':
     case 'review':
-      return `${name} ready`
+      return `${name}: ${summary || 'available'}`
     case 'running':
       return `${name} running`
     case 'queued':
       return `${name} queued`
     case 'needs_validation':
-      return `${name} needs validation`
+      return `${name}: ${summary || 'needs validation'}`
     case 'needs_prepare':
-      return `${name} needs preparation`
+      return `${name}: ${summary || 'needs preparation'}`
     case 'blocked':
     case 'needs_setup':
     case 'error':
-      return `${name}: ${String((entry && entry.summary) || 'needs attention').trim()}`
+      return `${name}: ${summary || 'needs attention'}`
     default:
-      return `${name}: ${String((entry && entry.summary) || 'checking status').trim()}`
+      return `${name}: ${summary || 'checking status'}`
   }
 }
 
@@ -1205,7 +1570,8 @@ function qsRenderAppReadiness () {
   const availableEntries = entries.filter(entry => qsIsAppReadinessAvailable(entry))
   const runningEntries = entries.filter(entry => qsGetAppReadinessState(entry) === 'running')
   const validationEntries = entries.filter(entry => qsGetAppReadinessState(entry) === 'needs_validation')
-  const setupEntries = entries.filter((entry) => ['needs_setup', 'needs_prepare', 'blocked', 'error'].includes(qsGetAppReadinessState(entry)))
+  const prepareEntries = entries.filter(entry => qsGetAppReadinessState(entry) === 'needs_prepare')
+  const setupEntries = entries.filter((entry) => ['needs_setup', 'blocked', 'error'].includes(qsGetAppReadinessState(entry)))
 
   let lineState = 'unknown'
   let lineText = 'Apps: checking status...'
@@ -1213,20 +1579,16 @@ function qsRenderAppReadiness () {
 
   if (availableEntries.length === entries.length) {
     lineState = 'ok'
-    if (entries.length === 1) {
-      lineText = `Apps: ${entries[0].name} is ready.`
-    } else {
-      lineText = `Apps: ${entries.map(entry => entry.name).join(' and ')} are ready.`
-    }
-    groupMetaText = runningEntries.length > 0 ? `${runningEntries.length} Running` : `${availableEntries.length} Ready`
+    lineText = `Apps: ${entries.map(qsFormatAppReadinessSnippet).join('; ')}.`
+    groupMetaText = runningEntries.length > 0 ? `${runningEntries.length} Running` : `${availableEntries.length} Available`
   } else if (availableEntries.length > 0) {
     lineState = 'warn'
     lineText = `Apps: ${entries.map(qsFormatAppReadinessSnippet).join('; ')}.`
-    groupMetaText = `${availableEntries.length} Ready`
-  } else if (validationEntries.length > 0) {
+    groupMetaText = `${availableEntries.length} Available`
+  } else if (validationEntries.length > 0 || prepareEntries.length > 0) {
     lineState = 'warn'
     lineText = `Apps: ${entries.map(qsFormatAppReadinessSnippet).join('; ')}.`
-    groupMetaText = 'Validate'
+    groupMetaText = validationEntries.length > 0 ? 'Validate' : 'Prepare'
   } else if (setupEntries.length > 0) {
     lineState = 'error'
     lineText = `Apps: ${entries.map(qsFormatAppReadinessSnippet).join('; ')}.`
@@ -1254,8 +1616,48 @@ function qsRenderAppReadiness () {
   qsSetStepGroupIndicatorState(appsGroup, lineState)
 }
 
-function qsRefreshAppReadiness () {
-  qsRenderAppReadiness()
+function qsFetchAppReadiness () {
+  if (qsAppReadinessRequest) return qsAppReadinessRequest
+
+  qsAppReadinessPollInFlight = true
+  qsAppReadinessRequest = fetch(`/workspace_app_readiness?_=${Date.now()}`, {
+    method: 'GET',
+    cache: 'no-store',
+    credentials: 'same-origin',
+    headers: { Accept: 'application/json' }
+  })
+    .then(res => res.json())
+    .then((data) => {
+      qsLatestAppReadiness = data
+      qsRenderAppReadiness()
+      return data
+    })
+    .catch(() => null)
+    .finally(() => {
+      qsAppReadinessPollInFlight = false
+      qsAppReadinessRequest = null
+    })
+
+  return qsAppReadinessRequest
+}
+
+function qsRefreshAppReadiness (options = {}) {
+  const shouldFetch = options === true || Boolean(options.fetch || options.immediate)
+  if (!shouldFetch) {
+    qsRenderAppReadiness()
+    return Promise.resolve(qsLatestAppReadiness)
+  }
+
+  const requests = [qsFetchAppReadiness()]
+  if (options.workspaceStatus !== false && typeof qsRefreshWorkspaceStatus === 'function') {
+    requests.push(qsRefreshWorkspaceStatus({
+      immediate: true,
+      configName: options.configName || ''
+    }))
+  }
+
+  return Promise.allSettled(requests)
+    .then(() => qsLatestAppReadiness)
 }
 
 window.QS_refreshAppReadiness = qsRefreshAppReadiness
@@ -1315,17 +1717,7 @@ window.QS_refreshAppReadiness = qsRefreshAppReadiness
 ;(function qsAppReadinessPoll () {
   const poll = () => {
     if (!qsShouldPollBackgroundState() || qsAppReadinessPollInFlight) return
-    qsAppReadinessPollInFlight = true
-    fetch('/workspace_app_readiness')
-      .then(res => res.json())
-      .then((data) => {
-        qsLatestAppReadiness = data
-        qsRenderAppReadiness()
-      })
-      .catch(() => {})
-      .finally(() => {
-        qsAppReadinessPollInFlight = false
-      })
+    qsFetchAppReadiness()
   }
   setTimeout(poll, 900)
   setInterval(poll, QS_APP_READINESS_POLL_INTERVAL_MS)
@@ -1349,6 +1741,50 @@ window.QS_refreshAppReadiness = qsRefreshAppReadiness
   }
   setTimeout(poll, 1500)
   setInterval(poll, QS_BACKGROUND_JOBS_POLL_INTERVAL_MS)
+})()
+
+;(function qsKometaProgressPoll () {
+  if (qsSkipMaintenancePoll) return
+  const poll = () => {
+    if (!qsShouldPollBackgroundState() || qsKometaProgressPollInFlight) return
+    const active = qsLatestKometaStatus && (
+      String(qsLatestKometaStatus.status || '').trim().toLowerCase() === 'running' ||
+      Boolean(qsLatestKometaStatus.maintenance_paused)
+    )
+    if (!active) return
+    qsKometaProgressPollInFlight = true
+    fetch('/logscan/progress', { cache: 'no-store' })
+      .then(res => {
+        if (!res.ok) return null
+        return res.json()
+      })
+      .then(data => qsHandleKometaRunProgress(data))
+      .catch(() => {})
+      .finally(() => {
+        qsKometaProgressPollInFlight = false
+      })
+  }
+  setTimeout(poll, 2600)
+  setInterval(poll, QS_KOMETA_PROGRESS_POLL_INTERVAL_MS)
+})()
+
+;(function qsBulkValidationPoll () {
+  const poll = () => {
+    if (!qsShouldPollBackgroundState() || qsBulkValidationPollInFlight) return
+    qsBulkValidationPollInFlight = true
+    fetch('/validate_all_services/status', { cache: 'no-store' })
+      .then(res => res.json())
+      .then((data) => {
+        qsLatestBulkValidationProgress = data && data.success ? (data.progress || null) : null
+        qsRenderActiveWorkCard()
+      })
+      .catch(() => {})
+      .finally(() => {
+        qsBulkValidationPollInFlight = false
+      })
+  }
+  setTimeout(poll, 2200)
+  setInterval(poll, QS_BULK_VALIDATION_POLL_INTERVAL_MS)
 })()
 
 document.addEventListener('click', (event) => {
@@ -1443,6 +1879,8 @@ function qsCurrentStepHasMeaningfulInput () {
     '040-github': ['github_token'],
     '050-omdb': ['omdb_apikey'],
     '060-mdblist': ['mdblist_apikey'],
+    '065-serializd': ['serializd_email', 'serializd_password'],
+    '067-floppy': ['floppy_url', 'floppy_token'],
     '070-notifiarr': ['notifiarr_apikey'],
     '080-gotify': ['gotify_url', 'gotify_token'],
     '085-ntfy': ['ntfy_url', 'ntfy_token', 'ntfy_topic'],
@@ -1450,7 +1888,6 @@ function qsCurrentStepHasMeaningfulInput () {
     '088-yamtrack': ['yamtrack_url', 'yamtrack_username', 'yamtrack_password'],
     '110-radarr': ['radarr_url', 'radarr_token'],
     '120-sonarr': ['sonarr_url', 'sonarr_token'],
-    '130-trakt': ['trakt_client_id', 'trakt_client_secret', 'trakt_pin', 'trakt_access_token', 'trakt_refresh_token'],
     '140-mal': ['mal_client_id', 'mal_client_secret', 'mal_localhost_url', 'mal_access_token', 'mal_refresh_token']
   }
   const mappedFields = fieldMap[stepKey] || []
@@ -1576,7 +2013,7 @@ function qsRefreshSectionRollups () {
   })
 }
 
-function qsRefreshSidebarValidationState (inputId) {
+function qsRefreshSidebarValidationState (inputId, options = {}) {
   const validatedInput = inputId ? document.getElementById(inputId) : getValidatedInput()
   if (!validatedInput) return
 
@@ -1594,7 +2031,7 @@ function qsRefreshSidebarValidationState (inputId) {
   qsRecalculateReadinessFromSidebar()
   qsApplyAllDependencyHints()
 
-  if (previousState !== stepState && window.QSWorkspaceStatus && typeof window.QSWorkspaceStatus.refresh === 'function') {
+  if (options.refreshWorkspace !== false && previousState !== stepState && window.QSWorkspaceStatus && typeof window.QSWorkspaceStatus.refresh === 'function') {
     window.QSWorkspaceStatus.refresh({ reason: 'validation-state-change', delayMs: 120 })
   }
 }
@@ -1647,19 +2084,47 @@ function qsApplyGroupMembership (requiredKeys, optionalKeys, reviewKeys) {
     stepMap[key] = stepLink
   })
 
-  const appendInOrder = (listEl, keys) => {
+  const groupedDestination = (listEl, key) => {
+    const subgroup = Array.from(listEl.querySelectorAll('[data-step-keys]')).find((candidate) => {
+      return String(candidate.dataset.stepKeys || '').split(/\s+/).includes(key)
+    })
+    return {
+      element: subgroup?.querySelector('.qs-step-subgroup-list') || listEl.querySelector('[data-step-subgroup="other"] .qs-step-subgroup-list') || listEl,
+      orderedKeys: String(subgroup?.dataset.stepKeys || '').split(/\s+/).filter(Boolean)
+    }
+  }
+
+  const appendInOrder = (listEl, keys, grouped = false) => {
     if (!listEl) return
-    keys.forEach((key) => {
+    keys.forEach((key, index) => {
       const stepLink = stepMap[key]
       if (!stepLink) return
-      listEl.appendChild(stepLink)
+      if (!grouped) {
+        const nextSibling = keys.slice(index + 1).map((nextKey) => stepMap[nextKey]).find((candidate) => candidate?.parentElement === listEl) || null
+        if (stepLink.parentElement !== listEl || stepLink.nextElementSibling !== nextSibling) {
+          listEl.insertBefore(stepLink, nextSibling)
+        }
+        return
+      }
+      const destination = groupedDestination(listEl, key)
+      const orderedKeys = destination.orderedKeys.length ? destination.orderedKeys : keys
+      const targetOrder = orderedKeys.indexOf(key)
+      const siblings = Array.from(destination.element.querySelectorAll('.qs-step-link[data-step-key]')).filter((candidate) => candidate !== stepLink)
+      const nextSibling = siblings.find((candidate) => orderedKeys.indexOf(String(candidate.dataset.stepKey || '')) > targetOrder)
+      if (stepLink.parentElement !== destination.element || stepLink.nextElementSibling !== (nextSibling || null)) {
+        destination.element.insertBefore(stepLink, nextSibling || null)
+      }
+      destination.element.closest('.qs-step-subgroup')?.classList.remove('d-none')
     })
   }
 
-  appendInOrder(groups.required, requiredKeys)
-  appendInOrder(groups.optional, optionalKeys)
+  appendInOrder(groups.required, requiredKeys, true)
+  appendInOrder(groups.optional, optionalKeys, true)
   appendInOrder(groups.review, reviewKeys)
 
+  document.querySelectorAll('.qs-step-subgroup').forEach((subgroup) => {
+    subgroup.classList.toggle('d-none', !subgroup.querySelector('.qs-step-link[data-step-key]'))
+  })
   // Preserve user-controlled expanded/collapsed state.
   // Only auto-open when the current step actually moves to a different section
   // (e.g., Optional -> Required via dependency changes such as MAL).
@@ -1781,6 +2246,16 @@ function qsDependencyConfigMap () {
       windowKey: 'QS_MDBLIST_REQUIREMENT_REASONS',
       label: 'MDBList'
     },
+    floppy: {
+      stepKey: '067-floppy',
+      windowKey: 'QS_FLOPPY_REQUIREMENT_REASONS',
+      label: 'Floppy'
+    },
+    serializd: {
+      stepKey: '065-serializd',
+      windowKey: 'QS_SERIALIZD_REQUIREMENT_REASONS',
+      label: 'Serializd'
+    },
     anidb: {
       stepKey: '100-anidb',
       windowKey: 'QS_ANIDB_REQUIREMENT_REASONS',
@@ -1795,11 +2270,6 @@ function qsDependencyConfigMap () {
       stepKey: '120-sonarr',
       windowKey: 'QS_SONARR_REQUIREMENT_REASONS',
       label: 'Sonarr'
-    },
-    trakt: {
-      stepKey: '130-trakt',
-      windowKey: 'QS_TRAKT_REQUIREMENT_REASONS',
-      label: 'Trakt'
     },
     mal: {
       stepKey: '140-mal',
@@ -2005,10 +2475,11 @@ function qsApplyWorkspaceStatus (payload) {
   const tracearrReasons = qsArrayFromKeys(payload.tracearr_requirement_reasons)
   const omdbReasons = qsArrayFromKeys(payload.omdb_requirement_reasons)
   const mdblistReasons = qsArrayFromKeys(payload.mdblist_requirement_reasons)
+  const floppyReasons = qsArrayFromKeys(payload.floppy_requirement_reasons)
+  const serializdReasons = qsArrayFromKeys(payload.serializd_requirement_reasons)
   const anidbReasons = qsArrayFromKeys(payload.anidb_requirement_reasons)
   const radarrReasons = qsArrayFromKeys(payload.radarr_requirement_reasons)
   const sonarrReasons = qsArrayFromKeys(payload.sonarr_requirement_reasons)
-  const traktReasons = qsArrayFromKeys(payload.trakt_requirement_reasons)
   const malReasons = qsArrayFromKeys(payload.mal_requirement_reasons)
 
   window.QS_REQUIRED_KEYS = requiredKeys
@@ -2018,10 +2489,11 @@ function qsApplyWorkspaceStatus (payload) {
   window.QS_TRACEARR_REQUIREMENT_REASONS = tracearrReasons
   window.QS_OMDB_REQUIREMENT_REASONS = omdbReasons
   window.QS_MDBLIST_REQUIREMENT_REASONS = mdblistReasons
+  window.QS_FLOPPY_REQUIREMENT_REASONS = floppyReasons
+  window.QS_SERIALIZD_REQUIREMENT_REASONS = serializdReasons
   window.QS_ANIDB_REQUIREMENT_REASONS = anidbReasons
   window.QS_RADARR_REQUIREMENT_REASONS = radarrReasons
   window.QS_SONARR_REQUIREMENT_REASONS = sonarrReasons
-  window.QS_TRAKT_REQUIREMENT_REASONS = traktReasons
   window.QS_MAL_REQUIREMENT_REASONS = malReasons
 
   qsApplyGroupMembership(requiredKeys, optionalKeys, reviewKeys)
@@ -2030,10 +2502,11 @@ function qsApplyWorkspaceStatus (payload) {
     tracearr: tracearrReasons,
     omdb: omdbReasons,
     mdblist: mdblistReasons,
+    floppy: floppyReasons,
+    serializd: serializdReasons,
     anidb: anidbReasons,
     radarr: radarrReasons,
     sonarr: sonarrReasons,
-    trakt: traktReasons,
     mal: malReasons
   })
 
@@ -2047,7 +2520,8 @@ function qsApplyWorkspaceStatus (payload) {
   qsRefreshSectionRollups()
   qsApplyReadinessStrip(payload.readiness || {})
   qsRecalculateReadinessFromSidebar()
-  updateValidationCallouts()
+  // Local validation may not be saved yet; reconciling it must not fetch the same stale status again.
+  updateValidationCallouts(undefined, { refreshWorkspace: false })
 }
 
 function qsFetchWorkspaceStatus (options = {}) {
@@ -2219,13 +2693,55 @@ function qsSetBulkValidationLoading (isLoading) {
   })
 }
 
-function qsRunBulkValidation (options = {}) {
-  if (qsBulkValidationRequest) return qsBulkValidationRequest
+function qsShouldPromptForBulkValidationDuringScheduledKometa (options = {}) {
+  if (options.skipScheduledKometaPrompt) return false
+  if (options.silentToast || options.source === 'final-freshness') return false
+  const status = String((qsLatestKometaStatus && qsLatestKometaStatus.status) || '').trim().toLowerCase()
+  return status === 'scheduled_waiting'
+}
 
-  document.dispatchEvent(new CustomEvent('qs:bulk-validation-start', { detail: { source: options.source || null } }))
+function qsConfirmBulkValidationDuringScheduledKometa (options = {}) {
+  if (!qsShouldPromptForBulkValidationDuringScheduledKometa(options)) return Promise.resolve(true)
+  const nextRun = String((qsLatestKometaStatus && qsLatestKometaStatus.scheduled_run_local) || '').trim()
+  return qsConfirmAction({
+    title: 'Kometa scheduler is waiting',
+    message: 'Validate All can continue, but it will not stop the waiting scheduler. If validation finds critical issues, stop Kometa before the next scheduled run.',
+    details: nextRun ? `Next scheduled run: ${nextRun}` : '',
+    confirmText: 'Continue Validate All',
+    cancelText: 'Cancel',
+    confirmClass: 'btn-warning',
+    iconClass: 'bi bi-exclamation-triangle text-warning'
+  }).then((confirmed) => {
+    if (!confirmed && typeof showToast === 'function') {
+      showToast('info', 'Validate All cancelled. Kometa scheduler is still waiting for its next run.')
+    }
+    return confirmed
+  })
+}
+
+function qsStartBulkValidation (options = {}) {
+  const runId = options.runId || `bulk-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  qsLatestBulkValidationProgress = {
+    run_id: runId,
+    phase: 'running',
+    total: 0,
+    completed: 0,
+    current_key: '',
+    current_label: 'Preparing validation',
+    current_status: 'running',
+    results: {},
+    summary: { validated: 0, failed: 0, skipped: 0 },
+    updated_at: new Date().toISOString()
+  }
+  qsRenderActiveWorkCard()
+  document.dispatchEvent(new CustomEvent('qs:bulk-validation-start', { detail: { source: options.source || null, runId } }))
   qsSetBulkValidationLoading(true)
 
-  qsBulkValidationRequest = fetch('/validate_all_services', { method: 'POST' })
+  qsBulkValidationRequest = fetch('/validate_all_services', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ run_id: runId })
+  })
     .then(async (res) => {
       let data = null
       try {
@@ -2244,6 +2760,9 @@ function qsRunBulkValidation (options = {}) {
 
       const results = data.results || {}
       const summary = data.summary || {}
+      data.run_id = data.run_id || runId
+      qsLatestBulkValidationProgress = data.progress || null
+      qsRenderActiveWorkCard()
       qsApplyBulkValidationResults(results, summary)
       document.dispatchEvent(new CustomEvent('qs:bulk-validation-complete', { detail: data }))
 
@@ -2259,6 +2778,19 @@ function qsRunBulkValidation (options = {}) {
       if (typeof showToast === 'function') {
         showToast('error', message)
       }
+      qsLatestBulkValidationProgress = {
+        run_id: runId,
+        phase: 'error',
+        total: 0,
+        completed: 0,
+        current_key: '',
+        current_label: message,
+        current_status: 'failed',
+        results: {},
+        summary: { validated: 0, failed: 0, skipped: 0 },
+        updated_at: new Date().toISOString()
+      }
+      qsRenderActiveWorkCard()
       document.dispatchEvent(new CustomEvent('qs:bulk-validation-error', { detail: { message } }))
       throw err
     })
@@ -2270,13 +2802,20 @@ function qsRunBulkValidation (options = {}) {
   return qsBulkValidationRequest
 }
 
-function updateValidationCallouts (inputId) {
+function qsRunBulkValidation (options = {}) {
+  if (qsBulkValidationRequest) return qsBulkValidationRequest
+  return qsConfirmBulkValidationDuringScheduledKometa(options)
+    .then((confirmed) => confirmed ? qsStartBulkValidation(options) : null)
+}
+
+function updateValidationCallouts (inputId, options = {}) {
   const callouts = document.querySelectorAll('.qs-validation-accordion')
   if (callouts.length) {
     callouts.forEach((wrapper) => {
       const targetId = inputId || wrapper.dataset.qsValidatedInput
       const validatedInput = targetId ? document.getElementById(targetId) : getValidatedInput()
       const isConfigured = qsIsCurrentStepConfigured(validatedInput)
+      const state = qsGetCalloutAccordionState(isConfigured)
 
       const alert = wrapper.querySelector('.qs-validation-callout')
       if (alert) {
@@ -2287,7 +2826,7 @@ function updateValidationCallouts (inputId) {
       const button = wrapper.querySelector('.accordion-button')
       if (!collapse || !button) return
 
-      const shouldCollapse = isConfigured && wrapper.dataset.qsAutoCollapsed !== 'true'
+      const shouldCollapse = state === 'ok' && wrapper.dataset.qsAutoCollapsed !== 'true'
       if (shouldCollapse) {
         button.classList.add('collapsed')
         button.setAttribute('aria-expanded', 'false')
@@ -2299,6 +2838,17 @@ function updateValidationCallouts (inputId) {
           collapse.classList.remove('show')
         }
         wrapper.dataset.qsAutoCollapsed = 'true'
+      } else if (state !== 'ok') {
+        button.classList.remove('collapsed')
+        button.setAttribute('aria-expanded', 'true')
+
+        if (typeof bootstrap !== 'undefined' && bootstrap.Collapse) {
+          const instance = bootstrap.Collapse.getOrCreateInstance(collapse, { toggle: false })
+          instance.show()
+        } else {
+          collapse.classList.add('show')
+        }
+        delete wrapper.dataset.qsAutoCollapsed
       }
 
       refreshValidationAccordionTitle(wrapper, isConfigured)
@@ -2310,7 +2860,7 @@ function updateValidationCallouts (inputId) {
     applyDynamicValidationCalloutState(alert)
   })
 
-  qsRefreshSidebarValidationState(inputId)
+  qsRefreshSidebarValidationState(inputId, options)
 }
 
 function getCurrentTemplateKey () {
@@ -2329,6 +2879,23 @@ function getCurrentTemplateGroup () {
   return 'optional'
 }
 
+function qsCurrentValidationCalloutState (isConfigured) {
+  const inputState = qsStateFromValidatedInput(getValidatedInput())
+  const currentState = qsGetCurrentStepStatus()
+  if (inputState === 'ok') return 'ok'
+  if (currentState === 'error' || inputState === 'error') return 'error'
+  if (currentState === 'warn' || inputState === 'warn') return 'warn'
+  if (isConfigured || currentState === 'ok') return 'ok'
+  if (currentState === 'unknown' || inputState === 'unknown') return 'unknown'
+  return null
+}
+
+function qsRequiredCalloutHeading (isConfigured, state) {
+  if (state === 'ok') return 'This required page passed validation'
+  if (state === 'error' && isConfigured) return 'This required page failed validation'
+  return 'This required page needs validation'
+}
+
 function applyDynamicValidationCalloutState (alert, isConfiguredOverride = null) {
   if (!alert) return
 
@@ -2344,6 +2911,7 @@ function applyDynamicValidationCalloutState (alert, isConfiguredOverride = null)
   const isConfigured = isConfiguredOverride === null
     ? qsIsCurrentStepConfigured(getValidatedInput())
     : Boolean(isConfiguredOverride)
+  const state = qsCurrentValidationCalloutState(isConfigured)
 
   let html = alert.dataset.qsOriginalHtml
 
@@ -2359,16 +2927,16 @@ function applyDynamicValidationCalloutState (alert, isConfiguredOverride = null)
   const heading = alert.querySelector('h6, h4')
   if (heading && !isReview) {
     heading.innerHTML = `<b>${
-      isConfigured
-        ? (isRequired ? 'This required page passed validation' : 'This optional page is configured')
-        : (isRequired ? 'This required page needs validation' : 'This page is optional')
+      isRequired
+        ? qsRequiredCalloutHeading(isConfigured, state)
+        : (state === 'ok' ? 'This optional page is configured' : 'This page is optional')
     }</b>`
   }
 
   alert.classList.remove('alert-info', 'alert-danger', 'alert-warning', 'alert-success')
-  if (isConfigured || isReview) {
+  if (state === 'ok' || isReview) {
     alert.classList.add('alert-success')
-  } else if (isRequired) {
+  } else if (isRequired || state === 'error') {
     alert.classList.add('alert-danger')
   } else if (isOptional) {
     alert.classList.add('alert-info')
@@ -2417,11 +2985,8 @@ function applyDynamicValidationCalloutState (alert, isConfiguredOverride = null)
 }
 
 function qsGetCalloutAccordionState (isConfigured) {
-  if (isConfigured) return 'ok'
-  const inputState = qsStateFromValidatedInput(getValidatedInput())
-  if (inputState) return inputState
-  const currentState = qsGetCurrentStepStatus()
-  if (currentState) return currentState
+  const state = qsCurrentValidationCalloutState(isConfigured)
+  if (state) return state
   const group = getCurrentTemplateGroup()
   if (group === 'required') return 'error'
   if (group === 'optional') return 'unknown'
@@ -2455,11 +3020,17 @@ function refreshValidationAccordionTitle (wrapper, isValidated) {
 
   let title = baseTitle
   const state = qsGetCalloutAccordionState(isValidated)
-  if (isValidated) {
-    const group = getCurrentTemplateGroup()
-    if (group === 'required') {
+  const group = getCurrentTemplateGroup()
+  if (group === 'required') {
+    if (state === 'ok') {
       title = 'Required page validated'
-    } else if (group === 'optional') {
+    } else if (state === 'error' && isValidated) {
+      title = 'Required page failed validation'
+    } else {
+      title = 'Required page needs validation'
+    }
+  } else if (state === 'ok') {
+    if (group === 'optional') {
       title = 'Optional page guidance'
     } else if (group === 'review') {
       title = 'Review page guidance'
@@ -2493,6 +3064,8 @@ function setupValidationCallouts () {
 
     const validatedInput = getValidatedInput()
     const isValidated = qsIsCurrentStepConfigured(validatedInput)
+    const initialState = qsGetCalloutAccordionState(isValidated)
+    const shouldExpand = initialState !== 'ok'
 
     applyDynamicValidationCalloutState(alert, isValidated)
     const heading = alert.querySelector('h6, h4')
@@ -2513,11 +3086,11 @@ function setupValidationCallouts () {
     header.id = headingId
 
     const button = document.createElement('button')
-    button.className = `accordion-button ${isValidated ? 'collapsed' : ''}`
+    button.className = `accordion-button ${shouldExpand ? '' : 'collapsed'}`
     button.type = 'button'
     button.setAttribute('data-bs-toggle', 'collapse')
     button.setAttribute('data-bs-target', `#${collapseId}`)
-    button.setAttribute('aria-expanded', isValidated ? 'false' : 'true')
+    button.setAttribute('aria-expanded', shouldExpand ? 'true' : 'false')
     button.setAttribute('aria-controls', collapseId)
     button.textContent = title
 
@@ -2525,7 +3098,7 @@ function setupValidationCallouts () {
 
     const collapse = document.createElement('div')
     collapse.id = collapseId
-    collapse.className = `accordion-collapse collapse ${isValidated ? '' : 'show'}`
+    collapse.className = `accordion-collapse collapse ${shouldExpand ? 'show' : ''}`
     collapse.setAttribute('aria-labelledby', headingId)
 
     const body = document.createElement('div')
@@ -2612,7 +3185,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('click', (event) => {
     const target = event.target instanceof window.Element ? event.target : null
     if (!target) return
-    if (target.closest('#validateButton, #validate_trakt_pin, #validate_mal_url, .validate-button')) {
+    if (target.closest('#validateButton, #validate_mal_url, .validate-button')) {
       qsSetCurrentValidationAttempted(true)
     }
   })
@@ -2733,9 +3306,18 @@ function restartQuickstart (reason) {
 
 function getQuickstartUpdateCommand (info) {
   const branch = String(info?.branch || 'master')
-  if (branch === 'master') return 'git pull && pip install -r requirements.txt'
-  if (branch === 'develop') return 'git fetch && git reset --hard kometa-team/develop && pip install -r requirements.txt'
-  return `git fetch && git checkout ${branch} && pip install -r requirements.txt`
+  if (info?.update_command) return String(info.update_command)
+  const remote = String(info?.update_remote || 'kometa-team')
+  const remoteRef = `${remote}/${branch}`
+  return `git fetch ${remote} --prune && git switch -C ${branch} --track ${remoteRef} && git reset --hard ${remoteRef} && python -m pip install --upgrade pip && python -m pip install --no-cache-dir --upgrade -r requirements.txt`
+}
+
+function isQuickstartBuildPending (info) {
+  return String(info?.update_check_status || '') === 'build_pending'
+}
+
+function getQuickstartBuildPendingMessage (info) {
+  return String(info?.update_message || 'Quickstart build metadata is still publishing. Try again in a few minutes.')
 }
 
 function renderQuickstartUpdateAlert (info) {
@@ -2743,20 +3325,36 @@ function renderQuickstartUpdateAlert (info) {
   existingAlerts.forEach(el => el.remove())
   document.querySelectorAll('[data-qs-update-alert-spacer]').forEach(el => el.remove())
 
-  if (!info || !info.update_available) return
+  const buildPending = isQuickstartBuildPending(info)
+  if (!info || (!info.update_available && !buildPending)) return
 
   const anchor = document.querySelector('[data-qs-update-alert-anchor]') || document.querySelector('.early-warning')
   const wrapper = anchor?.parentElement || document.querySelector('.qs-content-wrapper')
   if (!wrapper) return
 
   const alert = document.createElement('div')
-  alert.className = 'alert alert-danger text-center qs-wide-alert'
+  alert.className = `alert ${buildPending ? 'alert-warning' : 'alert-danger'} text-center qs-wide-alert`
   alert.id = 'quickstart-update-alert'
   alert.dataset.qsUpdateAlert = 'true'
   alert.setAttribute('role', 'alert')
 
   const icon = document.createElement('i')
-  icon.className = 'bi bi-arrow-up-circle'
+  icon.className = `bi ${buildPending ? 'bi-hourglass-split' : 'bi-arrow-up-circle'}`
+  if (buildPending) {
+    alert.append(icon, document.createTextNode(` ${getQuickstartBuildPendingMessage(info)}`))
+    if (info.remote_base_version) {
+      alert.append(document.createElement('br'))
+      const version = document.createElement('strong')
+      version.textContent = info.remote_base_version
+      alert.append(document.createTextNode('Remote version detected: '), version)
+    }
+    const spacer = document.createElement('br')
+    spacer.dataset.qsUpdateAlertSpacer = 'true'
+    wrapper.insertBefore(alert, anchor || wrapper.firstChild)
+    wrapper.insertBefore(spacer, anchor || alert.nextSibling)
+    return
+  }
+
   alert.append(icon, document.createTextNode(' A new version of Quickstart ('))
 
   const version = document.createElement('strong')
@@ -2820,6 +3418,8 @@ async function runQuickstartUpdateCheck (options = {}) {
   if (!options.silent && typeof showToast === 'function') {
     if (data.version_info?.update_available) {
       showToast('warning', `Quickstart update available: ${data.version_info.remote_version || 'unknown'}`)
+    } else if (isQuickstartBuildPending(data.version_info)) {
+      showToast('info', getQuickstartBuildPendingMessage(data.version_info))
     } else {
       showToast('success', 'Quickstart is up to date.')
     }
@@ -2949,6 +3549,9 @@ document.addEventListener('DOMContentLoaded', () => {
         if (info?.update_available) {
           setUpdateStatus(`${info.local_version || 'unknown'} -> ${info.remote_version || 'unknown'}`, false)
           showToast('warning', `Quickstart update available: ${info.remote_version || 'unknown'}`)
+        } else if (isQuickstartBuildPending(info)) {
+          setUpdateStatus('Build publishing; try again soon.', false)
+          showToast('info', getQuickstartBuildPendingMessage(info))
         } else {
           setUpdateStatus(`Up to date (${info?.local_version || 'unknown'})`, false)
           showToast('success', 'Quickstart is up to date.')
@@ -3832,8 +4435,16 @@ document.addEventListener('DOMContentLoaded', () => {
   const output = modalEl.querySelector('#supportInfoOutput')
   const refreshBtn = modalEl.querySelector('#supportInfoRefresh')
   const copyBtn = modalEl.querySelector('#supportInfoCopy')
+  const includeLogs = modalEl.querySelector('#supportInfoIncludeLogs')
   const status = modalEl.querySelector('#supportInfoStatus')
+  const jumpWrap = modalEl.querySelector('#supportInfoJumpWrap')
+  const jumpSelect = modalEl.querySelector('#supportInfoJump')
+  const copyFallback = modalEl.querySelector('#supportInfoCopyFallback')
+  const copyFallbackMessage = modalEl.querySelector('#supportInfoCopyFallbackMessage')
+  const copyFallbackText = modalEl.querySelector('#supportInfoCopyText')
   const isSecureContext = window.isSecureContext
+  let supportInfoText = ''
+  let supportInfoRequestId = 0
 
   function setStatus (text, isError) {
     if (!status) return
@@ -3846,100 +4457,221 @@ document.addEventListener('DOMContentLoaded', () => {
     copyBtn.textContent = 'Select'
   }
 
+  function findSupportInfoSections (text) {
+    const sections = [...findYamlMajorSections(text)]
+    String(text || '').split(/\r?\n/).forEach((line, index) => {
+      const headingMatch = line.match(/^#\s+(.+?)\s*$/)
+      if (!headingMatch) return
+      const label = headingMatch[1].trim()
+      const lower = label.toLowerCase()
+      if (
+        lower === 'system information' ||
+        lower.startsWith('libraries configured with quickstart') ||
+        lower.startsWith('quickstart log tail')
+      ) {
+        sections.push({ line: index + 1, label })
+      }
+    })
+    const seen = new Set()
+    return sections
+      .sort((a, b) => a.line - b.line)
+      .filter((section) => {
+        const key = `${section.line}:${section.label}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+  }
+
+  function syncSupportInfoJump (text) {
+    if (!jumpWrap || !jumpSelect) return
+    const sections = findSupportInfoSections(text)
+    const previous = jumpSelect.value
+    jumpWrap.hidden = sections.length === 0
+    jumpWrap.classList.toggle('d-none', sections.length === 0)
+    jumpSelect.replaceChildren()
+    const placeholder = document.createElement('option')
+    placeholder.value = ''
+    placeholder.textContent = sections.length ? 'Select a section' : 'No sections found'
+    jumpSelect.append(placeholder)
+    sections.forEach((section) => {
+      const option = document.createElement('option')
+      option.value = String(section.line)
+      option.textContent = `${section.label} - line ${section.line.toLocaleString()}`
+      jumpSelect.append(option)
+    })
+    if (previous && sections.some(section => String(section.line) === previous)) {
+      jumpSelect.value = previous
+    }
+  }
+
+  function renderSupportInfoText (text, opts = {}) {
+    if (!output) return
+    const content = String(text || '')
+    if (opts.copyable !== false) supportInfoText = content
+    renderLogRows(output, content, { highlightLevels: false })
+    syncSupportInfoJump(content)
+  }
+
+  function hideCopyFallback () {
+    if (copyFallback) copyFallback.classList.add('d-none')
+    if (copyFallbackText) copyFallbackText.value = ''
+  }
+
+  function showCopyFallback (text, message) {
+    if (!copyFallback || !copyFallbackText) return
+    if (copyFallbackMessage) {
+      copyFallbackMessage.textContent = message || 'Clipboard access is blocked. The raw support info is selected below.'
+    }
+    copyFallbackText.value = text
+    copyFallback.classList.remove('d-none')
+    try {
+      copyFallback.scrollIntoView({ block: 'nearest' })
+    } catch {
+      // No-op: older mobile browsers may not support scroll options.
+    }
+    focusWithoutScrolling(copyFallbackText)
+    copyFallbackText.select()
+    copyFallbackText.setSelectionRange(0, copyFallbackText.value.length)
+  }
+
   async function loadSupportInfo () {
     if (!output) return
+    const requestId = ++supportInfoRequestId
     if (copyBtn) copyBtn.disabled = true
     setStatus('Loading...', false)
-    output.textContent = 'Loading support info...'
+    supportInfoText = ''
+    hideCopyFallback()
+    renderSupportInfoText('Loading support info...', { copyable: false })
 
     try {
-      const res = await fetch('/support-info')
+      const params = new URLSearchParams({ include_logs: includeLogs?.checked ? '1' : '0' })
+      const res = await fetch(`/support-info?${params}`)
       const data = await res.json()
+      if (requestId !== supportInfoRequestId) return
       if (!res.ok || !data || !data.text) {
         throw new Error((data && data.error) || 'Failed to load support info.')
       }
-      output.textContent = data.text
+      renderSupportInfoText(data.text)
       setStatus(data.generated_at ? `Updated ${data.generated_at}` : 'Updated', false)
       if (copyBtn) copyBtn.disabled = !data.text.trim()
     } catch (err) {
-      output.textContent = `Unable to load support info.\n${err.message || String(err)}`
+      if (requestId !== supportInfoRequestId) return
+      supportInfoText = ''
+      hideCopyFallback()
+      renderSupportInfoText(`Unable to load support info.\n${err.message || String(err)}`, { copyable: false })
       setStatus('Error loading support info', true)
       if (copyBtn) copyBtn.disabled = true
     }
   }
 
-  function fallbackCopy (text, opts = {}) {
-    const showFailureToast = opts.showFailureToast !== false
-    const showSuccessToast = opts.showSuccessToast !== false
+  function getWindowScrollPosition () {
+    return {
+      x: window.scrollX || window.pageXOffset || 0,
+      y: window.scrollY || window.pageYOffset || 0
+    }
+  }
+
+  function restoreWindowScrollPosition (position) {
+    if (!position || typeof window.scrollTo !== 'function') return
+    window.scrollTo(position.x, position.y)
+  }
+
+  function focusWithoutScrolling (element) {
+    if (!element || typeof element.focus !== 'function') return
+    try {
+      element.focus({ preventScroll: true })
+    } catch {
+      element.focus()
+    }
+  }
+
+  function fallbackCopy (text) {
+    const windowScroll = getWindowScrollPosition()
+    const activeElement = document.activeElement
     const textarea = document.createElement('textarea')
     textarea.value = text
     textarea.setAttribute('readonly', '')
-    textarea.style.position = 'absolute'
-    textarea.style.left = '-9999px'
+    textarea.setAttribute('aria-hidden', 'true')
+    textarea.style.position = 'fixed'
+    textarea.style.top = '0'
+    textarea.style.left = '0'
+    textarea.style.width = '1px'
+    textarea.style.height = '1px'
+    textarea.style.opacity = '0'
+    textarea.style.pointerEvents = 'none'
     document.body.appendChild(textarea)
-    textarea.focus()
+    focusWithoutScrolling(textarea)
     textarea.select()
     textarea.setSelectionRange(0, textarea.value.length)
     try {
-      const success = document.execCommand('copy')
-      if (success) {
-        if (showSuccessToast) showToast('success', 'Support info copied to clipboard.')
-        return true
-      }
-      if (showFailureToast) showToast('error', 'Copy failed. Please copy manually.')
+      return document.execCommand('copy')
     } catch {
-      if (showFailureToast) showToast('error', 'Copy failed. Please copy manually.')
+      return false
     } finally {
       document.body.removeChild(textarea)
-    }
-    return false
-  }
-
-  function selectSupportInfoText () {
-    if (!output) return
-    try {
-      const selection = window.getSelection()
-      const range = document.createRange()
-      range.selectNodeContents(output)
-      selection.removeAllRanges()
-      selection.addRange(range)
-      if (typeof output.focus === 'function') output.focus()
-    } catch {
-      // No-op: selection best-effort only.
+      restoreWindowScrollPosition(windowScroll)
+      if (activeElement && document.contains(activeElement)) {
+        focusWithoutScrolling(activeElement)
+        restoreWindowScrollPosition(windowScroll)
+      }
     }
   }
 
   async function copySupportInfo () {
     if (!output) return
-    const text = output.textContent || ''
+    const text = supportInfoText || ''
     if (!text.trim()) {
-      showToast('warning', 'Nothing to copy yet.')
+      hideCopyFallback()
+      setStatus('Nothing to copy yet.', true)
       return
     }
     const canUseClipboard = isSecureContext && navigator.clipboard && navigator.clipboard.writeText
     if (canUseClipboard) {
       try {
         await navigator.clipboard.writeText(text)
-        showToast('success', 'Support info copied to clipboard.')
+        if (text !== supportInfoText) return
+        hideCopyFallback()
+        setStatus('Copied', false)
         return
       } catch {
         // Fall back to execCommand below.
       }
     }
-    if (canUseClipboard) {
-      fallbackCopy(text, { showFailureToast: true })
+
+    if (text !== supportInfoText) return
+    if (!canUseClipboard) {
+      showCopyFallback(text, 'Clipboard blocked on non-HTTPS. The raw support info is selected below.')
       return
     }
-    fallbackCopy(text, { showFailureToast: false, showSuccessToast: false })
-    selectSupportInfoText()
-    showToast('warning', 'Clipboard blocked on non-HTTPS. Text selected; press Ctrl+C to copy.')
+
+    if (fallbackCopy(text)) {
+      hideCopyFallback()
+      setStatus('Copied', false)
+      return
+    }
+    showCopyFallback(text, 'Copy failed. The raw support info is selected below.')
   }
 
   modalEl.addEventListener('show.bs.modal', () => {
+    if (includeLogs) includeLogs.checked = false
     loadSupportInfo()
   })
 
+  if (jumpSelect) {
+    jumpSelect.addEventListener('change', function () {
+      const lineNumber = Number(this.value)
+      if (!output || !Number.isFinite(lineNumber) || lineNumber < 1) return
+      const row = output.querySelector(`[data-line="${lineNumber}"]`)
+      if (!row) return
+      output.scrollTop = row.offsetTop - output.offsetTop
+      row.classList.add('qs-log-line--jumped')
+      window.setTimeout(() => row.classList.remove('qs-log-line--jumped'), 1400)
+    })
+  }
+
   if (refreshBtn) refreshBtn.addEventListener('click', loadSupportInfo)
+  if (includeLogs) includeLogs.addEventListener('change', loadSupportInfo)
   if (copyBtn) copyBtn.addEventListener('click', copySupportInfo)
 })
 
@@ -4415,6 +5147,7 @@ window.showNavigationLoadingOverlay = showNavigationLoadingOverlay
 window.showSpinner = showSpinner
 window.showToast = showToast
 window.qsQueueFlashToast = qsQueueFlashToast
+window.QS_renderQuickstartUpdateAlert = renderQuickstartUpdateAlert
 
 // ES module exports for other modules. Currently consumed by
 // static/local-js/001-start.js (which is also loaded as type="module").

@@ -1,6 +1,10 @@
 /* global bootstrap */
 import { getAppConfig } from './modules/appConfig.js'
 import { elementGroup } from './modules/elementGroup.js'
+import { nbspLeadingSpaces } from './modules/kometa/_util.js'
+import { initLogscanUpload } from './modules/kometa/_logscanUpload.js'
+
+const logscanUpload = initLogscanUpload({ historical: true })
 
 const tableBody = document.querySelector('#logscan-trends-table tbody')
 const tableSummary = document.getElementById('logscan-table-summary')
@@ -19,6 +23,8 @@ const tableSelectIncomplete = document.getElementById('logscan-table-select-inco
 const tableClearSelection = document.getElementById('logscan-table-clear-selection')
 const tableCompressSelected = document.getElementById('logscan-table-compress-selected')
 const tableDeleteSelected = document.getElementById('logscan-table-delete-selected')
+const tableUploadSelected = document.getElementById('logscan-table-upload-selected')
+const tableUploadFilter = document.getElementById('logscan-table-upload-filter')
 const tableSelectionSummary = document.getElementById('logscan-table-selection-summary')
 const tableCollapseEl = document.getElementById('logscan-recent-runs-collapse')
 const summaryEl = document.getElementById('logscan-trends-summary')
@@ -91,6 +97,14 @@ const deleteLogModalEl = document.getElementById('logscan-delete-log-modal')
 const compressLogModalEl = document.getElementById('logscan-compress-log-modal')
 const runDetailsModalEl = document.getElementById('logscan-run-details-modal')
 const preferencesModalEl = document.getElementById('logscan-preferences-modal')
+const filterPickerModalEl = document.getElementById('logscan-filter-picker-modal')
+const filterPickerTitle = document.getElementById('logscan-filter-picker-title')
+const filterPickerBody = document.getElementById('logscan-filter-picker-body')
+const filterPickerApply = document.getElementById('logscan-filter-picker-apply')
+const filterPickerClear = document.getElementById('logscan-filter-picker-clear')
+const analyticsSectionExpandAll = document.getElementById('logscan-sections-expand-all')
+const analyticsSectionCollapseAll = document.getElementById('logscan-sections-collapse-all')
+const analyticsSections = document.querySelectorAll('.logscan-analytics-section')
 let missingDownloadUrl = ''
 let pendingInvalidLogCleanup = null
 let pendingDeleteRun = null
@@ -110,20 +124,177 @@ let allIncompleteRunsTotal = 0
 let latestArchiveStorage = null
 let tablePage = 1
 let tableStatusFilter = 'all'
+let analyticsControlsDisabled = false
 const selectedRunKeys = new Set()
 const sortState = { key: 'finished_at', dir: 'desc' }
 let lastIngestState = null
 let analyticsPrefs = null
+let activeFilterPickerSelect = null
 const defaultReingestButtonLabel = reingest.textContent.trim() || 'Reingest logs'
+
+function setAnalyticsSectionsExpanded (expanded) {
+  analyticsSections.forEach(section => {
+    if (window.bootstrap && typeof window.bootstrap.Collapse === 'function') {
+      const collapse = window.bootstrap.Collapse.getOrCreateInstance(section, { toggle: false })
+      if (expanded) {
+        collapse.show()
+      } else {
+        collapse.hide()
+      }
+      return
+    }
+    section.classList.toggle('show', expanded)
+  })
+}
+
+function getSelectedValues (control) {
+  const el = control && control.elements ? control.elements[0] : control
+  if (!el) return []
+  if (!el.multiple) {
+    const value = String(el.value || '').trim()
+    return value ? [value] : []
+  }
+  return Array.from(el.selectedOptions || [])
+    .map(option => String(option.value || '').trim())
+    .filter(Boolean)
+}
+
+function setSelectedValues (controls, values) {
+  if (!controls) return
+  const elements = controls.elements || (controls.nodeType === 1 ? [controls] : Array.from(controls || []))
+  if (!elements.length) return
+  const selected = new Set(Array.isArray(values) ? values.map(value => String(value || '').trim()).filter(Boolean) : [])
+  for (const el of elements) {
+    if (!el.multiple) {
+      el.value = Array.from(selected)[0] || ''
+      continue
+    }
+    Array.from(el.options || []).forEach(option => {
+      option.selected = selected.has(String(option.value || '').trim())
+    })
+  }
+}
+
+function sameSelection (a, b) {
+  const left = Array.isArray(a) ? a.slice().sort() : []
+  const right = Array.isArray(b) ? b.slice().sort() : []
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
 
 function syncMirroredControlValue (controls, source) {
   if (!controls.length || !source) return
+  if (source.multiple) {
+    setSelectedValues(controls, getSelectedValues(source))
+    return
+  }
   const value = source.value
   for (const el of controls) {
     if (el === source) continue
     el.value = value
   }
 }
+function getFilterLabel (select) {
+  if (!select) return 'Filter'
+  if (select.dataset && select.dataset.filterLabel) return select.dataset.filterLabel
+  const group = select.closest('.input-group')
+  const label = group ? group.querySelector('.input-group-text') : null
+  return label ? label.textContent.trim() : 'Filter'
+}
+
+function getOptionLabel (option) {
+  if (!option) return ''
+  return String(option.getAttribute('title') || option.textContent || option.value || '').trim()
+}
+
+function getAllOptionLabel (select) {
+  const first = select && select.options ? Array.from(select.options).find(option => !String(option.value || '').trim()) : null
+  return first ? getOptionLabel(first) : `All ${getFilterLabel(select).toLowerCase()}`
+}
+
+function getFilterSelectionSummary (select) {
+  const values = new Set(getSelectedValues(select))
+  if (!values.size) return getAllOptionLabel(select)
+  const labels = Array.from(select.options || [])
+    .filter(option => values.has(String(option.value || '').trim()))
+    .map(option => getOptionLabel(option))
+    .filter(Boolean)
+  if (!labels.length) return getAllOptionLabel(select)
+  if (labels.length <= 2) return labels.join(', ')
+  return `${labels.length} selected`
+}
+
+function updateFilterPickerButton (select) {
+  if (!select || !select.id) return
+  const button = document.querySelector(`[data-filter-picker-target="${select.id}"]`)
+  if (!button) return
+  const value = getFilterSelectionSummary(select)
+  button.querySelector('.logscan-filter-picker-value').textContent = value
+  button.setAttribute('title', value)
+}
+
+function syncFilterPickerButtons () {
+  document.querySelectorAll('select.logscan-multi-filter').forEach(updateFilterPickerButton)
+}
+
+function ensureFilterPickerButtons () {
+  document.querySelectorAll('select.logscan-multi-filter').forEach(select => {
+    select.classList.add('logscan-native-multi-filter')
+    if (!select.id || document.querySelector(`[data-filter-picker-target="${select.id}"]`)) {
+      updateFilterPickerButton(select)
+      return
+    }
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'btn nav-button btn-sm logscan-filter-picker-button'
+    button.dataset.filterPickerTarget = select.id
+    button.innerHTML = `
+      <span class="logscan-filter-picker-label">${escapeHtml(getFilterLabel(select))}</span>
+      <span class="logscan-filter-picker-value"></span>
+    `
+    button.addEventListener('click', function () {
+      openFilterPicker(select)
+    })
+    select.insertAdjacentElement('afterend', button)
+    updateFilterPickerButton(select)
+  })
+}
+
+function renderFilterPickerOptions (select) {
+  if (!filterPickerBody) return
+  const selected = new Set(getSelectedValues(select))
+  const options = Array.from(select.options || []).filter(option => String(option.value || '').trim())
+  if (!options.length) {
+    filterPickerBody.innerHTML = '<div class="text-muted small">No filter choices available.</div>'
+    return
+  }
+  filterPickerBody.innerHTML = options.map((option, index) => {
+    const value = String(option.value || '').trim()
+    const inputId = `logscan-filter-picker-option-${index}`
+    const checked = selected.has(value) ? ' checked' : ''
+    return `
+      <label class="logscan-filter-picker-option" for="${inputId}">
+        <input class="form-check-input" type="checkbox" id="${inputId}" value="${escapeHtml(value)}"${checked}>
+        <span>${escapeHtml(getOptionLabel(option))}</span>
+      </label>
+    `
+  }).join('')
+}
+
+function openFilterPicker (select) {
+  if (!select || !filterPickerModalEl) return
+  activeFilterPickerSelect = select
+  if (filterPickerTitle) filterPickerTitle.textContent = `Filter by ${getFilterLabel(select)}`
+  renderFilterPickerOptions(select)
+  bootstrap.Modal.getOrCreateInstance(filterPickerModalEl).show()
+}
+
+function applyFilterPickerSelection (values) {
+  if (!activeFilterPickerSelect) return
+  setSelectedValues(activeFilterPickerSelect, values)
+  activeFilterPickerSelect.dispatchEvent(new Event('change', { bubbles: true }))
+  updateFilterPickerButton(activeFilterPickerSelect)
+}
+
 
 function escapeHtml (value) {
   return String(value || '')
@@ -175,6 +346,51 @@ function formatBytes (value) {
   const rounded = Number(size.toFixed(precision))
   const display = Number.isInteger(rounded) ? String(rounded) : String(rounded)
   return `${display} ${units[unitIndex]}`
+}
+
+function formatCompressionRatio (originalBytes, compressedBytes) {
+  if (typeof originalBytes !== 'number' || typeof compressedBytes !== 'number') return null
+  if (!Number.isFinite(originalBytes) || !Number.isFinite(compressedBytes)) return null
+  if (originalBytes <= 0 || compressedBytes <= 0) return null
+  const ratio = originalBytes / compressedBytes
+  const saved = Math.max(0, Math.round((1 - (compressedBytes / originalBytes)) * 100))
+  if (!Number.isFinite(ratio) || ratio <= 0) return null
+  return `${ratio.toFixed(1).replace(/\.0$/, '')}:1, ${saved}% smaller`
+}
+
+function formatArchiveSizeDetails (compressedBytes, originalBytes, fallbackBytes) {
+  const hasCompressed = typeof compressedBytes === 'number' && Number.isFinite(compressedBytes) && compressedBytes >= 0
+  const hasOriginal = typeof originalBytes === 'number' && Number.isFinite(originalBytes) && originalBytes > 0
+  if (hasCompressed && hasOriginal && originalBytes !== compressedBytes) {
+    const ratio = formatCompressionRatio(originalBytes, compressedBytes)
+    return `${formatBytes(compressedBytes)} compressed (${formatBytes(originalBytes)} original${ratio ? `, ${ratio}` : ''})`
+  }
+  return formatBytes(typeof fallbackBytes === 'number' ? fallbackBytes : (hasCompressed ? compressedBytes : originalBytes))
+}
+
+function formatRunLogSizeDetails (run, resolvedBytes) {
+  const originalBytes = typeof run.log_original_size === 'number' && Number.isFinite(run.log_original_size)
+    ? run.log_original_size
+    : null
+  const compressedBytes = typeof run.log_compressed_size === 'number' && Number.isFinite(run.log_compressed_size)
+    ? run.log_compressed_size
+    : null
+  if (run.log_is_compressed && compressedBytes !== null && originalBytes !== null && originalBytes !== compressedBytes) {
+    const ratio = formatCompressionRatio(originalBytes, compressedBytes)
+    return `
+      <span class="logscan-log-size">
+        <span class="logscan-log-size__primary">
+          <span class="logscan-log-size__label">Compressed</span>
+          <strong>${escapeHtml(formatBytes(compressedBytes))}</strong>
+        </span>
+        <span class="logscan-log-size__meta">
+          <span><span class="logscan-log-size__label">Original</span> ${escapeHtml(formatBytes(originalBytes))}</span>
+          ${ratio ? `<span class="logscan-log-size__ratio">${escapeHtml(ratio)}</span>` : ''}
+        </span>
+      </span>
+    `
+  }
+  return escapeHtml(formatBytes(resolvedBytes))
 }
 
 function formatTimestamp (value) {
@@ -320,10 +536,6 @@ function normalizeRunCommand (command) {
     }
   })
   return parts.join(' ').trim()
-}
-
-function getDefaultToolFilterValue (tools) {
-  return ''
 }
 
 function getRunCommandValue (run) {
@@ -584,7 +796,7 @@ function renderProgressSnapshotPanel (run, snapshot) {
     const phaseHtml = columns.map((column, index) => `<td class="text-end">${renderProgressSnapshotCellLabel(phaseCells[index])}</td>`).join('')
     return `
       <tr>
-        <td>${escapeHtml(row.name || '—')}</td>
+        <td><code>${escapeHtml(nbspLeadingSpaces(row.name || '—'))}</code></td>
         <td>${escapeHtml(row.type || '—')}</td>
         <td><span class="badge${statusClass}">${escapeHtml(row.status || 'Pending')}</span></td>
         ${phaseHtml}
@@ -735,16 +947,7 @@ function getCountsTotal (run) {
 }
 
 function getDisplayedItemsTotal (run) {
-  if (getRunToolName(run) === 'imagemaid') {
-    const cache = getCount(run, 'cache_line_count')
-    const debug = getCount(run, 'debug_count')
-    const info = getCount(run, 'info_count')
-    const warnings = getCount(run, 'warning_count')
-    const errors = getCount(run, 'error_count')
-    const critical = getCount(run, 'critical_count')
-    const traces = getCount(run, 'trace_count')
-    return cache + debug + info + warnings + errors + critical + traces
-  }
+  if (getRunToolName(run) === 'imagemaid') return getTotalLogLineCount(run)
   return getRunLibraryTotals(run).total
 }
 
@@ -781,6 +984,12 @@ function getCount (run, key) {
   return Number.isFinite(value) ? value : 0
 }
 
+function getTotalLogLineCount (run) {
+  const direct = run && typeof run.total_log_line_count === 'number' ? run.total_log_line_count : null
+  if (direct !== null && Number.isFinite(direct)) return direct
+  return getCount(run, 'debug_count') + getCount(run, 'info_count') + getCount(run, 'warning_count') + getCount(run, 'error_count') + getCount(run, 'critical_count') + getCount(run, 'trace_count')
+}
+
 function renderRunCountChips (run) {
   if (getRunToolName(run) === 'imagemaid') {
     const cache = getCount(run, 'cache_line_count')
@@ -790,7 +999,7 @@ function renderRunCountChips (run) {
     const errors = getCount(run, 'error_count')
     const critical = getCount(run, 'critical_count')
     const traces = getCount(run, 'trace_count')
-    const total = cache + debug + info + warnings + errors + critical + traces
+    const totalLogLines = getTotalLogLineCount(run)
     return [
       renderCountChip('C', 'Cache lines', cache, 'cache'),
       renderCountChip('D', 'Debug lines', debug, 'debug'),
@@ -799,7 +1008,7 @@ function renderRunCountChips (run) {
       renderCountChip('E', 'Errors', errors, 'error'),
       renderCountChip('Cr', 'Critical lines', critical, 'critical'),
       renderCountChip('T', 'Tracebacks', traces, 'trace'),
-      renderCountChip('Items', 'Total counted lines', total, 'total')
+      renderCountChip('Lines', 'Total log-level lines', totalLogLines, 'lines')
     ].join('')
   }
 
@@ -810,6 +1019,7 @@ function renderRunCountChips (run) {
   const errors = getCount(run, 'error_count')
   const critical = getCount(run, 'critical_count')
   const traces = getCount(run, 'trace_count')
+  const totalLogLines = getTotalLogLineCount(run)
   const libraryTotals = getRunLibraryTotals(run)
   return [
     renderCountChip('C', 'Cache lines', cache, 'cache'),
@@ -819,6 +1029,7 @@ function renderRunCountChips (run) {
     renderCountChip('E', 'Errors', errors, 'error'),
     renderCountChip('Cr', 'Critical lines', critical, 'critical'),
     renderCountChip('T', 'Tracebacks', traces, 'trace'),
+    renderCountChip('Lines', 'Total log-level lines', totalLogLines, 'lines'),
     renderCountChip('M', 'Movies', libraryTotals.movies, 'movie'),
     renderCountChip('S', 'Shows', libraryTotals.shows, 'show'),
     renderCountChip('Ep', 'Episodes', libraryTotals.episodes, 'episode'),
@@ -1159,6 +1370,7 @@ const PANEL_PREFS = [
 ]
 
 const LOG_LEVEL_SERIES = [
+  { key: 'total_log_line_count', short: 'Lines', label: 'Log lines', css: 'logscan-stack-lines' },
   { key: 'cache_line_count', short: 'C', label: 'Cache', css: 'logscan-stack-cache' },
   { key: 'debug_count', short: 'D', label: 'Debug', css: 'logscan-stack-debug' },
   { key: 'info_count', short: 'I', label: 'Info', css: 'logscan-stack-info' },
@@ -1683,16 +1895,20 @@ function renderArchiveStorageSummary (storage) {
     : (imagemaidKeepLimit > 0 ? `Keep last ${imagemaidKeepLimit} archived logs` : 'Keep all archived logs')
   const archivedFiles = storage && Number.isFinite(storage.archived_files) ? storage.archived_files : 0
   const archivedBytes = storage && Number.isFinite(storage.archived_bytes) ? storage.archived_bytes : 0
+  const archivedOriginalBytes = storage && Number.isFinite(storage.archived_original_bytes) ? storage.archived_original_bytes : 0
+  const archivedCompressedBytes = storage && Number.isFinite(storage.archived_compressed_bytes) ? storage.archived_compressed_bytes : 0
   const extraArchivedFiles = storage && Number.isFinite(storage.extra_archived_files) ? storage.extra_archived_files : 0
   const extraArchivedBytes = storage && Number.isFinite(storage.extra_archived_bytes) ? storage.extra_archived_bytes : 0
+  const extraOriginalBytes = storage && Number.isFinite(storage.extra_archived_original_bytes) ? storage.extra_archived_original_bytes : 0
+  const extraCompressedBytes = storage && Number.isFinite(storage.extra_archived_compressed_bytes) ? storage.extra_archived_compressed_bytes : 0
   const fileLabel = archivedFiles === 1 ? 'file' : 'files'
   const lines = [
     `Archived log retention: Kometa: ${kometaRetentionLabel} | ImageMaid: ${imagemaidRetentionLabel}`,
-    `Tracked archived log storage: ${formatBytes(archivedBytes)} across ${archivedFiles} ${fileLabel}`
+    `Tracked archived log storage: ${formatArchiveSizeDetails(archivedCompressedBytes, archivedOriginalBytes, archivedBytes)} across ${archivedFiles} ${fileLabel}`
   ]
   if (extraArchivedFiles > 0) {
     const extraLabel = extraArchivedFiles === 1 ? 'file' : 'files'
-    lines.push(`Additional archived logs on disk not linked to Analytics: ${formatBytes(extraArchivedBytes)} across ${extraArchivedFiles} ${extraLabel}`)
+    lines.push(`Additional archived logs on disk not linked to Analytics: ${formatArchiveSizeDetails(extraCompressedBytes, extraOriginalBytes, extraArchivedBytes)} across ${extraArchivedFiles} ${extraLabel}`)
   }
   tablePolicy.innerHTML = lines.map(line => `<div>${escapeHtml(line)}</div>`).join('')
 }
@@ -1835,7 +2051,15 @@ function getTablePageSize () {
 }
 
 function isRunSelectable (run) {
-  return Boolean(run && run.run_key && run.log_can_delete)
+  return Boolean(run && run.run_key && (run.log_can_delete || isRunUploadable(run)))
+}
+
+function isRunUploadable (run) {
+  return Boolean(run?.run_key && run.log_available && ['kometa', 'imagemaid'].includes(getRunToolName(run)))
+}
+
+function getSelectedUploadableRuns () {
+  return allTableRuns.filter(run => selectedRunKeys.has(run.run_key) && isRunUploadable(run))
 }
 
 function getSelectableRuns (runs) {
@@ -1875,17 +2099,20 @@ function updateSelectionSummary () {
   const visibleCompleteSelectable = getSelectableRunsByCompletion(currentTableRuns, false).length
   const visibleIncompleteSelectable = getSelectableRunsByCompletion(currentTableRuns, true).length
   const selectedCompressibleCount = getSelectedCompressibleRuns().length
+  const selectedUploadableCount = getSelectedUploadableRuns().length
+  const selectedDeletableCount = getSelectedRuns().length
   if (!selectedCount) {
     tableSelectionSummary.textContent = 'No logs selected.'
   } else {
-    tableSelectionSummary.textContent = `${selectedCount} selected. ${selectedCompressibleCount} compressible. ${visibleSelectable} deletable in current view.`
+    tableSelectionSummary.textContent = `${selectedCount} selected. ${selectedUploadableCount} uploadable, ${selectedCompressibleCount} compressible, ${selectedDeletableCount} deletable.`
   }
   if (tableCompressSelected) {
     tableCompressSelected.disabled = selectedCompressibleCount === 0
   }
   if (tableDeleteSelected) {
-    tableDeleteSelected.disabled = selectedCount === 0
+    tableDeleteSelected.disabled = analyticsControlsDisabled || selectedDeletableCount === 0
   }
+  if (tableUploadSelected) tableUploadSelected.disabled = analyticsControlsDisabled || selectedUploadableCount === 0 || logscanUpload?.isBusy()
   if (tableClearSelection) {
     tableClearSelection.disabled = selectedCount === 0
   }
@@ -1904,6 +2131,14 @@ function updateSelectionSummary () {
 
 function filterTableRunsByStatus (runs) {
   if (!Array.isArray(runs) || !runs.length) return []
+  const uploadFilter = tableUploadFilter?.value || 'all'
+  if (uploadFilter !== 'all') {
+    runs = runs.filter(run => {
+      if (!['kometa', 'imagemaid'].includes(getRunToolName(run))) return false
+      const uploaded = Boolean(logscanUpload?.hasResult(run.run_key, run.portal_upload))
+      return uploadFilter === 'uploaded' ? uploaded : !uploaded
+    })
+  }
   if (tableStatusFilter === 'complete') {
     return runs.filter(run => !run.is_incomplete)
   }
@@ -2019,8 +2254,20 @@ function renderTable (runs) {
           Download
         </a>
       `)
+      if (isRunUploadable(run)) {
+        logActions.push(`
+          <button type="button" class="btn nav-button btn-sm logscan-action-btn logscan-upload-log"
+            data-run-key="${escapeHtml(runKey)}" data-run-label="${escapeHtml(runLabel)}"
+            title="Upload this log to online Logscan" ${logscanUpload?.isBusy() ? 'disabled' : ''}>
+            <i class="bi bi-cloud-upload" aria-hidden="true"></i> Upload to Logscan
+          </button>
+        `)
+      }
     } else {
       logActions.push('<span class="small text-muted">Unavailable</span>')
+    }
+    if (['kometa', 'imagemaid'].includes(getRunToolName(run))) {
+      logActions.push(`<div class="logscan-upload-feedback logscan-action-stack d-none" data-run-key="${escapeHtml(runKey)}" role="status" aria-live="polite"></div>`)
     }
     if (run.log_can_compress) {
       logActions.push(`
@@ -2031,7 +2278,7 @@ function renderTable (runs) {
         </button>
       `)
     } else if (run.log_is_compressed) {
-      logActions.push('<span class="small text-muted">Compressed</span>')
+      logActions.push(`<span class="small text-muted">${run.log_location === 'archive' ? 'Archived compressed' : 'Compressed'}</span>`)
     }
     if (run.log_can_delete) {
       logActions.push(`
@@ -2053,7 +2300,7 @@ function renderTable (runs) {
     ].filter(Boolean).join(' ')
     return `
       <tr class="${rowClasses}">
-        ${renderRunCardCell('Select', 'Select this archived log for bulk actions.', `
+        ${renderRunCardCell('Select', 'Select this log for bulk actions.', `
           <span class="logscan-select-wrap">
             <span class="form-check form-switch logscan-select-switch">
               <input type="checkbox" class="form-check-input logscan-select-toggle-input"
@@ -2079,8 +2326,8 @@ function renderTable (runs) {
         ${renderRunCardCell('Quiet periods', 'Emphasizes the longest unexplained delay between timestamped run log lines, with maintenance-related gaps available in the details view.', renderQuietPeriodCell(run))}
         ${renderRunCardCell(progressLabel, progressHelpText, renderProgressSnapshotCell(run, runKey), 'class="logscan-progress-cell"')}
         ${isImageMaidRun ? '' : renderRunCardCell('Section runtimes', 'Runtime totals parsed per run section when available.', sectionCell)}
-        ${renderRunCardCell('Log size', 'Current on-disk size of the resolved log file when available, otherwise the ingested size.', escapeHtml(formatBytes(sizeBytes)))}
-        ${renderRunCardCell('Log', 'Download the source log for this run. Archived plain logs can also be compressed, and archived logs can be deleted here.', `<div class="logscan-action-stack">${logActions.join('')}</div>`)}
+        ${renderRunCardCell('Log size', 'Current resolved log size. Compressed archives also show original size and compression ratio when known.', formatRunLogSizeDetails(run, sizeBytes))}
+        ${renderRunCardCell('Log', 'Download the resolved log for this run. Finished runs prefer archived compressed copies when available; archived plain logs can also be compressed and archived logs can be deleted here.', `<div class="logscan-action-stack">${logActions.join('')}</div>`)}
         ${renderRunCardCell('Report', run.is_incomplete ? 'Open recommendations and diagnostics captured for this incomplete log.' : 'Open the recommendations recorded for the run.', `
           <div class="logscan-action-stack">
             <button type="button" class="btn nav-button btn-sm logscan-action-btn logscan-run-details"
@@ -2091,6 +2338,7 @@ function renderTable (runs) {
     `
   })
   tableBody.innerHTML = rows.join('')
+  logscanUpload?.refresh(pageRuns)
 }
 
 function renderRuntimeDistribution (runs) {
@@ -2155,6 +2403,8 @@ function renderCountsMix (runs) {
           ? run.cache_line_count
           : 0
         buckets[key][series.key] += cacheValue
+      } else if (series.key === 'total_log_line_count') {
+        buckets[key][series.key] += getTotalLogLineCount(run)
       } else {
         buckets[key][series.key] += getCount(run, series.key)
       }
@@ -2288,15 +2538,16 @@ function renderIssueTrends (runs) {
 function updateLibraryFilter (runs) {
   if (!libraryFilter.length) return false
   const names = collectLibraryNames(runs)
-  const selected = libraryFilter.value || ''
+  const selected = getSelectedValues(libraryFilter)
   const options = ['<option value="">All libraries</option>']
   names.forEach(name => {
-    options.push(`<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`)
+    options.push(`<option value="${escapeHtml(name)}" title="${escapeHtml(name)}">[${escapeHtml(nbspLeadingSpaces(name))}]</option>`)
   })
   libraryFilter.setHTML(options.join(''))
-  const nextValue = selected && names.includes(selected) ? selected : ''
-  libraryFilter.setValue(nextValue)
-  return nextValue !== selected
+  const nextValues = selected.filter(name => names.includes(name))
+  setSelectedValues(libraryFilter, nextValues)
+  syncFilterPickerButtons()
+  return !sameSelection(nextValues, selected)
 }
 
 function renderLibraryInventory (runs) {
@@ -2311,7 +2562,7 @@ function renderLibraryInventory (runs) {
     librariesEl.textContent = 'No library totals yet.'
     return
   }
-  const selectedLibrary = libraryFilter.value || ''
+  const selectedLibraries = getSelectedValues(libraryFilter)
   const snapshots = buildLibrarySnapshots(runsWithCounts)
   const days = Object.keys(snapshots).sort().slice(-14)
   if (!days.length) {
@@ -2325,12 +2576,14 @@ function renderLibraryInventory (runs) {
     let episodes = 0
     let shows = 0
     let total = 0
-    if (selectedLibrary) {
-      const entryTotals = getLibraryMediaTotals(libraries[selectedLibrary] || {})
-      movies = entryTotals.movies
-      episodes = entryTotals.episodes
-      shows = entryTotals.shows
-      total = entryTotals.total
+    if (selectedLibraries.length) {
+      selectedLibraries.forEach(selectedLibrary => {
+        const entryTotals = getLibraryMediaTotals(libraries[selectedLibrary] || {})
+        movies += entryTotals.movies
+        episodes += entryTotals.episodes
+        shows += entryTotals.shows
+        total += entryTotals.total
+      })
     } else {
       Object.values(libraries).forEach(entry => {
         const entryTotals = getLibraryMediaTotals(entry)
@@ -2348,8 +2601,8 @@ function renderLibraryInventory (runs) {
       total
     }
   })
-  if (selectedLibrary && rowsData.every(row => row.total === 0 && row.shows === 0)) {
-    librariesEl.textContent = 'No totals recorded for the selected library yet.'
+  if (selectedLibraries.length && rowsData.every(row => row.total === 0 && row.shows === 0)) {
+    librariesEl.textContent = 'No totals recorded for the selected libraries yet.'
     return
   }
   const totals = rowsData.map(row => row.total || 0)
@@ -2393,7 +2646,7 @@ function renderLibraryInventory (runs) {
     </div>`
   ))
   const labelStyle = `style="grid-template-columns: repeat(${rowsData.length}, minmax(0, 1fr));"`
-  const metaLabel = selectedLibrary ? `Tracking: ${escapeHtml(selectedLibrary)}` : 'Tracking: All libraries'
+  const metaLabel = selectedLibraries.length ? `Tracking: ${escapeHtml(selectedLibraries.join(', '))}` : 'Tracking: All libraries'
   const legend = `
     <div class="logscan-daily-legend">
       <span class="logscan-legend-item"><span class="logscan-legend-swatch" style="background:#43aa8b"></span>Movies</span>
@@ -2418,7 +2671,7 @@ function renderLibraryInventory (runs) {
 }
 
 function renderIngestHealth (state) {
-  if (!ingest.length) return
+  if (!ingest) return
   const invalidArchivedCount = Number.isFinite(state && state.invalid_archived_count) ? state.invalid_archived_count : 0
   const invalidArchivedSample = Array.isArray(state && state.invalid_archived_sample) ? state.invalid_archived_sample : []
 
@@ -2501,9 +2754,9 @@ function renderIngestHealth (state) {
   } else if (state.total === 0) {
     lines.push('No log files found yet.')
   } else if (state.needs_reingest) {
-    lines.push('Missing or incomplete logs detected. Use Reingest logs to catch up.')
+    lines.push('Missing or incomplete live logs detected. Use Reingest logs to catch up.')
   } else {
-    lines.push('All available logs are ingested.')
+    lines.push('Live log folders are caught up. Archived logs are read from the Analytics cache unless you reingest.')
   }
   if (state.pending_active) {
     lines.push('Active run detected; meta.log will ingest after completion.')
@@ -2517,6 +2770,9 @@ function renderIngestHealth (state) {
   }
   if (Array.isArray(state.incomplete_sample) && state.incomplete_sample.length) {
     lines.push(`Incomplete samples: ${state.incomplete_sample.join(', ')}`)
+  }
+  if (state.archive_scan_skipped) {
+    lines.push('Archive validation skipped for faster page load.')
   }
   if (invalidArchivedCount > 0) {
     lines.push(`Invalid archived logs: ${invalidArchivedCount}. Use Clear invalid archived logs to remove them.`)
@@ -2550,6 +2806,8 @@ function getSortValue (run, key) {
       return getRunCommandValue(run)
     case 'counts':
       return getCountsTotal(run)
+    case 'total_log_line_count':
+      return getTotalLogLineCount(run)
     case 'warning_count':
     case 'debug_count':
     case 'info_count':
@@ -2634,21 +2892,22 @@ function updateSortIndicators () {
 
 function updateConfigFilter (runs) {
   if (!configFilter.length) return false
-  const selected = configFilter.value || ''
+  const selected = getSelectedValues(configFilter)
   const configs = Array.from(new Set(runs.map(run => normalizeConfigName(run.config_name)))).sort()
   const options = ['<option value="">All configs</option>']
   configs.forEach(cfg => {
     options.push(`<option value="${escapeHtml(cfg)}">${escapeHtml(cfg)}</option>`)
   })
   configFilter.setHTML(options.join(''))
-  const nextValue = selected && configs.includes(selected) ? selected : ''
-  configFilter.setValue(nextValue)
-  return nextValue !== selected
+  const nextValues = selected.filter(cfg => configs.includes(cfg))
+  setSelectedValues(configFilter, nextValues)
+  syncFilterPickerButtons()
+  return !sameSelection(nextValues, selected)
 }
 
 function updateCommandFilter (runs) {
   if (!commandFilter.length) return false
-  const selected = commandFilter.value || ''
+  const selected = getSelectedValues(commandFilter)
   const counts = new Map()
   runs.forEach(run => {
     const command = getRunCommandValue(run)
@@ -2668,9 +2927,10 @@ function updateCommandFilter (runs) {
     )
   })
   commandFilter.setHTML(options.join(''))
-  const nextValue = selected && counts.has(selected) ? selected : ''
-  commandFilter.setValue(nextValue)
-  return nextValue !== selected
+  const nextValues = selected.filter(command => counts.has(command))
+  setSelectedValues(commandFilter, nextValues)
+  syncFilterPickerButtons()
+  return !sameSelection(nextValues, selected)
 }
 
 function getAvailableDateBounds (runs) {
@@ -2761,13 +3021,13 @@ function updateRunCountDisplay (filtered) {
 
 function getFilterState () {
   return {
-    config: configFilter.value || '',
-    tool: toolFilter.value || '',
-    toolVersion: toolVersionFilter.value || '',
-    quickstartVersion: quickstartVersionFilter.value || '',
+    config: getSelectedValues(configFilter),
+    tool: getSelectedValues(toolFilter),
+    toolVersion: getSelectedValues(toolVersionFilter),
+    quickstartVersion: getSelectedValues(quickstartVersionFilter),
     timeRange: timeRange.value || 'all',
-    command: commandFilter.value || '',
-    library: libraryFilter.value || '',
+    command: getSelectedValues(commandFilter),
+    library: getSelectedValues(libraryFilter),
     start: dateStart.value || '',
     end: dateEnd.value || ''
   }
@@ -2785,11 +3045,11 @@ function filterRuns (runs, state) {
     rangeEnd = relative.end
   }
   return runs.filter(run => {
-    if (state.config && normalizeConfigName(run.config_name) !== state.config) return false
-    if (state.tool && getRunToolName(run) !== state.tool) return false
-    if (state.toolVersion && getRunToolVersionValue(run) !== state.toolVersion) return false
-    if (state.quickstartVersion && getRunQuickstartVersionValue(run) !== state.quickstartVersion) return false
-    if (state.command && getRunCommandValue(run) !== state.command) return false
+    if (state.config.length && !state.config.includes(normalizeConfigName(run.config_name))) return false
+    if (state.tool.length && !state.tool.includes(getRunToolName(run))) return false
+    if (state.toolVersion.length && !state.toolVersion.includes(getRunToolVersionValue(run))) return false
+    if (state.quickstartVersion.length && !state.quickstartVersion.includes(getRunQuickstartVersionValue(run))) return false
+    if (state.command.length && !state.command.includes(getRunCommandValue(run))) return false
     if (rangeStart || rangeEnd) {
       const dateKey = getRunDateKey(run)
       if (!isDateWithinRange(dateKey, rangeStart, rangeEnd)) return false
@@ -2800,19 +3060,19 @@ function filterRuns (runs, state) {
 
 function updateFilterOptions (state) {
   let changed = false
-  changed = updateConfigFilter(filterRuns(allTableRuns, { ...state, config: '' })) || changed
-  changed = updateToolFilter(filterRuns(allTableRuns, { ...state, tool: '' })) || changed
-  changed = updateToolVersionFilter(filterRuns(allTableRuns, { ...state, toolVersion: '' })) || changed
-  changed = updateQuickstartVersionFilter(filterRuns(allTableRuns, { ...state, quickstartVersion: '' })) || changed
-  changed = updateCommandFilter(filterRuns(allTableRuns, { ...state, command: '' })) || changed
+  changed = updateConfigFilter(filterRuns(allTableRuns, { ...state, config: [] })) || changed
+  changed = updateToolFilter(filterRuns(allTableRuns, { ...state, tool: [] })) || changed
+  changed = updateToolVersionFilter(filterRuns(allTableRuns, { ...state, toolVersion: [] })) || changed
+  changed = updateQuickstartVersionFilter(filterRuns(allTableRuns, { ...state, quickstartVersion: [] })) || changed
+  changed = updateCommandFilter(filterRuns(allTableRuns, { ...state, command: [] })) || changed
   changed = updateDateRangeInputs(filterRuns(allTableRuns, { ...state, start: '', end: '', timeRange: 'all' }), state) || changed
-  changed = updateLibraryFilter(filterRuns(allRuns, { ...state, library: '' })) || changed
+  changed = updateLibraryFilter(filterRuns(allRuns, { ...state, library: [] })) || changed
   return changed
 }
 
 function updateToolFilter (runs) {
   if (!toolFilter.length) return false
-  const selected = toolFilter.value || ''
+  const selected = getSelectedValues(toolFilter)
   const tools = Array.from(new Set(runs.map(run => getRunToolName(run)))).sort()
   const options = ['<option value="">All apps</option>']
   tools.forEach(tool => {
@@ -2820,14 +3080,15 @@ function updateToolFilter (runs) {
     options.push(`<option value="${escapeHtml(tool)}">${escapeHtml(label)}</option>`)
   })
   toolFilter.setHTML(options.join(''))
-  const nextValue = selected && tools.includes(selected) ? selected : getDefaultToolFilterValue(tools)
-  toolFilter.setValue(nextValue)
-  return nextValue !== selected
+  const nextValues = selected.filter(tool => tools.includes(tool))
+  setSelectedValues(toolFilter, nextValues)
+  syncFilterPickerButtons()
+  return !sameSelection(nextValues, selected)
 }
 
 function updateToolVersionFilter (runs) {
   if (!toolVersionFilter.length) return false
-  const selected = toolVersionFilter.value || ''
+  const selected = getSelectedValues(toolVersionFilter)
   const counts = new Map()
   runs.forEach(run => {
     const version = getRunToolVersionValue(run)
@@ -2840,14 +3101,15 @@ function updateToolVersionFilter (runs) {
     options.push(`<option value="${escapeHtml(version)}">${escapeHtml(version)}</option>`)
   })
   toolVersionFilter.setHTML(options.join(''))
-  const nextValue = selected && counts.has(selected) ? selected : ''
-  toolVersionFilter.setValue(nextValue)
-  return nextValue !== selected
+  const nextValues = selected.filter(version => counts.has(version))
+  setSelectedValues(toolVersionFilter, nextValues)
+  syncFilterPickerButtons()
+  return !sameSelection(nextValues, selected)
 }
 
 function updateQuickstartVersionFilter (runs) {
   if (!quickstartVersionFilter.length) return false
-  const selected = quickstartVersionFilter.value || ''
+  const selected = getSelectedValues(quickstartVersionFilter)
   const counts = new Map()
   runs.forEach(run => {
     const version = getRunQuickstartVersionValue(run)
@@ -2860,12 +3122,13 @@ function updateQuickstartVersionFilter (runs) {
     options.push(`<option value="${escapeHtml(version)}">${escapeHtml(version)}</option>`)
   })
   quickstartVersionFilter.setHTML(options.join(''))
-  const nextValue = selected && counts.has(selected) ? selected : ''
-  quickstartVersionFilter.setValue(nextValue)
-  return nextValue !== selected
+  const nextValues = selected.filter(version => counts.has(version))
+  setSelectedValues(quickstartVersionFilter, nextValues)
+  syncFilterPickerButtons()
+  return !sameSelection(nextValues, selected)
 }
 
-function applyFiltersAndRender () {
+function getFilteredAnalyticsRuns () {
   syncDateRangeVisibility()
   let state = getFilterState()
   for (let i = 0; i < 2; i += 1) {
@@ -2877,6 +3140,10 @@ function applyFiltersAndRender () {
   const filteredTableRuns = filterTableRunsByStatus(filterRuns(allTableRuns, state))
   currentFilteredRuns = filtered
   updateRunCountDisplay(filtered)
+  return { filtered, filteredTableRuns }
+}
+
+function renderAnalyticsChartsAndTable (filtered, filteredTableRuns) {
   renderSummary(filtered)
   renderDaily(filtered)
   renderImagemaidSummary(filtered)
@@ -2903,17 +3170,127 @@ function applyFiltersAndRender () {
   updateSortIndicators()
 }
 
+function nextAnalyticsFrame () {
+  return new Promise(resolve => {
+    window.requestAnimationFrame(() => window.setTimeout(resolve, 0))
+  })
+}
+
+function setAnalyticsLoadingPanels (message) {
+  const text = String(message || '').trim()
+  if (!text) return
+  ;[summaryEl, daily, dailyRuntime, runtimeEl, countsEl, issuesEl, librariesEl].forEach(el => {
+    if (!el) return
+    const current = String(el.textContent || '').trim()
+    if (!current || current.startsWith('Loading') || current.startsWith('Rendering')) {
+      el.textContent = text
+    }
+  })
+}
+
+function setAnalyticsRenderPhase (message) {
+  updateStatus(message)
+  updateIndeterminateProgress(message)
+}
+
+function fetchAnalyticsJson (url, options = {}) {
+  const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : 90000
+  const label = options.label || url
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+  const timer = controller
+    ? window.setTimeout(() => controller.abort(), timeoutMs)
+    : null
+  return fetch(url, { cache: 'no-store', signal: controller ? controller.signal : undefined })
+    .then(res => {
+      if (!res.ok) {
+        throw new Error(`${label} failed with HTTP ${res.status}.`)
+      }
+      return res.json()
+    })
+    .catch(err => {
+      if (err && err.name === 'AbortError') {
+        throw new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)} seconds.`)
+      }
+      throw err
+    })
+    .finally(() => {
+      if (timer) window.clearTimeout(timer)
+    })
+}
+
+async function applyFiltersAndRenderStaged () {
+  setProgressVisible(true)
+  setAnalyticsRenderPhase('Preparing Analytics filters...')
+  setAnalyticsLoadingPanels('Preparing Analytics filters...')
+  await nextAnalyticsFrame()
+
+  const { filtered, filteredTableRuns } = getFilteredAnalyticsRuns()
+  const rowCount = filtered.length.toLocaleString()
+  setAnalyticsRenderPhase(`Rendering summary for ${rowCount} runs...`)
+  renderSummary(filtered)
+  await nextAnalyticsFrame()
+
+  setAnalyticsRenderPhase(`Rendering daily totals and runtime charts for ${rowCount} runs...`)
+  renderDaily(filtered)
+  renderRuntimeDistribution(filtered)
+  await nextAnalyticsFrame()
+
+  setAnalyticsRenderPhase(`Rendering log counts, issue trends, and library totals for ${rowCount} runs...`)
+  renderCountsMix(filtered)
+  renderIssueTrends(filtered)
+  updateLibraryFilter(filtered)
+  renderLibraryInventory(filtered)
+  await nextAnalyticsFrame()
+
+  setAnalyticsRenderPhase(`Rendering ImageMaid charts and recent run table for ${rowCount} runs...`)
+  renderImagemaidSummary(filtered)
+  renderImagemaidTrendChart(imagemaidRecovered, filtered, 'recoveredBytes', {
+    barColor: '#43aa8b',
+    seriesLabel: 'Recovered space',
+    formatValue: value => formatBytes(value),
+    metaLabel: 'Daily total recovered space from ImageMaid runs'
+  })
+  renderImagemaidTrendChart(imagemaidFiles, filtered, 'removedFiles', {
+    barColor: '#f9c74f',
+    seriesLabel: 'Files removed',
+    formatValue: value => formatCompactNumber(value),
+    metaLabel: 'Daily total files removed by ImageMaid'
+  })
+  renderImagemaidModeMix(filtered)
+  renderTable(sortRuns(filteredTableRuns))
+  renderIngestHealth(lastIngestState)
+  updateSortIndicators()
+  await nextAnalyticsFrame()
+}
+
+function applyFiltersAndRender (options = {}) {
+  if (options && options.staged) return applyFiltersAndRenderStaged()
+  const { filtered, filteredTableRuns } = getFilteredAnalyticsRuns()
+  renderAnalyticsChartsAndTable(filtered, filteredTableRuns)
+  return Promise.resolve()
+}
+
 function updateStatus (message) {
   if (statusEl) statusEl.textContent = message
 }
 
+function updateIndeterminateProgress (message) {
+  if (progressBar) {
+    progressBar.classList.add('progress-bar-striped', 'progress-bar-animated')
+    progressBar.style.width = '100%'
+  }
+  if (progressText) {
+    progressText.textContent = message
+  }
+}
+
 function setReingestButtonLabel (label) {
-  if (!reingest.length) return
+  if (!reingest) return
   reingest.textContent = label || defaultReingestButtonLabel
 }
 
 function setProgressVisible (visible) {
-  if (!progress.length) return
+  if (!progress) return
   if (visible) {
     progress.classList.remove('d-none')
   } else {
@@ -2922,7 +3299,7 @@ function setProgressVisible (visible) {
 }
 
 function updateProgressFromState (state) {
-  if (!state || !progressBar.length) return
+  if (!state || !progressBar) return
   lastIngestState = state
   renderIngestHealth(lastIngestState)
   const total = Number.isFinite(state.total) ? state.total : 0
@@ -2932,7 +3309,8 @@ function updateProgressFromState (state) {
   const skippedInvalid = Number.isFinite(state.skipped_invalid) ? state.skipped_invalid : 0
   const errors = Number.isFinite(state.errors) ? state.errors : 0
   const pct = total ? Math.min(100, Math.round((scanned / total) * 100)) : 0
-  progressBar.css('width', `${pct}%`)
+  progressBar.classList.add('progress-bar-striped', 'progress-bar-animated')
+  progressBar.style.width = `${pct}%`
   const pieces = [
     `Scanned: ${scanned}/${total}`,
     `Ingested: ${ingested}`,
@@ -2942,7 +3320,7 @@ function updateProgressFromState (state) {
   if (state.current_file) {
     pieces.unshift(`Processing: ${formatProcessingFileLabel(state.current_file)}`)
   }
-  if (progressText.length) {
+  if (progressText) {
     progressText.textContent = pieces.join(' | ')
   }
 }
@@ -3004,6 +3382,7 @@ function setCompressModalBusy (busy) {
 }
 
 function setControlsDisabled (disabled) {
+  analyticsControlsDisabled = disabled
   reset.disabled = disabled
   reingest.disabled = disabled
   clearInvalidArchived.disabled = disabled || clearInvalidArchived.classList.contains('d-none')
@@ -3027,12 +3406,16 @@ function setControlsDisabled (disabled) {
   tableSelectIncomplete.disabled = disabled || getSelectableRunsByCompletion(currentTableRuns, true).length === 0
   tableClearSelection.disabled = disabled || selectedRunKeys.size === 0
   tableCompressSelected.disabled = disabled || getSelectedCompressibleRuns().length === 0
-  tableDeleteSelected.disabled = disabled || selectedRunKeys.size === 0
+  tableDeleteSelected.disabled = disabled || getSelectedRuns().length === 0
+  if (tableUploadSelected) tableUploadSelected.disabled = disabled || getSelectedUploadableRuns().length === 0 || logscanUpload?.isBusy()
+  if (tableUploadFilter) tableUploadFilter.disabled = disabled
 }
 
-function setMissingDownloadVisible (visible, count) {
+function setMissingDownloadVisible (visible, count, logCount) {
   if (visible) {
-    if (typeof count === 'number') {
+    if (typeof count === 'number' && typeof logCount === 'number' && logCount > 1) {
+      missingDownload.textContent = `Download missing people log (${count} from ${logCount} logs)`
+    } else if (typeof count === 'number') {
       missingDownload.textContent = `Download missing people log (${count})`
     } else {
       missingDownload.textContent = 'Download missing people log'
@@ -3051,7 +3434,10 @@ function checkMissingDownload () {
       const count = data && typeof data.missing_people_unique === 'number'
         ? data.missing_people_unique
         : undefined
-      setMissingDownloadVisible(exists, count)
+      const logCount = data && typeof data.missing_people_logs === 'number'
+        ? data.missing_people_logs
+        : undefined
+      setMissingDownloadVisible(exists, count, logCount)
     })
     .catch(() => {
       setMissingDownloadVisible(false)
@@ -3099,7 +3485,7 @@ function applyReingestSummary (data) {
   const isStartupMigration = data && data.trigger === 'startup_migration'
   updateStatus(`${isStartupMigration ? 'Startup Analytics migration complete.' : 'Reingest complete.'} ${summary}`)
   fetchRuns({ suppressStatus: true })
-  setMissingDownloadVisible(Boolean(data.missing_people_log_ready), data.missing_people_unique)
+  setMissingDownloadVisible(Boolean(data.missing_people_log_ready), data.missing_people_unique, data.missing_people_logs)
   setProgressVisible(false)
   setControlsDisabled(false)
   setReingestButtonLabel(defaultReingestButtonLabel)
@@ -3114,12 +3500,15 @@ function stopReingestPolling () {
   setReingestButtonLabel(defaultReingestButtonLabel)
 }
 
-function fetchReingestStatus (jobId) {
+function fetchReingestStatus (jobId, options = {}) {
+  const applyComplete = !options || options.applyComplete !== false
   const query = jobId ? `?job=${encodeURIComponent(jobId)}` : ''
-  return fetch(`/logscan/trends/reingest/status${query}`)
-    .then(res => res.json().then(data => ({ ok: res.ok, data })))
-    .then(({ ok, data }) => {
-      if (!ok || !data) return data
+  return fetchAnalyticsJson(`/logscan/trends/reingest/status${query}`, {
+    label: 'Analytics reingest status request',
+    timeoutMs: 10000
+  })
+    .then(data => {
+      if (!data) return data
       if (typeof window.QS_handleLogscanReingestStatus === 'function') {
         window.QS_handleLogscanReingestStatus(data)
       }
@@ -3143,7 +3532,9 @@ function fetchReingestStatus (jobId) {
       }
       if (data.status === 'complete') {
         stopReingestPolling()
-        applyReingestSummary(data)
+        if (applyComplete) {
+          applyReingestSummary(data)
+        }
         return data
       }
       if (data.status === 'error') {
@@ -3273,10 +3664,10 @@ function buildKometaDetailsBlock (run) {
 
 function showRunDetails (runKey) {
   if (!runKey) return
-  if (runDetailsBody.length) {
+  if (runDetailsBody) {
     runDetailsBody.innerHTML = 'Loading recommendations...'
   }
-  if (runDetailsTitle.length) {
+  if (runDetailsTitle) {
     runDetailsTitle.textContent = 'Run Recommendations'
   }
   if (runDetailsModalEl) {
@@ -3286,7 +3677,7 @@ function showRunDetails (runKey) {
     .then(res => res.json().then(data => ({ ok: res.ok, data })))
     .then(({ ok, data }) => {
       if (!ok) {
-        if (runDetailsBody.length) {
+        if (runDetailsBody) {
           runDetailsBody.textContent = data && data.error ? data.error : 'Unable to load recommendations.'
         }
         return
@@ -3294,7 +3685,7 @@ function showRunDetails (runKey) {
       const detailsBlock = `${buildKometaDetailsBlock(data && data.run)}${buildImagemaidDetailsBlock(data && data.run)}`
       const recs = Array.isArray(data.recommendations) ? data.recommendations : []
       if (!recs.length) {
-        if (runDetailsBody.length) {
+        if (runDetailsBody) {
           runDetailsBody.innerHTML = detailsBlock || 'No recommendations recorded for this run.'
         }
         return
@@ -3309,12 +3700,12 @@ function showRunDetails (runKey) {
           </div>
         `
       })
-      if (runDetailsBody.length) {
+      if (runDetailsBody) {
         runDetailsBody.innerHTML = `${detailsBlock}${blocks.join('')}`
       }
     })
     .catch(() => {
-      if (runDetailsBody.length) {
+      if (runDetailsBody) {
         runDetailsBody.textContent = 'Unable to load recommendations.'
       }
     })
@@ -3355,6 +3746,102 @@ function handleRunningTrendsPayload (data) {
   startReingestPolling(state.job_id || null)
   updateStatus('Reingest is running. Analytics will refresh when it finishes.')
   return true
+}
+
+function createAnalyticsRequestId () {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function formatElapsedSeconds (seconds) {
+  const safeSeconds = Number(seconds)
+  if (!Number.isFinite(safeSeconds) || safeSeconds <= 0) return '0s'
+  return formatSeconds(safeSeconds)
+}
+
+function getAnalyticsLoadPhaseLabel (phase) {
+  const labels = {
+    starting: 'Preparing Analytics request',
+    checking_reingest: 'Checking active reingest state',
+    counting_runs: 'Counting saved Analytics runs',
+    active_reingest: 'Analytics reingest is already running',
+    archiving_live_logs: 'Checking completed live logs',
+    building_resolution_context: 'Resolving archived log paths and config references',
+    loading_runs: 'Loading saved runs from the Analytics database',
+    annotating_runs: 'Annotating runs for filters, tables, and charts',
+    loading_incomplete_runs: 'Loading incomplete run records',
+    summarizing_archive_storage: 'Calculating archived log storage totals',
+    complete: 'Analytics request complete',
+    error: 'Analytics request failed'
+  }
+  return labels[phase] || ''
+}
+
+function formatAnalyticsLoadStatus (state, fallbackOperation, endpoint, startedAt) {
+  const stateElapsed = state ? Number(state.elapsed_seconds) : NaN
+  const elapsed = Number.isFinite(stateElapsed)
+    ? stateElapsed
+    : (Date.now() - startedAt) / 1000
+  const phaseLabel = getAnalyticsLoadPhaseLabel(state && state.phase) || fallbackOperation
+  const pieces = [`${phaseLabel}. Waiting ${formatElapsedSeconds(elapsed)}.`]
+  if (state && state.detail) pieces.push(state.detail)
+  if (state && Number.isFinite(Number(state.total_runs))) pieces.push(`Saved runs: ${Number(state.total_runs).toLocaleString()}.`)
+  if (state && Number.isFinite(Number(state.loaded_runs))) pieces.push(`Loaded rows: ${Number(state.loaded_runs).toLocaleString()}.`)
+  if (state && state.limit) pieces.push(`Limit: ${state.limit}.`)
+  if (state && state.status === 'unknown') pieces.push('Backend phase has not been published for this request yet.')
+  pieces.push(`Request: ${endpoint}.`)
+  return pieces.join(' ')
+}
+
+function createAnalyticsLoadTimer (suppressStatus, messages, options = {}) {
+  if (suppressStatus || !Array.isArray(messages) || !messages.length) return () => {}
+  const startedAt = Date.now()
+  const operation = messages.find(item => item && item.operation)?.operation || 'Loading Analytics data'
+  const endpoint = messages.find(item => item && item.endpoint)?.endpoint || '/logscan/trends'
+  const statusEndpoint = options.statusEndpoint || null
+  const requestId = options.requestId || null
+  let lastStatusState = null
+  const updateLoadingProgress = () => {
+    const message = formatAnalyticsLoadStatus(lastStatusState, operation, endpoint, startedAt)
+    updateIndeterminateProgress(message)
+    if (endpoint === '/logscan/trends') setAnalyticsLoadingPanels(message)
+  }
+  const pollStatus = () => {
+    if (!statusEndpoint || !requestId) return
+    fetch(`${statusEndpoint}?request_id=${encodeURIComponent(requestId)}`, { cache: 'no-store' })
+      .then(res => res.json())
+      .then(data => {
+        if (!data || data.status === 'unknown') return
+        lastStatusState = data
+        const message = formatAnalyticsLoadStatus(lastStatusState, operation, endpoint, startedAt)
+        updateStatus(message)
+        updateIndeterminateProgress(message)
+        if (endpoint === '/logscan/trends') setAnalyticsLoadingPanels(message)
+      })
+      .catch(() => {})
+  }
+  setProgressVisible(true)
+  updateLoadingProgress()
+  pollStatus()
+  const heartbeat = setInterval(updateLoadingProgress, 1000)
+  const statusPoll = statusEndpoint && requestId ? setInterval(pollStatus, 1500) : null
+  const timers = messages
+    .filter(item => item && item.message)
+    .map(item => {
+      const delay = Number.isFinite(item.delay) ? item.delay : 0
+      return setTimeout(() => {
+        const elapsed = formatElapsedSeconds((Date.now() - startedAt) / 1000)
+        updateStatus(`${item.message} Elapsed: ${elapsed}.`)
+        updateLoadingProgress()
+      }, delay)
+    })
+  return function clearAnalyticsLoadTimer () {
+    clearInterval(heartbeat)
+    if (statusPoll) clearInterval(statusPoll)
+    timers.forEach(timer => clearTimeout(timer))
+    if (!lastIngestState || lastIngestState.status !== 'running') {
+      setProgressVisible(false)
+    }
+  }
 }
 
 function fetchIngestHealth () {
@@ -3421,10 +3908,10 @@ function fetchIncompleteRuns (safeLimit) {
 function showSectionDetails (runKey) {
   const payload = sectionDetailsByRunKey.get(runKey)
   if (!payload) return
-  if (runDetailsTitle.length) {
+  if (runDetailsTitle) {
     runDetailsTitle.textContent = 'Section Runtimes'
   }
-  if (runDetailsBody.length) {
+  if (runDetailsBody) {
     const summary = payload.summary || 'n/a'
     const details = Array.isArray(payload.details) ? payload.details : []
     let bodyHtml = `
@@ -3454,10 +3941,10 @@ function showQuietPeriodDetails (runKey) {
   const run = allTableRuns.find(entry => entry && entry.run_key === runKey)
   const summary = getQuietPeriodSummary(run)
   if (!run || summary.longestGapSeconds <= 0) return
-  if (runDetailsTitle.length) {
+  if (runDetailsTitle) {
     runDetailsTitle.textContent = 'Quiet Period Details'
   }
-  if (runDetailsBody.length) {
+  if (runDetailsBody) {
     const renderGapBlock = (title, gapSeconds, startedAtRaw, endedAtRaw, startLine, endLine, overlap, lastLine, firstLine) => {
       if (!(gapSeconds > 0)) {
         return `
@@ -3574,9 +4061,30 @@ function fetchRuns (options = {}) {
   const suppressStatus = options && options.suppressStatus
   const rawLimit = String(limit.value || '500').toLowerCase()
   const safeLimit = rawLimit === 'all' ? 'all' : (Number.isFinite(parseInt(rawLimit, 10)) ? parseInt(rawLimit, 10) : 500)
-  if (!suppressStatus) updateStatus('Loading trends...')
-  fetch(`/logscan/trends?limit=${safeLimit}&include_archive_storage=0&include_ingest_health=0&include_incomplete=0`)
-    .then(res => res.json())
+  const requestId = createAnalyticsRequestId()
+  const clearLoadTimer = createAnalyticsLoadTimer(suppressStatus, [
+    {
+      operation: 'Loading saved Analytics runs',
+      endpoint: '/logscan/trends'
+    },
+    {
+      delay: 8000,
+      message: 'Still loading saved Analytics runs. Large log history or slow storage can make this take longer.'
+    },
+    {
+      delay: 30000,
+      message: 'Analytics is still active. The progress line shows the latest backend phase, elapsed time, saved run count, and loaded row count when available.'
+    },
+    {
+      delay: 120000,
+      message: 'Analytics is still active on the backend. If the phase stops changing, check the Quickstart console or container logs for the slow /logscan/trends timing warning.'
+    }
+  ], { requestId, statusEndpoint: '/logscan/trends/status' })
+  if (!suppressStatus) updateStatus('Loading saved analytics runs...')
+  return fetchAnalyticsJson(`/logscan/trends?limit=${safeLimit}&include_archive_storage=0&include_ingest_health=0&include_incomplete=0&request_id=${encodeURIComponent(requestId)}`, {
+    label: 'Analytics saved runs request',
+    timeoutMs: 90000
+  })
     .then(data => {
       if (handleRunningTrendsPayload(data)) return
       allRuns = Array.isArray(data.runs) ? data.runs : []
@@ -3588,21 +4096,25 @@ function fetchRuns (options = {}) {
       updateConfigFilter(allTableRuns)
       updateCommandFilter(allTableRuns)
       updateDateRangeInputs(allTableRuns, getFilterState())
-      loadPreferences()
+      if (!suppressStatus) updateStatus('Rendering analytics charts...')
+      return loadPreferences()
         .then(() => {
-          applyFiltersAndRender()
-          if (!suppressStatus && (!lastIngestState || lastIngestState.status !== 'running')) {
-            updateStatus(`Last updated: ${formatTimestamp(new Date().toISOString())}`)
-          }
-          fetchIncompleteRuns(safeLimit)
-          fetchArchiveStorage()
-          fetchIngestHealth()
+          return applyFiltersAndRender({ staged: true })
+            .then(() => {
+              if (!suppressStatus && (!lastIngestState || lastIngestState.status !== 'running')) {
+                updateStatus(`Last updated: ${formatTimestamp(new Date().toISOString())}`)
+              }
+              fetchIncompleteRuns(safeLimit)
+              fetchArchiveStorage()
+              fetchIngestHealth()
+            })
         })
     })
     .catch(err => {
       console.error(err)
-      if (!suppressStatus) updateStatus('Failed to load trends.')
-      summaryEl.textContent = 'Unable to load summary.'
+      const message = err && err.message ? err.message : 'Failed to load trends.'
+      if (!suppressStatus) updateStatus(message)
+      summaryEl.textContent = message
       daily.textContent = 'Unable to load daily totals.'
       if (dailyRuntime) {
         dailyRuntime.textContent = 'Unable to load runtime averages.'
@@ -3619,21 +4131,23 @@ function fetchRuns (options = {}) {
       tableBody.innerHTML = '<tr><td colspan="18" class="text-muted">Unable to load runs.</td></tr>'
       updateSelectionSummary()
     })
+    .finally(() => {
+      clearLoadTimer()
+    })
 }
 
 function refreshAnalyticsPage (options = {}) {
   const suppressStatus = Boolean(options && options.suppressStatus)
   checkMissingDownload()
-  fetchReingestStatus()
-    .then(data => {
-      if (data && (data.status === 'running' || data.status === 'complete')) return
-      fetchRuns({ suppressStatus })
-    })
+  const runsRequest = fetchRuns({ suppressStatus })
+  fetchReingestStatus(null, { applyComplete: false }).catch(err => {
+    console.error(err)
+  })
+  return runsRequest
 }
-
 function getSelectedRuns () {
   if (!selectedRunKeys.size) return []
-  return getSelectableRuns(allTableRuns).filter(run => selectedRunKeys.has(run.run_key))
+  return allTableRuns.filter(run => run.log_can_delete && selectedRunKeys.has(run.run_key))
 }
 
 function openCompressLogModal (runKeys, runLabel) {
@@ -3646,7 +4160,7 @@ function openCompressLogModal (runKeys, runLabel) {
     runLabel,
     bulk: normalizedRunKeys.length > 1
   }
-  if (compressLogBody.length) {
+  if (compressLogBody) {
     if (normalizedRunKeys.length === 1) {
       compressLogBody.innerHTML = `Compress archived log for <strong>${escapeHtml(runLabel || normalizedRunKeys[0])}</strong> as <code>.log.gz</code>?`
     } else {
@@ -3675,7 +4189,7 @@ function openDeleteLogModal (runKeys, runLabel) {
     runLabel,
     bulk: normalizedRunKeys.length > 1
   }
-  if (deleteLogBody.length) {
+  if (deleteLogBody) {
     if (normalizedRunKeys.length === 1) {
       deleteLogBody.innerHTML = `Delete log for <strong>${escapeHtml(runLabel || normalizedRunKeys[0])}</strong> from disk and remove it from Analytics?`
     } else {
@@ -3920,31 +4434,45 @@ tableNext.addEventListener('click', function () {
 })
 if (tableCollapseEl) {
   tableCollapseEl.addEventListener('shown.bs.collapse', function () {
-    tableToggle.textContent = 'Hide table'
+    tableToggle.textContent = 'Hide runs'
   })
   tableCollapseEl.addEventListener('hidden.bs.collapse', function () {
-    tableToggle.textContent = 'Show table'
+    tableToggle.textContent = 'Show runs'
+  })
+}
+if (analyticsSectionExpandAll) {
+  analyticsSectionExpandAll.addEventListener('click', function () {
+    setAnalyticsSectionsExpanded(true)
+  })
+}
+if (analyticsSectionCollapseAll) {
+  analyticsSectionCollapseAll.addEventListener('click', function () {
+    setAnalyticsSectionsExpanded(false)
   })
 }
 configFilter.on('change', function () {
   syncMirroredControlValue(configFilter, this)
   tablePage = 1
+  syncFilterPickerButtons()
   loadPreferences().then(() => applyFiltersAndRender())
 })
 toolFilter.on('change', function () {
   syncMirroredControlValue(toolFilter, this)
   tablePage = 1
+  syncFilterPickerButtons()
   clearDateFilters()
   applyFiltersAndRender()
 })
 toolVersionFilter.on('change', function () {
   syncMirroredControlValue(toolVersionFilter, this)
   tablePage = 1
+  syncFilterPickerButtons()
   applyFiltersAndRender()
 })
 quickstartVersionFilter.on('change', function () {
   syncMirroredControlValue(quickstartVersionFilter, this)
   tablePage = 1
+  syncFilterPickerButtons()
   applyFiltersAndRender()
 })
 timeRange.on('change', function () {
@@ -3956,6 +4484,7 @@ timeRange.on('change', function () {
 commandFilter.on('change', function () {
   syncMirroredControlValue(commandFilter, this)
   tablePage = 1
+  syncFilterPickerButtons()
   applyFiltersAndRender()
 })
 dateStart.on('change', function () {
@@ -3970,6 +4499,7 @@ dateEnd.on('change', function () {
 })
 libraryFilter.on('change', function () {
   syncMirroredControlValue(libraryFilter, this)
+  syncFilterPickerButtons()
   renderLibraryInventory(currentFilteredRuns)
 })
 delegate(countsSeries, 'click', '.logscan-series-toggle', function () {
@@ -3988,13 +4518,15 @@ resetFilters.on('click', function () {
   limit.setValue('500')
   tablePage = 1
   tableStatusFilter = 'all'
-  configFilter.setValue('')
-  toolFilter.setValue('')
-  toolVersionFilter.setValue('')
-  quickstartVersionFilter.setValue('')
+  if (tableUploadFilter) tableUploadFilter.value = 'all'
+  setSelectedValues(configFilter, [])
+  setSelectedValues(toolFilter, [])
+  setSelectedValues(toolVersionFilter, [])
+  setSelectedValues(quickstartVersionFilter, [])
   timeRange.setValue('all')
-  commandFilter.setValue('')
-  libraryFilter.setValue('')
+  setSelectedValues(commandFilter, [])
+  setSelectedValues(libraryFilter, [])
+  syncFilterPickerButtons()
   clearDateFilters()
   fetchRuns({ suppressStatus: true })
 })
@@ -4036,6 +4568,27 @@ preferencesRecommended.addEventListener('click', function () {
       }
     })
 })
+if (filterPickerApply) {
+  filterPickerApply.addEventListener('click', function () {
+    const values = Array.from(filterPickerBody ? filterPickerBody.querySelectorAll('input[type="checkbox"]:checked') : [])
+      .map(input => input.value)
+      .filter(Boolean)
+    applyFilterPickerSelection(values)
+    hideModal(filterPickerModalEl)
+  })
+}
+if (filterPickerClear) {
+  filterPickerClear.addEventListener('click', function () {
+    applyFilterPickerSelection([])
+    hideModal(filterPickerModalEl)
+  })
+}
+if (filterPickerModalEl) {
+  filterPickerModalEl.addEventListener('hidden.bs.modal', function () {
+    activeFilterPickerSelect = null
+  })
+}
+
 confirmReset.addEventListener('click', handleReset)
 confirmReingest.addEventListener('click', handleReingest)
 clearInvalidArchived.addEventListener('click', function () {
@@ -4142,6 +4695,18 @@ tableCompressSelected.addEventListener('click', function () {
   if (!selectedRuns.length) return
   openCompressLogModal(selectedRuns.map(run => run.run_key), `${selectedRuns.length} selected logs`)
 })
+tableUploadSelected?.addEventListener('click', () => logscanUpload?.uploadSelected(getSelectedUploadableRuns()))
+tableUploadFilter?.addEventListener('change', () => {
+  tablePage = 1
+  applyFiltersAndRender()
+})
+document.addEventListener('logscan-upload-change', event => {
+  updateSelectionSummary()
+  if (event.detail?.resultsChanged) {
+    const filtered = filterTableRunsByStatus(filterRuns(allTableRuns, getFilterState()))
+    renderTable(sortRuns(filtered))
+  }
+})
 delegate(tableBody, 'click', '[data-section-details="1"]', function () {
   const runKey = this.dataset.runKey || this.getAttribute('data-run-key')
   showSectionDetails(runKey)
@@ -4166,5 +4731,6 @@ window.addEventListener('pageshow', function (event) {
   if (!event || !event.persisted) return
   refreshAnalyticsPage({ suppressStatus: true })
 })
+ensureFilterPickerButtons()
 renderCountsSeriesSelector()
 refreshAnalyticsPage()

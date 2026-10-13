@@ -1,4 +1,7 @@
+import pytest
 from ruamel.yaml import YAML
+
+from modules.rating_sources import RATING_SOURCE_DETAILS
 
 
 def _template_vars_from_yaml(yaml_content):
@@ -189,6 +192,18 @@ def test_ratings_yaml_contract_bottom_horizontal_prunes_default_offsets(monkeypa
     assert "addon_position" not in template_vars
 
 
+@pytest.mark.parametrize("source", list(RATING_SOURCE_DETAILS))
+def test_direct_rating_sources_survive_yaml_generation(monkeypatch, qs_module, source):
+    payload = _build_library_payload({"rating1": source, "rating1_image": "imdb", "rating2": "none", "rating3": "none"})
+    if source == "serializd":
+        payload["libraries"] = {key.replace("mov-library_", "sho-library_").replace("-movie-", "-show-"): value for key, value in payload["libraries"].items()}
+    template_vars = _template_vars_from_yaml(_run_build_config_with_payload(qs_module, monkeypatch, payload))
+    assert template_vars["rating1"] == source
+    assert template_vars["rating1_image"] == "imdb"
+    assert "rating2" not in template_vars
+    assert "rating3" not in template_vars
+
+
 def test_generated_playlist_files_get_header_without_legacy_playlist_page(monkeypatch, qs_module):
     payload = _build_library_payload(
         {
@@ -231,6 +246,27 @@ def test_playlist_files_follow_library_output_order(monkeypatch, qs_module):
 
     assert library_order == ["A Movies", "B Movies", "Z Shows"]
     assert playlist_order == library_order
+
+
+def test_playlist_files_resolve_true_library_toggle_through_plex_id_name_map(monkeypatch, qs_module):
+    payload = {
+        "validated": True,
+        "libraries": {
+            "mov-library_1-library": "true",
+            "mov-library_1-playlist": "true",
+            "mov-library_1-collection_collectionless": True,
+        },
+    }
+    monkeypatch.setattr(qs_module.output.persistence, "get_library_names", lambda *_args, **_kwargs: {"1": " Movies "})
+
+    parsed = _parsed_yaml(_run_build_config_with_payload(qs_module, monkeypatch, payload))
+
+    library_order = list(parsed["libraries"].keys())
+    playlist_order = parsed["playlist_files"][0]["template_variables"]["libraries"]
+
+    assert library_order == [" Movies "]
+    assert playlist_order == [" Movies "]
+    assert playlist_order != ["True"]
 
 
 def test_playlist_files_emit_shared_and_keyed_template_variables(monkeypatch, qs_module):
@@ -277,7 +313,7 @@ def test_playlist_files_emit_shared_and_keyed_template_variables(monkeypatch, qs
     assert "sonarr_add_missing" not in template_vars
     assert template_vars["sonarr_folder"] == "/data/media/shows"
     assert template_vars["sonarr_tag"] == "playlist-show"
-    assert template_vars["trakt_list"] == "https://trakt.tv/users/example/lists/default"
+    assert "trakt_list" not in template_vars
     assert template_vars["name_mcu"] == "Marvel Timeline"
     assert template_vars["delete_playlist_mcu"] is True
     assert template_vars["radarr_add_missing_mcu"] is True
@@ -286,7 +322,7 @@ def test_playlist_files_emit_shared_and_keyed_template_variables(monkeypatch, qs
     assert template_vars["sonarr_add_missing_mcu"] is False
     assert template_vars["sonarr_folder_mcu"] == "/data/media/shows/mcu"
     assert template_vars["sonarr_tag_mcu"] == "mcu-show"
-    assert template_vars["trakt_list_mcu"] == "https://trakt.tv/users/example/lists/mcu"
+    assert "trakt_list_mcu" not in template_vars
     assert template_vars["exclude_users_mcu"] == "guest"
 
 
@@ -320,11 +356,19 @@ def test_playlist_files_emit_direct_file_and_repo_entries(monkeypatch, qs_module
             "mov-library_movies-library": "Movies",
             "mov-library_movies-playlist": "true",
             "mov-library_movies-collection_collectionless": True,
-            "playlist_files_entries": '[{"type":"file","location":"config/extra_playlists.yml"},{"type":"repo","location":"bullmoose20/playlists.yml"}]',
+            "playlist_files_entries": '[{"type":"file","location":"config/extra_playlists.yml","schedule":"weekly(friday)","template_variables":{"custom_playlist_flag":true}},{"type":"folder","location":"config/playlist_folder","template_variables":{"custom_folder_flag":true}},{"type":"repo","location":"bullmoose20/playlists.yml"}]',
         },
     }
 
     parsed = _parsed_yaml(_run_build_config_with_payload(qs_module, monkeypatch, payload))
 
-    assert parsed["playlist_files"][1] == {"file": "config/extra_playlists.yml"}
-    assert parsed["playlist_files"][2] == {"repo": "bullmoose20/playlists.yml"}
+    assert parsed["playlist_files"][1] == {
+        "file": "config/extra_playlists.yml",
+        "schedule": "weekly(friday)",
+        "template_variables": {"custom_playlist_flag": True},
+    }
+    assert parsed["playlist_files"][2] == {
+        "folder": "config/playlist_folder",
+        "template_variables": {"custom_folder_flag": True},
+    }
+    assert parsed["playlist_files"][3] == {"repo": "bullmoose20/playlists.yml"}

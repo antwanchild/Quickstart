@@ -40,6 +40,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,7 @@ from pathlib import Path
 import psutil
 
 from modules import helpers
+from modules.kometa_integrity import current_integrity, stamp_integrity_comments
 from modules.process_control_state import normalize_kometa_start_mode
 from modules.process_markers import (
     extract_kometa_config_path,
@@ -55,11 +57,15 @@ from modules.process_markers import (
 )
 from modules.process_run_context import update_imagemaid_run_context
 
-_KOMETA_RUNTIME_BRANCHES = {"master", "develop", "nightly"}
+_KOMETA_RUNTIME_BRANCHES = {"master", "develop"}
+_LAUNCHED_PROCESSES = {}
+_LAUNCHED_PROCESSES_LOCK = threading.Lock()
 
 
 def _normalize_kometa_runtime_branch(value):
     branch = str(value or "").strip().lower()
+    if branch == "nightly":
+        branch = "develop"
     return branch if branch in _KOMETA_RUNTIME_BRANCHES else None
 
 
@@ -111,6 +117,28 @@ def stop_process_tree(proc):
     return alive
 
 
+def stop_launched_processes():
+    """Stop only Kometa/ImageMaid processes launched by this Quickstart process."""
+    with _LAUNCHED_PROCESSES_LOCK:
+        launched = list(_LAUNCHED_PROCESSES.items())
+        _LAUNCHED_PROCESSES.clear()
+
+    alive = []
+    for pid, child in launched:
+        if child.poll() is not None:
+            continue
+        try:
+            alive.extend(stop_process_tree(psutil.Process(pid)))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return alive
+
+
+def _track_launched_process(proc):
+    with _LAUNCHED_PROCESSES_LOCK:
+        _LAUNCHED_PROCESSES[proc.pid] = proc
+
+
 def launch_kometa_command(command, config_name=None, start_mode="current"):
     if not command:
         return False, "No command provided"
@@ -144,6 +172,9 @@ def launch_kometa_command(command, config_name=None, start_mode="current"):
     helpers.normalize_flag_values(command_parts)
 
     config_path = extract_kometa_config_path(command_parts, kometa_root)
+    integrity_report = current_integrity(kometa_root)
+    if config_path and not stamp_integrity_comments(config_path, integrity_report):
+        helpers.ts_log("Unable to refresh Kometa integrity comments; diagnostics will still be included in the run marker.", level="WARNING")
     stamp_quickstart_config_marker(config_path, config_name)
 
     helpers.ts_log(f"argv={command_parts!r}", level="DEBUG")
@@ -161,11 +192,12 @@ def launch_kometa_command(command, config_name=None, start_mode="current"):
         start_new_session=True,
         env=runtime_env,
     )
+    _track_launched_process(proc)
 
     with open(helpers.get_kometa_pid_file(), "w", encoding="utf-8") as f:
         f.write(str(proc.pid))
 
-    schedule_quickstart_run_marker(kometa_root, config_name, start_mode=normalize_kometa_start_mode(start_mode))
+    schedule_quickstart_run_marker(kometa_root, config_name, start_mode=normalize_kometa_start_mode(start_mode), integrity_report=integrity_report)
     return True, proc.pid
 
 
@@ -225,6 +257,7 @@ def launch_imagemaid_command(command, mode=None, config_name=None):
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        _track_launched_process(proc)
 
         with open(helpers.get_imagemaid_pid_file(), "w", encoding="utf-8") as f:
             f.write(str(proc.pid))
@@ -232,6 +265,8 @@ def launch_imagemaid_command(command, mode=None, config_name=None):
         time.sleep(1.0)
         return_code = proc.poll()
         if return_code is not None:
+            with _LAUNCHED_PROCESSES_LOCK:
+                _LAUNCHED_PROCESSES.pop(proc.pid, None)
             launch_log.flush()
             try:
                 os.remove(helpers.get_imagemaid_pid_file())

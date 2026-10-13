@@ -1,6 +1,18 @@
 <div class="alert alert-danger qs-validation-callout" role="alert">
   <h6><b>This page is mandatory and must be completed</b></h6>
-  Enter your Plex URL/Token and press "Validate" to continue.
-  <br><br><a href="https://kometa.wiki/en/{{ version_info.kometa_branch }}/config/plex/" target="_blank">Click Here</a>
-  to go to the Kometa wiki for this connector.
+  <p>A valid Plex server URL and token are required. Choose either option:</p>
+  <ul class="mb-3">
+    <li class="mb-2"><b>Sign in with Plex:</b> Approve access in the Plex window, including two-factor authentication if enabled.
+      Quickstart fills only the token; enter the server URL yourself. An existing URL is kept and validated after sign-in.
+      If the popup is blocked, use <b>Open Plex</b>.</li>
+    <li><b>Manual entry:</b> Enter your direct server URL and an existing <code>X-Plex-Token</code>, then select <b>Validate</b>.
+      You can also obtain the token through sign-in before entering the URL.</li>
+  </ul>
+  <p>Quickstart and Kometa must both be able to reach the server address.
+    If Plex runs in Docker and Kometa runs on another machine, use the Docker host's LAN address and published Plex port,
+    not a private container IP or <code>localhost</code>.
+    <code>https://app.plex.tv</code> is not a direct server address.</p>
+  <p>A <code>plex.direct</code> address is normal for Plex HTTPS connections, not an authentication token.
+    Sign-in does not change your server address or remote-access settings. Keep your Plex token private.</p>
+  <a href="https://kometa.wiki/en/{{ version_info.kometa_branch }}/config/plex/" target="_blank" rel="noopener noreferrer">Plex configuration documentation</a>
 </div>

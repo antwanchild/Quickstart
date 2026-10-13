@@ -15,7 +15,7 @@ jobs:
     steps:
 
       - name: Check Out Repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
@@ -26,7 +26,7 @@ jobs:
           echo "commit-msg=$(git log -1 HEAD --pretty=format:%s)" >> $GITHUB_OUTPUT
 
   build-releases:
-    name: Build ${{ matrix.os_upper }} Executable
+    name: Build ${{ matrix.os_upper }}${{ matrix.arch_suffix }} Executable
     runs-on: ${{ matrix.os }}-${{ matrix.os_version }}
     needs: [ get-version ]
     strategy:
@@ -37,18 +37,26 @@ jobs:
             os_upper: 'Windows'
             os_version: 'latest'
             ext: '.exe'
+            arch_suffix: ''
           - os: 'ubuntu'
             os_upper: 'Linux'
             os_version: 'latest'
             ext: ''
+            arch_suffix: ''
           - os: 'macos'
             os_upper: 'MacOS'
             os_version: '15-intel'
             ext: ''
+            arch_suffix: '-x86_64'
+          - os: 'macos'
+            os_upper: 'MacOS'
+            os_version: '15'
+            ext: ''
+            arch_suffix: '-arm64'
     steps:
 
       - name: Check Out Repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
@@ -57,7 +65,7 @@ jobs:
       # See modules/helpers/_vite_manifest.py for how templates consume
       # this at request time; roadmap #1334 Step 4.
       - name: Setup Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: 'npm'
@@ -68,7 +76,7 @@ jobs:
           npm run build
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.13'
 
@@ -88,9 +96,9 @@ jobs:
             pyinstaller -y ./quickstart.spec -- --build ${{ runner.os }}
             version_value=${tag_name}
           fi
-          mv dist/Quickstart${{ matrix.ext }} dist/Quickstart-${version_value}-${{ runner.os }}${{ matrix.ext }}
-          echo "$tag_name dist/Quickstart-$version_value-${{ runner.os }}${{ matrix.ext }}"
-          gh release upload ${tag_name} dist/Quickstart-${version_value}-${{ runner.os }}${{ matrix.ext }}
+          mv dist/Quickstart${{ matrix.ext }} dist/Quickstart-${version_value}-${{ runner.os }}${{ matrix.arch_suffix }}${{ matrix.ext }}
+          echo "$tag_name dist/Quickstart-$version_value-${{ runner.os }}${{ matrix.arch_suffix }}${{ matrix.ext }}"
+          gh release upload ${tag_name} dist/Quickstart-${version_value}-${{ runner.os }}${{ matrix.arch_suffix }}${{ matrix.ext }}
 
 
   failure-notification:

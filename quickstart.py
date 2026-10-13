@@ -25,7 +25,9 @@ import os
 import platform
 import psutil
 import re
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -62,11 +64,15 @@ from werkzeug.datastructures import MultiDict
 from werkzeug.wrappers import Request
 from flask_session import Session
 from modules import validations, output, persistence, helpers, database, logscan, path_validation, url_validation
+from modules.kometa_integrity import current_integrity, format_integrity, integrity_comments
 from modules import importer  # noqa: F401 (load-bearing: tests do monkeypatch.setattr(qs_module.importer, ...))
 from modules.dependency_reasons import (  # noqa: F401 (re-exports for tests/legacy in-module callers)
     QS_ANIDB_DEP_SOURCE_PREFIXES,
     QS_ANIDB_OVERLAY_IMAGE_VALUES,
     QS_ANIDB_REQUIRED_STEP_KEY,
+    QS_FLOPPY_DEP_SOURCE_PREFIXES,
+    QS_FLOPPY_OVERLAY_SOURCE_VALUES,
+    QS_FLOPPY_REQUIRED_STEP_KEY,
     QS_MAL_DEP_ATTRIBUTE_OPERATIONS,
     QS_MAL_DEP_ATTRIBUTE_VALUES,
     QS_MAL_DEP_COLLECTION_IDS,
@@ -89,13 +95,11 @@ from modules.dependency_reasons import (  # noqa: F401 (re-exports for tests/leg
     QS_TAUTULLI_REQUIRED_STEP_KEY,
     QS_TRACEARR_DEP_COLLECTION_IDS,
     QS_TRACEARR_REQUIRED_STEP_KEY,
-    QS_TRAKT_DEP_COLLECTION_IDS,
-    QS_TRAKT_OVERLAY_IMAGE_VALUES,
-    QS_TRAKT_REQUIRED_STEP_KEY,
     _active_library_prefixes,
     _append_dependency_reason,
     _attribute_dependency_source_reasons,
     _config_anidb_dependency_reasons,
+    _config_floppy_dependency_reasons,
     _config_dependency_reasons,
     _config_mal_dependency_reasons,
     _config_mdblist_dependency_reasons,
@@ -105,15 +109,16 @@ from modules.dependency_reasons import (  # noqa: F401 (re-exports for tests/leg
     _config_sonarr_dependency_reasons,
     _config_tautulli_dependency_reasons,
     _config_tracearr_dependency_reasons,
-    _config_trakt_dependency_reasons,
     _dependency_reason_label,
     _is_truthy_setting_value,
     _libraries_data_anidb_dependency_reasons,
+    _libraries_data_floppy_dependency_reasons,
     _libraries_data_collection_dependency_reasons,
     _libraries_data_mal_dependency_reasons,
     _libraries_data_mdblist_dependency_reasons,
     _libraries_data_omdb_dependency_reasons,
     _libraries_data_overlay_rating_dependency_reasons,
+    _libraries_data_overlay_rating_source_dependency_reasons,
     _libraries_data_radarr_dependency_reasons,
     _libraries_data_requires_mal,
     _libraries_data_service_dependency_reasons,
@@ -121,7 +126,6 @@ from modules.dependency_reasons import (  # noqa: F401 (re-exports for tests/leg
     _libraries_data_tautulli_dependency_reasons,
     _libraries_data_tracearr_dependency_reasons,
     _libraries_data_template_collection_dependency_reasons,
-    _libraries_data_trakt_dependency_reasons,
     _library_prefix_from_key,
     _normalize_status,
     _parse_json_array,
@@ -197,6 +201,7 @@ from modules.background_jobs import (
     complete_background_job as _complete_background_job,  # noqa: F401 (used directly by tests as qs_module._complete_background_job)
 )
 from blueprints.validation_routes import bp as validation_routes_bp, refresh_plex_libraries
+from blueprints.plex_auth_routes import bp as plex_auth_routes_bp
 from blueprints.asset_routes import bp as asset_routes_bp
 from blueprints.kometa_updates import bp as kometa_updates_bp
 from blueprints.imagemaid_updates import bp as imagemaid_updates_bp
@@ -210,8 +215,10 @@ from blueprints.library_routes import (
     bp as library_routes_bp,
     _build_library_lists,  # noqa: F401 (used by tests as qs_module._build_library_lists)
     _configured_library_ids,  # noqa: F401 (used internally + by tests)
+    _library_lists_from_telemetry,
     _legacy_playlist_library_names,  # noqa: F401
     _migrate_legacy_playlist_libraries_to_library_toggles,  # noqa: F401 (patched in tests)
+    _normalize_library_toggle_names,  # noqa: F401
     _build_merged_libraries_hint_payload,  # noqa: F401
     _libraries_dependency_hint_response,  # noqa: F401
 )
@@ -273,6 +280,8 @@ from modules.logscan_cache import (
 )
 from modules.logscan_resume import (
     build_resume_library_scope as _build_resume_library_scope,  # noqa: F401 (used directly by tests as qs_module._build_resume_library_scope)
+    build_recovery_command as _build_recovery_command,
+    extract_selected_libraries as _extract_selected_libraries,
     extract_first_log_timestamp as _extract_first_log_timestamp,
     build_incomplete_run_timing_summary as _build_incomplete_run_timing_summary,  # noqa: F401 (used directly by tests as qs_module._build_incomplete_run_timing_summary)
     build_incomplete_scope_summary as _build_incomplete_scope_summary,  # noqa: F401 (used directly by tests as qs_module._build_incomplete_scope_summary)
@@ -280,6 +289,13 @@ from modules.logscan_resume import (
     build_recovery_suggestions as _build_recovery_suggestions,  # noqa: F401 (used directly by tests as qs_module._build_recovery_suggestions)
     build_resume_explanation as _build_resume_explanation,  # noqa: F401 (used directly by tests as qs_module._build_resume_explanation)
 )
+
+build_resume_library_scope = _build_resume_library_scope
+build_recovery_command = _build_recovery_command
+extract_selected_libraries = _extract_selected_libraries
+build_recovery_suggestions = _build_recovery_suggestions
+build_resume_explanation = _build_resume_explanation
+
 from modules.logscan_imagemaid_analysis import (
     resolve_imagemaid_run_config_name as _resolve_imagemaid_run_config_name,
 )
@@ -350,6 +366,7 @@ from modules.process_control import (
     find_running_imagemaid_processes as _find_running_imagemaid_processes,  # noqa: F401 (load-bearing: tests + blueprints/imagemaid_routes.py access via qs_module)
     find_running_imagemaid_process as _find_running_imagemaid_process,  # noqa: F401 (load-bearing: tests + blueprints/imagemaid_routes.py access via qs_module)
     stop_process_tree as _stop_process_tree,
+    stop_launched_processes as _stop_launched_processes,
     launch_kometa_command as _launch_kometa_command,
     launch_imagemaid_command as _launch_imagemaid_command,  # noqa: F401 (load-bearing: tests + blueprints/imagemaid_routes.py access via qs_module)
     reset_imagemaid_runtime_env as _reset_imagemaid_runtime_env,  # noqa: F401 (used directly by tests as qs_module._reset_imagemaid_runtime_env)
@@ -386,6 +403,19 @@ _retrieve_settings_for_config = persistence.retrieve_settings_for_config
 apply_validation_metadata = persistence.apply_validation_metadata
 _is_logscan_gzip_path = helpers.is_logscan_gzip_path
 _read_logscan_text = helpers.read_logscan_text
+
+
+def _get_logscan_gzip_original_size(path):
+    try:
+        path = Path(path)
+        if not _is_logscan_gzip_path(path) or path.stat().st_size < 4:
+            return None
+        with path.open("rb") as handle:
+            handle.seek(-4, os.SEEK_END)
+            return int.from_bytes(handle.read(4), byteorder="little", signed=False)
+    except Exception:
+        return None
+
 
 ACTIVE_WORK_POLICIES = {
     "kometa_run": [
@@ -436,6 +466,7 @@ ACTIVE_WORK_POLICIES = {
 LOG_STATS_CACHE = {"mtime": None, "size": None, "stats": None}
 LOGSCAN_ANALYSIS_CACHE_VERSION = 3
 LOGSCAN_ANALYSIS_CACHE = {"mtime": None, "size": None, "version": LOGSCAN_ANALYSIS_CACHE_VERSION, "data": None}
+LOGSCAN_PROGRESS_SNAPSHOT_VERSION = 1
 LOGSCAN_PROGRESS_CACHE = {"mtime": None, "size": None, "aux_signature": None, "data": None}
 
 VALIDATION_DOC_BASE = "/step/"
@@ -455,6 +486,8 @@ MODULE_PAGE_SCRIPTS = frozenset(
         "040-github",
         "050-omdb",
         "060-mdblist",
+        "065-serializd",
+        "067-floppy",
         "070-notifiarr",
         "080-gotify",
         "085-ntfy",
@@ -464,7 +497,6 @@ MODULE_PAGE_SCRIPTS = frozenset(
         "100-anidb",
         "110-radarr",
         "120-sonarr",
-        "130-trakt",
         "140-mal",
         "150-settings",
         "150-settings",
@@ -479,13 +511,14 @@ VALIDATION_DOCS = {
     "libraries": f"{VALIDATION_DOC_BASE}025-libraries",
     "plex": f"{VALIDATION_DOC_BASE}010-plex",
     "tmdb": f"{VALIDATION_DOC_BASE}020-tmdb",
-    "trakt": f"{VALIDATION_DOC_BASE}130-trakt",
     "radarr": f"{VALIDATION_DOC_BASE}110-radarr",
     "sonarr": f"{VALIDATION_DOC_BASE}120-sonarr",
     "tautulli": f"{VALIDATION_DOC_BASE}030-tautulli",
     "tracearr": f"{VALIDATION_DOC_BASE}035-tracearr",
     "omdb": f"{VALIDATION_DOC_BASE}050-omdb",
     "mdblist": f"{VALIDATION_DOC_BASE}060-mdblist",
+    "serializd": f"{VALIDATION_DOC_BASE}065-serializd",
+    "floppy": f"{VALIDATION_DOC_BASE}067-floppy",
     "notifiarr": f"{VALIDATION_DOC_BASE}070-notifiarr",
     "github": f"{VALIDATION_DOC_BASE}040-github",
     "gotify": f"{VALIDATION_DOC_BASE}080-gotify",
@@ -504,7 +537,7 @@ VALIDATION_REASON_LABELS = {
     "missing_plex_validation": "Plex not validated",
     "no_libraries": "No libraries selected",
     "invalid_paths": "Invalid paths",
-    "invalid_arr_overrides": "Invalid Arr overrides",
+    "invalid_arr_overrides": "Invalid Arr modifications",
     "missing_library_defaults": "Missing library defaults",
     "missing_separator_placeholder": "Missing separator placeholder",
     "invalid_metadata_files": "Invalid metadata files",
@@ -886,7 +919,7 @@ def _validate_library_service_overrides(library_id, libraries_data, force_valida
             "skipped": False,
             "service": service_name,
             "overrides": overrides,
-            "errors": [f"{scoped_label}: URL and token are required after applying overrides."],
+            "errors": [f"{scoped_label}: URL and token are required after applying modifications."],
         }
 
     if service_name == "radarr":
@@ -1113,7 +1146,7 @@ def _merge_libraries_payload_for_partial_step_save(incoming_libraries):
         elif shared in existing_libraries and shared not in merged_libraries:
             merged_libraries[shared] = existing_libraries[shared]
 
-    return merged_libraries
+    return _normalize_library_toggle_names(merged_libraries)
 
 
 DOTENV = os.path.relpath(os.path.join(helpers.CONFIG_DIR, ".env"))
@@ -1139,8 +1172,26 @@ app = Flask(__name__)
 # so ``python quickstart.py`` after a fresh clone still works.
 # Roadmap #1334 Step 4 activation. See modules/helpers/_vite_manifest.py.
 app.jinja_env.globals["asset_url"] = helpers.asset_url
+app.jinja_env.globals["vite_dev_origin"] = helpers.vite_dev_origin
 
+
+def _nbsp_leading_spaces(s: str) -> str:
+    """Replace leading/trailing ASCII spaces with EM SPACE (U+2003) so they are visible in dropdowns."""
+    s = str(s)
+    lstripped = s.lstrip(" ")
+    leading = len(s) - len(lstripped)
+    rstripped = lstripped.rstrip(" ")
+    trailing = len(lstripped) - len(rstripped)
+    return " " * leading + rstripped + " " * trailing
+
+
+app.jinja_env.filters["nbsp_leading_spaces"] = _nbsp_leading_spaces
+
+from blueprints.logscan_upload_routes import logscan_upload_bp, portal_uploader
+
+app.register_blueprint(logscan_upload_bp)
 app.register_blueprint(validation_routes_bp)
+app.register_blueprint(plex_auth_routes_bp)
 app.register_blueprint(asset_routes_bp)
 app.register_blueprint(kometa_updates_bp)
 app.register_blueprint(imagemaid_updates_bp)
@@ -1321,6 +1372,13 @@ os.makedirs(flask_cache_dir, exist_ok=True)
 
 logscan_reingest_lock = threading.Lock()
 logscan_ingest_lock = threading.Lock()
+logscan_trends_request_lock = threading.Lock()
+logscan_trends_request_state = {
+    "status": "idle",
+    "request_id": None,
+}
+BULK_VALIDATION_PROGRESS = {}
+BULK_VALIDATION_PROGRESS_LOCK = threading.Lock()
 logscan_reingest_state = {
     "status": "idle",
     "job_id": None,
@@ -1337,7 +1395,7 @@ LOGSCAN_STARTUP_MIGRATION_JOB_ID = "startup-logscan-migration"
 
 session_ttl = _get_session_lifetime_seconds()
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(seconds=session_ttl)
-app.config["SESSION_REFRESH_EACH_REQUEST"] = True
+app.config["SESSION_REFRESH_EACH_REQUEST"] = False
 app.config["QS_SESSION_LIFETIME_DAYS"] = _get_session_lifetime_days()
 app.config["QS_FLASK_SESSION_DIR"] = flask_cache_dir
 app.config["SESSION_CACHELIB"] = FileSystemCache(cache_dir=flask_cache_dir, threshold=500, default_timeout=session_ttl)
@@ -1347,9 +1405,26 @@ app.config["SESSION_USE_SIGNER"] = False
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB, adjust as needed
 app.config["MAX_FORM_MEMORY_SIZE"] = 16 * 1024 * 1024  # 16 MB
 
+SESSIONLESS_HEALTHCHECK_ENDPOINTS = {"kometa_status"}
+SESSIONLESS_HEALTHCHECK_PATHS = {"/kometa-status"}
+
+
+def _is_sessionless_request():
+    if request.method != "GET":
+        return False
+    return (
+        request.endpoint == "static"
+        or request.path.startswith("/static/")
+        or request.endpoint in SESSIONLESS_HEALTHCHECK_ENDPOINTS
+        or request.path in SESSIONLESS_HEALTHCHECK_PATHS
+    )
+
 
 @app.before_request
 def before_request():
+    if _is_sessionless_request():
+        return None
+
     # Assign user UUID if not already present
     if "qs_session_id" not in session:
         session["qs_session_id"] = str(uuid.uuid4())[:8]
@@ -1368,11 +1443,16 @@ def before_request():
 
     try:
         ua = request.user_agent
-        session["qs_user_agent"] = ua.string or ""
-        session["qs_user_agent_browser"] = ua.browser or ""
-        session["qs_user_agent_version"] = ua.version or ""
-        session["qs_user_agent_platform"] = ua.platform or ""
-        session["qs_user_agent_raw"] = request.headers.get("User-Agent", "") or ""
+        user_agent_values = {
+            "qs_user_agent": ua.string or "",
+            "qs_user_agent_browser": ua.browser or "",
+            "qs_user_agent_version": ua.version or "",
+            "qs_user_agent_platform": ua.platform or "",
+            "qs_user_agent_raw": request.headers.get("User-Agent", "") or "",
+        }
+        for key, value in user_agent_values.items():
+            if session.get(key) != value:
+                session[key] = value
     except Exception:
         pass
 
@@ -1434,6 +1514,16 @@ def check_quickstart_update():
 
 # Initialize Flask-Session
 server_session = Session(app)
+_save_server_session = app.session_interface.save_session
+
+
+def _save_session_unless_sessionless_request(app_obj, session_obj, response):
+    if has_request_context() and _is_sessionless_request():
+        return None
+    return _save_server_session(app_obj, session_obj, response)
+
+
+app.session_interface.save_session = _save_session_unless_sessionless_request
 server_thread = None
 shutdown_event = threading.Event()
 
@@ -1465,13 +1555,18 @@ def start():
     return redirect(url_for("step", name="001-start"))
 
 
-def _build_logscan_resolution_context(log_dir=None, include_candidate_files=True):
+def _build_logscan_resolution_context(log_dir=None, include_candidate_files=True, run_keys=None):
     cache_entries = []
+    run_key_filter = None
+    if run_keys is not None:
+        run_key_filter = {str(value or "").strip() for value in run_keys if str(value or "").strip()}
     ingest_cache = _load_logscan_ingest_cache()
     cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
     if isinstance(cache_logs, dict):
         for raw_path, entry in cache_logs.items():
             if not isinstance(entry, dict):
+                continue
+            if run_key_filter is not None and str(entry.get("run_key") or "").strip() not in run_key_filter:
                 continue
             try:
                 path = Path(raw_path).resolve()
@@ -1483,11 +1578,27 @@ def _build_logscan_resolution_context(log_dir=None, include_candidate_files=True
                 stats = path.stat()
             except Exception:
                 continue
+            location = _classify_logscan_file_location(path, log_dir=log_dir)
+            is_compressed = _is_logscan_gzip_path(path)
+            compressed_size = int(stats.st_size) if is_compressed else None
+            original_size = entry.get("original_size")
+            if original_size is None:
+                original_size = entry.get("uncompressed_size")
+            try:
+                original_size = int(original_size) if original_size is not None else None
+            except Exception:
+                original_size = None
+            if original_size is None and is_compressed:
+                original_size = _get_logscan_gzip_original_size(path)
             cache_entries.append(
                 {
                     "path": path,
                     "mtime": float(stats.st_mtime),
                     "size": int(stats.st_size),
+                    "original_size": original_size,
+                    "compressed_size": compressed_size,
+                    "location": location,
+                    "is_compressed": is_compressed,
                     "run_key": entry.get("run_key"),
                     "tool_name": _normalize_logscan_tool_name(entry.get("tool_name") or _detect_logscan_tool_from_path(path, log_dir=log_dir)),
                 }
@@ -1500,16 +1611,44 @@ def _build_logscan_resolution_context(log_dir=None, include_candidate_files=True
                 stats = path.stat()
             except Exception:
                 continue
+            is_compressed = _is_logscan_gzip_path(path)
             candidate_files.append(
                 {
                     "path": path,
                     "mtime": float(stats.st_mtime),
                     "size": int(stats.st_size),
+                    "original_size": _get_logscan_gzip_original_size(path) if is_compressed else int(stats.st_size),
+                    "compressed_size": int(stats.st_size) if is_compressed else None,
                     "location": _classify_logscan_file_location(path, log_dir=log_dir),
+                    "is_compressed": is_compressed,
                     "tool_name": _detect_logscan_tool_from_path(path, log_dir=log_dir),
                 }
             )
-    return {"cache_entries": cache_entries, "candidate_files": candidate_files}
+    return {
+        "cache_entries": cache_entries,
+        "candidate_files": candidate_files,
+        "candidate_files_scanned": bool(include_candidate_files),
+        "run_key_filtered": run_key_filter is not None,
+    }
+
+
+def _logscan_match_sort_key(entry, log_dir=None):
+    path = entry.get("path") if isinstance(entry, dict) else None
+    location = entry.get("location") if isinstance(entry, dict) else None
+    if not location and path:
+        location = _classify_logscan_file_location(path, log_dir=log_dir)
+    is_compressed = bool(entry.get("is_compressed")) if isinstance(entry, dict) else False
+    if not is_compressed and path:
+        is_compressed = _is_logscan_gzip_path(path)
+    if location == "archive" and is_compressed:
+        rank = 0
+    elif location == "archive":
+        rank = 1
+    elif location == "live":
+        rank = 3
+    else:
+        rank = 2
+    return (rank, -float(entry.get("mtime", 0) or 0))
 
 
 def _find_logscan_cache_entry_for_run(run_key):
@@ -1519,6 +1658,7 @@ def _find_logscan_cache_entry_for_run(run_key):
     cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
     if not isinstance(cache_logs, dict):
         return None
+    matches = []
     for raw_path, entry in cache_logs.items():
         if not isinstance(entry, dict) or entry.get("run_key") != run_key:
             continue
@@ -1535,14 +1675,34 @@ def _find_logscan_cache_entry_for_run(run_key):
         except Exception:
             mtime = float(entry.get("mtime", 0) or 0)
             size = int(entry.get("size", 0) or 0)
-        return {
-            "path": path,
-            "mtime": mtime,
-            "size": size,
-            "run_key": entry.get("run_key"),
-            "tool_name": _normalize_logscan_tool_name(entry.get("tool_name") or _detect_logscan_tool_from_path(path)),
-        }
-    return None
+        is_compressed = _is_logscan_gzip_path(path)
+        compressed_size = size if is_compressed else None
+        original_size = entry.get("original_size")
+        if original_size is None:
+            original_size = entry.get("uncompressed_size")
+        try:
+            original_size = int(original_size) if original_size is not None else None
+        except Exception:
+            original_size = None
+        if original_size is None and is_compressed:
+            original_size = _get_logscan_gzip_original_size(path)
+        matches.append(
+            {
+                "path": path,
+                "mtime": mtime,
+                "size": size,
+                "original_size": original_size,
+                "compressed_size": compressed_size,
+                "location": _classify_logscan_file_location(path),
+                "is_compressed": is_compressed,
+                "run_key": entry.get("run_key"),
+                "tool_name": _normalize_logscan_tool_name(entry.get("tool_name") or _detect_logscan_tool_from_path(path)),
+            }
+        )
+    if not matches:
+        return None
+    matches.sort(key=_logscan_match_sort_key)
+    return matches[0]
 
 
 def _match_logscan_run_to_file(run_record, context=None, log_dir=None, allow_live_fallback=True):
@@ -1556,12 +1716,15 @@ def _match_logscan_run_to_file(run_record, context=None, log_dir=None, allow_liv
             entry for entry in context.get("cache_entries", []) if entry.get("run_key") == run_key and _normalize_logscan_tool_name(entry.get("tool_name")) == run_tool_name
         ]
         if cache_matches:
-            cache_matches.sort(key=lambda entry: entry.get("mtime", 0), reverse=True)
+            cache_matches.sort(key=lambda entry: _logscan_match_sort_key(entry, log_dir=log_dir))
             match = cache_matches[0]
             return {
                 "path": match["path"],
-                "location": _classify_logscan_file_location(match["path"], log_dir=log_dir),
+                "location": match.get("location") or _classify_logscan_file_location(match["path"], log_dir=log_dir),
                 "size": match.get("size"),
+                "original_size": match.get("original_size"),
+                "compressed_size": match.get("compressed_size"),
+                "is_compressed": bool(match.get("is_compressed")),
                 "mtime": match.get("mtime"),
                 "source": "cache",
             }
@@ -1599,6 +1762,9 @@ def _match_logscan_run_to_file(run_record, context=None, log_dir=None, allow_liv
         "path": match["path"],
         "location": match.get("location") or _classify_logscan_file_location(match["path"], log_dir=log_dir),
         "size": match.get("size"),
+        "original_size": match.get("original_size"),
+        "compressed_size": match.get("compressed_size"),
+        "is_compressed": bool(match.get("is_compressed")),
         "mtime": match.get("mtime"),
         "source": "fallback",
     }
@@ -1620,14 +1786,17 @@ def _resolve_logscan_run_log_info(run_key, run_record=None, context=None):
         if direct_match and (not run_tool_name or _normalize_logscan_tool_name(direct_match.get("tool_name")) == run_tool_name):
             cache_matches = [direct_match]
     if cache_matches:
-        cache_matches.sort(key=lambda entry: entry.get("mtime", 0), reverse=True)
+        cache_matches.sort(key=_logscan_match_sort_key)
         match = cache_matches[0]
-        location = _classify_logscan_file_location(match["path"])
+        location = match.get("location") or _classify_logscan_file_location(match["path"])
         if not (isinstance(run_record, dict) and location == "live"):
             return {
                 "path": match["path"],
                 "location": location,
                 "size": match.get("size"),
+                "original_size": match.get("original_size"),
+                "compressed_size": match.get("compressed_size"),
+                "is_compressed": bool(match.get("is_compressed")),
                 "mtime": match.get("mtime"),
                 "source": "cache",
             }
@@ -1639,14 +1808,20 @@ def _resolve_logscan_run_log_info(run_key, run_record=None, context=None):
                 "path": match["path"],
                 "location": _classify_logscan_file_location(match["path"]),
                 "size": match.get("size"),
+                "original_size": match.get("original_size"),
+                "compressed_size": match.get("compressed_size"),
+                "is_compressed": bool(match.get("is_compressed")),
                 "mtime": match.get("mtime"),
                 "source": "cache",
             }
         return None
     full_context = context
-    if not isinstance(full_context, dict) or not isinstance(full_context.get("candidate_files"), list) or not full_context.get("candidate_files"):
-        full_context = _build_logscan_resolution_context(include_candidate_files=True)
-    info = _match_logscan_run_to_file(run_record, context=full_context, allow_live_fallback=False)
+    if isinstance(full_context, dict) and full_context.get("candidate_files_scanned") is False:
+        info = None
+    else:
+        if not isinstance(full_context, dict) or not isinstance(full_context.get("candidate_files"), list) or not full_context.get("candidate_files"):
+            full_context = _build_logscan_resolution_context(include_candidate_files=True)
+        info = _match_logscan_run_to_file(run_record, context=full_context, allow_live_fallback=False)
     if info:
         return info
     if cache_matches:
@@ -1655,6 +1830,9 @@ def _resolve_logscan_run_log_info(run_key, run_record=None, context=None):
             "path": match["path"],
             "location": _classify_logscan_file_location(match["path"]),
             "size": match.get("size"),
+            "original_size": match.get("original_size"),
+            "compressed_size": match.get("compressed_size"),
+            "is_compressed": bool(match.get("is_compressed")),
             "mtime": match.get("mtime"),
             "source": "cache",
         }
@@ -1771,6 +1949,10 @@ def _compress_logscan_run_artifact(run_key):
     if not info or not info.get("path"):
         return False, {"error": "Archived log file for this run could not be found.", "run_key": run_key}, 404
     source_path = Path(info["path"])
+    try:
+        source_size = int(source_path.stat().st_size)
+    except Exception:
+        source_size = int(info.get("size", 0) or 0)
     if info.get("location") != "archive":
         return False, {"error": "Only archived logs can be compressed from Analytics.", "run_key": run_key}, 409
     if _is_logscan_gzip_path(source_path):
@@ -1799,8 +1981,11 @@ def _compress_logscan_run_artifact(run_key):
         compressed_stats = compressed_path.stat()
         cache_entry["mtime"] = compressed_stats.st_mtime
         cache_entry["size"] = compressed_stats.st_size
+        cache_entry["compressed_size"] = compressed_stats.st_size
     except Exception:
         pass
+    if source_size:
+        cache_entry["original_size"] = int(cache_entry.get("original_size") or source_size)
     cache_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
     cache_logs[compressed_key] = cache_entry
     cache["logs"] = cache_logs
@@ -1823,6 +2008,7 @@ def _annotate_logscan_runs(runs, context=None):
         return [] if isinstance(runs, list) else []
     context = context or _build_logscan_resolution_context()
     annotated = []
+    upload_results = portal_uploader.saved_run_results()
     for run in runs:
         if not isinstance(run, dict):
             continue
@@ -1833,9 +2019,15 @@ def _annotate_logscan_runs(runs, context=None):
         row["log_available"] = bool(info and info.get("path"))
         row["log_location"] = info.get("location") if info else "missing"
         row["log_resolved_size"] = info.get("size") if info and isinstance(info.get("size"), int) else row.get("log_size")
-        row["log_is_compressed"] = bool(info and info.get("path") and _is_logscan_gzip_path(info["path"]))
+        row["log_original_size"] = info.get("original_size") if info and isinstance(info.get("original_size"), int) else row.get("log_size")
+        row["log_compressed_size"] = info.get("compressed_size") if info and isinstance(info.get("compressed_size"), int) else None
+        row["log_is_compressed"] = bool(info and (info.get("is_compressed") or (info.get("path") and _is_logscan_gzip_path(info["path"]))))
         row["log_can_delete"] = row["log_location"] == "archive" and row["log_available"]
         row["log_can_compress"] = row["log_location"] == "archive" and row["log_available"] and not row["log_is_compressed"]
+        if _normalize_logscan_tool_name(row.get("tool_name")) in ("kometa", "imagemaid"):
+            row["portal_upload"] = upload_results.get(row.get("run_key"))
+            if not row["portal_upload"] and row["log_available"] and row["log_location"] in ("live", "archive"):
+                row["portal_upload_pending"] = portal_uploader.restore_run_result(row.get("run_key"), info["path"])
         annotated.append(row)
     return annotated
 
@@ -1988,6 +2180,20 @@ def logscan_trends_log_compress():
 
 @app.route("/step/<name>", methods=["GET", "POST"])
 def step(name):
+    if name == "130-trakt":
+        page_info = {
+            "title": "Trakt Support Removed",
+            "template_name": "130-trakt-retired",
+            "template_uses_module": False,
+            "suppress_page_script": True,
+            "plex_valid": False,
+            "tmdb_valid": False,
+            "libs_valid": False,
+            "sett_valid": False,
+            "yaml_valid": False,
+            "save_error": None,
+        }
+        return render_template("trakt-retired.html", page_info=page_info), 410
     page_info = {}
     header_style = "single line"
     save_error = None
@@ -2277,6 +2483,9 @@ def step(name):
             refresh_plex_libraries()
             all_libraries = persistence.retrieve_settings("010-plex")
             plex_data = all_libraries.get("plex", {})
+            if name == "025-libraries":
+                # Re-read after migration may have renamed old name-based keys to ID-based keys.
+                data = persistence.retrieve_settings(name)
 
     telemetry_payload = {}
     try:
@@ -2309,49 +2518,41 @@ def step(name):
 
     page_info["telemetry"] = telemetry_data
 
-    # Extract the movie and show libraries
+    # Extract the movie and show libraries by Plex section ID with display-name lookup.
+    _lib_name_map = persistence.get_library_names("010-plex")
     movie_libraries_raw = plex_data.get("tmp_movie_libraries", "")
     show_libraries_raw = plex_data.get("tmp_show_libraries", "")
 
-    # Debugging extracted values
     if app.config["QS_DEBUG"]:
         helpers.ts_log("Extracted movie libraries:", movie_libraries_raw, level="DEBUG")
         helpers.ts_log("Extracted show libraries:", show_libraries_raw, level="DEBUG")
 
-    # Ensure it's a string before splitting
-    if not isinstance(movie_libraries_raw, str):
-        if app.config["QS_DEBUG"]:
-            helpers.ts_log("tmp_movie_libraries is not a string!", level="ERROR")
-
-        movie_libraries_raw = ""
-
-    if not isinstance(show_libraries_raw, str):
-        if app.config["QS_DEBUG"]:
-            helpers.ts_log("tmp_show_libraries is not a string!", level="ERROR")
-
-        show_libraries_raw = ""
-
-    existing_ids = set()  # Track used IDs to prevent duplicates
-
     movie_libraries = [
         {
-            "id": f"mov-library_{helpers.normalize_id(lib.strip(), existing_ids)}",
-            "name": lib.strip(),
+            "id": f"mov-library_{lib_id}",
+            "name": _lib_name_map.get(str(lib_id), f"Library {lib_id}"),
             "type": "movie",
         }
-        for lib in movie_libraries_raw.split(",")
-        if lib.strip()
+        for lib_id in persistence.decode_library_ids(movie_libraries_raw)
+        if lib_id
     ]
 
     show_libraries = [
         {
-            "id": f"sho-library_{helpers.normalize_id(lib.strip(), existing_ids)}",
-            "name": lib.strip(),
+            "id": f"sho-library_{lib_id}",
+            "name": _lib_name_map.get(str(lib_id), f"Library {lib_id}"),
             "type": "show",
         }
-        for lib in show_libraries_raw.split(",")
-        if lib.strip()
+        for lib_id in persistence.decode_library_ids(show_libraries_raw)
+        if lib_id
     ]
+
+    if name == "025-libraries" and (not movie_libraries or not show_libraries):
+        telemetry_movies, telemetry_shows = _library_lists_from_telemetry(telemetry_data)
+        if not movie_libraries:
+            movie_libraries = telemetry_movies
+        if not show_libraries:
+            show_libraries = telemetry_shows
 
     # Ensure `libraries` dictionary exists
     if "libraries" not in data:
@@ -2389,9 +2590,10 @@ def step(name):
         data["sho-template_variables"] = {}
 
     # Ensure these are lists
-    plex_data["tmp_movie_libraries"] = plex_data.get("tmp_movie_libraries", "").split(",") if isinstance(plex_data.get("tmp_movie_libraries"), str) else []
-    plex_data["tmp_show_libraries"] = plex_data.get("tmp_show_libraries", "").split(",") if isinstance(plex_data.get("tmp_show_libraries"), str) else []
-    plex_data["tmp_music_libraries"] = plex_data.get("tmp_music_libraries", "").split(",") if isinstance(plex_data.get("tmp_music_libraries"), str) else []
+    plex_data["tmp_movie_libraries"] = persistence.decode_library_ids(plex_data.get("tmp_movie_libraries", ""))
+    plex_data["tmp_show_libraries"] = persistence.decode_library_ids(plex_data.get("tmp_show_libraries", ""))
+    plex_data["tmp_music_libraries"] = persistence.decode_library_ids(plex_data.get("tmp_music_libraries", ""))
+    plex_data["tmp_library_names"] = persistence.get_library_names("010-plex")
     plex_data["tmp_user_list"] = plex_data.get("tmp_user_list", "").split(",") if isinstance(plex_data.get("tmp_user_list"), str) else []
 
     # Ensure correct rendering for the Kometa page
@@ -2414,8 +2616,9 @@ def step(name):
         "tmdb": False,
         "omdb": False,
         "mdblist": False,
+        "floppy": False,
+        "serializd": False,
         "anidb": False,
-        "trakt": False,
         "mal": False,
         "tracearr": False,
     }
@@ -2427,8 +2630,9 @@ def step(name):
         ("035-tracearr", "tracearr"),
         ("050-omdb", "omdb"),
         ("060-mdblist", "mdblist"),
+        ("065-serializd", "serializd"),
+        ("067-floppy", "floppy"),
         ("100-anidb", "anidb"),
-        ("130-trakt", "trakt"),
         ("140-mal", "mal"),
     ]
     for section, key in service_validation_sources:
@@ -2464,6 +2668,8 @@ def step(name):
         page_info["imagemaid_supports_overlays_only"] = bool(imagemaid_state.get("supports_overlays_only"))
 
     if name == "900-kometa":
+        page_info["kometa_integrity"] = current_integrity()
+        page_info["kometa_integrity_lines"] = format_integrity(page_info["kometa_integrity"])
         validation_meta = []
         validation_groups = []
         validation_bulk_rollup = None
@@ -2633,7 +2839,6 @@ def step(name):
         movie_libraries = []
         show_libraries = []
         library_dropdown = []
-        existing_ids = set()
 
         for key, value in library_settings.items():
             if key.startswith("mov-library_") and key.endswith("-library"):
@@ -2684,10 +2889,10 @@ def step(name):
             tracearr_requirement_reasons=workspace_status.get("tracearr_requirement_reasons", []),
             omdb_requirement_reasons=workspace_status.get("omdb_requirement_reasons", []),
             mdblist_requirement_reasons=workspace_status.get("mdblist_requirement_reasons", []),
+            floppy_requirement_reasons=workspace_status.get("floppy_requirement_reasons", []),
             anidb_requirement_reasons=workspace_status.get("anidb_requirement_reasons", []),
             radarr_requirement_reasons=workspace_status.get("radarr_requirement_reasons", []),
             sonarr_requirement_reasons=workspace_status.get("sonarr_requirement_reasons", []),
-            trakt_requirement_reasons=workspace_status.get("trakt_requirement_reasons", []),
             mal_requirement_reasons=workspace_status.get("mal_requirement_reasons", []),
             workspace_readiness=workspace_status.get("readiness", {}),
             final_gate=final_gate,
@@ -2734,10 +2939,10 @@ def step(name):
         tracearr_requirement_reasons=workspace_status.get("tracearr_requirement_reasons", []),
         omdb_requirement_reasons=workspace_status.get("omdb_requirement_reasons", []),
         mdblist_requirement_reasons=workspace_status.get("mdblist_requirement_reasons", []),
+        floppy_requirement_reasons=workspace_status.get("floppy_requirement_reasons", []),
         anidb_requirement_reasons=workspace_status.get("anidb_requirement_reasons", []),
         radarr_requirement_reasons=workspace_status.get("radarr_requirement_reasons", []),
         sonarr_requirement_reasons=workspace_status.get("sonarr_requirement_reasons", []),
-        trakt_requirement_reasons=workspace_status.get("trakt_requirement_reasons", []),
         mal_requirement_reasons=workspace_status.get("mal_requirement_reasons", []),
         workspace_readiness=workspace_status.get("readiness", {}),
         image_data=image_data,
@@ -2772,10 +2977,10 @@ def workspace_status():
         tracearr_requirement_reasons=status.get("tracearr_requirement_reasons", []),
         omdb_requirement_reasons=status.get("omdb_requirement_reasons", []),
         mdblist_requirement_reasons=status.get("mdblist_requirement_reasons", []),
+        floppy_requirement_reasons=status.get("floppy_requirement_reasons", []),
         anidb_requirement_reasons=status.get("anidb_requirement_reasons", []),
         radarr_requirement_reasons=status.get("radarr_requirement_reasons", []),
         sonarr_requirement_reasons=status.get("sonarr_requirement_reasons", []),
-        trakt_requirement_reasons=status.get("trakt_requirement_reasons", []),
         mal_requirement_reasons=status.get("mal_requirement_reasons", []),
         readiness=status.get("readiness", {}),
     )
@@ -2991,9 +3196,65 @@ def lookup_template_string_value():
     return jsonify({"error": f"Unsupported lookup preset: {preset}"}), 400
 
 
+def _bulk_validation_progress_key(config_name):
+    return str(config_name or "__default__").strip() or "__default__"
+
+
+def _clone_bulk_validation_progress(progress):
+    if not isinstance(progress, dict):
+        return {}
+    snapshot = dict(progress)
+    snapshot["steps"] = [dict(step) for step in progress.get("steps", []) if isinstance(step, dict)]
+    snapshot["results"] = {str(key): dict(value) if isinstance(value, dict) else value for key, value in (progress.get("results") or {}).items()}
+    snapshot["summary"] = dict(progress.get("summary") or {})
+    return snapshot
+
+
+def _set_bulk_validation_progress(config_name, **updates):
+    progress_key = _bulk_validation_progress_key(config_name)
+    with BULK_VALIDATION_PROGRESS_LOCK:
+        progress = dict(BULK_VALIDATION_PROGRESS.get(progress_key) or {})
+        progress.update(updates)
+        progress["config_name"] = progress_key
+        progress["updated_at"] = utc_now_iso()
+        BULK_VALIDATION_PROGRESS[progress_key] = progress
+        return _clone_bulk_validation_progress(progress)
+
+
+def _get_bulk_validation_progress(config_name):
+    progress_key = _bulk_validation_progress_key(config_name)
+    with BULK_VALIDATION_PROGRESS_LOCK:
+        return _clone_bulk_validation_progress(BULK_VALIDATION_PROGRESS.get(progress_key) or {})
+
+
+@app.route("/validate_all_services/status", methods=["GET"])
+def validate_all_services_status():
+    config_name = session.get("config_name") or persistence.ensure_session_config_name()
+    requested_run_id = str(request.args.get("run_id") or "").strip()
+    progress = _get_bulk_validation_progress(config_name)
+    if requested_run_id and progress.get("run_id") != requested_run_id:
+        progress = {}
+    if not progress:
+        progress = {
+            "config_name": _bulk_validation_progress_key(config_name),
+            "run_id": requested_run_id,
+            "phase": "idle",
+            "total": 0,
+            "completed": 0,
+            "current_key": "",
+            "current_label": "",
+            "results": {},
+            "summary": {"validated": 0, "failed": 0, "skipped": 0},
+        }
+    return jsonify({"success": True, "progress": progress})
+
+
 @app.route("/validate_all_services", methods=["POST"])
 def validate_all_services():
+    request_data = request.get_json(silent=True) or {}
+    run_id = str(request_data.get("run_id") or secrets.token_urlsafe(8)).strip()
     config_name = session.get("config_name") or persistence.ensure_session_config_name()
+    floppy_token_required = bool(_config_floppy_dependency_reasons(database.retrieve_config_sections(config_name)))
 
     def is_blank_value(value):
         if value is None:
@@ -3070,6 +3331,28 @@ def validate_all_services():
         ("040-github", "github", validations.validate_github_server, lambda s: {"github_token": s.get("github", {}).get("token")}, ["github_token"]),
         ("050-omdb", "omdb", validations.validate_omdb_server, lambda s: {"omdb_apikey": s.get("omdb", {}).get("apikey")}, ["omdb_apikey"]),
         ("060-mdblist", "mdblist", validations.validate_mdblist_server, lambda s: {"mdblist_apikey": s.get("mdblist", {}).get("apikey")}, ["mdblist_apikey"]),
+        (
+            "065-serializd",
+            "serializd",
+            validations.validate_serializd_server,
+            lambda s: {
+                "serializd_email": s.get("serializd", {}).get("email"),
+                "serializd_password": s.get("serializd", {}).get("password"),
+                "serializd_timeout": s.get("serializd", {}).get("timeout", 60),
+            },
+            ["serializd_email", "serializd_password"],
+        ),
+        (
+            "067-floppy",
+            "floppy",
+            validations.validate_floppy_server,
+            lambda s: {
+                "floppy_url": s.get("floppy", {}).get("url"),
+                "floppy_token": s.get("floppy", {}).get("token"),
+                "floppy_require_token": floppy_token_required,
+            },
+            ["floppy_url", *(["floppy_token"] if floppy_token_required else [])],
+        ),
         ("070-notifiarr", "notifiarr", validations.validate_notifiarr_server, lambda s: {"notifiarr_apikey": s.get("notifiarr", {}).get("apikey")}, ["notifiarr_apikey"]),
         (
             "080-gotify",
@@ -3119,10 +3402,69 @@ def validate_all_services():
         ),
     ]
 
+    label_map = {}
+    try:
+        for file, display_name in helpers.get_menu_list():
+            label_map[file.rsplit(".", 1)[0]] = display_name
+    except Exception:
+        label_map = {}
+
+    def label_for_key(key):
+        return label_map.get(key, key)
+
     results = {}
     summary = {"validated": 0, "failed": 0, "skipped": 0}
+    manual_progress_keys = ["001-start", "025-libraries", "150-settings", "100-anidb", "090-webhooks", "140-mal"]
+    progress_steps = [{"key": template_key, "label": label_for_key(template_key)} for template_key, *_rest in targets]
+    progress_steps.extend({"key": key, "label": label_for_key(key)} for key in manual_progress_keys)
+    progress_completed = 0
+    _set_bulk_validation_progress(
+        config_name,
+        run_id=run_id,
+        phase="running",
+        total=len(progress_steps),
+        completed=0,
+        current_key="",
+        current_label="Preparing validation",
+        current_status="pending",
+        steps=progress_steps,
+        results={},
+        summary=summary,
+    )
+
+    def start_progress_step(template_key):
+        _set_bulk_validation_progress(
+            config_name,
+            phase="running",
+            total=len(progress_steps),
+            completed=progress_completed,
+            current_key=template_key,
+            current_label=label_for_key(template_key),
+            current_status="running",
+            steps=progress_steps,
+            results=results,
+            summary=summary,
+        )
+
+    def finish_progress_step(template_key):
+        nonlocal progress_completed
+        progress_completed += 1
+        result = results.get(template_key) or {}
+        _set_bulk_validation_progress(
+            config_name,
+            phase="running",
+            total=len(progress_steps),
+            completed=progress_completed,
+            current_key=template_key,
+            current_label=label_for_key(template_key),
+            current_status=result.get("status", "complete") if isinstance(result, dict) else "complete",
+            steps=progress_steps,
+            results=results,
+            summary=summary,
+        )
 
     for template_key, section, validator, payload_builder, required_keys in targets:
+        start_progress_step(template_key)
         settings = persistence.retrieve_settings(template_key)
         validated_at = settings.get("validated_at")
         payload = payload_builder(settings) or {}
@@ -3137,6 +3479,7 @@ def validate_all_services():
                 }
                 persist_validation_metadata(section, "skipped", reason="missing_location")
                 summary["skipped"] += 1
+                finish_progress_step(template_key)
                 continue
         if not has_required_credentials(payload, required_keys):
             results[template_key] = {
@@ -3146,6 +3489,7 @@ def validate_all_services():
             }
             persist_validation_metadata(section, "skipped", reason="missing_credentials")
             summary["skipped"] += 1
+            finish_progress_step(template_key)
             continue
         try:
             response = validator(payload)
@@ -3177,6 +3521,8 @@ def validate_all_services():
             )
             results[template_key] = {"status": "validated", "validated_at": new_validated_at}
             summary["validated"] += 1
+            finish_progress_step(template_key)
+            continue
         else:
             stored_data["validated"] = False
             if existing_validated_at:
@@ -3199,6 +3545,7 @@ def validate_all_services():
             if message:
                 results[template_key]["details"] = message
             summary["failed"] += 1
+            finish_progress_step(template_key)
 
     def update_section_validation(template_key, section, is_valid, reason=None, details=None):
         stored_validated, user_entered, stored_data = database.retrieve_section_data(config_name, section)
@@ -3262,6 +3609,7 @@ def validate_all_services():
         results[template_key] = result
         summary["skipped"] += 1
 
+    start_progress_step("001-start")
     kometa_settings, kometa_section = _get_kometa_settings_section(config_name)
     del kometa_settings
     kometa_valid, kometa_reason, kometa_details = _validate_saved_kometa_selection(kometa_section)
@@ -3272,8 +3620,10 @@ def validate_all_services():
         reason=kometa_reason,
         details=kometa_details,
     )
+    finish_progress_step("001-start")
 
     # Validate All checks for libraries
+    start_progress_step("025-libraries")
     plex_settings = persistence.retrieve_settings("010-plex") or {}
     plex_is_valid = helpers.booler(plex_settings.get("validated", False)) if isinstance(plex_settings, dict) else False
     if not plex_is_valid:
@@ -3394,8 +3744,10 @@ def validate_all_services():
                     else arr_override_errors if libraries_reason == "invalid_arr_overrides" else auto_sort_hubs_errors if libraries_reason == "invalid_library_settings" else None
                 ),
             )
+    finish_progress_step("025-libraries")
 
     # Validate All checks for settings
+    start_progress_step("150-settings")
     settings_settings = persistence.retrieve_settings("150-settings") or {}
     settings_section = settings_settings.get("settings", {}) if isinstance(settings_settings, dict) else {}
     if not isinstance(settings_section, dict) or not settings_section:
@@ -3457,8 +3809,10 @@ def validate_all_services():
             update_section_validation("150-settings", "settings", False, reason="invalid_fields")
         else:
             update_section_validation("150-settings", "settings", True)
+    finish_progress_step("150-settings")
 
     # Validate All checks for AniDB
+    start_progress_step("100-anidb")
     anidb_settings = persistence.retrieve_settings("100-anidb") or {}
     anidb_data = anidb_settings.get("anidb", {}) if isinstance(anidb_settings, dict) else {}
     anidb_enabled = helpers.booler(anidb_data.get("enable")) if isinstance(anidb_data, dict) else False
@@ -3466,8 +3820,10 @@ def validate_all_services():
         update_section_validation("100-anidb", "anidb", True)
     else:
         skip_section_validation("100-anidb", "anidb", reason="disabled")
+    finish_progress_step("100-anidb")
 
     # Validate All checks for Webhooks
+    start_progress_step("090-webhooks")
     webhooks_settings = persistence.retrieve_settings("090-webhooks") or {}
     webhooks_data = webhooks_settings.get("webhooks", {}) if isinstance(webhooks_settings, dict) else {}
     configured_webhooks = False
@@ -3481,39 +3837,10 @@ def validate_all_services():
         update_section_validation("090-webhooks", "webhooks", True)
     else:
         skip_section_validation("090-webhooks", "webhooks", reason="no_webhooks")
-
-    # Validate All checks for Trakt (token check if present)
-    trakt_settings = persistence.retrieve_settings("130-trakt") or {}
-    trakt_data = trakt_settings.get("trakt", {}) if isinstance(trakt_settings, dict) else {}
-    trakt_auth = trakt_data.get("authorization", {}) if isinstance(trakt_data, dict) else {}
-    trakt_access = trakt_auth.get("access_token") if isinstance(trakt_auth, dict) else None
-    trakt_client_id = trakt_data.get("client_id") if isinstance(trakt_data, dict) else None
-    if is_blank_value(trakt_access) or is_blank_value(trakt_client_id):
-        skip_section_validation("130-trakt", "trakt", reason="missing_tokens")
-    else:
-        try:
-            response = requests.get(
-                "https://api.trakt.tv/users/settings",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {trakt_access}",
-                    "trakt-api-version": "2",
-                    "trakt-api-key": trakt_client_id,
-                },
-                timeout=10,
-            )
-            if response.status_code == 200:
-                update_section_validation("130-trakt", "trakt", True)
-            elif response.status_code == 423:
-                update_section_validation("130-trakt", "trakt", False, reason="account_locked")
-            elif response.status_code in (401, 403):
-                update_section_validation("130-trakt", "trakt", False, reason="token_invalid")
-            else:
-                update_section_validation("130-trakt", "trakt", False, reason="validation_error")
-        except requests.exceptions.RequestException:
-            update_section_validation("130-trakt", "trakt", False, reason="validation_error")
+    finish_progress_step("090-webhooks")
 
     # Validate All checks for MAL (token check if present)
+    start_progress_step("140-mal")
     mal_settings = persistence.retrieve_settings("140-mal") or {}
     mal_data = mal_settings.get("mal", {}) if isinstance(mal_settings, dict) else {}
     mal_auth = mal_data.get("authorization", {}) if isinstance(mal_data, dict) else {}
@@ -3535,6 +3862,7 @@ def validate_all_services():
                 update_section_validation("140-mal", "mal", False, reason="validation_error")
         except requests.exceptions.RequestException:
             update_section_validation("140-mal", "mal", False, reason="validation_error")
+    finish_progress_step("140-mal")
 
     reason_labels = {
         "missing_credentials": "Missing credentials",
@@ -3542,7 +3870,7 @@ def validate_all_services():
         "no_libraries": "No libraries selected",
         "missing_location": "Missing location",
         "invalid_paths": "Invalid paths",
-        "invalid_arr_overrides": "Invalid Arr overrides",
+        "invalid_arr_overrides": "Invalid Arr modifications",
         "missing_library_defaults": "Missing library defaults",
         "missing_separator_placeholder": "Missing separator placeholder",
         "invalid_fields": "Invalid fields",
@@ -3605,7 +3933,32 @@ def validate_all_services():
         user_entered=True,
         data=summary_payload,
     )
-    return jsonify({"success": True, "results": results, "summary": summary, "summary_text": summary_text, "summary_updated_at": summary_updated_at})
+    progress_snapshot = _set_bulk_validation_progress(
+        config_name,
+        run_id=run_id,
+        phase="complete",
+        total=len(progress_steps),
+        completed=len(progress_steps),
+        current_key="",
+        current_label="Validation complete",
+        current_status="complete",
+        steps=progress_steps,
+        results=results,
+        summary=summary,
+        summary_text=summary_text,
+        summary_updated_at=summary_updated_at,
+    )
+    return jsonify(
+        {
+            "success": True,
+            "results": results,
+            "summary": summary,
+            "summary_text": summary_text,
+            "summary_updated_at": summary_updated_at,
+            "progress": progress_snapshot,
+            "run_id": run_id,
+        }
+    )
 
 
 @app.route("/shutdown", methods=["POST"])
@@ -3637,6 +3990,9 @@ def shutdown():
 
         shutdown_event.set()
 
+        if not app.config.get("QUICKSTART_DOCKER"):
+            _stop_launched_processes()
+
         try:
             from PyQt5.QtCore import QTimer
             from PyQt5.QtWidgets import QApplication
@@ -3653,6 +4009,158 @@ def shutdown():
 
     threading.Thread(target=shutdown_later, daemon=True).start()
     return jsonify(success=True, message="Shutting down..."), 200
+
+
+def _hhmm_to_minutes(value):
+    match = re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", str(value or "").strip())
+    if not match:
+        return None
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def _minutes_to_hhmm(value):
+    minutes = int(value or 0) % 1440
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _time_min_within_window(time_min, start_min, end_min):
+    if time_min is None or start_min is None or end_min is None or start_min == end_min:
+        return False
+    if start_min < end_min:
+        return start_min <= time_min < end_min
+    return time_min >= start_min or time_min < end_min
+
+
+def _split_kometa_command_parts(command):
+    try:
+        return shlex.split(str(command or ""), posix=not sys.platform.startswith("win"))
+    except Exception:
+        return str(command or "").split()
+
+
+def _strip_cli_value_quotes(value):
+    text = str(value or "").strip()
+    if len(text) >= 2 and ((text[0] == '"' and text[-1] == '"') or (text[0] == "'" and text[-1] == "'")):
+        return text[1:-1]
+    return text
+
+
+def _extract_kometa_scheduled_times(command):
+    parts = _split_kometa_command_parts(command)
+    if not parts:
+        return ["05:00"], True
+    for idx, part in enumerate(parts):
+        if part.startswith("--times="):
+            raw = _strip_cli_value_quotes(part.split("=", 1)[1])
+            return [item.strip() for item in raw.split("|") if item.strip()], False
+        if part == "--times" and idx + 1 < len(parts):
+            raw = _strip_cli_value_quotes(parts[idx + 1])
+            return [item.strip() for item in raw.split("|") if item.strip()], False
+    immediate_flags = {"--run", "--run-libraries", "--resume"}
+    if any(part in immediate_flags or part.startswith("--run-libraries=") or part.startswith("--resume=") for part in parts):
+        return [], False
+    return ["05:00"], True
+
+
+def _next_local_datetime_for_hhmm(value, now=None, after=None):
+    minutes = _hhmm_to_minutes(value)
+    if minutes is None:
+        return None
+    now = now or datetime.now()
+    reference = after or now
+    candidate = reference.replace(hour=minutes // 60, minute=minutes % 60, second=0, microsecond=0)
+    if candidate <= reference:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _format_local_datetime_payload(value):
+    if not value:
+        return None, None
+    return value.isoformat(), value.strftime("%Y-%m-%d %I:%M %p").lstrip("0")
+
+
+def _build_kometa_schedule_timing_payload(command, now=None, after=None):
+    times, uses_default = _extract_kometa_scheduled_times(command)
+    candidates = [_next_local_datetime_for_hhmm(value, now=now, after=after) for value in times]
+    candidates = [value for value in candidates if value is not None]
+    if not candidates:
+        return {"schedule_times": times, "scheduled_run_at": None, "scheduled_run_local": None, "uses_default_schedule_time": uses_default}
+    scheduled = min(candidates)
+    scheduled_at, scheduled_local = _format_local_datetime_payload(scheduled)
+    return {
+        "schedule_times": times,
+        "scheduled_run_at": scheduled_at,
+        "scheduled_run_local": scheduled_local,
+        "uses_default_schedule_time": uses_default,
+    }
+
+
+def _maintenance_window_end_datetime(now, start_min, end_min):
+    if start_min is None or end_min is None or start_min == end_min:
+        return None
+    now = now or datetime.now()
+    end_dt = now.replace(hour=end_min // 60, minute=end_min % 60, second=0, microsecond=0)
+    if start_min < end_min:
+        if end_dt <= now:
+            end_dt += timedelta(days=1)
+        return end_dt
+    if (now.hour * 60 + now.minute) >= start_min:
+        end_dt += timedelta(days=1)
+    return end_dt
+
+
+def _build_kometa_queue_timing_payload(command, start_min, end_min, now=None):
+    now = now or datetime.now()
+    queued_start = _maintenance_window_end_datetime(now, start_min, end_min)
+    queued_start_at, queued_start_local = _format_local_datetime_payload(queued_start)
+    payload = {
+        "queued_start_at": queued_start_at,
+        "queued_start_local": queued_start_local,
+    }
+    payload.update(_build_kometa_schedule_timing_payload(command, now=now))
+    return payload
+
+
+def _get_pending_kometa_timing_payload(pending=None, now=None, include_window=True):
+    pending = pending if pending is not None else _peek_pending_kometa_start()
+    if not pending:
+        return {}
+    config_name = pending.get("config_name")
+    start_min, end_min, window_str = _resolve_maintenance_window_live(config_name=config_name)
+    if start_min is None or end_min is None:
+        start_min, end_min, window_str = _resolve_maintenance_window_from_db(config_name=config_name)
+    payload = _build_kometa_queue_timing_payload(pending.get("command"), start_min, end_min, now=now or datetime.now())
+    if include_window and window_str:
+        payload["maintenance_window"] = window_str
+    payload["queued_reason"] = "plex_maintenance"
+    return payload
+
+
+def _get_kometa_schedule_maintenance_conflict(command, start_min, end_min, window_str=None):
+    if start_min is None or end_min is None:
+        return None
+    times, uses_default = _extract_kometa_scheduled_times(command)
+    overlapping = []
+    for value in times:
+        minutes = _hhmm_to_minutes(value)
+        if _time_min_within_window(minutes, start_min, end_min):
+            overlapping.append(value)
+    if not overlapping:
+        return None
+    if uses_default:
+        message = f"Kometa default scheduled time 05:00 starts during Plex maintenance ({window_str or f'{_minutes_to_hhmm(start_min)}-{_minutes_to_hhmm(end_min)}'}). Choose --run to start immediately, or set --times after the maintenance window."
+    else:
+        label = ", ".join(overlapping)
+        message = f"Kometa scheduled time{'s' if len(overlapping) > 1 else ''} {label} start{'s' if len(overlapping) == 1 else ''} during Plex maintenance ({window_str or f'{_minutes_to_hhmm(start_min)}-{_minutes_to_hhmm(end_min)}'}). Choose a time after the maintenance window."
+    return {
+        "message": message,
+        "times": overlapping,
+        "maintenance_start": _minutes_to_hhmm(start_min),
+        "maintenance_end": _minutes_to_hhmm(end_min),
+        "maintenance_window": window_str,
+        "uses_default_schedule_time": uses_default,
+    }
 
 
 @app.route("/start-kometa", methods=["POST"])
@@ -3705,15 +4213,37 @@ def start_kometa():
             payload["phase"] = job.get("phase")
         return jsonify(payload), 409
 
+    _clear_logscan_progress_snapshot()
     _update_run_context(command, start_mode=start_mode)
 
     maintenance_config_name = session.get("config_name")
     start_min, end_min, window_str = _resolve_maintenance_window_live(config_name=maintenance_config_name)
     if start_min is None or end_min is None:
         start_min, end_min, window_str = _resolve_maintenance_window_from_db(config_name=maintenance_config_name)
+    schedule_conflict = _get_kometa_schedule_maintenance_conflict(command, start_min, end_min, window_str)
+    if schedule_conflict:
+        return (
+            jsonify(
+                {
+                    "error": schedule_conflict["message"],
+                    "status": "blocked",
+                    "blocked_by": "maintenance_schedule",
+                    "maintenance_window": window_str,
+                    "schedule_conflict": schedule_conflict,
+                }
+            ),
+            400,
+        )
     if _is_within_maintenance_window(datetime.now(), start_min, end_min):
         _set_pending_kometa_start(command, session.get("config_name"), start_mode=start_mode)
-        return jsonify({"status": "queued", "maintenance_window": window_str, "start_mode": start_mode}), 202
+        payload = {
+            "status": "queued",
+            "maintenance_window": window_str,
+            "start_mode": start_mode,
+            "queued_reason": "plex_maintenance",
+        }
+        payload.update(_build_kometa_queue_timing_payload(command, start_min, end_min, now=datetime.now()))
+        return jsonify(payload), 202
 
     ok, result = _launch_kometa_command(command, session.get("config_name"), start_mode=start_mode)
     if ok:
@@ -3791,6 +4321,80 @@ def stop_kometa():
         return jsonify({"error": f"Failed to stop Kometa: {str(e)}"}), 500
 
 
+def _kometa_command_has_schedule(command):
+    times, _uses_default = _extract_kometa_scheduled_times(command)
+    return bool(times)
+
+
+def _kometa_log_looks_waiting_after_finished(log_path, started_at_ts=None):
+    try:
+        stats = log_path.stat()
+    except Exception:
+        return False
+    if started_at_ts is not None and stats.st_mtime < (started_at_ts - 30):
+        return False
+    try:
+        content = _read_text_tail(log_path, 4000)
+    except Exception:
+        return False
+    finished_matches = list(re.finditer(r"\bFinished(?:\s+(?:Libraries|\d{1,2}:\d{2}))?\s+Run\b", content, flags=re.IGNORECASE))
+    if not finished_matches:
+        return False
+    finished_match = finished_matches[-1]
+    after_finished = content[finished_match.end() :]
+    if re.search(r"Mapping\s+.+?\s+Library|Starting\s+(Run|Library)|Processing\s+", after_finished, flags=re.IGNORECASE):
+        return False
+    finished_at = None
+    line_start = content.rfind("\n", 0, finished_match.start()) + 1
+    line_end = content.find("\n", finished_match.end())
+    if line_end == -1:
+        line_end = len(content)
+    finished_line = content[line_start:line_end]
+    ts_match = re.search(r"\[(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", finished_line)
+    if ts_match:
+        try:
+            finished_at = datetime.strptime(f"{ts_match.group(1)} {ts_match.group(2)}", "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            finished_at = None
+    return {"finished_at": finished_at}
+
+
+def _build_scheduled_waiting_payload(command, log_path, started_at_ts=None):
+    if not _kometa_command_has_schedule(command):
+        return None
+    finished_info = _kometa_log_looks_waiting_after_finished(log_path, started_at_ts=started_at_ts)
+    if not finished_info:
+        return None
+    now = datetime.now()
+    payload = _build_kometa_schedule_timing_payload(command, now=now, after=finished_info.get("finished_at") or now)
+    payload["message"] = "Kometa finished the current scheduled run and is waiting for the next scheduled time."
+    payload["scheduled_waiting_reason"] = "between_runs"
+    return payload
+
+
+def _kometa_log_is_fresh_for_run(log_path, started_at_ts=None):
+    if started_at_ts is None:
+        return True
+    try:
+        stats = log_path.stat()
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+    return stats.st_mtime >= (started_at_ts - 30)
+
+
+def _build_scheduled_waiting_for_log_payload(command, log_path, started_at_ts=None):
+    if not _kometa_command_has_schedule(command):
+        return None
+    if _kometa_log_is_fresh_for_run(log_path, started_at_ts=started_at_ts):
+        return None
+    payload = _build_kometa_schedule_timing_payload(command, now=datetime.now())
+    payload["message"] = "Kometa scheduler is waiting for the next scheduled run and has not written a fresh meta.log for this run yet."
+    payload["scheduled_waiting_reason"] = "waiting_for_log"
+    return payload
+
+
 @app.route("/kometa-status", methods=["GET"])
 def kometa_status():
     try:
@@ -3802,6 +4406,7 @@ def kometa_status():
     pending_requested_at = pending.get("requested_at") if pending else None
     pending_start_mode = _normalize_kometa_start_mode(pending.get("start_mode")) if pending else "current"
     pending_command = pending.get("command") if pending else None
+    pending_timing = _get_pending_kometa_timing_payload(pending, include_window=False) if pending else {}
     ctx = _get_run_context()
     pid = helpers.get_kometa_pid()
     if not pid:
@@ -3814,11 +4419,9 @@ def kometa_status():
             except Exception:
                 pid = None
     if not pid:
-        try:
-            _ingest_completed_live_logs("kometa")
-        except Exception:
-            pass
-        _clear_run_context()
+        if not pending_start:
+            _start_logscan_live_ingest("kometa")
+            _clear_run_context()
         with MAINTENANCE_STATE_LOCK:
             maintenance_active = MAINTENANCE_STATE["active"]
             maintenance_paused = MAINTENANCE_STATE["paused"]
@@ -3828,7 +4431,7 @@ def kometa_status():
             window_unavailable = MAINTENANCE_STATE["window_unavailable"]
             window_unavailable_since = MAINTENANCE_STATE["window_unavailable_since"]
         return jsonify(
-            status="not started",
+            status="queued" if pending_start else "not started",
             maintenance_active=maintenance_active,
             maintenance_paused=maintenance_paused,
             maintenance_window=maintenance_window,
@@ -3840,6 +4443,7 @@ def kometa_status():
             pending_requested_at=pending_requested_at,
             pending_start_mode=pending_start_mode,
             pending_command=pending_command,
+            **pending_timing,
         )
 
     try:
@@ -3877,8 +4481,22 @@ def kometa_status():
                     queued_started_at = MAINTENANCE_STATE["queued_started_at"]
                     window_unavailable = MAINTENANCE_STATE["window_unavailable"]
                     window_unavailable_since = MAINTENANCE_STATE["window_unavailable_since"]
+                context_command = ctx.get("command")
+                active_command = context_command or cmdline
+                active_log_path = helpers.get_kometa_log_dir() / "meta.log"
+                scheduled_waiting = None
+                if context_command:
+                    scheduled_waiting = _build_scheduled_waiting_payload(
+                        context_command,
+                        active_log_path,
+                        started_at_ts=started_at_ts,
+                    ) or _build_scheduled_waiting_for_log_payload(
+                        context_command,
+                        active_log_path,
+                        started_at_ts=started_at_ts,
+                    )
                 return jsonify(
-                    status="running",
+                    status="scheduled_waiting" if scheduled_waiting else "running",
                     pid=pid,
                     started_at=started_at,
                     started_at_ts=started_at_ts,
@@ -3904,7 +4522,9 @@ def kometa_status():
                     pending_start=pending_start,
                     pending_requested_at=pending_requested_at,
                     start_mode=_normalize_kometa_start_mode(ctx.get("start_mode")),
-                    active_command=ctx.get("command"),
+                    active_command=active_command,
+                    scheduled_waiting=bool(scheduled_waiting),
+                    **(scheduled_waiting or {}),
                 )
         # If we're here, it likely ended; try to get a return code
         try:
@@ -3917,10 +4537,7 @@ def kometa_status():
                 os.remove(helpers.get_kometa_pid_file())
             except Exception:
                 pass
-        try:
-            _ingest_completed_live_logs("kometa")
-        except Exception:
-            pass
+        _start_logscan_live_ingest("kometa")
         _clear_process_metric_cache(pid, "kometa")
         _clear_run_context()
         with MAINTENANCE_STATE_LOCK:
@@ -3952,7 +4569,8 @@ def kometa_status():
             os.remove(helpers.get_kometa_pid_file())
         except Exception:
             pass
-        _clear_run_context()
+        if not pending_start:
+            _clear_run_context()
         with MAINTENANCE_STATE_LOCK:
             maintenance_active = MAINTENANCE_STATE["active"]
             maintenance_paused = MAINTENANCE_STATE["paused"]
@@ -3962,7 +4580,7 @@ def kometa_status():
             window_unavailable = MAINTENANCE_STATE["window_unavailable"]
             window_unavailable_since = MAINTENANCE_STATE["window_unavailable_since"]
         return jsonify(
-            status="not started",
+            status="queued" if pending_start else "not started",
             maintenance_active=maintenance_active,
             maintenance_paused=maintenance_paused,
             maintenance_window=maintenance_window,
@@ -3974,19 +4592,95 @@ def kometa_status():
             pending_requested_at=pending_requested_at,
             pending_start_mode=pending_start_mode,
             pending_command=pending_command,
+            **pending_timing,
         )
+
+
+def _get_active_kometa_started_at_ts():
+    pid = helpers.get_kometa_pid()
+    candidates = []
+    if pid:
+        try:
+            candidates.append(psutil.Process(pid))
+        except Exception:
+            pass
+    try:
+        proc = _find_running_kometa_process()
+        if proc:
+            candidates.append(proc)
+    except Exception:
+        pass
+    for proc in candidates:
+        try:
+            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                cmdline = " ".join(proc.cmdline() or [])
+                if "kometa.py" in cmdline:
+                    return proc.create_time()
+        except Exception:
+            continue
+    return None
+
+
+def _build_waiting_for_kometa_log_payload(log_path, status="waiting_for_log", started_at_ts=None):
+    payload = {
+        "status": status,
+        "log": "",
+        "log_mtime": None,
+        "log_age_seconds": None,
+        "log_is_stale": True,
+        "log_path": str(log_path),
+    }
+    if status == "queued":
+        pending = _peek_pending_kometa_start()
+        payload.update(_get_pending_kometa_timing_payload(pending))
+        payload.update(
+            {
+                "pending_start": True,
+                "pending_requested_at": pending.get("requested_at") if pending else None,
+                "pending_start_mode": _normalize_kometa_start_mode(pending.get("start_mode")) if pending else "current",
+                "pending_command": pending.get("command") if pending else None,
+                "message": "Kometa is queued and has not started writing a log yet.",
+            }
+        )
+    else:
+        ctx = _get_run_context()
+        payload.update(_build_kometa_schedule_timing_payload(ctx.get("command"), now=datetime.now()))
+        payload["pending_start"] = False
+        payload["started_at_ts"] = started_at_ts
+        payload["message"] = "Kometa is running but has not written a fresh meta.log for this run yet."
+    return payload
+
+
+def _get_kometa_log_wait_payload(log_path):
+    pending = _peek_pending_kometa_start()
+    active_started_at = _get_active_kometa_started_at_ts()
+    if pending and active_started_at is None:
+        return _build_waiting_for_kometa_log_payload(log_path, status="queued")
+    if active_started_at is None:
+        return None
+    try:
+        log_stats = log_path.stat()
+    except FileNotFoundError:
+        return _build_waiting_for_kometa_log_payload(log_path, started_at_ts=active_started_at)
+    except Exception:
+        return None
+    if log_stats.st_mtime < (active_started_at - 30):
+        return _build_waiting_for_kometa_log_payload(log_path, started_at_ts=active_started_at)
+    return None
 
 
 @app.route("/tail-log")
 def tail_log():
     log_path = helpers.get_kometa_log_dir() / "meta.log"
 
+    wait_payload = _get_kometa_log_wait_payload(log_path)
+    if wait_payload:
+        return jsonify(wait_payload)
+
     if not log_path.exists():
         return jsonify({"error": f"Log file not found at: {log_path}"}), 404
 
     try:
-        from collections import deque
-
         size_param = request.args.get("size", "2000")
         download = request.args.get("download")
         stats_param = request.args.get("stats", "")
@@ -4005,11 +4699,9 @@ def tail_log():
             log_stats = None
 
         if max_lines:
-            with log_path.open("r", encoding="utf-8", errors="replace") as f:
-                lines = deque(f, maxlen=max_lines)
-            log_content = "".join(lines)
+            log_content = _read_text_tail(log_path, max_lines)
         else:
-            log_content = log_path.read_text(encoding="utf-8", errors="replace")
+            log_content = _read_text_tail(log_path, None)
 
         if download:
             return send_file(
@@ -4044,7 +4736,7 @@ def tail_log():
                     for line in handle:
                         counts["total_lines"] += 1
                         upper = line.upper()
-                        if "FROM CACHE" in upper:
+                        if "FROM CACHE" in upper or "[CACHE]" in upper:
                             counts["cache"] += 1
                         if "[DEBUG]" in upper:
                             counts["debug"] += 1
@@ -4084,12 +4776,14 @@ def tail_log():
         log_is_stale = False
         if log_mtime is not None and kometa_started_at is not None:
             log_is_stale = log_mtime < (kometa_started_at - 30)
+        log_is_previous_run = kometa_started_at is None
 
         response = {
             "log": log_content,
             "log_mtime": log_mtime,
             "log_age_seconds": log_age_seconds,
             "log_is_stale": log_is_stale,
+            "log_is_previous_run": log_is_previous_run,
             "log_path": str(log_path),
         }
         if include_stats:
@@ -4102,12 +4796,172 @@ def tail_log():
         return jsonify({"error": f"Failed to read log: {str(e)}"}), 500
 
 
+def _read_text_tail(path, max_lines, encoding="utf-8", errors="replace", block_size=64 * 1024):
+    if max_lines is None:
+        return path.read_text(encoding=encoding, errors=errors)
+
+    max_lines = max(1, int(max_lines))
+    chunks = []
+    newline_count = 0
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        offset = handle.tell()
+        while offset > 0 and newline_count <= max_lines:
+            read_size = min(block_size, offset)
+            offset -= read_size
+            handle.seek(offset)
+            chunk = handle.read(read_size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
+
+    data = b"".join(reversed(chunks))
+    if newline_count > max_lines:
+        data = b"".join(data.splitlines(keepends=True)[-max_lines:])
+    return data.decode(encoding, errors=errors)
+
+
+def _json_safe_progress_value(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe_progress_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_progress_value(item) for item in value]
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        if hasattr(value, "isoformat"):
+            try:
+                return value.isoformat()
+            except Exception:
+                pass
+        return str(value)
+
+
+def _normalize_progress_identity_value(value):
+    if value in (None, ""):
+        return None
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _progress_data_matches_run(data, started_at):
+    if not isinstance(data, dict):
+        return False
+    if started_at in (None, ""):
+        return True
+    return _normalize_progress_identity_value(data.get("run_started_at")) == _normalize_progress_identity_value(started_at)
+
+
+def _get_logscan_progress_snapshot_path():
+    snapshot_dir = _get_logscan_cache_dir() / "progress"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    return snapshot_dir / "kometa-progress.json"
+
+
+def _build_logscan_progress_snapshot_metadata(log_path, log_stats=None, aux_signature=None, started_at=None, config_path=None, run_mode=None):
+    try:
+        resolved_log_path = str(Path(log_path).resolve())
+    except Exception:
+        resolved_log_path = str(log_path)
+    return {
+        "version": LOGSCAN_PROGRESS_SNAPSHOT_VERSION,
+        "log_path": resolved_log_path,
+        "log_mtime": float(log_stats.st_mtime) if log_stats else None,
+        "log_size": int(log_stats.st_size) if log_stats else None,
+        "aux_signature": _json_safe_progress_value(aux_signature or ()),
+        "run_started_at": _normalize_progress_identity_value(started_at),
+        "config_path": str(config_path or "") or None,
+        "run_mode": str(run_mode or "") or None,
+    }
+
+
+def _load_logscan_progress_snapshot(log_path, log_stats=None, started_at=None):
+    path = _get_logscan_progress_snapshot_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != LOGSCAN_PROGRESS_SNAPSHOT_VERSION:
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    try:
+        current_log_path = str(Path(log_path).resolve())
+    except Exception:
+        current_log_path = str(log_path)
+    if metadata.get("log_path") != current_log_path:
+        return None
+    if log_stats and metadata.get("log_size") is not None:
+        try:
+            if int(metadata.get("log_size")) > int(log_stats.st_size):
+                return None
+        except Exception:
+            return None
+    snapshot_started_at = metadata.get("run_started_at") or data.get("run_started_at")
+    if started_at not in (None, "") and _normalize_progress_identity_value(snapshot_started_at) != _normalize_progress_identity_value(started_at):
+        return None
+    return data
+
+
+def _save_logscan_progress_snapshot(log_path, log_stats=None, aux_signature=None, started_at=None, config_path=None, run_mode=None, data=None):
+    if not isinstance(data, dict) or not log_stats:
+        return False
+    path = _get_logscan_progress_snapshot_path()
+    payload = {
+        "version": LOGSCAN_PROGRESS_SNAPSHOT_VERSION,
+        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "metadata": _build_logscan_progress_snapshot_metadata(
+            log_path,
+            log_stats=log_stats,
+            aux_signature=aux_signature,
+            started_at=started_at,
+            config_path=config_path,
+            run_mode=run_mode,
+        ),
+        "data": _json_safe_progress_value(data),
+    }
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n", encoding="utf-8")
+        os.replace(tmp_path, path)
+        return True
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def _clear_logscan_progress_snapshot():
+    LOGSCAN_PROGRESS_CACHE.update({"mtime": None, "size": None, "aux_signature": None, "data": None})
+    try:
+        _get_logscan_progress_snapshot_path().unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
 @app.route("/logscan/analyze", methods=["GET"])
 def logscan_analyze():
     log_path = helpers.get_kometa_log_dir() / "meta.log"
     config_name = session.get("config_name")
     normalized_name = (config_name or "").strip().lower().replace(" ", "_") or "default"
     config_path = helpers.get_kometa_config_dir() / f"{normalized_name}_config.yml"
+
+    wait_payload = _get_kometa_log_wait_payload(log_path)
+    if wait_payload:
+        wait_payload.update({"cached": False, "ingest_skipped": True, "summary": None, "recommendations": []})
+        return jsonify(wait_payload)
 
     if not log_path.exists():
         return jsonify({"error": f"Log file not found at: {log_path}"}), 404
@@ -4186,11 +5040,15 @@ def logscan_progress():
     sidecar_path = _get_kometa_maintenance_sidecar_path(kometa_root)
     pending_path = _get_kometa_pending_marker_path(kometa_root)
 
+    wait_payload = _get_kometa_log_wait_payload(log_path)
+    if wait_payload:
+        wait_payload.update({"libraries": [], "total_count": 0, "completed_count": 0})
+        return jsonify(wait_payload)
+
     if not log_path.exists():
         return jsonify({"error": f"Log file not found at: {log_path}"}), 404
 
     try:
-        from collections import deque
         from copy import deepcopy
 
         size_arg = request.args.get("size")
@@ -4236,14 +5094,15 @@ def logscan_progress():
                 return False
             if cached.get("mtime") != log_stats.st_mtime or cached.get("size") != log_stats.st_size:
                 return False
-            return cached.get("aux_signature") == aux_signature
+            cached_aux_signature = cached.get("aux_signature")
+            if not aux_signature and cached_aux_signature in (None, ()):
+                return True
+            return cached_aux_signature == aux_signature
 
         def _read_progress_log_content():
             if force_full_read:
                 return _read_logscan_text(log_path)
-            with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-                lines = deque(handle, maxlen=max_lines)
-            content = "".join(lines)
+            content = _read_text_tail(log_path, max_lines)
             try:
                 aux_content = []
                 for aux_path in (pending_path, sidecar_path):
@@ -4325,6 +5184,27 @@ def logscan_progress():
                             entry["status"] = "Stopped"
             return data
 
+        def normalize_progress_for_finished(data):
+            if not isinstance(data, dict) or not data.get("run_finished"):
+                return data
+            data = deepcopy(data)
+            data["current_library"] = None
+            data["phase_current"] = None
+            data["playlist_running"] = False
+            libraries = data.get("libraries")
+            if isinstance(libraries, list):
+                completed = 0
+                for entry in libraries:
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("status") == "Skipped":
+                        continue
+                    entry["status"] = "Done"
+                    completed += 1
+                data["completed_count"] = completed
+                data["total_count"] = data.get("total_count") or len(libraries)
+            return data
+
         ctx = _get_run_context()
         selected = ctx.get("selected_libraries")
         started_at = ctx.get("started_at")
@@ -4332,7 +5212,13 @@ def logscan_progress():
         run_mode = ctx.get("run_mode") or "all"
         stopped_requested = bool(ctx.get("stop_requested_at"))
         cached_data = LOGSCAN_PROGRESS_CACHE.get("data")
-        cache_matches_run = bool(cached_data and cached_data.get("run_started_at") == started_at)
+        cache_matches_run = _progress_data_matches_run(cached_data, started_at)
+        if not cache_matches_run:
+            persisted_data = _load_logscan_progress_snapshot(log_path, log_stats=log_stats, started_at=started_at)
+            if persisted_data:
+                cached_data = persisted_data
+                LOGSCAN_PROGRESS_CACHE["data"] = cached_data
+                cache_matches_run = True
 
         # Seed progress from the full log when no explicit size was requested and
         # the current run has no matching cached progress state yet. After the
@@ -4344,11 +5230,13 @@ def logscan_progress():
         if not force_full_read and _cache_matches_progress_signature():
             data = cached.get("data") or {}
             data = refresh_live_progress_elapsed(data, running, started_at)
+            data = normalize_progress_for_finished(data)
             data = normalize_progress_for_stopped(data, running, stopped_requested)
             return jsonify(data)
 
-        if cached_data and cached_data.get("run_started_at") != started_at:
+        if cached_data and not _progress_data_matches_run(cached_data, started_at):
             LOGSCAN_PROGRESS_CACHE.update({"mtime": None, "size": None, "aux_signature": None, "data": None})
+            cached_data = None
         analyzer = logscan.LogscanAnalyzer()
         config_data = _load_progress_config(config_path)
         log_content = _read_progress_log_content()
@@ -4360,7 +5248,7 @@ def logscan_progress():
                 config_data=config_data,
             ),
             selected_libraries=selected,
-            previous=LOGSCAN_PROGRESS_CACHE.get("data"),
+            previous=cached_data,
             run_started_at=started_at,
             now_ts=datetime.now(timezone.utc),
             is_running=running,
@@ -4368,7 +5256,7 @@ def logscan_progress():
         phase_order = _get_progress_run_order(config_data=config_data)
         allowed_phases = phase_order or ["operations", "metadata", "collections", "overlays"]
         playlists_configured = bool(config_data.get("playlists")) if isinstance(config_data, dict) else False
-        if run_mode in ("collections", "overlays", "operations", "metadata", "playlists"):
+        if run_mode in ("collections", "overlays", "operations", "metadata", "playlists") and not progress.get("run_finished"):
             allowed_phases = [run_mode]
             progress["phase_current"] = run_mode
             progress["phases_completed"] = []
@@ -4380,6 +5268,7 @@ def logscan_progress():
         maintenance_summary = analyzer.extract_maintenance_summary(log_content)
         progress["maintenance_summary"] = maintenance_summary if isinstance(maintenance_summary, dict) else {}
         progress["maintenance_had_pause"] = bool((progress.get("maintenance_summary") or {}).get("had_pause"))
+        progress = normalize_progress_for_finished(progress)
         progress = normalize_progress_for_stopped(progress, running, stopped_requested)
         if log_stats:
             progress["last_log_at"] = datetime.fromtimestamp(log_stats.st_mtime, tz=timezone.utc).isoformat()
@@ -4392,51 +5281,63 @@ def logscan_progress():
                     "data": progress,
                 }
             )
+            _save_logscan_progress_snapshot(
+                log_path,
+                log_stats=log_stats,
+                aux_signature=aux_signature,
+                started_at=started_at,
+                config_path=config_path,
+                run_mode=run_mode,
+                data=progress,
+            )
         return jsonify(progress)
     except Exception as e:
         return jsonify({"error": f"Failed to analyze log progress: {str(e)}"}), 500
 
 
+def _update_logscan_trends_request_state(request_id, **updates):
+    now = datetime.now(timezone.utc).isoformat()
+    with logscan_trends_request_lock:
+        current_request_id = logscan_trends_request_state.get("request_id")
+        if current_request_id != request_id or updates.get("reset"):
+            logscan_trends_request_state.clear()
+            logscan_trends_request_state.update(
+                {
+                    "request_id": request_id,
+                    "started_at": now,
+                    "started_monotonic": time.perf_counter(),
+                }
+            )
+        updates.pop("reset", None)
+        logscan_trends_request_state.update(updates)
+        logscan_trends_request_state["updated_at"] = now
+
+
+def _logscan_trends_request_snapshot(request_id=None):
+    with logscan_trends_request_lock:
+        snapshot = dict(logscan_trends_request_state)
+    if request_id and snapshot.get("request_id") != request_id:
+        return {
+            "status": "unknown",
+            "request_id": request_id,
+            "message": "No active Analytics request matches this browser request.",
+        }
+    started_monotonic = snapshot.pop("started_monotonic", None)
+    if isinstance(started_monotonic, (int, float)):
+        snapshot["elapsed_seconds"] = max(0, round(time.perf_counter() - started_monotonic, 1))
+    return snapshot
+
+
+@app.route("/logscan/trends/status", methods=["GET"])
+def logscan_trends_status():
+    request_id = str(request.args.get("request_id") or "").strip() or None
+    return jsonify(_logscan_trends_request_snapshot(request_id=request_id))
+
+
 @app.route("/logscan/trends", methods=["GET"])
 def logscan_trends():
-    snapshot = _logscan_reingest_snapshot()
-    if logscan_ingest_lock.locked() or snapshot.get("status") == "running":
-        total_runs = database.get_log_runs_count()
-        running_health = {
-            "source": "running",
-            "status": snapshot.get("status") or "running",
-            "job_id": snapshot.get("job_id"),
-            "trigger": snapshot.get("trigger"),
-            "migration_level": snapshot.get("migration_level"),
-            "total": snapshot.get("total", 0),
-            "scanned": snapshot.get("scanned", 0),
-            "ingested": snapshot.get("ingested", 0),
-            "duplicates": snapshot.get("duplicates", 0),
-            "skipped_incomplete": snapshot.get("skipped_incomplete", 0),
-            "skipped_invalid": snapshot.get("skipped_invalid", 0),
-            "errors": snapshot.get("errors", 0),
-            "current_file": snapshot.get("current_file"),
-            "needs_reingest": True,
-            "pending_active": True,
-        }
-        return jsonify(
-            {
-                "runs": [],
-                "incomplete_runs": [],
-                "total_runs": total_runs,
-                "total_incomplete_runs": 0,
-                "ingest_health": running_health,
-                "archive_storage": None,
-                "reingest_running": True,
-                "reingest": snapshot,
-            }
-        )
-
-    try:
-        _ingest_completed_live_logs("imagemaid")
-        _archive_finished_live_meta_log_if_idle()
-    except Exception:
-        pass
+    request_started_at = time.perf_counter()
+    request_id = str(request.args.get("request_id") or uuid.uuid4()).strip()[:80]
     raw_limit = str(request.args.get("limit", "50")).strip().lower()
     if raw_limit == "all":
         limit = None
@@ -4446,38 +5347,156 @@ def logscan_trends():
         except Exception:
             limit = 50
         limit = max(1, min(limit, 500))
-    include_ingest_health = str(request.args.get("include_ingest_health", "1")).strip().lower() not in {"0", "false", "no", "off"}
-    include_archive_storage = str(request.args.get("include_archive_storage", "1")).strip().lower() not in {"0", "false", "no", "off"}
-    include_incomplete = str(request.args.get("include_incomplete", "1")).strip().lower() not in {"0", "false", "no", "off"}
-    total_runs = database.get_log_runs_count()
-    resolution_context = _build_logscan_resolution_context()
-    runs = _annotate_logscan_runs(database.get_log_runs(limit=limit), context=resolution_context)
-    incomplete_runs = []
-    all_incomplete_runs = []
-    if include_incomplete:
-        incomplete_runs = _annotate_logscan_runs(_get_logscan_incomplete_runs(limit=limit), context=resolution_context)
-        all_incomplete_runs = _get_logscan_incomplete_runs(limit=None)
-    payload = {
-        "runs": runs,
-        "incomplete_runs": incomplete_runs,
-        "total_runs": total_runs,
-        "total_incomplete_runs": len(all_incomplete_runs),
-        "ingest_health": _logscan_ingest_health() if include_ingest_health else None,
-        "archive_storage": None,
-        "reingest_running": False,
-    }
-    if include_archive_storage:
-        all_runs = database.get_log_runs(limit=None) if total_runs else []
-        payload["archive_storage"] = _get_logscan_archive_storage_summary(
-            all_runs=all_runs,
-            incomplete_runs=all_incomplete_runs,
-            context=resolution_context,
+
+    def _include_flag(name):
+        return str(request.args.get(name, "1")).strip().lower() not in {"0", "false", "no", "off"}
+
+    include_ingest_health = _include_flag("include_ingest_health")
+    include_archive_storage = _include_flag("include_archive_storage")
+    include_incomplete = _include_flag("include_incomplete")
+    lightweight_request = not include_ingest_health and not include_archive_storage and not include_incomplete
+
+    def _phase(phase, detail=None, **extra):
+        payload = {
+            "status": "running",
+            "phase": phase,
+            "detail": detail,
+            "limit": raw_limit,
+            "lightweight": lightweight_request,
+            "include_ingest_health": include_ingest_health,
+            "include_archive_storage": include_archive_storage,
+            "include_incomplete": include_incomplete,
+        }
+        payload.update(extra)
+        _update_logscan_trends_request_state(request_id, **payload)
+
+    def _finish(status, **extra):
+        _update_logscan_trends_request_state(request_id, status=status, **extra)
+
+    _update_logscan_trends_request_state(
+        request_id,
+        reset=True,
+        status="running",
+        phase="starting",
+        detail="Preparing Analytics request.",
+        limit=raw_limit,
+        lightweight=lightweight_request,
+        include_ingest_health=include_ingest_health,
+        include_archive_storage=include_archive_storage,
+        include_incomplete=include_incomplete,
+    )
+
+    try:
+        _phase("checking_reingest", "Checking whether an Analytics reingest is already running.")
+        snapshot = _logscan_reingest_snapshot()
+        if logscan_ingest_lock.locked() or snapshot.get("status") == "running":
+            _phase("counting_runs", "A reingest is running; counting saved runs before returning progress.")
+            total_runs = database.get_log_runs_count()
+            running_health = {
+                "source": "running",
+                "status": snapshot.get("status") or "running",
+                "job_id": snapshot.get("job_id"),
+                "trigger": snapshot.get("trigger"),
+                "migration_level": snapshot.get("migration_level"),
+                "total": snapshot.get("total", 0),
+                "scanned": snapshot.get("scanned", 0),
+                "ingested": snapshot.get("ingested", 0),
+                "duplicates": snapshot.get("duplicates", 0),
+                "skipped_incomplete": snapshot.get("skipped_incomplete", 0),
+                "skipped_invalid": snapshot.get("skipped_invalid", 0),
+                "errors": snapshot.get("errors", 0),
+                "current_file": snapshot.get("current_file"),
+                "needs_reingest": True,
+                "pending_active": True,
+            }
+            _finish("complete", phase="active_reingest", total_runs=total_runs, loaded_runs=0)
+            return jsonify(
+                {
+                    "request_id": request_id,
+                    "runs": [],
+                    "incomplete_runs": [],
+                    "total_runs": total_runs,
+                    "total_incomplete_runs": 0,
+                    "ingest_health": running_health,
+                    "archive_storage": None,
+                    "reingest_running": True,
+                    "reingest": snapshot,
+                }
+            )
+
+        if not lightweight_request:
+            _phase("archiving_live_logs", "Checking for completed live logs that should be archived before Analytics loads.")
+            try:
+                _ingest_completed_live_logs("imagemaid")
+                _archive_finished_live_meta_log_if_idle()
+            except Exception:
+                pass
+        _phase("counting_runs", "Counting saved Analytics runs in the local database.")
+        total_runs = database.get_log_runs_count()
+        _phase("loading_runs", "Loading saved run rows from the Analytics database.", total_runs=total_runs)
+        raw_runs = database.get_log_runs(limit=limit)
+        raw_incomplete_runs = []
+        all_incomplete_runs = []
+        if include_incomplete:
+            _phase("loading_incomplete_runs", "Loading incomplete run records.", total_runs=total_runs, loaded_runs=len(raw_runs))
+            raw_incomplete_runs = _get_logscan_incomplete_runs(limit=limit)
+            all_incomplete_runs = _get_logscan_incomplete_runs(limit=None)
+
+        visible_run_keys = {run.get("run_key") for run in raw_runs if isinstance(run, dict) and run.get("run_key")}
+        visible_run_keys.update(run.get("run_key") for run in raw_incomplete_runs if isinstance(run, dict) and run.get("run_key"))
+        full_archive_context = include_archive_storage or include_ingest_health
+        _phase(
+            "building_resolution_context",
+            "Resolving cached log paths for visible rows." if not full_archive_context else "Resolving archived log paths and config references.",
+            total_runs=total_runs,
+            loaded_runs=len(raw_runs),
         )
-    return jsonify(payload)
+        resolution_context = _build_logscan_resolution_context(
+            include_candidate_files=full_archive_context,
+            run_keys=None if full_archive_context else visible_run_keys,
+        )
+        _phase(
+            "annotating_runs",
+            "Annotating saved runs for filters, tables, and chart labels.",
+            total_runs=total_runs,
+            loaded_runs=len(raw_runs),
+        )
+        runs = _annotate_logscan_runs(raw_runs, context=resolution_context)
+        incomplete_runs = _annotate_logscan_runs(raw_incomplete_runs, context=resolution_context) if include_incomplete else []
+        payload = {
+            "request_id": request_id,
+            "runs": runs,
+            "incomplete_runs": incomplete_runs,
+            "total_runs": total_runs,
+            "total_incomplete_runs": len(all_incomplete_runs),
+            "ingest_health": _logscan_ingest_health() if include_ingest_health else None,
+            "archive_storage": None,
+            "reingest_running": False,
+        }
+        if include_archive_storage:
+            _phase("summarizing_archive_storage", "Calculating archived log storage totals.", total_runs=total_runs, loaded_runs=len(runs))
+            all_runs = database.get_log_runs(limit=None) if total_runs else []
+            payload["archive_storage"] = _get_logscan_archive_storage_summary(
+                all_runs=all_runs,
+                incomplete_runs=all_incomplete_runs,
+                context=resolution_context,
+            )
+        elapsed = time.perf_counter() - request_started_at
+        _finish("complete", phase="complete", total_runs=total_runs, loaded_runs=len(runs), elapsed_seconds=round(elapsed, 1))
+        if elapsed >= 2:
+            helpers.ts_log(
+                f"Analytics trends request took {elapsed:.2f}s (limit={raw_limit}, lightweight={lightweight_request}, runs={len(runs)}, total={total_runs}).",
+                level="WARNING",
+            )
+        return jsonify(payload)
+    except Exception as exc:
+        _finish("error", phase="error", error=str(exc))
+        raise
 
 
 @app.route("/logscan/trends/ingest-health", methods=["GET"])
 def logscan_trends_ingest_health():
+    validate_archives = str(request.args.get("validate_archives", "0")).strip().lower() in {"1", "true", "yes", "on"}
     snapshot = _logscan_reingest_snapshot()
     if logscan_ingest_lock.locked() or snapshot.get("status") == "running":
         return jsonify(
@@ -4499,7 +5518,7 @@ def logscan_trends_ingest_health():
                 "pending_active": True,
             }
         )
-    return jsonify(_logscan_ingest_health())
+    return jsonify(_logscan_ingest_health(validate_archives=validate_archives))
 
 
 @app.route("/logscan/trends/archive-storage", methods=["GET"])
@@ -4507,9 +5526,11 @@ def logscan_trends_archive_storage():
     snapshot = _logscan_reingest_snapshot()
     if logscan_ingest_lock.locked() or snapshot.get("status") == "running":
         return jsonify({"status": "running", "archive_storage": None, "reingest": snapshot}), 202
-    resolution_context = _build_logscan_resolution_context()
+    scan_disk = str(request.args.get("scan_disk", "0")).strip().lower() in {"1", "true", "yes", "on"}
     all_runs = database.get_log_runs(limit=None) if database.get_log_runs_count() else []
     all_incomplete_runs = _get_logscan_incomplete_runs(limit=None)
+    run_keys = {run.get("run_key") for run in list(all_runs or []) + list(all_incomplete_runs or []) if isinstance(run, dict) and run.get("run_key")}
+    resolution_context = _build_logscan_resolution_context(include_candidate_files=scan_disk, run_keys=None if scan_disk else run_keys)
     return jsonify(
         {
             "status": "idle",
@@ -4624,9 +5645,50 @@ def _reset_logscan_reingest_state():
         )
 
 
+def _get_logscan_archive_size_details(info, archive_paths=None):
+    if not isinstance(info, dict):
+        return {"size": 0, "original_size": 0, "compressed_size": 0}
+    path_key = None
+    if info.get("path"):
+        try:
+            path_key = str(Path(info["path"]).resolve())
+        except Exception:
+            path_key = None
+    archive_entry = archive_paths.get(path_key) if isinstance(archive_paths, dict) and path_key else None
+    size = info.get("size")
+    if not isinstance(size, int) and isinstance(archive_entry, dict):
+        size = archive_entry.get("size")
+    size = int(size) if isinstance(size, int) else 0
+    is_compressed = bool(info.get("is_compressed"))
+    if not is_compressed and info.get("path"):
+        is_compressed = _is_logscan_gzip_path(info["path"])
+    original_size = info.get("original_size")
+    if not isinstance(original_size, int) and isinstance(archive_entry, dict):
+        original_size = archive_entry.get("original_size") or archive_entry.get("uncompressed_size")
+    if not isinstance(original_size, int) and is_compressed and info.get("path"):
+        original_size = _get_logscan_gzip_original_size(info["path"])
+    if not isinstance(original_size, int) and not is_compressed:
+        original_size = size
+    compressed_size = info.get("compressed_size")
+    if not isinstance(compressed_size, int) and isinstance(archive_entry, dict):
+        compressed_size = archive_entry.get("compressed_size")
+    if not isinstance(compressed_size, int):
+        compressed_size = size
+    return {
+        "size": size,
+        "original_size": int(original_size) if isinstance(original_size, int) else 0,
+        "compressed_size": int(compressed_size) if isinstance(compressed_size, int) else 0,
+    }
+
+
 def _get_logscan_archive_storage_summary(all_runs=None, incomplete_runs=None, context=None):
     context = context or _build_logscan_resolution_context()
     archive_paths = {}
+    for entry in context.get("cache_entries", []):
+        path = entry.get("path")
+        if not path or (entry.get("location") or _classify_logscan_file_location(path)) != "archive":
+            continue
+        archive_paths[str(path.resolve())] = entry
     for entry in context.get("candidate_files", []):
         path = entry.get("path")
         if not path or _classify_logscan_file_location(path) != "archive":
@@ -4635,6 +5697,8 @@ def _get_logscan_archive_storage_summary(all_runs=None, incomplete_runs=None, co
 
     tracked_paths = set()
     tracked_bytes = 0
+    tracked_original_bytes = 0
+    tracked_compressed_bytes = 0
     for run in list(all_runs or []) + list(incomplete_runs or []):
         if not isinstance(run, dict):
             continue
@@ -4645,30 +5709,41 @@ def _get_logscan_archive_storage_summary(all_runs=None, incomplete_runs=None, co
         if path_key in tracked_paths:
             continue
         tracked_paths.add(path_key)
-        if isinstance(info.get("size"), int):
-            tracked_bytes += info["size"]
-        else:
-            entry = archive_paths.get(path_key)
-            tracked_bytes += int(entry.get("size", 0)) if isinstance(entry, dict) else 0
+        size_info = _get_logscan_archive_size_details(info, archive_paths=archive_paths)
+        tracked_bytes += size_info["size"]
+        tracked_original_bytes += size_info["original_size"]
+        tracked_compressed_bytes += size_info["compressed_size"]
 
     total_archived_bytes = 0
+    total_archived_original_bytes = 0
+    total_archived_compressed_bytes = 0
     for entry in archive_paths.values():
-        if isinstance(entry.get("size"), int):
-            total_archived_bytes += entry["size"]
+        size_info = _get_logscan_archive_size_details(entry, archive_paths=archive_paths)
+        total_archived_bytes += size_info["size"]
+        total_archived_original_bytes += size_info["original_size"]
+        total_archived_compressed_bytes += size_info["compressed_size"]
 
     total_archived_files = len(archive_paths)
     tracked_archived_files = len(tracked_paths)
     extra_archived_files = max(0, total_archived_files - tracked_archived_files)
     extra_archived_bytes = max(0, total_archived_bytes - tracked_bytes)
+    extra_original_bytes = max(0, total_archived_original_bytes - tracked_original_bytes)
+    extra_compressed_bytes = max(0, total_archived_compressed_bytes - tracked_compressed_bytes)
     kometa_keep_limit = _get_logscan_keep_limit("kometa")
     imagemaid_keep_limit = _get_logscan_keep_limit("imagemaid")
     return {
         "archived_bytes": tracked_bytes,
+        "archived_original_bytes": tracked_original_bytes,
+        "archived_compressed_bytes": tracked_compressed_bytes,
         "archived_files": tracked_archived_files,
         "disk_archived_bytes": total_archived_bytes,
+        "disk_archived_original_bytes": total_archived_original_bytes,
+        "disk_archived_compressed_bytes": total_archived_compressed_bytes,
         "disk_archived_files": total_archived_files,
         "extra_archived_files": extra_archived_files,
         "extra_archived_bytes": extra_archived_bytes,
+        "extra_archived_original_bytes": extra_original_bytes,
+        "extra_archived_compressed_bytes": extra_compressed_bytes,
         "keep_limit": kometa_keep_limit,
         "retention_label": f"Kometa: {_format_archived_log_retention_label(kometa_keep_limit)} | ImageMaid: {_format_archived_log_retention_label(imagemaid_keep_limit)}",
         "kometa_keep_limit": kometa_keep_limit,
@@ -4676,6 +5751,7 @@ def _get_logscan_archive_storage_summary(all_runs=None, incomplete_runs=None, co
         "kometa_retention_label": _format_archived_log_retention_label(kometa_keep_limit),
         "imagemaid_retention_label": _format_archived_log_retention_label(imagemaid_keep_limit),
         "compression_ready": True,
+        "disk_scan_skipped": not bool(context.get("candidate_files_scanned")),
     }
 
 
@@ -4750,7 +5826,7 @@ def _normalize_logscan_archive_filenames(archive_dir=None):
 
 
 def _logscan_needs_reingest(cache_logs, log_dir):
-    return bool(_get_logscan_delta_files(log_dir=log_dir, include_archive=True))
+    return bool(_get_logscan_delta_files(log_dir=log_dir, include_archive=False))
 
 
 def _get_logscan_invalid_archived_logs(log_dir=None, limit=None):
@@ -4819,12 +5895,12 @@ def _get_logscan_invalid_archived_logs(log_dir=None, limit=None):
     return invalid_logs[:safe_limit]
 
 
-def _logscan_ingest_health(log_dir=None):
+def _logscan_ingest_health(log_dir=None, include_archive=False, validate_archives=False):
     log_dir = Path(log_dir) if log_dir else helpers.get_kometa_log_dir()
     log_dir_exists = log_dir.exists()
     imagemaid_log_dir = _get_logscan_live_dir("imagemaid")
     imagemaid_dir_exists = imagemaid_log_dir.exists()
-    log_files = _get_logscan_log_files(log_dir=log_dir, include_archive=True) if (log_dir_exists or imagemaid_dir_exists) else []
+    log_files = _get_logscan_log_files(log_dir=log_dir, include_archive=include_archive) if (log_dir_exists or imagemaid_dir_exists) else []
     ingest_cache = _load_logscan_ingest_cache()
     cache_logs = ingest_cache["logs"]
     missing = []
@@ -4861,7 +5937,7 @@ def _logscan_ingest_health(log_dir=None):
     if total < 0:
         total = 0
     needs_reingest = bool(missing or incomplete)
-    invalid_archived = _get_logscan_invalid_archived_logs(log_dir=log_dir)
+    invalid_archived = _get_logscan_invalid_archived_logs(log_dir=log_dir) if validate_archives else []
 
     return {
         "source": "health",
@@ -4875,6 +5951,7 @@ def _logscan_ingest_health(log_dir=None):
         "incomplete_sample": incomplete[:5],
         "invalid_archived_count": len(invalid_archived),
         "invalid_archived_sample": [entry.get("name") for entry in invalid_archived[:5] if entry.get("name")],
+        "archive_scan_skipped": not bool(include_archive or validate_archives),
         "needs_reingest": needs_reingest,
         "pending_active": pending_active,
         "last_updated": latest_updated,
@@ -4912,6 +5989,134 @@ def _start_logscan_auto_reingest(log_dir):
     thread = threading.Thread(target=_run_logscan_reingest_job, args=(job_id, False), daemon=True, name="logscan-auto-reingest")
     thread.start()
     return True
+
+
+def _logscan_live_ingest_candidates(tool_name="kometa", log_dir=None):
+    tool_name = _normalize_logscan_tool_name(tool_name)
+    live_dir = _get_logscan_live_dir(tool_name, log_dir=log_dir if tool_name == "kometa" else None)
+    if not live_dir.exists():
+        return []
+    if tool_name == "kometa":
+        path = live_dir / "meta.log"
+        return [path] if path.exists() and path.is_file() else []
+    return [path for path in sorted(live_dir.glob("*.log*"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True) if path.is_file() and ".log" in path.name.lower()]
+
+
+def _logscan_live_ingest_has_work(tool_name="kometa", log_dir=None):
+    try:
+        candidates = _logscan_live_ingest_candidates(tool_name, log_dir=log_dir)
+        if not candidates:
+            return False
+        ingest_cache = _load_logscan_ingest_cache()
+        cache_logs = ingest_cache.get("logs", {}) if isinstance(ingest_cache, dict) else {}
+        if not isinstance(cache_logs, dict):
+            cache_logs = {}
+        for path in candidates:
+            try:
+                stats = path.stat()
+                cache_key = str(path.resolve())
+                if not _logscan_cache_entry_matches(path, cache_entry=cache_logs.get(cache_key, {}), stats=stats):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+def _start_logscan_live_ingest(tool_name="kometa", log_dir=None):
+    tool_name = _normalize_logscan_tool_name(tool_name)
+    if logscan_ingest_lock.locked():
+        return False
+    snapshot = _logscan_reingest_snapshot()
+    if snapshot.get("status") == "running":
+        return False
+    if not _logscan_live_ingest_has_work(tool_name, log_dir=log_dir):
+        return False
+    job_id = secrets.token_urlsafe(8)
+    now = datetime.now(timezone.utc).isoformat()
+    current_file = "meta.log" if tool_name == "kometa" else None
+    _update_logscan_reingest_state(
+        status="running",
+        job_id=job_id,
+        trigger=f"{tool_name}_run_complete",
+        phase="ingesting_live_log",
+        started_at=now,
+        finished_at=None,
+        total=1,
+        scanned=0,
+        ingested=0,
+        archived=0,
+        duplicates=0,
+        skipped_incomplete=0,
+        skipped_invalid=0,
+        errors=0,
+        current_file=current_file,
+        missing_people_unique=0,
+        missing_people_logs=0,
+        missing_people_log_ready=False,
+        missing_people_log_lines=0,
+        sample_incomplete=[],
+        sample_errors=[],
+    )
+    raw_log_dir = str(log_dir) if log_dir else None
+    thread = threading.Thread(
+        target=_run_logscan_live_ingest_job,
+        args=(job_id, tool_name, raw_log_dir),
+        daemon=True,
+        name=f"logscan-live-ingest-{tool_name}",
+    )
+    thread.start()
+    return True
+
+
+def _run_logscan_live_ingest_job(job_id, tool_name, raw_log_dir=None):
+    if not logscan_ingest_lock.acquire(blocking=False):
+        _update_logscan_reingest_state(
+            status="error",
+            job_id=job_id,
+            error="Logscan ingest already running.",
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return
+    try:
+        with app.app_context():
+            log_dir = Path(raw_log_dir) if raw_log_dir else None
+            current_file = "meta.log" if tool_name == "kometa" else None
+            _update_logscan_reingest_state(
+                status="running",
+                job_id=job_id,
+                phase="ingesting_live_log",
+                current_file=current_file,
+                total=1,
+                scanned=0,
+            )
+            result = _ingest_completed_live_logs(tool_name, log_dir=log_dir)
+            ingested = int(result.get("ingested") or 0) if isinstance(result, dict) else 0
+            archived = int(result.get("archived") or 0) if isinstance(result, dict) else 0
+            _update_logscan_reingest_state(
+                status="complete",
+                job_id=job_id,
+                phase="complete",
+                scanned=1,
+                ingested=ingested,
+                archived=archived,
+                errors=0,
+                current_file=None,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                success=True,
+            )
+    except Exception as exc:
+        _update_logscan_reingest_state(
+            status="error",
+            job_id=job_id,
+            error=str(exc),
+            errors=1,
+            current_file=None,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+    finally:
+        logscan_ingest_lock.release()
 
 
 def _ingest_completed_live_logs(tool_name="kometa", log_dir=None):
@@ -5039,7 +6244,7 @@ def _ingest_completed_live_logs(tool_name="kometa", log_dir=None):
                     archived_stats = archived_path.stat()
                     if not path.exists():
                         cache_logs.pop(cache_key, None)
-                    cache_logs[str(archived_path.resolve())] = {
+                    archive_entry = {
                         "mtime": archived_stats.st_mtime,
                         "size": archived_stats.st_size,
                         "content_md5": content_md5,
@@ -5048,6 +6253,10 @@ def _ingest_completed_live_logs(tool_name="kometa", log_dir=None):
                         "run_complete": True,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    if _is_logscan_gzip_path(archived_path):
+                        archive_entry["compressed_size"] = archived_stats.st_size
+                        archive_entry["original_size"] = int(stats.st_size)
+                    cache_logs[str(archived_path.resolve())] = archive_entry
                     cache_dirty = True
                     archived += 1
                 except Exception:
@@ -5169,11 +6378,21 @@ def _archive_finished_live_meta_log_if_idle(log_dir=None):
         return None
 
     updated_entry = dict(live_entry)
+    original_size = live_entry.get("original_size") or live_entry.get("size")
+    try:
+        original_size = int(original_size) if original_size is not None else int(live_path.stat().st_size)
+    except Exception:
+        original_size = None
     updated_entry["mtime"] = archived_stats.st_mtime
     updated_entry["size"] = archived_stats.st_size
+    updated_entry["compressed_size"] = archived_stats.st_size
+    if original_size is not None:
+        updated_entry["original_size"] = original_size
     updated_entry["content_md5"] = content_md5
     updated_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
     live_entry["content_md5"] = content_md5
+    if original_size is not None:
+        live_entry["original_size"] = original_size
     cache_logs[live_key] = live_entry
     cache_logs[archived_key] = updated_entry
     ingest_cache["logs"] = cache_logs
@@ -5223,6 +6442,14 @@ def _archive_rotated_log_and_update_cache(path, cache_logs, archive_dir, run_key
     updated_entry = dict(existing_entry)
     updated_entry["mtime"] = archived_stats.st_mtime
     updated_entry["size"] = archived_stats.st_size
+    if _is_logscan_gzip_path(archived_path):
+        updated_entry["compressed_size"] = archived_stats.st_size
+        try:
+            updated_entry["original_size"] = int(existing_entry.get("original_size") or source_path.stat().st_size)
+        except Exception:
+            pass
+    else:
+        updated_entry["original_size"] = archived_stats.st_size
     updated_entry["run_complete"] = bool(run_complete)
     updated_entry["tool_name"] = _detect_logscan_tool_from_path(source_path)
     updated_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -5280,6 +6507,150 @@ def _prune_logscan_archive(archive_dir):
     return removed
 
 
+def _extract_logscan_missing_people_header(text, max_lines=200):
+    header_lines = []
+    for line in text.splitlines():
+        header_lines.append(line)
+        if "Locating config..." in line:
+            break
+        if len(header_lines) >= max_lines:
+            break
+    return "\n".join(header_lines).rstrip()
+
+
+def _iter_logscan_missing_people_export_paths(cache_logs):
+    if not isinstance(cache_logs, dict):
+        return []
+    candidates = []
+    seen_paths = set()
+    seen_md5s = set()
+    for raw_path, entry in cache_logs.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("run_complete") is not True:
+            continue
+        if _normalize_logscan_tool_name(entry.get("tool_name") or _detect_logscan_tool_from_path(raw_path)) != "kometa":
+            continue
+        content_md5 = str(entry.get("content_md5") or "").strip()
+        if content_md5:
+            if content_md5 in seen_md5s:
+                continue
+            seen_md5s.add(content_md5)
+        try:
+            path = Path(raw_path)
+            resolved = path.resolve()
+        except Exception:
+            continue
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        try:
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            stats = resolved.stat()
+        except Exception:
+            continue
+        candidates.append((stats.st_mtime, resolved))
+    candidates.sort(key=lambda item: item[0])
+    return [path for _mtime, path in candidates]
+
+
+def _rebuild_logscan_missing_people_export(cache_logs, analyzer=None):
+    cache_dir = _get_logscan_cache_dir()
+    missing_people_log = cache_dir / "meta_people_missing.log"
+    missing_people_meta = cache_dir / "meta_people_missing.json"
+    missing_people_unique = set()
+    missing_people_logs = 0
+    missing_people_blocks = []
+    missing_people_seen_blocks = set()
+    missing_people_seen_names = set()
+    missing_people_header = None
+    sample_errors = []
+
+    analyzer = analyzer or logscan.LogscanAnalyzer()
+    for path in _iter_logscan_missing_people_export_paths(cache_logs):
+        try:
+            content = _read_logscan_text(path, encoding="utf-8", errors="replace")
+            people_items = analyzer.collect_missing_people_lines(
+                content,
+                available_index=getattr(analyzer, "_people_index", None),
+                log_path=path,
+            )
+        except Exception as exc:
+            if len(sample_errors) < 5:
+                sample_errors.append(f"{path.name}: {exc}")
+            continue
+        if not people_items:
+            continue
+        log_names = set()
+        for item in people_items:
+            names = {str(name).strip().lower() for name in item.get("names", set()) if str(name).strip()}
+            if not names:
+                continue
+            log_names.update(names)
+            if names.issubset(missing_people_seen_names):
+                continue
+            block = item.get("block")
+            if block and block not in missing_people_seen_blocks:
+                missing_people_blocks.append(block)
+                missing_people_seen_blocks.add(block)
+            missing_people_seen_names.update(names)
+        if log_names:
+            missing_people_logs += 1
+            missing_people_unique.update(log_names)
+            if missing_people_header is None:
+                missing_people_header = _extract_logscan_missing_people_header(content)
+
+    missing_people_log_ready = False
+    missing_people_log_lines = 0
+    if missing_people_blocks:
+        try:
+            missing_people_log_lines = sum(len(block.splitlines()) for block in missing_people_blocks)
+            output_parts = []
+            if missing_people_header:
+                output_parts.append(missing_people_header)
+                missing_people_log_lines += len(missing_people_header.splitlines())
+            output_parts.extend(missing_people_blocks)
+            missing_people_log.write_text("\n".join(output_parts).rstrip() + "\n", encoding="utf-8")
+            missing_people_log_ready = True
+            try:
+                missing_people_meta.write_text(
+                    json.dumps(
+                        {
+                            "missing_people_unique": len(missing_people_unique),
+                            "missing_people_logs": missing_people_logs,
+                            "missing_people_log_lines": missing_people_log_lines,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                        ensure_ascii=True,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            if len(sample_errors) < 5:
+                sample_errors.append(f"{missing_people_log.name}: {exc}")
+    else:
+        try:
+            if missing_people_log.exists():
+                missing_people_log.unlink()
+            if missing_people_meta.exists():
+                missing_people_meta.unlink()
+        except Exception:
+            pass
+
+    return {
+        "missing_people_unique": len(missing_people_unique),
+        "missing_people_logs": missing_people_logs,
+        "missing_people_log_ready": missing_people_log_ready,
+        "missing_people_log_lines": missing_people_log_lines,
+        "sample_errors": sample_errors,
+    }
+
+
 def _perform_logscan_reingest(reset, job_id=None, update_state=True):
     if not logscan_ingest_lock.acquire(blocking=False):
         message = "Logscan ingest already running."
@@ -5308,16 +6679,6 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
             sample_incomplete=[],
             sample_errors=[],
         )
-
-    def _extract_fake_people_header(text, max_lines=200):
-        header_lines = []
-        for line in text.splitlines():
-            header_lines.append(line)
-            if "Locating config..." in line:
-                break
-            if len(header_lines) >= max_lines:
-                break
-        return "\n".join(header_lines).rstrip()
 
     try:
         ingest_cache = _load_logscan_ingest_cache()
@@ -5351,12 +6712,6 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
         skipped_incomplete = 0
         skipped_invalid = 0
         errors = 0
-        missing_people_unique = set()
-        missing_people_logs = 0
-        missing_people_blocks = []
-        missing_people_seen_blocks = set()
-        missing_people_seen_names = set()
-        missing_people_header = None
         sample_incomplete = []
         sample_errors = []
 
@@ -5506,25 +6861,6 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                         if archived_path:
                             cache_dirty = True
                     continue
-                missing_people = result.get("missing_people") if tool_name == "kometa" and isinstance(result, dict) else None
-                if missing_people:
-                    missing_people_logs += 1
-                    missing_people_unique.update({name.lower() for name in missing_people})
-                    if missing_people_header is None:
-                        missing_people_header = _extract_fake_people_header(content)
-                people_items = analyzer.collect_missing_people_lines(content, available_index=analyzer._people_index)
-                if people_items:
-                    for item in people_items:
-                        names = {name for name in item.get("names", set()) if name in missing_people_unique}
-                        if not names:
-                            continue
-                        if names.issubset(missing_people_seen_names):
-                            continue
-                        block = item.get("block")
-                        if block and block not in missing_people_seen_blocks:
-                            missing_people_blocks.append(block)
-                            missing_people_seen_blocks.add(block)
-                        missing_people_seen_names.update(names)
                 if skip_save_if_cached and cached_run_key == summary.get("run_key"):
                     duplicates += 1
                 else:
@@ -5557,7 +6893,7 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                     if archived_path:
                         try:
                             archived_stats = archived_path.stat()
-                            cache_logs[str(archived_path.resolve())] = {
+                            archive_entry = {
                                 "mtime": archived_stats.st_mtime,
                                 "size": archived_stats.st_size,
                                 "content_md5": content_md5,
@@ -5566,6 +6902,10 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                                 "run_complete": True,
                                 "updated_at": datetime.now(timezone.utc).isoformat(),
                             }
+                            if _is_logscan_gzip_path(archived_path):
+                                archive_entry["compressed_size"] = archived_stats.st_size
+                                archive_entry["original_size"] = int(stats.st_size)
+                            cache_logs[str(archived_path.resolve())] = archive_entry
                             cache_dirty = True
                         except Exception:
                             pass
@@ -5581,57 +6921,17 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
                     skipped_incomplete=skipped_incomplete,
                     skipped_invalid=skipped_invalid,
                     errors=errors,
-                    missing_people_unique=len(missing_people_unique),
-                    missing_people_logs=missing_people_logs,
                     sample_incomplete=sample_incomplete,
                     sample_errors=sample_errors,
                 )
             if idx % LOGSCAN_INGEST_CACHE_FLUSH_INTERVAL == 0:
                 _flush_ingest_cache_progress(force=True)
 
-        cache_dir = _get_logscan_cache_dir()
-        missing_people_log = cache_dir / "meta_people_missing.log"
-        missing_people_meta = cache_dir / "meta_people_missing.json"
-        missing_people_log_ready = False
-        missing_people_log_lines = 0
-        if missing_people_blocks:
-            try:
-                missing_people_log_lines = sum(len(block.splitlines()) for block in missing_people_blocks)
-                output_parts = []
-                if missing_people_header:
-                    output_parts.append(missing_people_header)
-                    missing_people_log_lines += len(missing_people_header.splitlines())
-                output_parts.extend(missing_people_blocks)
-                missing_people_log.write_text("\n".join(output_parts).rstrip() + "\n", encoding="utf-8")
-                missing_people_log_ready = True
-                try:
-                    missing_people_meta.write_text(
-                        json.dumps(
-                            {
-                                "missing_people_unique": len(missing_people_unique),
-                                "missing_people_logs": missing_people_logs,
-                                "updated_at": datetime.now(timezone.utc).isoformat(),
-                            },
-                            ensure_ascii=True,
-                            indent=2,
-                        )
-                        + "\n",
-                        encoding="utf-8",
-                    )
-                except Exception:
-                    pass
-            except Exception as exc:
-                errors += 1
-                if len(sample_errors) < 5:
-                    sample_errors.append(f"{missing_people_log.name}: {exc}")
-        else:
-            try:
-                if missing_people_log.exists():
-                    missing_people_log.unlink()
-                if missing_people_meta.exists():
-                    missing_people_meta.unlink()
-            except Exception:
-                pass
+        missing_people_export = _rebuild_logscan_missing_people_export(cache_logs, analyzer=analyzer)
+        missing_export_errors = missing_people_export.get("sample_errors") if isinstance(missing_people_export, dict) else []
+        if missing_export_errors:
+            errors += len(missing_export_errors)
+            sample_errors.extend(error for error in missing_export_errors if len(sample_errors) < 5)
 
         result = {
             "success": True,
@@ -5641,10 +6941,10 @@ def _perform_logscan_reingest(reset, job_id=None, update_state=True):
             "skipped_incomplete": skipped_incomplete,
             "skipped_invalid": skipped_invalid,
             "errors": errors,
-            "missing_people_unique": len(missing_people_unique),
-            "missing_people_logs": missing_people_logs,
-            "missing_people_log_ready": missing_people_log_ready,
-            "missing_people_log_lines": missing_people_log_lines,
+            "missing_people_unique": missing_people_export.get("missing_people_unique", 0),
+            "missing_people_logs": missing_people_export.get("missing_people_logs", 0),
+            "missing_people_log_ready": missing_people_export.get("missing_people_log_ready", False),
+            "missing_people_log_lines": missing_people_export.get("missing_people_log_lines", 0),
             "sample_incomplete": sample_incomplete,
             "sample_errors": sample_errors,
         }
@@ -6002,10 +7302,10 @@ def logscan_trends_page():
         tracearr_requirement_reasons=workspace_status.get("tracearr_requirement_reasons", []),
         omdb_requirement_reasons=workspace_status.get("omdb_requirement_reasons", []),
         mdblist_requirement_reasons=workspace_status.get("mdblist_requirement_reasons", []),
+        floppy_requirement_reasons=workspace_status.get("floppy_requirement_reasons", []),
         anidb_requirement_reasons=workspace_status.get("anidb_requirement_reasons", []),
         radarr_requirement_reasons=workspace_status.get("radarr_requirement_reasons", []),
         sonarr_requirement_reasons=workspace_status.get("sonarr_requirement_reasons", []),
-        trakt_requirement_reasons=workspace_status.get("trakt_requirement_reasons", []),
         mal_requirement_reasons=workspace_status.get("mal_requirement_reasons", []),
         workspace_readiness=workspace_status.get("readiness", {}),
     )
@@ -6059,6 +7359,8 @@ def logscan_trends_people_missing_status():
         {
             "exists": True,
             "missing_people_unique": meta.get("missing_people_unique"),
+            "missing_people_logs": meta.get("missing_people_logs"),
+            "missing_people_log_lines": meta.get("missing_people_log_lines"),
             "updated_at": meta.get("updated_at"),
         }
     )
@@ -6132,23 +7434,36 @@ def support_info():
     if not plex_summary or plex_summary.lower().startswith("plex summary unavailable"):
         plex_summary = "Plex info unavailable."
 
-    library_settings = persistence.retrieve_settings("025-libraries").get("libraries", {})
+    library_settings = (persistence.retrieve_settings("025-libraries") or {}).get("libraries", {})
+    lib_name_map = persistence.get_library_names("010-plex") or {}
+
+    selected_library_id_map = {}
     movie_libraries = []
     show_libraries = []
     for key, value in library_settings.items():
-        if not key.endswith("-library") or value in [None, "", False]:
+        if not isinstance(key, str) or not key.endswith("-library"):
             continue
+        if value in [None, "", False]:
+            continue
+        lib_id = None
         if key.startswith("mov-library_"):
-            movie_libraries.append(str(value))
+            lib_id = key[len("mov-library_") : -len("-library")]
+            movie_libraries.append(str(lib_id))
         elif key.startswith("sho-library_"):
-            show_libraries.append(str(value))
+            lib_id = key[len("sho-library_") : -len("-library")]
+            show_libraries.append(str(lib_id))
+        if not lib_id:
+            continue
+        selected_library_id_map[str(lib_id)] = lib_name_map.get(str(lib_id), str(lib_id))
 
-    movie_libraries = sorted((name.strip() for name in movie_libraries if str(name).strip()), key=lambda value: value.casefold())
-    show_libraries = sorted((name.strip() for name in show_libraries if str(name).strip()), key=lambda value: value.casefold())
-    library_names = movie_libraries + show_libraries
+    library_names = dict(sorted(selected_library_id_map.items(), key=lambda item: str(item[1]).casefold()))
     if library_names:
         library_details = helpers.get_library_summaries(library_names)
         if library_details.lower().startswith("plex library summary unavailable"):
+            helpers.ts_log(
+                f"Support-info library summary unavailable for config '{config_name}' " f"with libraries {list(library_names.keys())}: {library_details}",
+                level="WARNING",
+            )
             library_details = "Library details unavailable."
     else:
         library_details = "No libraries configured."
@@ -6164,9 +7479,11 @@ def support_info():
     lines.append(f"# Python: {python_version}")
     lines.append(f"# Git: {git_version}")
     lines.append(f"# Browser: {browser_line}")
+    lines.append("# Viewers: enhanced line numbers and section jump controls enabled")
     lines.extend(helpers.get_quickstart_settings_summary())
     lines.extend([f"# {line}" for line in plex_summary.splitlines()])
     lines.append(f"# Quickstart: {quickstart_version} | Branch: {quickstart_branch} | Environment: {quickstart_environment}")
+    lines.extend(integrity_comments(current_integrity()).splitlines())
     lines.append("###")
     lines.append(f"# Libraries configured with Quickstart: {len(movie_libraries)} movie, {len(show_libraries)} show")
     if library_details:
@@ -6177,26 +7494,28 @@ def support_info():
                 lines.append("#")
     lines.append("###")
 
-    log_path = Path(helpers.LOG_FILE).resolve()
-    log_lines = []
+    if request.args.get("include_logs") == "1":
+        log_path = Path(helpers.LOG_FILE).resolve()
+        log_lines = []
 
-    if log_path.exists():
-        try:
-            with log_path.open("r", encoding="utf-8", errors="replace") as f:
-                tail = deque(f, maxlen=200)
-            for line in tail:
-                log_lines.append(helpers.redact_string(line.rstrip("\n")))
-            if not log_lines:
-                log_lines.append("Quickstart log is empty.")
-        except Exception:
+        if log_path.exists():
+            try:
+                with log_path.open("r", encoding="utf-8", errors="replace") as f:
+                    tail = deque(f, maxlen=200)
+                for line in tail:
+                    log_lines.append(helpers.redact_string(line.rstrip("\n")))
+                if not log_lines:
+                    log_lines.append("Quickstart log is empty.")
+            except Exception:
+                log_lines.append("Quickstart log unavailable.")
+        else:
             log_lines.append("Quickstart log unavailable.")
-    else:
-        log_lines.append("Quickstart log unavailable.")
 
-    lines.append("# Quickstart log tail (last 200 lines)")
-    lines.append("")
+        lines.append("# Quickstart log tail (last 200 lines)")
+        lines.append("")
+        lines.extend(log_lines)
 
-    text = "\n".join(lines + log_lines)
+    text = "\n".join(lines)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return jsonify({"text": text, "generated_at": generated_at})
 
@@ -6633,6 +7952,23 @@ if __name__ == "__main__":
     except (ModuleNotFoundError, ImportError):
         has_tray = False
 
+    def handle_sigint(signum, frame):
+        if app.config["QUICKSTART_DOCKER"]:
+            signal.default_int_handler(signum, frame)
+            return
+        helpers.ts_log("\nShutting down Quickstart...", level="INFO")
+        _stop_launched_processes()
+        shutdown_event.set()
+        if has_tray:
+            qt_app = QApplication.instance()
+            if qt_app:
+                qt_app.quit()
+            return
+        raise KeyboardInterrupt
+
+    if not app.config["QUICKSTART_DOCKER"]:
+        signal.signal(signal.SIGINT, handle_sigint)
+
     if not has_tray:
         # Headless mode: skip system tray
         helpers.ts_log("Running in headless mode — no system tray will be shown...", level="INFO")
@@ -6658,9 +7994,11 @@ if __name__ == "__main__":
                 time.sleep(1)  # Keep main thread alive
         except KeyboardInterrupt:
             helpers.ts_log("\nShutting down Quickstart...", level="INFO")
+            _stop_launched_processes()
             sys.exit(0)
 
         helpers.ts_log("Shutting down Quickstart...", level="INFO")
+        _stop_launched_processes()
         sys.exit(0)
 
     else:
@@ -6822,6 +8160,8 @@ if __name__ == "__main__":
                 global server_thread, update_thread
 
                 helpers.ts_log("Shutting down Quickstart...", level="INFO")
+                shutdown_event.set()
+                _stop_launched_processes()
 
                 # Stop tray icon
                 self.tray.hide()
@@ -6848,3 +8188,5 @@ if __name__ == "__main__":
                 os.execl(python, python, *sys.argv)
 
         QuickstartTrayApp().exec()
+
+# TEMP: touch to satisfy CI's build-trigger file match so the macOS arm64 matrix leg runs on this PR - revert before merge

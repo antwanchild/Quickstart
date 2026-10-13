@@ -1,32 +1,46 @@
 {% extends "000-base.html" %} {% block content %}
 {% include "001-navigation.html" %}
 {% include "modals/" + page_info['template_name'] + ".html" ignore missing %}
+<div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+    <button class="btn btn-primary" id="plexSignIn" type="button">
+        <i class="bi bi-box-arrow-up-right me-1" aria-hidden="true"></i>Sign in with Plex
+    </button>
+    <button class="btn btn-outline-secondary d-none" id="plexSignInCancel" type="button">
+        <i class="bi bi-x-lg me-1" aria-hidden="true"></i>Cancel
+    </button>
+    <a class="btn btn-outline-secondary d-none" id="plexSignInOpen" target="_blank" rel="noopener noreferrer">
+        <i class="bi bi-box-arrow-up-right me-1" aria-hidden="true"></i>Open Plex
+    </a>
+    <span id="plexSignInSpinner" class="spinner-border spinner-border-sm d-none" aria-hidden="true"></span>
+</div>
+<div id="plexAuthStatus" class="status-message text-break mb-2" role="status" aria-live="polite"></div>
 <div class="input-group mb-2">
     <span class="input-group-text" id="plex_url_text" style="width: 180px; justify-content: space-between;">
         Plex URL
         <span class="text-info ms-3" data-bs-toggle="tooltip" data-bs-html="true" style="margin-left: 10px;"
-            title="You must provide the direct address you use to access your server, including the port. You cannot use https://app.plex.tv<br><br>
-            <b>NOTE:</b> If Plex, Quickstart or Kometa are running in Docker, they must be on the same Docker network (e.g., a user-defined bridge network) for the containers to communicate.">
+            title="Enter the address Kometa will use to reach Plex, including the port. Plex sign-in fills only the token, not this address.<br><br>
+            Use a direct server address, not https://app.plex.tv. A plex.direct hostname is normal for HTTPS and is not your token.<br><br>
+            <b>NOTE:</b> Quickstart and Kometa must both be able to reach this address. If Plex runs in Docker and Kometa runs on another machine, use the Docker host's LAN address and published Plex port, not a private container IP or localhost.">
             <i class="bi bi-info-circle-fill"></i>
         </span>
     </span>
     <input type="text" class="form-control" id="plex_url" name="plex_url"
         value="{{ data['plex']['url'] | string if data['plex']['url'] and 'http://192.168.1.12:32400' not in data['plex']['url'] | string else '' }}"
-        aria-describedby="plex_url_text">
+        aria-describedby="plex_url_text" placeholder="http://192.168.1.20:32400">
 </div>
 <div class="input-group mb-2">
     <span class="input-group-text" id="plex_token_text" style="width: 180px; justify-content: space-between;">
         Plex Token
         <span class="text-info ms-3" data-bs-toggle="tooltip" data-bs-html="true" style="margin-left: 10px;"
-            title="Your token may change if you sign out of your devices, <b>do not</b> use the token that is found in Preferences.xml<br><br>
-            If you do not know how to get your token, search Plex's guidance on finding an authentication token / X-Plex-Token">
+            title="Sign in with Plex to fill this automatically, or enter an existing authentication token / X-Plex-Token and select Validate.<br><br>
+            Keep this token private. It may change if you sign out of your devices. <b>Do not</b> use the token found in Preferences.xml.">
             <i class="bi bi-info-circle-fill"></i>
         </span>
     </span>
     <input type="password" class="form-control" id="plex_token" name="plex_token"
         value="{{ data['plex']['token'] | string if data['plex']['token'] and 'Enter Plex Token' not in data['plex']['token'] | string else '' }}"
-        aria-describedby="plex_url_text">
-    <button class="btn btn-outline-secondary" id="toggleApikeyVisibility" type="button">
+        aria-describedby="plex_token_text" autocomplete="off">
+    <button class="btn btn-outline-secondary" id="toggleApikeyVisibility" type="button" title="Show or hide Plex token" aria-label="Show or hide Plex token">
         <i class="fas fa-eye"></i>
     </button>
     <button class="btn btn-success" id="validateButton" type="button">
@@ -52,6 +66,8 @@
     value="{{ data['plex']['tmp_movie_libraries'] }}" title="">
 <input type="hidden" class="form-control" id="tmp_show_libraries" name="tmp_show_libraries"
     value="{{ data['plex']['tmp_show_libraries'] }}" title="">
+<input type="hidden" class="form-control" id="tmp_library_names" name="tmp_library_names"
+    value="{{ data['plex']['tmp_library_names'] | default('') }}" title="">
 <div class="form-floating" style="display:none;">
     <input type="text" class="form-control" id="plex_validated" name="plex_validated" value="{{ data['validated'] }}"
         title="">

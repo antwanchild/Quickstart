@@ -47,14 +47,15 @@ from flask import has_request_context, url_for
 from modules import database
 from modules.dependency_reasons import (
     QS_ANIDB_REQUIRED_STEP_KEY,
+    QS_FLOPPY_REQUIRED_STEP_KEY,
     QS_MAL_REQUIRED_STEP_KEY,
     QS_MDBLIST_REQUIRED_STEP_KEY,
     QS_OMDB_REQUIRED_STEP_KEY,
     QS_RADARR_REQUIRED_STEP_KEY,
     QS_SONARR_REQUIRED_STEP_KEY,
+    QS_SERIALIZD_REQUIRED_STEP_KEY,
     QS_TAUTULLI_REQUIRED_STEP_KEY,
     QS_TRACEARR_REQUIRED_STEP_KEY,
-    QS_TRAKT_REQUIRED_STEP_KEY,
     _normalize_status,
 )
 from modules.workspace_status_constants import (
@@ -206,6 +207,10 @@ def _build_final_gate(workspace_status, template_list, validation_bulk_rollup_at
         seen.add(key)
 
     for key in optional_keys:
+        # Unvalidated optional services are omitted from generated YAML.
+        # Active dependencies are promoted to required_keys by workspace status.
+        if key in QS_VALIDATION_STEP_KEYS:
+            continue
         state = step_statuses.get(key, "unknown")
         if state not in {"warn", "error"} or key in seen:
             continue
@@ -217,10 +222,11 @@ def _build_final_gate(workspace_status, template_list, validation_bulk_rollup_at
         ("tracearr", QS_TRACEARR_REQUIRED_STEP_KEY, "Tracearr", "tracearr_requirement_reasons", "qs-tracearr-required-hint"),
         ("omdb", QS_OMDB_REQUIRED_STEP_KEY, "OMDb", "omdb_requirement_reasons", "qs-omdb-required-hint"),
         ("mdblist", QS_MDBLIST_REQUIRED_STEP_KEY, "MDBList", "mdblist_requirement_reasons", "qs-mdblist-required-hint"),
+        ("floppy", QS_FLOPPY_REQUIRED_STEP_KEY, "Floppy", "floppy_requirement_reasons", "qs-floppy-required-hint"),
+        ("serializd", QS_SERIALIZD_REQUIRED_STEP_KEY, "Serializd", "serializd_requirement_reasons", "qs-serializd-required-hint"),
         ("anidb", QS_ANIDB_REQUIRED_STEP_KEY, "AniDB", "anidb_requirement_reasons", "qs-anidb-required-hint"),
         ("radarr", QS_RADARR_REQUIRED_STEP_KEY, "Radarr", "radarr_requirement_reasons", "qs-radarr-required-hint"),
         ("sonarr", QS_SONARR_REQUIRED_STEP_KEY, "Sonarr", "sonarr_requirement_reasons", "qs-sonarr-required-hint"),
-        ("trakt", QS_TRAKT_REQUIRED_STEP_KEY, "Trakt", "trakt_requirement_reasons", "qs-trakt-required-hint"),
         ("mal", QS_MAL_REQUIRED_STEP_KEY, "MyAnimeList", "mal_requirement_reasons", "qs-mal-required-hint"),
     ]
     dependency_cards = []
@@ -293,8 +299,8 @@ def _workspace_step_status_from_app_readiness(state):
     normalized = str(state or "").strip().lower()
     if normalized in {"ready", "review", "running", "queued"}:
         return "ok"
-    if normalized == "needs_validation":
+    if normalized in {"needs_validation", "needs_prepare"}:
         return "warn"
-    if normalized in {"needs_prepare", "needs_setup", "blocked", "error"}:
+    if normalized in {"needs_setup", "blocked", "error"}:
         return "error"
     return "unknown"

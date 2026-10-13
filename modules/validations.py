@@ -108,6 +108,7 @@ from modules.validations_yaml_files import (  # noqa: F401
 from modules.validations_services import (  # noqa: F401
     _validate_service_url,
     validate_apprise_server,
+    validate_floppy_server,
     validate_gotify_server,
     validate_github_server,
     validate_mal_server,
@@ -118,6 +119,7 @@ from modules.validations_services import (  # noqa: F401
     validate_plex_server,
     validate_radarr_payload,
     validate_radarr_server,
+    validate_serializd_server,
     validate_sonarr_payload,
     validate_sonarr_server,
     validate_tautulli_server,

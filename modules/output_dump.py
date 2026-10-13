@@ -38,7 +38,12 @@ from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.scalarstring import PlainScalarString
 
 from modules import database, helpers
-from modules.output_collections import _LOOKUP_LABELS_SUFFIX, _normalize_settings_section_value, _TEMPLATE_VARIABLE_COMMENTS_KEY, _parse_template_lookup_labels
+from modules.output_collections import (
+    _LOOKUP_LABELS_SUFFIX,
+    _normalize_settings_section_value,
+    _TEMPLATE_VARIABLE_COMMENTS_KEY,
+    _parse_template_lookup_labels,
+)
 from modules.output_headers import render_section_header
 from modules.output_values import _normalize_asset_directory_values
 
@@ -61,6 +66,8 @@ _ALPHABETICALLY_SORTED_SECTIONS = frozenset(
         "github",
         "omdb",
         "mdblist",
+        "serializd",
+        "floppy",
         "notifiarr",
         "gotify",
         "ntfy",
@@ -87,6 +94,8 @@ _PLAIN_SCALAR_SECTIONS = frozenset(
         "github",
         "omdb",
         "mdblist",
+        "serializd",
+        "floppy",
         "notifiarr",
         "gotify",
         "ntfy",
@@ -166,10 +175,19 @@ def _clean_data(obj, dump_name):
         if dump_name in _ALPHABETICALLY_SORTED_SECTIONS:
             obj = dict(sorted(obj.items()))
         cleaned_dict = {}
+        default_name = str(obj.get("default") or "").strip()
+        runtime_template_vars = obj.get("template_variables")
+        preserve_runtime_empty_text = (
+            (default_name == "runtimes" or default_name.startswith("overlay_runtimes")) and isinstance(runtime_template_vars, dict) and runtime_template_vars.get("text") == ""
+        )
         for k, v in obj.items():
             if k == "valid":
                 continue
             cleaned_value = _clean_data(v, dump_name)
+            if k == "template_variables" and preserve_runtime_empty_text:
+                if cleaned_value is _EMPTY_OUTPUT:
+                    cleaned_value = {}
+                cleaned_value = {"text": "", **cleaned_value}
             if cleaned_value is _EMPTY_OUTPUT:
                 continue
             cleaned_dict[k] = cleaned_value
@@ -340,7 +358,13 @@ def _apply_mal_trakt_int_coercions(cleaned_data, dump_name):
     _coerce_int_or_ignore(section, "cache_expiration")
 
 
-_TRAKT_PREFERRED_ORDER = ("authorization", "client_id", "client_secret", "pin", "force_refresh")
+_TRAKT_PREFERRED_ORDER = (
+    "authorization",
+    "client_id",
+    "client_secret",
+    "pin",
+    "force_refresh",
+)
 
 
 def _apply_trakt_reorder(cleaned_data):
@@ -599,7 +623,13 @@ def _inject_library_section_headers(yaml_string, font):
 
         # Only inject header for lines like "  Movies:" or "  TV Shows:" inside the libraries block
         if in_libraries_block and line.startswith("  ") and not line.startswith("   ") and stripped.endswith(":") and not stripped.startswith("-"):
-            library_name = stripped.rstrip(":")
+            key_str = stripped.rstrip(":")
+            # Strip only the outermost matching YAML quote pair, not all quotes.
+            # A name like `" Movies "` is serialised as `'" Movies "'` — the inner
+            # `"` chars are part of the name and must be kept.
+            if len(key_str) >= 2 and key_str[0] == key_str[-1] and key_str[0] in ("'", '"'):
+                key_str = key_str[1:-1]
+            library_name = key_str
             output.append(render_section_header(library_name, font))
         else:
             subheader_title = None

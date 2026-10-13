@@ -8,18 +8,30 @@ Covers:
   - quickstart.py                → /lookup_template_string_value
 """
 
+import pytest
+
 # ===========================================================================
 # /activate-config
 # ===========================================================================
 
 
 def test_activate_config_creates_new_config_and_sets_session(client, isolated_config_dir):
+    from modules import database, persistence
+
     resp = client.post("/activate-config", json={"name": "myprofile"})
     assert resp.status_code == 200
     data = resp.get_json()
     assert data["success"] is True
     assert data["name"] == "myprofile"
     assert data["created"] is True  # brand-new config
+    with client.session_transaction() as sess:
+        assert sess["config_name"] == "myprofile"
+
+    validated, user_entered, stored = database.retrieve_section_data("myprofile", "settings")
+    assert validated is True
+    assert user_entered is False
+    assert stored["settings"] == persistence.get_dummy_data("settings")
+    assert stored["validated_at"]
 
 
 def test_activate_config_existing_config_not_flagged_as_created(client, isolated_config_dir):
@@ -51,6 +63,96 @@ def test_activate_config_sanitises_name(client, isolated_config_dir):
     data = resp.get_json()
     # "My Config!" → "myconfig" (special chars stripped)
     assert data["name"] == "myconfig"
+
+
+def test_support_info_uses_library_ids_not_boolean_toggles(client, isolated_config_dir, qs_module, monkeypatch):
+    import modules.helpers as helpers
+    import modules.persistence as persistence
+
+    captured = {}
+
+    def fake_retrieve_settings(section_name):
+        if section_name == "010-plex":
+            return {
+                "validated": True,
+                "plex": {
+                    "tmp_movie_libraries": "1,2",
+                    "tmp_show_libraries": "5",
+                    "tmp_library_names": '{"1": "Movies", "2": "TV Movies", "5": "Shows"}',
+                },
+            }
+        if section_name == "025-libraries":
+            return {
+                "validated": True,
+                "libraries": {
+                    "mov-library_1-library": "true",
+                    "mov-library_2-library": "true",
+                    "sho-library_5-library": "true",
+                },
+            }
+        return {}
+
+    def fake_get_library_summaries(value):
+        captured["value"] = value
+        return "OK"
+
+    monkeypatch.setattr(persistence, "retrieve_settings", fake_retrieve_settings)
+    monkeypatch.setattr(helpers, "get_plex_summary", lambda: "Connected to Plex server Test")
+    monkeypatch.setattr(helpers, "get_library_summaries", fake_get_library_summaries)
+    monkeypatch.setattr(helpers, "get_quickstart_settings_summary", lambda: ["# Quickstart Settings: test"])
+
+    with client.session_transaction() as sess:
+        sess["config_name"] = "support_info_test"
+
+    resp = client.get("/support-info")
+
+    assert resp.status_code == 200
+    assert captured["value"] == {"1": "Movies", "2": "TV Movies", "5": "Shows"}
+
+
+def test_library_lists_from_telemetry_builds_movie_and_show_descriptors():
+    from blueprints import library_routes
+
+    movie_libraries, show_libraries = library_routes._library_lists_from_telemetry(
+        {
+            "libraries": {
+                "1": {"name": "Movies", "type": "movie"},
+                "2": {"name": "TV Shows", "type": "show"},
+                "3": {"name": "Music", "type": "artist"},
+            }
+        }
+    )
+
+    assert movie_libraries == [{"id": "mov-library_1", "name": "Movies", "type": "movie"}]
+    assert show_libraries == [{"id": "sho-library_2", "name": "TV Shows", "type": "show"}]
+
+
+@pytest.mark.parametrize(
+    ("movie_ids", "show_ids"),
+    [("", ""), ("", "2"), ("1", ""), ("1", "2")],
+    ids=["both-missing", "movies-missing", "shows-missing", "both-present"],
+)
+def test_build_library_lists_falls_back_per_type(monkeypatch, library_routes_module, movie_ids, show_ids):
+    telemetry = {
+        "plex_pass": True,
+        "libraries": {
+            "1": {"name": "Movies", "type": "movie"},
+            "2": {"name": "TV Shows", "type": "show"},
+            "3": {"name": "Music", "type": "artist"},
+        },
+    }
+    settings = {
+        "010-plex": {"plex": {"tmp_movie_libraries": movie_ids, "tmp_show_libraries": show_ids}},
+        "plex_telemetry": {"plex_telemetry": telemetry},
+    }
+    monkeypatch.setattr(library_routes_module.persistence, "retrieve_settings", lambda section: settings[section])
+    monkeypatch.setattr(library_routes_module.persistence, "get_library_names", lambda section: {"1": "Cached Movies", "2": "Cached Shows"})
+
+    movies, shows, actual_telemetry = library_routes_module._build_library_lists()
+
+    assert movies == [{"id": "mov-library_1", "name": "Cached Movies" if movie_ids else "Movies", "type": "movie"}]
+    assert shows == [{"id": "sho-library_2", "name": "Cached Shows" if show_ids else "TV Shows", "type": "show"}]
+    assert actual_telemetry == telemetry
 
 
 # ===========================================================================
@@ -129,6 +231,65 @@ def test_clear_data_removes_db_entries(client, isolated_config_dir):
 # ===========================================================================
 # /autosave_library/<library_id>
 # ===========================================================================
+
+
+@pytest.mark.parametrize("kind", ["collection_files", "metadata_files", "overlay_files"])
+@pytest.mark.parametrize("replacement", ["[]", '[{"type":"url","location":"https://example.test/fixed.yml"}]'])
+def test_autosave_file_list_clear_or_edit_ignores_other_library_failures(
+    client,
+    isolated_config_dir,
+    qs_module,
+    monkeypatch,
+    kind,
+    replacement,
+):
+    from modules import database
+
+    config_name = f"pytest_file_clear_{kind}"
+    broken = '[{"type":"url","location":"https://example.test/missing.yml"}]'
+    database.save_section_data(
+        name=config_name,
+        section="libraries",
+        validated=False,
+        user_entered=True,
+        data={
+            "libraries": {
+                "mov-library_movies-library": "Movies",
+                f"mov-library_movies-{kind}": broken,
+                "sho-library_tv-library": "TV Shows",
+                f"sho-library_tv-{kind}": broken,
+            }
+        },
+    )
+
+    def validate(libraries, selected):
+        return [f"{library} {kind}[1]: missing" for library in selected if libraries.get(f"{library}-{kind}") == broken]
+
+    monkeypatch.setattr(qs_module, f"_validate_library_{kind}", validate)
+    for other in {"collection_files", "metadata_files", "overlay_files"} - {kind}:
+        monkeypatch.setattr(qs_module, f"_validate_library_{other}", lambda *_: [])
+    monkeypatch.setattr(qs_module, "_validate_library_auto_sort_hubs", lambda *_: [])
+
+    def normalize(libraries, _config_name, **_kwargs):
+        assert all(key.startswith("mov-library_movies-") for key in libraries)
+        return libraries, [], False
+
+    monkeypatch.setattr(qs_module, "_normalize_library_file_entries_payload", normalize)
+    with client.session_transaction() as sess:
+        sess["config_name"] = config_name
+    response = client.post(
+        "/autosave_library/mov-library_movies",
+        json={
+            "config_name": config_name,
+            "__loaded_sections": [],
+            "mov-library_movies-library": "Movies",
+            f"mov-library_movies-{kind}": replacement,
+        },
+    )
+    assert response.status_code == 200
+    _, _, saved = database.retrieve_section_data(config_name, "libraries")
+    assert saved["libraries"][f"mov-library_movies-{kind}"] == replacement
+    assert saved["libraries"][f"sho-library_tv-{kind}"] == broken
 
 
 def test_autosave_library_returns_success_for_empty_payload(client, isolated_config_dir, qs_module, monkeypatch):
@@ -276,6 +437,86 @@ def test_autosave_library_reports_normalized_flag(client, isolated_config_dir, q
     data = resp.get_json()
     assert data["success"] is True
     assert data["normalized"] is True
+
+
+def test_autosave_library_preserves_explicit_blank_runtime_text(client, isolated_config_dir, qs_module, monkeypatch):
+    from modules import database
+
+    config_name = "pytest_runtime_text_blank_autosave"
+    monkeypatch.setattr(qs_module, "_selected_library_ids_from_libraries_data", lambda libs: {"mov-library_movies"})
+    monkeypatch.setattr(qs_module, "_validate_library_collection_files", lambda libs, ids: [])
+    monkeypatch.setattr(qs_module, "_validate_library_metadata_files", lambda libs, ids: [])
+    monkeypatch.setattr(qs_module, "_validate_library_overlay_files", lambda libs, ids: [])
+    monkeypatch.setattr(qs_module, "_validate_library_auto_sort_hubs", lambda libs, ids: [])
+    monkeypatch.setattr(
+        qs_module,
+        "_normalize_library_file_entries_payload",
+        lambda libs, config_name, **kw: (libs, [], False),
+    )
+
+    with client.session_transaction() as sess:
+        sess["config_name"] = config_name
+
+    resp = client.post(
+        "/autosave_library/mov-library_movies",
+        json={
+            "config_name": config_name,
+            "__loaded_sections": ["overlays"],
+            "mov-library_movies-library": "Movies",
+            "mov-library_movies-movie-overlay_runtimes": "true",
+            "mov-library_movies-movie-template_overlay_runtimes[text]": None,
+        },
+    )
+
+    assert resp.status_code == 200
+    _validated, _user_entered, saved = database.retrieve_section_data(config_name, "libraries")
+    libraries = saved["libraries"]
+    assert libraries["mov-library_movies-movie-template_overlay_runtimes[text]"] == ""
+
+
+def test_autosave_library_stores_exact_plex_name_for_checkbox_placeholder(
+    client,
+    isolated_config_dir,
+    qs_module,
+    library_routes_module,
+    monkeypatch,
+):
+    from modules import database
+
+    config_name = "pytest_library_toggle_exact_name"
+    monkeypatch.setattr(qs_module, "_selected_library_ids_from_libraries_data", lambda libs: {"mov-library_1"})
+    monkeypatch.setattr(qs_module, "_validate_library_collection_files", lambda libs, ids: [])
+    monkeypatch.setattr(qs_module, "_validate_library_metadata_files", lambda libs, ids: [])
+    monkeypatch.setattr(qs_module, "_validate_library_overlay_files", lambda libs, ids: [])
+    monkeypatch.setattr(qs_module, "_validate_library_auto_sort_hubs", lambda libs, ids: [])
+    monkeypatch.setattr(
+        qs_module,
+        "_normalize_library_file_entries_payload",
+        lambda libs, config_name, **kw: (libs, [], False),
+    )
+    monkeypatch.setattr(
+        library_routes_module.persistence,
+        "get_library_names",
+        lambda *_args, **_kwargs: {"1": "  Movies "},
+    )
+
+    with client.session_transaction() as sess:
+        sess["config_name"] = config_name
+
+    resp = client.post(
+        "/autosave_library/mov-library_1",
+        json={
+            "config_name": config_name,
+            "__loaded_sections": [],
+            "mov-library_1-library": "true",
+            "mov-library_1-playlist": "true",
+        },
+    )
+
+    assert resp.status_code == 200
+    _validated, _user_entered, saved = database.retrieve_section_data(config_name, "libraries")
+    assert saved["libraries"]["mov-library_1-library"] == "  Movies "
+    assert saved["libraries"]["mov-library_1-playlist"] is True
 
 
 def test_autosave_library_preserves_unloaded_lazy_collection_and_overlay_values(client, isolated_config_dir, qs_module, monkeypatch):
@@ -466,6 +707,91 @@ def test_autosave_library_preserves_unopened_lazy_collection_groups(
             "mov-library_movies-library": "Movies",
             "mov-library_movies-collection_award": "true",
             "mov-library_movies-template_collection_award_style": "updated",
+        },
+    )
+
+    assert resp.status_code == 200
+    _validated, _user_entered, saved = database.retrieve_section_data(config_name, "libraries")
+    libraries = saved["libraries"]
+    assert libraries["mov-library_movies-template_collection_award_style"] == "updated"
+    assert libraries["mov-library_movies-collection_chart"] is True
+    assert libraries["mov-library_movies-template_collection_chart_style"] == "compact"
+
+
+def test_autosave_library_preserves_unopened_lazy_collection_details(
+    client,
+    isolated_config_dir,
+    qs_module,
+    library_routes_module,
+    monkeypatch,
+):
+    from modules import database
+
+    config_name = "pytest_lazy_collection_detail_autosave"
+    database.save_section_data(
+        name=config_name,
+        section="libraries",
+        validated=True,
+        user_entered=True,
+        data={
+            "libraries": {
+                "mov-library_movies-library": "Movies",
+                "mov-library_movies-collection_award": "true",
+                "mov-library_movies-template_collection_award_style": "signature",
+                "mov-library_movies-collection_chart": "true",
+                "mov-library_movies-template_collection_chart_style": "compact",
+            },
+            "validated": True,
+        },
+    )
+
+    monkeypatch.setattr(
+        library_routes_module.helpers,
+        "load_quickstart_config",
+        lambda filename: (
+            [
+                {
+                    "accordion": "Collection Defaults",
+                    "collections": [
+                        {
+                            "id": "collection_award",
+                            "media_types": ["movie"],
+                            "template_variables": [{"key": "style", "type": "text_input", "default": ""}],
+                        },
+                        {
+                            "id": "collection_chart",
+                            "media_types": ["movie"],
+                            "template_variables": [{"key": "style", "type": "text_input", "default": ""}],
+                        },
+                    ],
+                },
+            ]
+            if filename == "quickstart_collections.json"
+            else {}
+        ),
+    )
+    monkeypatch.setattr(qs_module, "_selected_library_ids_from_libraries_data", lambda libs: {"mov-library_movies"})
+    monkeypatch.setattr(qs_module, "_validate_library_collection_files", lambda libs, ids: [])
+    monkeypatch.setattr(qs_module, "_validate_library_metadata_files", lambda libs, ids: [])
+    monkeypatch.setattr(qs_module, "_validate_library_overlay_files", lambda libs, ids: [])
+    monkeypatch.setattr(qs_module, "_validate_library_auto_sort_hubs", lambda libs, ids: [])
+    monkeypatch.setattr(
+        qs_module,
+        "_normalize_library_file_entries_payload",
+        lambda libs, config_name, **kw: (libs, [], False),
+    )
+
+    resp = client.post(
+        "/autosave_library/mov-library_movies",
+        json={
+            "config_name": config_name,
+            "__loaded_sections": ["collections"],
+            "__loaded_collection_groups": [0],
+            "__loaded_collection_details": ["collection_award"],
+            "mov-library_movies-library": "Movies",
+            "mov-library_movies-collection_award": "true",
+            "mov-library_movies-template_collection_award_style": "updated",
+            "mov-library_movies-collection_chart": "true",
         },
     )
 

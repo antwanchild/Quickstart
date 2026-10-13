@@ -28,7 +28,7 @@ import json
 _ACCEPTED_ENTRY_TYPES = frozenset({"file", "folder", "url", "git", "repo"})
 
 
-def _parse_config_file_block_entries(raw_value):
+def _parse_config_file_block_entries(raw_value, *, allow_schedule=False, allow_template_variables=False):
     """Normalize a config-file-list block into sorted ``[{kind: location}, ...]``."""
     if isinstance(raw_value, list):
         entries = raw_value
@@ -54,7 +54,16 @@ def _parse_config_file_block_entries(raw_value):
         location = str(entry.get("location") or "").strip()
         if entry_type not in _ACCEPTED_ENTRY_TYPES or not location:
             continue
-        normalized.append({entry_type: location})
+        normalized_entry = {entry_type: location}
+        if allow_schedule:
+            schedule = str(entry.get("schedule") or "").strip()
+            if schedule:
+                normalized_entry["schedule"] = schedule
+        if allow_template_variables:
+            template_variables = entry.get("template_variables")
+            if isinstance(template_variables, dict) and template_variables:
+                normalized_entry["template_variables"] = template_variables
+        normalized.append(normalized_entry)
 
     normalized.sort(key=lambda item: (next(iter(item.keys())), next(iter(item.values())).casefold()))
     return normalized
@@ -66,12 +75,12 @@ def _parse_config_file_block_entries(raw_value):
 
 
 def _parse_metadata_file_entries(raw_value):
-    return _parse_config_file_block_entries(raw_value)
+    return _parse_config_file_block_entries(raw_value, allow_schedule=True, allow_template_variables=True)
 
 
 def _parse_collection_file_block_entries(raw_value):
-    return _parse_config_file_block_entries(raw_value)
+    return _parse_config_file_block_entries(raw_value, allow_schedule=True, allow_template_variables=True)
 
 
 def _parse_overlay_file_block_entries(raw_value):
-    return _parse_config_file_block_entries(raw_value)
+    return _parse_config_file_block_entries(raw_value, allow_template_variables=True)

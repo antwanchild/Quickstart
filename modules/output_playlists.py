@@ -6,7 +6,7 @@ all deal with one of three closely-related concerns:
 1. **Playlist file entries** -- the ``playlist_files:`` YAML block that
    Kometa consumes.  Entries come in as raw JSON/py-literal strings,
    dicts, or lists, and need to be normalized into
-   ``{file|url|git|repo: <location>}`` shapes.  ``_format_*`` /
+   ``{file|folder|url|git|repo: <location>}`` shapes.  ``_format_*`` /
    ``_normalize_*`` / ``_parse_playlist_file_entries_value`` cover this.
 
 2. **Selecting which libraries feed a playlist** -- pulling library
@@ -62,7 +62,6 @@ PLAYLIST_SHARED_TEMPLATE_VAR_SPECS = {
     "sonarr_add_missing": "boolean",
     "sonarr_folder": "string",
     "sonarr_tag": "string_list",
-    "trakt_list": "string_list",
     "imdb_list": "string_list",
     "mdblist_list": "string_list",
 }
@@ -85,25 +84,43 @@ PLAYLIST_KEYED_TEMPLATE_VAR_SPECS = {
     "sonarr_folder_": "string",
     "sonarr_tag_": "string_list",
     "sync_to_users_": "string_list",
-    "trakt_list_": "string_list",
 }
+
+
+def _schedule_for_playlist_file_entry(entry):
+    schedule = str(entry.get("schedule") or "").strip() if isinstance(entry, dict) else ""
+    return schedule or None
 
 
 def _normalize_playlist_file_entry_for_output(entry):
     if not isinstance(entry, dict):
         return None
-    direct_entry = next(((key, value) for key, value in entry.items() if key in {"file", "url", "git", "repo"}), None)
+    direct_entry = next(((key, value) for key, value in entry.items() if key in {"file", "folder", "url", "git", "repo"}), None)
     if direct_entry:
         entry_type, location = direct_entry
         location = str(location or "").strip()
         if location:
-            return {entry_type: location}
+            normalized = {entry_type: location}
+            schedule = _schedule_for_playlist_file_entry(entry)
+            if schedule:
+                normalized["schedule"] = schedule
+            template_variables = entry.get("template_variables")
+            if isinstance(template_variables, dict) and template_variables:
+                normalized["template_variables"] = template_variables
+            return normalized
         return None
     entry_type = str(entry.get("type") or "").strip().lower()
     location = str(entry.get("location") or "").strip()
-    if entry_type not in {"file", "url", "git", "repo"} or not location:
+    if entry_type not in {"file", "folder", "url", "git", "repo"} or not location:
         return None
-    return {entry_type: location}
+    normalized = {entry_type: location}
+    schedule = _schedule_for_playlist_file_entry(entry)
+    if schedule:
+        normalized["schedule"] = schedule
+    template_variables = entry.get("template_variables")
+    if isinstance(template_variables, dict) and template_variables:
+        normalized["template_variables"] = template_variables
+    return normalized
 
 
 def _parse_playlist_file_entries_value(value):
@@ -180,10 +197,11 @@ def _library_names_in_output_order(libraries_section):
     return []
 
 
-def _playlist_libraries_from_library_toggles(nested_libraries_data, ordered_library_names=None):
+def _playlist_libraries_from_library_toggles(nested_libraries_data, ordered_library_names=None, library_names_by_prefix=None):
     if not isinstance(nested_libraries_data, dict):
         return False, []
 
+    library_names_by_prefix = library_names_by_prefix or {}
     has_playlist_toggle = any(isinstance(key, str) and key.endswith("-playlist") for key in nested_libraries_data)
     playlist_libraries = []
 
@@ -196,8 +214,12 @@ def _playlist_libraries_from_library_toggles(nested_libraries_data, ordered_libr
         include_playlist = _coerce_bool(nested_libraries_data.get(f"{prefix}-playlist"))
         if include_playlist is not True:
             continue
-        library_name = str(value).strip()
-        if library_name:
+        mapped_name = library_names_by_prefix.get(prefix)
+        if mapped_name is not None:
+            library_name = str(mapped_name)
+        else:
+            library_name = str(value).strip()
+        if library_name.strip():
             playlist_libraries.append(library_name)
 
     return has_playlist_toggle, _ordered_selected_libraries(playlist_libraries, ordered_library_names)
@@ -253,7 +275,6 @@ def _normalize_playlist_template_var_value(key, value):
         "item_sonarr_tag",
         "radarr_tag",
         "sonarr_tag",
-        "trakt_list",
         "imdb_list",
         "mdblist_list",
     }:
@@ -338,7 +359,7 @@ def _collect_playlist_file_entries_from_libraries_data(nested_libraries_data):
     return _parse_playlist_file_entries_value(nested_libraries_data.get("playlist_files_entries"))
 
 
-def apply_playlist_libraries_toggle(config_data, nested_libraries_data, libraries_section):
+def apply_playlist_libraries_toggle(config_data, nested_libraries_data, libraries_section, library_names_by_prefix=None):
     """Compute ``config_data['playlist_files']`` from library-level toggles.
 
     Runs AFTER :func:`build_libraries_section` has produced the ordered
@@ -364,6 +385,7 @@ def apply_playlist_libraries_toggle(config_data, nested_libraries_data, librarie
     has_playlist_toggle, playlist_libraries = _playlist_libraries_from_library_toggles(
         nested_libraries_data,
         ordered_library_names=ordered_library_names,
+        library_names_by_prefix=library_names_by_prefix,
     )
     playlist_template_variables = _collect_playlist_template_variables_from_libraries_data(nested_libraries_data)
     playlist_file_entries = _collect_playlist_file_entries_from_libraries_data(nested_libraries_data)

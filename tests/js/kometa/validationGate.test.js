@@ -28,7 +28,7 @@
 //                                syncFinalAccordionRollups)
 //             fire exactly once at every exit point
 //     Path H: kometaState.showYAML is correctly toggled per branch
-//     Path I: run-now button label defaults to 'Run Now' in all branches
+//     Path I: run-now button label defaults to 'Run' in all branches
 //
 // updateRunNowState + syncFinalAccordionRollups are mocked via
 // vi.mock() so we can spy on invocation counts without needing to
@@ -118,7 +118,7 @@ function installGateDom ({
   const downloadIds = ['download-btn', 'download-redacted-btn']
   downloadIds.forEach(id => { if (has(id)) parts.push(`<div id="${id}"></div>`) })
 
-  const yamlIds = ['yaml-content', 'final-yaml']
+  const yamlIds = ['yaml-content', 'final-yaml-viewer', 'final-yaml-section-jump-wrap']
   yamlIds.forEach(id => { if (has(id)) parts.push(`<div id="${id}" class="d-none"></div>`) })
 
   document.body.innerHTML = parts.join('\n')
@@ -207,7 +207,7 @@ describe('updateValidationGate stage=todo', () => {
     expect(document.getElementById('run-controls-container').classList.contains('d-none')).toBe(true)
     expect(document.getElementById('download-btn').classList.contains('d-none')).toBe(true)
     expect(document.getElementById('run-now').disabled).toBe(true)
-    expect(document.getElementById('run-now-label').textContent).toBe('Run Now')
+    expect(document.getElementById('run-now-label').textContent).toBe('Run')
   })
 
   it('invokes both callbacks exactly once', () => {
@@ -257,7 +257,7 @@ describe('updateValidationGate stage=config, all flags valid', () => {
     expect(document.getElementById('validation-messages').classList.contains('d-none')).toBe(true)
     expect(document.getElementById('no-validation-warning').classList.contains('d-none')).toBe(true)
     expect(document.getElementById('yaml-content').classList.contains('d-none')).toBe(false)
-    expect(document.getElementById('final-yaml').classList.contains('d-none')).toBe(false)
+    expect(document.getElementById('final-yaml-viewer').classList.contains('d-none')).toBe(false)
     expect(document.getElementById('run-controls-container').classList.contains('d-none')).toBe(false)
   })
 
@@ -269,7 +269,7 @@ describe('updateValidationGate stage=config, all flags valid', () => {
     updateValidationGate()
     // The gate itself doesn't enable the button -- that's updateRunNowState's job
     expect(document.getElementById('run-now').disabled).toBe(true)
-    expect(document.getElementById('run-now-label').textContent).toBe('Run Now')
+    expect(document.getElementById('run-now-label').textContent).toBe('Run')
   })
 })
 

@@ -37,6 +37,8 @@ QS_VALIDATION_STEP_KEYS = {
     "040-github",
     "050-omdb",
     "060-mdblist",
+    "065-serializd",
+    "067-floppy",
     "070-notifiarr",
     "080-gotify",
     "085-ntfy",
@@ -46,7 +48,6 @@ QS_VALIDATION_STEP_KEYS = {
     "100-anidb",
     "110-radarr",
     "120-sonarr",
-    "130-trakt",
     "140-mal",
     "150-settings",
 }

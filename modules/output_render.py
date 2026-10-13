@@ -68,6 +68,7 @@ from modules.output_playlists import apply_playlist_libraries_toggle
 from modules.output_postprocess import _rewrite_custom_font_paths, clean_section_data
 from modules.output_yaml_header import render_yaml_header
 from modules.jsonschema_compat import stringify_mapping_keys_for_jsonschema
+from modules.rating_sources import extend_rating_source_schema
 
 
 def retrieve_config_sections(header_style):
@@ -144,7 +145,19 @@ def process_libraries_block(config_data, *, debug=False):
     libraries_section = build_libraries_section(**bundle.to_section_kwargs())
 
     config_data["libraries"] = libraries_section.get("libraries", {}) if isinstance(libraries_section, dict) else {}
-    apply_playlist_libraries_toggle(config_data, nested_libraries_data, libraries_section)
+    library_names_by_prefix = {
+        helpers.strip_library_suffix(key): name
+        for key, name in {
+            **bundle.movie_libraries,
+            **bundle.show_libraries,
+        }.items()
+    }
+    apply_playlist_libraries_toggle(
+        config_data,
+        nested_libraries_data,
+        libraries_section,
+        library_names_by_prefix=library_names_by_prefix,
+    )
 
     if debug:
         helpers.ts_log(f"Final Libraries Section: {libraries_section}", level="DEBUG")
@@ -170,6 +183,8 @@ ORDERED_CONFIG_SECTIONS = (
     ("github", "040-github"),
     ("omdb", "050-omdb"),
     ("mdblist", "060-mdblist"),
+    ("serializd", "065-serializd"),
+    ("floppy", "067-floppy"),
     ("notifiarr", "070-notifiarr"),
     ("gotify", "080-gotify"),
     ("ntfy", "085-ntfy"),
@@ -178,7 +193,6 @@ ORDERED_CONFIG_SECTIONS = (
     ("anidb", "090-anidb"),
     ("radarr", "100-radarr"),
     ("sonarr", "110-sonarr"),
-    ("trakt", "120-trakt"),
     ("mal", "130-mal"),
 )
 
@@ -195,6 +209,25 @@ def _strip_mal_code_verifier(config_data):
         return
     authorization_data = config_data["mal"]["mal"].get("authorization", {})
     authorization_data.pop("code_verifier", None)
+
+
+def _strip_retired_trakt_fields(value):
+    """Remove native Trakt configuration and builders from generated output."""
+    if isinstance(value, dict):
+        for key in list(value):
+            key_text = str(key).lower()
+            if key_text == "trakt" or key_text.startswith("trakt_") or key_text.startswith("child_trakt_"):
+                value.pop(key, None)
+                continue
+            child = value[key]
+            if isinstance(child, str) and child.strip().lower() in {"trakt", "trakt_user", "mdb_trakt", "mdb_trakt_rating"}:
+                value.pop(key, None)
+                continue
+            _strip_retired_trakt_fields(child)
+    elif isinstance(value, list):
+        value[:] = [item for item in value if not (isinstance(item, str) and item.strip().lower() in {"trakt", "trakt_user", "mdb_trakt", "mdb_trakt_rating"})]
+        for item in value:
+            _strip_retired_trakt_fields(item)
 
 
 def apply_final_transformations(config_data, library_types, *, optimize_defaults=True):
@@ -223,6 +256,7 @@ def apply_final_transformations(config_data, library_types, *, optimize_defaults
     staying stable.
     """
     _strip_mal_code_verifier(config_data)
+    _strip_retired_trakt_fields(config_data)
     config_data = _normalize_legacy_collection_template_vars(config_data)
     if optimize_defaults:
         config_data = optimize_template_variables(config_data, library_types)
@@ -248,6 +282,8 @@ def _load_config_schema():
     schema_path = os.path.join(helpers.JSON_SCHEMA_DIR, "config-schema.json")
     with open(schema_path, "r") as file:
         schema = yaml.load(file)
+
+    extend_rating_source_schema(schema)
 
     return yaml, schema
 

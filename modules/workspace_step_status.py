@@ -95,6 +95,8 @@ def _has_meaningful_optional_input(template_key, payload):
         "040-github": ("github", ("token",)),
         "050-omdb": ("omdb", ("apikey",)),
         "060-mdblist": ("mdblist", ("apikey",)),
+        "065-serializd": ("serializd", ("email", "password")),
+        "067-floppy": ("floppy", ("url", "token")),
         "070-notifiarr": ("notifiarr", ("apikey",)),
         "080-gotify": ("gotify", ("url", "token")),
         "085-ntfy": ("ntfy", ("url", "token", "topic")),
@@ -243,17 +245,20 @@ def _derive_step_status(template_key, group, section_rows, config_exists):
         if group == "optional" and not _has_meaningful_optional_input(template_key, payload):
             return "unknown"
 
+        if template_key == "025-libraries" and validation_status == "skipped" and validation_reason == "no_libraries":
+            return "error"
+
         if validated or validation_status == "validated":
             return "ok"
 
         if validation_status == "failed":
-            return "error"
+            return "warn" if group == "optional" else "error"
 
         if validation_status == "skipped":
             if template_key == "027-playlist_files" and validation_reason == "no_libraries":
                 return "unknown"
             if validation_reason in QS_ERROR_REASONS:
-                return "error"
+                return "warn" if group == "optional" else "error"
             if group == "optional":
                 # Optional sections should remain neutral when users simply pass through
                 # or when validation is skipped due to missing optional inputs.
@@ -272,7 +277,7 @@ def _derive_step_status(template_key, group, section_rows, config_exists):
         if not user_entered and not was_previously_validated and not validation_status:
             return "unknown"
         if was_previously_validated:
-            return "error"
+            return "warn"
         return "warn" if user_entered else "ok"
 
     if group == "required":

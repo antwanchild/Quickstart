@@ -35,6 +35,17 @@
   data-bulk-fresh="{{ 'true' if final_gate and final_gate.bulk_validation_fresh else 'false' }}">
 </div>
 <div id="header-style-wait" class="form-text text-info mt-2 d-none">Updating header style... please wait.</div>
+{% if page_info.kometa_integrity %}
+<div id="kometa-integrity-panel" class="alert {{ 'alert-success' if page_info.kometa_integrity.state == 'clean' else ('alert-secondary' if page_info.kometa_integrity.state == 'not_applicable' else 'alert-warning') }}" role="status">
+  <div class="d-flex align-items-center justify-content-between gap-2 mb-2">
+    <strong>Kometa Integrity</strong>
+    <button id="refresh-kometa-integrity" type="button" class="btn btn-outline-secondary btn-sm" title="Check Kometa integrity" aria-label="Check Kometa integrity" data-bs-toggle="tooltip">
+      <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
+    </button>
+  </div>
+  <div id="kometa-integrity-details" class="small qs-kometa-integrity-details">{{ page_info.kometa_integrity_lines | join('\n') }}</div>
+</div>
+{% endif %}
 {% if not final_gate or final_gate.stage != 'todo' %}
 <div class="accordion mt-2 mb-2" id="header-style-grid-accordion">
   <div class="accordion-item">
@@ -168,6 +179,19 @@
           Validate All completed:
           <span id="validate-all-status-bulk-time" data-validation-iso="{{ validation_bulk_rollup_at | default('', true) }}">—</span>
         </div>
+        <div id="validate-all-progress" class="d-none mb-2" aria-live="polite">
+          <div class="d-flex flex-wrap justify-content-between gap-2 mb-1">
+            <span id="validate-all-progress-label" class="small text-info">Preparing validation...</span>
+            <span id="validate-all-progress-count" class="small text-muted">0 / 0</span>
+          </div>
+          <div class="progress" style="height: 8px;">
+            <div id="validate-all-progress-bar" class="progress-bar" role="progressbar" style="width: 0%"
+              aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+          </div>
+          <div id="validate-all-status" class="small text-info mt-1 d-none"></div>
+        </div>
+        {% set interactive_pages = [] %}
+        {% set nonservice_pages = ['001-start','900-kometa','910-sponsor','905-analytics'] %}
         <div class="table-responsive" data-qs-sticky-first="true">
           <table class="table table-sm table-dark table-striped align-middle mb-0">
             <thead>
@@ -286,7 +310,7 @@
         </div>
 
         <!-- YAML Output -->
-        <div class="form-floating mb-2">
+        <div class="mb-2">
           <div class="form-text" id="yaml-content">
             <br>
             <h5>Here is the YAML that was generated as a result of your inputs.</h5>
@@ -296,7 +320,14 @@
               As a reminder, this will most likely <b>NOT</b> work with Kometa as it has not passed validation.
             </div>
           </div>
-          <textarea readonly id="final-yaml" class="form-control" rows="20">{{ yaml_content }}</textarea>
+          <div class="d-flex flex-wrap align-items-center gap-2 mb-2 d-none" id="final-yaml-section-jump-wrap">
+            <label class="form-label small text-muted mb-0" for="final-yaml-section-jump">Jump to section</label>
+            <select id="final-yaml-section-jump" class="form-select form-select-sm w-auto">
+              <option value="">Select a section</option>
+            </select>
+          </div>
+          <textarea readonly id="final-yaml" class="d-none" aria-hidden="true">{{ yaml_content }}</textarea>
+          <div id="final-yaml-viewer" class="form-control qs-log-code qs-yaml-code" role="region" aria-label="Generated YAML output" tabindex="0"></div>
         </div>
 
         <!-- Download Buttons -->
@@ -387,7 +418,7 @@
   {% else %}
   <h5 class="mt-3">
     Prepare and Run Kometa
-    <a href="https://kometa.wiki/en/nightly/kometa/environmental/" target="_blank" class="text-decoration-none ms-2">
+    <a href="https://kometa.wiki/en/develop/kometa/environmental/" target="_blank" class="text-decoration-none ms-2">
       <i class="bi bi-box-arrow-up-right text-info" data-bs-toggle="tooltip"
         aria-label="Open Kometa CLI flag documentation"
         data-bs-original-title="Open Kometa CLI flag documentation - Run Commands & Environment Variables"></i>
@@ -452,7 +483,6 @@
                     <option value="">Auto (default)</option>
                     <option value="master">master</option>
                     <option value="develop">develop</option>
-                    <option value="nightly">nightly</option>
                   </select>
                 </div>
               </div>
@@ -461,7 +491,7 @@
               </div>
               <div class="alert alert-light border small py-2 px-3 mb-2" role="status">
                 <div><strong>Selection:</strong> <span id="kometa-branch-selection">Auto</span></div>
-                <div><strong>Effective branch:</strong> <code id="kometa-effective-branch">nightly</code></div>
+                <div><strong>Effective branch:</strong> <code id="kometa-effective-branch">develop</code></div>
                 <div><strong>Update phase:</strong> <span id="kometa-update-phase-badge" class="badge text-bg-secondary">Idle</span></div>
                 <div><strong>Local version:</strong> <span id="kometa-local-version-status">Unknown</span></div>
                 <div><strong>Remote version:</strong> <span id="kometa-remote-version-status">Not checked</span></div>
@@ -484,7 +514,7 @@
                 {% if page_info.kometa_install_mode == 'existing' %}
                 Quickstart will only check status and version information here. If an update is available, update this Kometa install manually outside Quickstart.
                 {% else %}
-                Force update re-downloads Kometa even if it is already up to date.
+                Force update replaces Kometa's installed files with a fresh upstream copy, even if up to date. The entire runtime config/ directory is preserved.
                 {% endif %}
               </div>
               <div id="kometa-update-box" class="alert alert-warning mt-2 mb-0 d-none" role="alert">
@@ -528,8 +558,7 @@
             </span>
           </button>
         </h2>
-        <div id="collapse-mode" class="accordion-collapse collapse" aria-labelledby="heading-mode"
-          data-bs-parent="#run-command-accordion">
+        <div id="collapse-mode" class="accordion-collapse collapse" aria-labelledby="heading-mode">
           <div class="accordion-body">
             <div class="form-check form-switch mb-2">
               <input class="form-check-input" type="checkbox" id="show-cli-toggle">
@@ -550,8 +579,7 @@
             </span>
           </button>
         </h2>
-        <div id="collapse-runopt" class="accordion-collapse collapse" aria-labelledby="heading-runopt"
-          data-bs-parent="#run-command-accordion">
+        <div id="collapse-runopt" class="accordion-collapse collapse" aria-labelledby="heading-runopt">
           <div class="accordion-body">
             <fieldset>
               <div class="form-check form-check-inline">
@@ -599,7 +627,7 @@
               <select multiple class="form-select" id="library-multiselect">
                 {% set dropdown_libraries = library_dropdown if library_dropdown else (movie_libraries + show_libraries) %}
                 {% for lib in dropdown_libraries %}
-                <option value="{{ lib.name }}">{{ lib.name }}</option>
+                <option value="{{ lib.name | e }}" title="{{ lib.name | e }}">[{{ lib.name | nbsp_leading_spaces }}]</option>
                 {% endfor %}
               </select>
             </div>
@@ -619,8 +647,7 @@
             </span>
           </button>
         </h2>
-        <div id="collapse-modeflags" class="accordion-collapse collapse" aria-labelledby="heading-modeflags"
-          data-bs-parent="#run-command-accordion">
+        <div id="collapse-modeflags" class="accordion-collapse collapse" aria-labelledby="heading-modeflags">
           <div class="accordion-body">
             <fieldset>
               <div class="form-check form-check-inline">
@@ -649,8 +676,7 @@
             </span>
           </button>
         </h2>
-        <div id="collapse-logflags" class="accordion-collapse collapse" aria-labelledby="heading-logflags"
-          data-bs-parent="#run-command-accordion">
+        <div id="collapse-logflags" class="accordion-collapse collapse" aria-labelledby="heading-logflags">
           <div class="accordion-body">
             <fieldset>
               <div class="form-check form-check-inline">
@@ -679,8 +705,7 @@
             </span>
           </button>
         </h2>
-        <div id="collapse-validationflags" class="accordion-collapse collapse" aria-labelledby="heading-validationflags"
-          data-bs-parent="#run-command-accordion">
+        <div id="collapse-validationflags" class="accordion-collapse collapse" aria-labelledby="heading-validationflags">
           <div class="accordion-body">
             <div class="alert alert-secondary small mb-3">
               Validation modes make Kometa validate and exit instead of running collections, overlays, operations, or schedules.
@@ -752,8 +777,7 @@
             </span>
           </button>
         </h2>
-        <div id="collapse-otherflags" class="accordion-collapse collapse" aria-labelledby="heading-otherflags"
-          data-bs-parent="#run-command-accordion">
+        <div id="collapse-otherflags" class="accordion-collapse collapse" aria-labelledby="heading-otherflags">
           <div class="accordion-body">
             <fieldset>
               <div class="row">
@@ -1021,7 +1045,7 @@
                         <tbody>
                           {% for row in incomplete_resume_hint.progress_snapshot.rows %}
                           <tr>
-                            <td>{{ row.name }}</td>
+                            <td><code>{{ row.name | nbsp_leading_spaces }}</code></td>
                             <td>{{ row.type }}</td>
                             <td><span class="badge {{ row.status_class }}">{{ row.status }}</span></td>
                             {% for cell in row.phase_cells %}
@@ -1076,7 +1100,7 @@
               </div>
               {% endif %}
               <button id="run-now" class="btn btn-primary mt-3" disabled>
-                <i class="bi bi-play-fill me-1"></i> <span id="run-now-label">Run Now</span>
+                <i class="bi bi-play-fill me-1"></i> <span id="run-now-label">Run</span>
               </button>
               {% if incomplete_resume_hint.suggested_command %}
               <button type="button" id="run-recovery-command" class="btn btn-warning mt-3 ms-2"
@@ -1141,7 +1165,7 @@
                   <div class="d-flex align-items-center gap-2 flex-wrap log-filter-row">
                     <label for="run-log-filter" class="form-label mb-0">Filter</label>
                     <div class="input-group input-group-sm" style="width: 210px;">
-                      <input id="run-log-filter" class="form-control" placeholder="Regex or text">
+                      <input id="run-log-filter" class="form-control" placeholder="/regex/ or text">
               <button class="btn btn-outline-secondary d-none" type="button" id="clear-log-filter"
                 aria-label="Clear filter" title="Clear filter">
                 <i class="bi bi-x-lg"></i>
@@ -1247,9 +1271,8 @@
             </div>
           </div>
         </div>
-        <pre class="bg-dark text-light p-2 rounded" id="run-output-log"
-          style="height: 300px; overflow-y: auto; overflow-x: auto; white-space: pre;">
-        </pre>
+        <div class="bg-dark text-light rounded qs-log-code" id="run-output-log"
+          style="height: 300px;" role="log" aria-label="Kometa log output"></div>
         <div class="accordion mt-3" id="logscan-accordion">
           <div class="accordion-item">
             <h2 class="accordion-header" id="logscan-accordion-heading">
@@ -1266,6 +1289,17 @@
             <div id="logscan-accordion-collapse" class="accordion-collapse collapse"
               aria-labelledby="logscan-accordion-heading" data-bs-parent="#logscan-accordion">
               <div class="accordion-body" id="logscan-panel">
+                <div class="mb-3">
+                  <button type="button" class="btn btn-outline-primary btn-sm" id="logscan-upload"><i class="bi bi-cloud-upload" aria-hidden="true"></i> Upload current log to Logscan</button>
+                  <div class="small" id="logscan-upload-status" role="status" aria-live="polite"></div>
+                  <div id="logscan-upload-links" class="d-none mt-2">
+                    <div class="d-flex flex-wrap align-items-center gap-2">
+                      <a id="logscan-upload-result" target="_blank" rel="noopener noreferrer">Open support result</a>
+                      <button type="button" class="btn btn-outline-secondary btn-sm" id="logscan-upload-copy"><i class="bi bi-clipboard" aria-hidden="true"></i> Copy support link</button>
+                      <a id="logscan-upload-management" target="_blank" rel="noopener noreferrer">Manage/delete upload (private)</a>
+                    </div>
+                  </div>
+                </div>
                 <div class="small mt-2" id="logscan-recommendations"></div>
                 <div class="small mt-3" id="logscan-sections"></div>
                 <div class="small mt-3 d-none" id="logscan-missing-people"></div>

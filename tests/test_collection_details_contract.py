@@ -18,6 +18,8 @@ COLLECTION_FILES_ACCORDION_PARTIAL_PATH = ROOT / "templates" / "partials" / "_li
 COLLECTION_FILES_PARTIAL_PATH = ROOT / "templates" / "partials" / "_library_collection_files.html"
 METADATA_FILES_PARTIAL_PATH = ROOT / "templates" / "partials" / "_library_metadata_files.html"
 OVERLAY_FILES_PARTIAL_PATH = ROOT / "templates" / "partials" / "_library_overlay_files.html"
+PLAYLIST_FILES_ACCORDION_PARTIAL_PATH = ROOT / "templates" / "partials" / "_library_playlist_files_accordion.html"
+PLAYLIST_FILES_PARTIAL_PATH = ROOT / "templates" / "partials" / "_library_playlist_files.html"
 RADARR_OVERRIDES_PARTIAL_PATH = ROOT / "templates" / "partials" / "_library_radarr_overrides.html"
 SONARR_OVERRIDES_PARTIAL_PATH = ROOT / "templates" / "partials" / "_library_sonarr_overrides.html"
 
@@ -59,6 +61,23 @@ def test_libraries_script_wires_collection_detail_toggles():
     assert "function updateTemplateVariableFieldOverrideStates" in script
     assert "data-template-variable-field-override" in script
     assert "[data-collection-field-wrapper]" in script
+
+
+def test_child_toggle_sections_have_bulk_select_controls():
+    macros = MACROS_PATH.read_text(encoding="utf-8")
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+
+    assert 'data-child-toggle-bulk-action="select"' in macros
+    assert 'data-child-toggle-bulk-action="unselect"' in macros
+    assert "render_group.id in ['included_items', 'child_collections', 'child_defaults', 'child_override_maps']" in macros
+    assert "Select all" in macros
+    assert "Unselect all" in macros
+    assert "function runChildToggleBulkAction" in script
+    assert "function wireChildToggleBulkActions" in script
+    assert 'input.template-child-toggle[type="checkbox"]' in script
+    assert "btn.dataset.childToggleBulkAction === 'select'" in script
+    assert "wireChildToggleBulkActions(card)" in script
+    assert "wireChildToggleBulkActions()" in script
 
 
 def test_event_handler_does_not_scan_selects_inside_input_loop():
@@ -137,6 +156,15 @@ def test_start_import_confirm_is_single_bound_and_in_flight_guarded():
     assert "importConfirmInFlight = false" in script
 
 
+def test_start_import_preview_clear_state_can_preserve_credential_panels():
+    script = START_JS_PATH.read_text(encoding="utf-8")
+    clear_fn = script.split("function clearImportPreviewState", 1)[1].split("function applyImportReportFilter", 1)[0]
+
+    assert "if (!options.keepCredentials)" in clear_fn
+    assert "if (importPlexCredentials) importPlexCredentials.classList.add('d-none')" in clear_fn
+    assert "if (importTmdbCredentials) importTmdbCredentials.classList.add('d-none')" in clear_fn
+
+
 def test_libraries_lookup_label_autosave_uses_narrow_payload():
     script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
 
@@ -146,13 +174,38 @@ def test_libraries_lookup_label_autosave_uses_narrow_payload():
     assert "lookupLabelsOnly ? buildLookupLabelPayloadFromCard(card) : buildPayloadFromCard(card)" in script
 
 
-def test_mirror_modal_explains_targets_stay_excluded():
+def test_mirror_modal_explains_auto_include_report():
     template = LIBRARIES_TEMPLATE_PATH.read_text(encoding="utf-8")
 
-    assert "does not include target libraries in the final config automatically" in template
-    assert "runs the normal library validation flow" in template
+    assert "If the source library is excluded, mirrored targets stay excluded" in template
+    assert "tries to include safe targets automatically" in template
+    assert "reports any target-specific values that need review" in template
     assert "placeholder IDs" in template
-    assert "enable <strong>Include in config</strong>" in template
+    assert 'id="copyLibraryReport"' in template
+
+
+def test_libraries_advanced_toggle_derives_initial_state_from_modifications():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+    partial = LIBRARY_CARD_PARTIAL_PATH.read_text(encoding="utf-8")
+
+    assert "function getPreferredAdvancedVisibility" in script
+    get_preferred = script.split("function getPreferredAdvancedVisibility", 1)[1].split("function wireAdvancedToggle", 1)[0]
+    assert "return hasConfiguredAdvancedValues(card)" in get_preferred
+    assert "localStorage" not in get_preferred
+    assert "advancedUserChoice" not in get_preferred
+    assert "setAdvancedVisibility(card, getPreferredAdvancedVisibility(card))" in script
+    assert "if (card.dataset.advancedToggleBound === 'true') return" in script
+    assert "toggle.addEventListener('change'" in script
+    assert "const nextVisible = toggle.checked" in script
+    assert "toggle.checked = !!visible" in script
+    assert "advancedVisibilityStorageKey" not in script
+    assert "advancedUserChoice" not in script
+    assert "MutationObserver(() => syncAdvancedToggleLabel(card))" not in script
+    assert "syncAdvancedToggleLabels(root)" not in script
+    assert 'type="checkbox"' in partial
+    assert 'role="switch"' in partial
+    assert "Show Advanced" in partial
+    assert "Hide Advanced" not in partial
 
 
 def test_playlist_toggle_preserves_mirrored_state_when_excluded():
@@ -160,6 +213,8 @@ def test_playlist_toggle_preserves_mirrored_state_when_excluded():
     partial = PLAYLIST_PARTIAL_PATH.read_text(encoding="utf-8")
 
     assert "{% if playlist_checked %}checked{% endif %}" in partial
+    assert 'title="{{ library.name | e }}"' in partial
+    assert "Include [{{ library.name | nbsp_leading_spaces }}]" in partial
     assert "playlistToggle.checked = false" not in script
     assert "payload[el.name] = el.checked ? (el.value || 'true') : 'false'" in script
 
@@ -239,18 +294,26 @@ def test_libraries_lazy_loads_heavy_collection_and_overlay_sections():
     assert "function wireLazyLibrarySections" in script
     assert "function wireLazyCollectionGroups" in script
     assert "function loadLazyCollectionGroup" in script
+    assert "function loadLazyCollectionDetail" in script
     assert "function markLazyCollectionGroupLoaded" in script
+    assert "function markLazyCollectionDetailLoaded" in script
     assert "function markCollectionDefaultsReset" in script
     assert "function clearLazyCollectionShellOverrideSummaries" in script
     assert "function updateLazySectionOverrideSummaries" in script
     assert "shown.bs.collapse" in script
     assert "/section/${encodeURIComponent(sectionName)}" in script
     assert "/section/collections/group/${encodeURIComponent(groupIndex)}" in script
+    assert "/detail/${encodeURIComponent(collectionId)}" in script
     assert "__loaded_collection_groups" in script
+    assert "__loaded_collection_details" in script
     assert "__reset_collection_defaults" in script
     assert "clearLazyCollectionShellOverrideSummaries(sectionBody)" in script
     assert "await autosaveActiveLibrary({ quiet: true })" in script
     assert "await loadAllLazyCollectionGroups(sectionBody, card)" not in script
+    assert "function fetchCollectionSectionEntries (libraryId)" in script
+    assert "collection_section_entries" in script
+    assert "collection_section_order" in script
+    assert "loadAllCollectionGroupsForReorder" not in script
     assert "await loadLazyCollectionGroup(lazyCollapse, card)" in script
     assert "initializeLibraryCardControls(card, libraryId)" in script
     assert "wireLazyLibrarySections(card)" in script
@@ -265,6 +328,7 @@ def test_libraries_lazy_loads_heavy_collection_and_overlay_sections():
     assert "defer_heavy_sections=True" in routes
     assert '@bp.route("/library_fragment/<library_id>/section/<section_name>")' in routes
     assert '@bp.route("/library_fragment/<library_id>/section/collections/group/<int:group_index>")' in routes
+    assert '@bp.route("/library_fragment/<library_id>/section/collections/group/<int:group_index>/detail/<collection_id>")' in routes
 
 
 def test_collection_section_partials_lazy_load_parent_groups():
@@ -284,7 +348,51 @@ def test_collection_section_partials_lazy_load_parent_groups():
         assert "Open this group to load" in partial
         assert "macros.collection_group_section" not in partial
 
-    assert "macros.collection_group_section(library, data, version_info, group, telemetry)" in group_fragment
+    assert "macros.collection_group_section(" in group_fragment
+    assert "defer_collection_details" in group_fragment
+    assert "group_index" in group_fragment
+    assert 'data-collection-detail-lazy-section="{{' in MACROS_PATH.read_text(encoding="utf-8")
+    assert "data-collection-detail-lazy-placeholder" in MACROS_PATH.read_text(encoding="utf-8")
+
+
+def test_collection_section_reorder_modal_sorts_by_saved_section_value():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+    entries_body = script.split("function getCollectionSectionEntries (libraryId) {", 1)[1].split(
+        "function buildCollectionSectionListItem",
+        1,
+    )[0]
+    sort_body = entries_body.split("entries.sort((left, right) => {", 1)[1].split("  })\n  return entries", 1)[0]
+
+    assert "const byValue = compareCollectionSectionValues(left.effectiveValue, right.effectiveValue)" in sort_body
+    assert "if (byValue !== 0) return byValue" in sort_body
+    assert "return left.domIndex - right.domIndex" in sort_body
+    assert "isCollectionless" not in sort_body
+
+
+def test_collection_section_reorder_modal_fetches_server_entries_before_render():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+    click_body = script.split("const trigger = event.target.closest('[data-collection-section-modal-trigger]')", 1)[1].split(
+        "const resetButton = event.target.closest('[data-collection-section-reset]')",
+        1,
+    )[0]
+
+    assert "const entries = await fetchCollectionSectionEntries(libraryId)" in click_body
+    assert click_body.index("const entries = await fetchCollectionSectionEntries(libraryId)") < click_body.index("renderCollectionSectionModalList(modalEl, entries)")
+    assert "loadAllCollectionGroupsForReorder" not in click_body
+    assert "Loading collection defaults..." in click_body
+    assert "Unable to load collection defaults for reordering. Try again." in click_body
+
+
+def test_collection_section_reorder_modal_saves_order_server_side():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+    save_body = script.split("async function saveCollectionSectionModalOrder (modalEl) {", 1)[1].split(
+        "function resetCollectionSectionModalOrder",
+        1,
+    )[0]
+
+    assert "await saveCollectionSectionOrderToServer(libraryId, orderedIds, resetMode)" in save_body
+    assert "syncHydratedCollectionSectionInputs(savedEntries)" in save_body
+    assert "document.getElementById(inputId)" not in save_body
 
 
 def test_cached_library_cards_do_not_submit_stale_form_fields():
@@ -305,6 +413,145 @@ def test_schedule_builder_allows_clearing_weekly_days():
     assert "const nextRaw = String(hidden.value || '').trim()" in script
     assert "nextValue = buildValueFromInputs(mode) || defaultValue || ''" not in script
     assert "const nextRaw = String(hidden.value || defaultValue || '').trim()" not in script
+
+
+def test_schedule_builder_supports_pipe_separated_range_values():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+    template = (ROOT / "templates" / "partials" / "_macros.html").read_text(encoding="utf-8")
+
+    assert "data-schedule-range-values" in template
+    assert 'placeholder="12/01-12/31"' in template
+    assert 'data-schedule-feedback="range"' in template
+    assert "const rangeValues = builder.querySelector('[data-schedule-range-values]')" in script
+    assert "return `range(${simplified})`" in script
+    assert "rangeValues: inner" in script
+    assert "if (rangeValues) rangeValues.value = parsed.rangeValues || ''" in script
+    assert "if (rangeValues) rangeValues.addEventListener('input', () => updateFromBuilder())" in script
+    assert "if (rangeValues) rangeValues.addEventListener('change', () => updateFromBuilder())" in script
+
+
+def test_schedule_builder_validates_range_values():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+
+    assert "function isValidRangeScheduleValues" in script
+    assert r"match(/^(\d{1,2})\/(\d{1,2})$/)" in script
+    assert "month < 1 || month > 12" in script
+    assert "const monthDays = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]" in script
+    assert "parts.length === 2 && isValidScheduleMonthDay(parts[0]) && isValidScheduleMonthDay(parts[1])" in script
+    assert "setScheduleFieldValidity(rangeValues, valid" in script
+    assert "Use valid date ranges like 12/01-12/31." in script
+
+
+def test_schedule_builder_supports_pipe_separated_hourly_values():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+    template = (ROOT / "templates" / "partials" / "_macros.html").read_text(encoding="utf-8")
+
+    assert "data-schedule-hour-values" in template
+    assert 'placeholder="2 or 5-7"' in template
+    assert "data-schedule-add-option" in template
+    assert 'data-schedule-feedback="hourly"' in template
+    assert "const hourValues = builder.querySelector('[data-schedule-hour-values]')" in script
+    assert "if (!valid) return ''" in script
+    assert "return `hourly(${simplified})`" in script
+    assert "hourValues: inner" in script
+    assert "if (hourValues) hourValues.value = parsed.hourValues || ''" in script
+    assert "if (hourValues) hourValues.addEventListener('input', () => updateFromBuilder())" in script
+    assert "if (hourValues) hourValues.addEventListener('change', () => updateFromBuilder())" in script
+
+
+def test_schedule_builder_validates_hourly_values():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+
+    assert "function isValidHourlyScheduleValues" in script
+    assert "hour >= 0 && hour <= 23" in script
+    assert "return rangeParts.length === 2 && isValidHourlyToken(rangeParts[0]) && isValidHourlyToken(rangeParts[1])" in script
+    assert "setScheduleFieldValidity(hourValues, valid" in script
+    assert "Use hours 0-23 or ranges like 5-7 / 17-04." in script
+
+
+def test_schedule_builder_supports_pipe_separated_monthly_values():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+    template = (ROOT / "templates" / "partials" / "_macros.html").read_text(encoding="utf-8")
+
+    assert "data-schedule-month-values" in template
+    assert 'placeholder="1 or 1-7 or last"' in template
+    assert "data-schedule-add-option" in template
+    assert 'data-schedule-feedback="monthly"' in template
+    assert "const monthlyValues = builder.querySelector('[data-schedule-month-values]')" in script
+    assert "if (!valid) return ''" in script
+    assert "return `monthly(${simplified})`" in script
+    assert "monthValues: inner" in script
+    assert "if (monthlyValues) monthlyValues.value = parsed.monthValues || ''" in script
+    assert "if (monthlyValues) monthlyValues.addEventListener('input', () => updateFromBuilder())" in script
+    assert "if (monthlyValues) monthlyValues.addEventListener('change', () => updateFromBuilder())" in script
+
+
+def test_schedule_builder_validates_monthly_day_values():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+
+    assert "function isValidMonthlyScheduleValues" in script
+    assert "day >= 1 && day <= 31" in script
+    assert r"if (!/^\d+$/.test(start) || !isValidMonthlyDayToken(start) || !isValidMonthlyDayToken(end)) return false" in script
+    assert "return Number(start) <= Number(end)" in script
+    assert "setScheduleFieldValidity(monthlyValues, valid" in script
+    assert "Use days 1-31, last, or ranges like 1-7 / 21-last." in script
+
+
+def test_schedule_builder_supports_pipe_separated_yearly_values():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+    template = (ROOT / "templates" / "partials" / "_macros.html").read_text(encoding="utf-8")
+
+    assert "data-schedule-year-values" in template
+    assert 'placeholder="01/30"' in template
+    assert "data-schedule-add-option" in template
+    assert 'data-schedule-feedback="yearly"' in template
+    assert "const yearlyValues = builder.querySelector('[data-schedule-year-values]')" in script
+    assert "return `yearly(${simplified})`" in script
+    assert "yearValues: inner" in script
+    assert "if (yearlyValues) yearlyValues.value = parsed.yearValues || parsed.monthDay || ''" in script
+    assert "if (yearlyValues) yearlyValues.addEventListener('input', () => updateFromBuilder())" in script
+    assert "if (yearlyValues) yearlyValues.addEventListener('change', () => updateFromBuilder())" in script
+
+
+def test_schedule_builder_validates_yearly_values():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+
+    assert "function isValidYearlyScheduleValues" in script
+    assert "dates.every(date => date && isValidScheduleMonthDay(date))" in script
+    assert "setScheduleFieldValidity(yearlyValues, valid" in script
+    assert "Use valid MM/DD dates like 01/30." in script
+
+
+def test_schedule_builder_add_option_buttons_append_separator():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+    template = (ROOT / "templates" / "partials" / "_macros.html").read_text(encoding="utf-8")
+
+    assert template.count("data-schedule-add-option") >= 6
+    assert "const addOptionButtons = Array.from(builder.querySelectorAll('[data-schedule-add-option]'))" in script
+    assert "function appendScheduleOptionSeparator (input)" in script
+    assert "!nextValue.endsWith('|') ? `${nextValue}|` : nextValue" in script
+    assert (
+        "button.closest('.input-group')?.querySelector('[data-schedule-range-values], [data-schedule-hour-values], [data-schedule-month-values], [data-schedule-year-values]')"
+        in script
+    )
+    assert "input.dispatchEvent(new Event('input', { bubbles: true }))" in script
+
+
+def test_schedule_builder_deduplicates_pipe_values():
+    script = LIBRARIES_JS_PATH.read_text(encoding="utf-8")
+
+    assert "function uniquePipeValues" in script
+    assert "const key = part.toLowerCase()" in script
+    assert "function simplifyScheduleValuesInput" in script
+    assert "input.value = simplified" in script
+    assert "const simplified = simplifyScheduleValuesInput(rangeValues)" in script
+    assert "return `range(${simplified})`" in script
+    assert "const simplified = simplifyScheduleValuesInput(monthlyValues)" in script
+    assert "return `monthly(${simplified})`" in script
+    assert "const simplified = simplifyScheduleValuesInput(yearlyValues)" in script
+    assert "return `yearly(${simplified})`" in script
+    assert "const simplified = simplifyScheduleValuesInput(hourValues)" in script
+    assert "return `hourly(${simplified})`" in script
 
 
 def test_attributes_and_playlists_have_override_scope_counts_and_resets():
@@ -331,10 +578,9 @@ def test_attributes_and_playlists_have_override_scope_counts_and_resets():
     assert 'data-library-override-label="Attributes"' in movie_settings
     assert 'data-library-override-label="Attributes"' in show_settings
     assert 'data-library-override-label="Playlists"' in playlists
-    assert 'data-library-override-label="Playlist Files"' in playlists
     assert 'id="{{ library.id }}-playlist-accordion"' in playlists
     assert 'data-library-override-label="Shared Playlist Defaults"' in playlist_vars
-    assert 'data-library-override-label="Per-Playlist Overrides"' in playlist_vars
+    assert 'data-library-override-label="Per-Playlist Modifications"' in playlist_vars
     for label in ("Separators", "Overlay Operations", "Library Operations", "Miscellaneous"):
         assert f'data-library-override-label="{label}"' in movie_attributes
         assert f'data-library-override-label="{label}"' in show_attributes
@@ -356,6 +602,8 @@ def test_advanced_library_sections_have_override_scope_counts_and_defaults():
     collection_files = COLLECTION_FILES_PARTIAL_PATH.read_text(encoding="utf-8")
     metadata_files = METADATA_FILES_PARTIAL_PATH.read_text(encoding="utf-8")
     overlay_files = OVERLAY_FILES_PARTIAL_PATH.read_text(encoding="utf-8")
+    playlist_files_accordion = PLAYLIST_FILES_ACCORDION_PARTIAL_PATH.read_text(encoding="utf-8")
+    playlist_files = PLAYLIST_FILES_PARTIAL_PATH.read_text(encoding="utf-8")
     radarr_overrides = RADARR_OVERRIDES_PARTIAL_PATH.read_text(encoding="utf-8")
     sonarr_overrides = SONARR_OVERRIDES_PARTIAL_PATH.read_text(encoding="utf-8")
 
@@ -368,6 +616,16 @@ def test_advanced_library_sections_have_override_scope_counts_and_defaults():
     assert "[data-collection-files-editor]" in script
     assert "[data-metadata-files-editor]" in script
     assert "[data-overlay-files-editor]" in script
+    assert "data-overlay-file-template-variables" in script
+    assert "data-metadata-file-template-variables" in script
+    assert "data-collection-file-template-variables" in script
+    assert "data-playlist-file-template-variables" in script
+    assert "parseOverlayFileTemplateVariables" in script
+    assert "formatOverlayFileTemplateVariables" in script
+    assert "template_variables" in script
+    assert "[data-overlay-file-type], [data-overlay-file-location], [data-overlay-file-template-variables]" in script
+    assert "[data-metadata-file-type], [data-metadata-file-location], [data-metadata-file-schedule], [data-metadata-file-template-variables]" in script
+    assert "[data-collection-file-type], [data-collection-file-location], [data-collection-file-schedule], [data-collection-file-template-variables]" in script
     assert "[data-playlist-key-toggle-group]" in script
     assert "[data-playlist-user-picker]" in script
     assert "name.includes('-library_service_')" in script
@@ -381,8 +639,9 @@ def test_advanced_library_sections_have_override_scope_counts_and_defaults():
     assert 'data-library-override-label="Collection Files"' in collection_files_accordion
     assert 'data-library-override-label="Metadata Files"' in metadata_files
     assert 'data-library-override-label="Overlay Files"' in overlay_files
-    assert 'data-library-override-label="Radarr Overrides"' in radarr_overrides
-    assert 'data-library-override-label="Sonarr Overrides"' in sonarr_overrides
+    assert 'data-library-override-label="Playlist Files"' in playlist_files_accordion
+    assert 'data-library-override-label="Radarr Modifications"' in radarr_overrides
+    assert 'data-library-override-label="Sonarr Modifications"' in sonarr_overrides
     assert radarr_overrides.count('data-default=""') >= 10
     assert sonarr_overrides.count('data-default=""') >= 10
     assert 'data-library-service-validated="radarr"' in radarr_overrides
@@ -390,18 +649,39 @@ def test_advanced_library_sections_have_override_scope_counts_and_defaults():
     assert 'data-default="[]"' in collection_files
     assert 'data-default="[]"' in metadata_files
     assert 'data-default="[]"' in overlay_files
+    assert 'data-default="[]"' in playlist_files
 
 
-def test_analytics_page_checks_reingest_status_before_loading_trends():
+def test_analytics_page_loads_trends_without_waiting_for_reingest_status():
     script = (ROOT / "static" / "local-js" / "905-analytics.js").read_text(encoding="utf-8")
 
-    assert "fetchReingestStatus()\n    .then(data => {" in script
-    assert "if (data && (data.status === 'running' || data.status === 'complete')) return" in script
-    assert "fetchRuns({ suppressStatus })" in script
+    runs_request = "const runsRequest = fetchRuns({ suppressStatus })"
+    reingest_request = "fetchReingestStatus(null, { applyComplete: false }).catch(err => {"
+    assert runs_request in script
+    assert reingest_request in script
+    assert script.index(runs_request) < script.index(reingest_request)
+    assert "return runsRequest" in script
     assert "/logscan/trends?limit=${safeLimit}&include_archive_storage=0&include_ingest_health=0&include_incomplete=0" in script
+    assert "total_log_line_count" in script
+    assert "Log Lines + Levels + Cache" in (ROOT / "templates" / "905-analytics.html").read_text(encoding="utf-8")
     assert "fetchIncompleteRuns(safeLimit)" in script
     assert "fetchArchiveStorage()" in script
     assert "fetchIngestHealth()" in script
+
+    template = (ROOT / "templates" / "905-analytics.html").read_text(encoding="utf-8")
+    for filter_id in (
+        "logscan-trends-tool-filter",
+        "logscan-trends-config-filter",
+        "logscan-trends-tool-version-filter",
+        "logscan-trends-quickstart-version-filter",
+        "logscan-trends-command-filter",
+        "logscan-trends-library-filter",
+    ):
+        marker = f'id="{filter_id}"'
+        start = template.index(marker)
+        select_fragment = template[start : template.index(">", start)]
+        assert "multiple" in select_fragment
+        assert "logscan-multi-filter" in select_fragment
 
 
 def test_template_variable_sections_show_override_rail():

@@ -8,6 +8,7 @@ from pathlib import Path
 from flask import Blueprint, jsonify, request, session
 
 from modules import database, helpers, kometa_install, persistence
+from modules.kometa_integrity import current_integrity, format_integrity
 from modules.background_jobs import (
     JOB_TARGET_PAGES,
     clear_active_background_job,
@@ -20,6 +21,12 @@ from modules.background_jobs import (
 )
 
 bp = Blueprint("kometa_updates", __name__)
+
+
+@bp.route("/kometa-integrity", methods=["GET"])
+def kometa_integrity():
+    report = current_integrity()
+    return jsonify(integrity=report, integrity_lines=format_integrity(report))
 
 
 def _kometa_root_validation_error(error, logs, status_code=200):
@@ -107,6 +114,8 @@ def save_kometa_install_mode():
     )
     selection = kometa_install.resolve_kometa_selection(section_payload["kometa"])
     kometa_install.apply_kometa_selection(selection)
+    selected_root = selection.get("selected_root")
+    runtime_state = kometa_install.probe_kometa_root_state(selected_root) if selected_root and selected_root.exists() else {}
 
     if install_mode == kometa_install.KOMETA_INSTALL_MODE_EXISTING:
         message = "Quickstart will now use the selected existing Kometa install for this config."
@@ -114,6 +123,11 @@ def save_kometa_install_mode():
         message = "Quickstart will now sync config and optional logs for the selected external Kometa setup."
     else:
         message = "Quickstart will now use its managed Kometa install for this config."
+    if runtime_state.get("kometa_legacy_nightly_branch"):
+        if install_mode == kometa_install.KOMETA_INSTALL_MODE_EXISTING:
+            message += " This install uses the retired nightly branch; switch it to develop or master outside Quickstart."
+        else:
+            message += " This install uses the retired nightly branch; Quickstart will run and update it as develop."
     return jsonify(
         success=True,
         message=message,
@@ -135,6 +149,9 @@ def save_kometa_install_mode():
         can_update=selection.get("can_update"),
         can_probe_runtime=selection.get("can_probe_runtime"),
         can_read_logs=selection.get("can_read_logs"),
+        kometa_detected_branch=runtime_state.get("kometa_detected_branch", ""),
+        kometa_effective_branch=runtime_state.get("kometa_effective_branch", ""),
+        kometa_legacy_nightly_branch=bool(runtime_state.get("kometa_legacy_nightly_branch")),
     )
 
 
@@ -159,6 +176,10 @@ def validate_kometa_root():
         return fail(target["error"])
     install_mode = target["install_mode"]
     p = target["path_obj"]
+    integrity_report = current_integrity(p, install_mode)
+    integrity_lines = format_integrity(integrity_report)
+    for line in integrity_lines:
+        log(line)
     config_dir = target.get("config_dir")
     log_dir = target.get("log_dir")
 
@@ -196,6 +217,8 @@ def validate_kometa_root():
                 venv_python_display="",
                 kometa_version="External / unmanaged",
                 external_mode=True,
+                integrity=integrity_report,
+                integrity_lines=integrity_lines,
                 log=logs,
                 synced_config=str(sync_result.get("destination")),
             ),
@@ -355,6 +378,8 @@ def validate_kometa_root():
             kometa_root_display=kometa_root_display,
             venv_python_display=str(python_bin),
             kometa_version=kometa_version,
+            integrity=integrity_report,
+            integrity_lines=integrity_lines,
             log=logs,
         ),
         200,
@@ -376,6 +401,7 @@ def probe_kometa_root():
     if target.get("install_mode") == kometa_install.KOMETA_INSTALL_MODE_EXTERNAL:
         config_dir = target.get("config_dir")
         log_dir = target.get("log_dir")
+        integrity_report = current_integrity(None, target["install_mode"])
         state = {
             "kometa_root": "",
             "kometa_root_display": "",
@@ -394,6 +420,8 @@ def probe_kometa_root():
             "venv_python_exists": False,
             "kometa_running": False,
             "external_mode": True,
+            "integrity": integrity_report,
+            "integrity_lines": format_integrity(integrity_report),
         }
         log(f"🔍 Probing external Kometa config path: {state['kometa_config_dir_display']}")
         if state["config_dir_exists"]:
@@ -424,6 +452,10 @@ def probe_kometa_root():
     import quickstart
 
     state = quickstart._probe_kometa_root_state(p)
+    state["integrity"] = current_integrity(p, target["install_mode"])
+    state["integrity_lines"] = format_integrity(state["integrity"])
+    for line in state["integrity_lines"]:
+        log(line)
     log(f"🔍 Probing Kometa path: {state['kometa_root_display']}")
     if not state["root_exists"]:
         log("ℹ️ Kometa root does not exist yet. Install required.")
@@ -551,7 +583,7 @@ def check_kometa_update():
     )
     local_version = update_info.get("local_version") or state["kometa_version"]
     remote_version = update_info.get("remote_version") or ""
-    remote_branch = update_info.get("branch") or "nightly"
+    remote_branch = update_info.get("branch") or "develop"
     local_branch = update_info.get("local_branch") or "unknown"
     local_sha = update_info.get("local_sha") or ""
     remote_sha = update_info.get("remote_sha") or ""
@@ -649,7 +681,7 @@ def update_kometa():
         if branch_override_raw and not branch_override:
             return jsonify({"success": False, "error": "Invalid Kometa branch override.", "log": ["❌ Invalid Kometa branch override."]}), 400
         qs_branch = data.get("branch") or helpers.detect_git_branch(quickstart.app.root_path)
-        kometa_branch = branch_override or ("master" if qs_branch == "master" else "nightly")
+        kometa_branch = branch_override or ("master" if qs_branch == "master" else "develop")
         force_update = helpers.booler(data.get("force", False))
         background = data.get("background") is True
 
