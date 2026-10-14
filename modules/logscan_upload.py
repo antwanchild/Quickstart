@@ -1,4 +1,4 @@
-"""Manual uploads of current and historical runtime logs to Logscan."""
+"""Manual and opt-in automatic uploads of runtime logs to Logscan."""
 
 import os
 import copy
@@ -24,6 +24,10 @@ from modules.logscan_cache import get_logscan_cache_dir
 PORTAL_URL = "https://logscan.kometa.team"
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
 MAX_BATCH_LOGS = 500
+UPLOAD_RESPONSE_TIMEOUT = 900
+SCAN_JOB_TIMEOUT = 900
+MAX_STATUS_FAILURES = 5
+UPLOAD_CHUNK_BYTES = 64 * 1024
 
 
 class UploadError(ValueError):
@@ -48,7 +52,7 @@ class MultipartLog:
     def __iter__(self):
         yield self.prefix
         self.snapshot.seek(0)
-        while chunk := self.snapshot.read(1024 * 1024):
+        while chunk := self.snapshot.read(UPLOAD_CHUNK_BYTES):
             yield chunk
         yield self.suffix
 
@@ -149,6 +153,9 @@ class LogscanUploader:
         self.receipts = {}
         self.receipts_loaded = False
         self.receipt_lock = threading.RLock()
+        self.automatic = {}
+        self.auto_queue = {}
+        self.auto_thread = None
         self.restore_queue = {}
         self.restore_checked = set()
         self.restore_thread = None
@@ -194,6 +201,14 @@ class LogscanUploader:
                 return
             data = json.loads(path.read_text(encoding="utf-8"))
             receipts = data.get("receipts", {}) if isinstance(data, dict) else {}
+            automatic = data.get("automatic", {}) if isinstance(data, dict) else {}
+            if isinstance(automatic, dict):
+                for key, value in automatic.items():
+                    if not isinstance(key, str) or not 0 < len(key) <= 256 or not isinstance(value, dict):
+                        continue
+                    if value.get("phase") not in {"complete", "failed", "not_uploaded"}:
+                        value = {"phase": "failed", "error": "Automatic upload was interrupted. Check Logscan before uploading manually.", "uncertain": True}
+                    self.automatic[key] = {**value, "run_key": key}
             if isinstance(receipts, dict):
                 for key, value in receipts.items():
                     if not isinstance(key, str) or not re.fullmatch(r"[a-f0-9]{64}", key) or not isinstance(value, dict):
@@ -312,6 +327,97 @@ class LogscanUploader:
                         }
             return results
 
+    def automatic_results(self):
+        with self.receipt_lock:
+            self._load_receipts()
+            results = copy.deepcopy(self.automatic)
+            saved = self.saved_run_results()
+            for key, value in results.items():
+                if key in saved:
+                    results[key] = saved[key]
+                elif value.get("phase") == "complete":
+                    results[key] = {"run_key": key, "phase": "expired"}
+            return results
+
+    def automatic_pending(self):
+        with self.receipt_lock:
+            return self.auto_thread is not None
+
+    def enqueue_auto(self, path, *, config_name, run_key, tool_name, enabled):
+        if not isinstance(run_key, str) or not 0 < len(run_key) <= 256 or tool_name not in {"kometa", "imagemaid"}:
+            return False
+        with self.receipt_lock:
+            self._load_receipts()
+            if run_key in self.automatic or run_key in self.saved_run_results():
+                return False
+            self.automatic[run_key] = {"run_key": run_key, "phase": "waiting"}
+            self.auto_queue[run_key] = (path, config_name, tool_name, enabled)
+            self._save_receipts()
+            if self.auto_thread is None:
+                self.auto_thread = threading.Thread(target=self._run_automatic, daemon=True, name="logscan-auto-upload")
+                try:
+                    self.auto_thread.start()
+                except Exception:
+                    self.auto_thread = None
+                    self.auto_queue.pop(run_key, None)
+                    self.automatic[run_key] = {"run_key": run_key, "phase": "failed", "error": "Automatic upload could not start. Nothing was uploaded."}
+                    self._save_receipts()
+                    raise
+            return True
+
+    def _set_automatic_result(self, run_key, data):
+        with self.receipt_lock:
+            self.automatic[run_key] = {key: value for key, value in data.items() if key in {"phase", "error", "uncertain", "already_uploaded"}}
+            self.automatic[run_key]["run_key"] = run_key
+            self._save_receipts()
+
+    def _run_automatic(self):
+        while True:
+            with self.receipt_lock:
+                if not self.auto_queue:
+                    self.auto_thread = None
+                    return
+                run_key = next(iter(self.auto_queue))
+                path, config_name, tool_name, enabled = self.auto_queue.pop(run_key)
+            try:
+                while True:
+                    if not enabled():
+                        self._set_automatic_result(run_key, {"phase": "not_uploaded"})
+                        break
+                    with self.lock:
+                        active = self.active
+                    if active:
+                        time.sleep(0.25)
+                        continue
+                    if not self.supports_tool(tool_name):
+                        raise UploadError("Online Logscan does not currently accept this log type. Nothing was uploaded.")
+                    if not enabled():
+                        continue
+                    try:
+                        job_id = self.start(path, config_name=config_name, run_key=run_key)
+                    except UploadError:
+                        with self.lock:
+                            if self.active:
+                                continue
+                        raise
+                    previous_phase = None
+                    while True:
+                        status = self.status(job_id)
+                        if status["phase"] != previous_phase:
+                            self._set_automatic_result(run_key, status)
+                            previous_phase = status["phase"]
+                        if status["phase"] in {"complete", "failed"}:
+                            break
+                        time.sleep(0.25)
+                    break
+            except (OSError, UploadError) as exc:
+                error = str(exc) if isinstance(exc, UploadError) else "The local log could not be read. Nothing was uploaded."
+                self._set_automatic_result(run_key, {"phase": "failed", "error": error})
+            except Exception:
+                self._set_automatic_result(
+                    run_key, {"phase": "failed", "uncertain": True, "error": "Automatic upload could not be confirmed. Check Logscan before uploading manually."}
+                )
+
     def restore_run_result(self, run_key, path):
         """Recover pre-association receipts locally, without delaying Analytics."""
         if not isinstance(run_key, str) or not 0 < len(run_key) <= 256:
@@ -383,7 +489,7 @@ class LogscanUploader:
             path.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
                 temporary = Path(handle.name)
-                json.dump({"version": 2, "receipts": self.receipts}, handle)
+                json.dump({"version": 3, "receipts": self.receipts, "automatic": dict(list(self.automatic.items())[-500:])}, handle)
             temporary.replace(path)
         except OSError:
             logging.getLogger(__name__).warning("Could not save the local Logscan upload receipt.")
@@ -597,54 +703,107 @@ class LogscanUploader:
                     with self.lock:
                         self.active = False
 
+    def _wait_for_remote_job(self, connection, job_id, *, recovery_error=None):
+        deadline = time.monotonic() + SCAN_JOB_TIMEOUT
+        failures = 0
+        last_error = recovery_error or "Logscan upload status is unavailable."
+        if recovery_error:
+            self._update(job_id, phase="checking_status")
+        while time.monotonic() < deadline:
+            time.sleep(2)
+            if time.monotonic() >= deadline:
+                break
+            try:
+                poll = connection.get(
+                    PORTAL_URL + f"/api/scan-jobs/{job_id}",
+                    timeout=(10, min(30, max(1, deadline - time.monotonic()))),
+                    allow_redirects=False,
+                )
+                try:
+                    if poll.status_code != 200:
+                        last_error = f"Logscan status request returned HTTP {poll.status_code}."
+                        if poll.status_code not in {404, 408, 429, 500, 502, 503, 504}:
+                            raise UploadError(last_error + " The upload may still be processing; check Logscan before retrying.", uncertain=True)
+                        payload = None
+                    else:
+                        payload = poll.json()
+                        if not isinstance(payload, dict) or payload.get("phase") not in {"uploading", "queued", "validating", "scanning", "saving", "complete", "failed"}:
+                            last_error = "Logscan returned an unexpected upload status."
+                            payload = None
+                finally:
+                    poll.close()
+            except requests.Timeout:
+                last_error = "A Logscan status request timed out."
+                payload = None
+            except requests.RequestException:
+                last_error = "The connection was interrupted while checking Logscan upload status."
+                payload = None
+            except ValueError as exc:
+                if isinstance(exc, UploadError):
+                    raise
+                last_error = "Logscan returned an unreadable upload status."
+                payload = None
+            if payload is None:
+                failures += 1
+                self._update(job_id, phase="checking_status", status_retry_count=failures)
+                if failures >= MAX_STATUS_FAILURES:
+                    reason = f"{recovery_error} {last_error}" if recovery_error and recovery_error != last_error else last_error
+                    raise UploadError(reason + " The upload could not be confirmed. Check Logscan before retrying; the file was not resent.", uncertain=True)
+                continue
+            failures = 0
+            self._update(job_id, phase=payload["phase"], status_retry_count=0)
+            if payload["phase"] == "failed":
+                raise UploadError("Logscan reported that the uploaded log could not be scanned.")
+            if payload["phase"] == "complete":
+                return payload.get("result") or {}
+        raise UploadError("Logscan has not finished within 15 minutes. Check Logscan before retrying; the file was not resent.", uncertain=True)
+
     def _run(self, job_id, snapshot, size, filename="qs-default-meta.gz"):
         try:
             with snapshot, requests.Session() as connection:
                 body = MultipartLog(snapshot, size, filename)
-                response = connection.post(
-                    PORTAL_URL + "/api/scan",
-                    data=body,
-                    headers={
-                        "Content-Type": f"multipart/form-data; boundary={body.boundary}",
-                        "X-Scan-Job-ID": job_id,
-                    },
-                    timeout=(10, 120),
-                    allow_redirects=False,
-                )
-                if response.status_code not in (200, 202):
-                    raise UploadError(
-                        f"Logscan rejected the upload (HTTP {response.status_code}).",
-                        uncertain=response.status_code >= 500 or 300 <= response.status_code < 400,
+                recovery_error = None
+                accepted_async = False
+                try:
+                    response = connection.post(
+                        PORTAL_URL + "/api/scan",
+                        data=body,
+                        headers={
+                            "Content-Type": f"multipart/form-data; boundary={body.boundary}",
+                            "X-Scan-Job-ID": job_id,
+                        },
+                        timeout=(10, UPLOAD_RESPONSE_TIMEOUT),
+                        allow_redirects=False,
                     )
-                payload = response.json()
-                deadline = time.monotonic() + 900
-                if response.status_code == 202:
-                    if payload.get("job_id") != job_id:
-                        raise UploadError("Logscan returned an unexpected upload job.", uncertain=True)
-                    while True:
-                        if time.monotonic() >= deadline:
-                            raise UploadError(
-                                "Logscan is still processing this upload. It may have been accepted; retrying could create a duplicate.",
-                                uncertain=True,
-                            )
-                        self._update(job_id, phase=payload.get("phase", "queued"))
-                        time.sleep(2)
-                        poll = connection.get(
-                            PORTAL_URL + f"/api/scan-jobs/{job_id}",
-                            timeout=(10, 30),
-                            allow_redirects=False,
-                        )
-                        if poll.status_code != 200:
-                            raise UploadError(
-                                "Upload status is unavailable. The log may have been accepted; retrying could create a duplicate.",
-                                uncertain=True,
-                            )
-                        payload = poll.json()
-                        if payload.get("phase") == "failed":
-                            raise UploadError("Logscan could not scan the uploaded log.")
-                        if payload.get("phase") == "complete":
-                            payload = payload.get("result") or {}
-                            break
+                    try:
+                        if response.status_code == 408 or 500 <= response.status_code < 600:
+                            recovery_error = f"Logscan's upload response returned HTTP {response.status_code}."
+                        elif response.status_code not in (200, 202):
+                            raise UploadError(f"Logscan rejected the upload (HTTP {response.status_code}).", uncertain=300 <= response.status_code < 400)
+                        else:
+                            try:
+                                payload = response.json()
+                            except ValueError:
+                                recovery_error = "Logscan's upload response was unreadable."
+                            else:
+                                if response.status_code == 202:
+                                    if not isinstance(payload, dict) or payload.get("job_id") != job_id:
+                                        raise UploadError("Logscan returned an unexpected upload job.", uncertain=True)
+                                    self._update(job_id, phase=payload.get("phase", "queued"))
+                                    accepted_async = True
+                    finally:
+                        response.close()
+                except requests.ConnectTimeout:
+                    raise UploadError("Quickstart could not connect to Logscan within 10 seconds. Nothing was uploaded.") from None
+                except requests.Timeout:
+                    recovery_error = "Quickstart timed out waiting for Logscan's upload response."
+                except requests.RequestException:
+                    recovery_error = "Quickstart lost its connection to Logscan during the upload."
+                if recovery_error:
+                    logging.getLogger(__name__).warning("%s Checking the existing upload job without resending the file.", recovery_error)
+                    payload = self._wait_for_remote_job(connection, job_id, recovery_error=recovery_error)
+                elif accepted_async:
+                    payload = self._wait_for_remote_job(connection, job_id)
                 try:
                     links = result_links(payload)
                 except UploadError as exc:

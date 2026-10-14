@@ -23,6 +23,57 @@ describe('manual compressed Logscan upload', () => {
     document.body.innerHTML = ''
   })
 
+  it('shows automatic queue progress without posting from the browser', async () => {
+    document.getElementById('logscan-upload').remove()
+    document.body.insertAdjacentHTML('beforeend', '<table id="logscan-trends-table"><tbody><tr><td><button class="logscan-upload-log" data-run-key="auto"></button><div class="logscan-upload-feedback" data-run-key="auto"></div></td></tr></tbody></table>')
+    fetch.mockResolvedValueOnce(reply({ phase: 'idle', automatic_pending: true, automatic_results: { auto: { phase: 'waiting' } }, run_results: {} }))
+      .mockResolvedValueOnce(reply({ phase: 'idle', automatic_pending: false, automatic_results: { auto: completed }, run_results: { auto: completed } }))
+    const control = initLogscanUpload({ historical: true })
+    await flush()
+    expect(control.isBusy()).toBe(true)
+    expect(control.hasResult('auto')).toBe(false)
+    expect(document.querySelector('.logscan-upload-feedback').textContent).toContain('Waiting')
+    expect(document.querySelector('.logscan-upload-log').disabled).toBe(true)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(control.hasResult('auto')).toBe(true)
+    expect(control.isBusy()).toBe(false)
+    expect(document.querySelector('.logscan-upload-feedback a').href).toBe(completed.result_url)
+    expect(fetch.mock.calls.every(([, options]) => !options?.method)).toBe(true)
+  })
+
+  it('restores automatic failures without marking them uploaded', async () => {
+    document.getElementById('logscan-upload').remove()
+    document.body.insertAdjacentHTML('beforeend', '<table id="logscan-trends-table"><tbody><tr><td><div class="logscan-upload-feedback" data-run-key="failed"></div></td></tr></tbody></table>')
+    fetch.mockResolvedValueOnce(reply({ phase: 'idle', run_results: {}, automatic_results: { failed: { phase: 'failed', error: 'Upload could not be confirmed.' } } }))
+    const control = initLogscanUpload({ historical: true })
+    await flush()
+    expect(control.hasResult('failed')).toBe(false)
+    expect(document.querySelector('.logscan-upload-feedback').textContent).toBe('Upload could not be confirmed.')
+    expect(document.querySelector('.logscan-upload-feedback a')).toBeNull()
+  })
+
+  it('continues polling Analytics for new automatic uploads without a manual click', async () => {
+    document.getElementById('logscan-upload').remove()
+    document.body.insertAdjacentHTML('beforeend', '<table id="logscan-trends-table"><tbody></tbody></table>')
+    fetch.mockResolvedValue(reply({ phase: 'idle', automatic_enabled: true }))
+    initLogscanUpload({ historical: true })
+    await flush()
+    await vi.advanceTimersByTimeAsync(15000)
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(fetch.mock.calls.every(([url, options]) => url === '/logscan/upload/status?history=1' && !options?.method)).toBe(true)
+  })
+
+  it('keeps saved links stable across automatic background polls', async () => {
+    document.getElementById('logscan-upload').remove()
+    document.body.insertAdjacentHTML('beforeend', '<table id="logscan-trends-table"><tbody><tr><td><div class="logscan-upload-feedback" data-run-key="auto"></div></td></tr></tbody></table>')
+    fetch.mockResolvedValue(reply({ phase: 'idle', automatic_enabled: true, run_results: { auto: completed } }))
+    initLogscanUpload({ historical: true })
+    await flush()
+    const link = document.querySelector('.logscan-upload-feedback a')
+    await vi.advanceTimersByTimeAsync(15000)
+    expect(document.querySelector('.logscan-upload-feedback a')).toBe(link)
+  })
+
   it('does not upload on initialization or cancelled confirmation', async () => {
     initLogscanUpload()
     await flush()
@@ -81,6 +132,18 @@ describe('manual compressed Logscan upload', () => {
     await flush()
     expect(document.getElementById('logscan-upload-status').textContent).toBe('Current log is not ready.')
     expect(document.getElementById('logscan-upload-links').classList.contains('d-none')).toBe(true)
+  })
+
+  it('keeps the existing upload busy while its response is recovered', async () => {
+    fetch.mockResolvedValueOnce(reply({ phase: 'checking_status' })).mockResolvedValueOnce(reply(completed))
+    initLogscanUpload()
+    await flush()
+    expect(document.getElementById('logscan-upload').disabled).toBe(true)
+    expect(document.getElementById('logscan-upload-status').textContent).toBe('Checking the existing upload with Logscan...')
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(document.getElementById('logscan-upload').disabled).toBe(false)
+    expect(document.getElementById('logscan-upload-result').href).toBe(completed.result_url)
+    expect(fetch.mock.calls.every(([url, options]) => url === '/logscan/upload/status' && !options?.method)).toBe(true)
   })
 
   it('binds once and ignores pages without the upload button', () => {
